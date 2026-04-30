@@ -1,6 +1,7 @@
 ---
 title: "Week 2.5 — GraphRAG on a Wikipedia Subset"
 created: 2026-04-24
+updated: 2026-04-30
 tags: [agent, curriculum, week-2-5, rag, graphrag, knowledge-graph, neo4j, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-02-5-graphrag"
@@ -547,6 +548,74 @@ GraphRAG ingestion cost is analogous to a materialised view vs an index. Materia
 
 ---
 
+## Lab Run-Through Bad Cases (2026-04-30)
+
+> Operational counterpart to the [[#Bad-Case Journal]] section below. The canonical §6 captures *architectural* failure modes that emerge in production GraphRAG (entity duplication, relation explosion, traversal flooding, dev-set bias). This section captures *operational* failures encountered the first time someone runs the lab end-to-end on the documented stack.
+
+The five bad cases below were measured during a 2026-04-30 end-to-end run-through on the documented stack (oMLX serving `gemma-4-26B-A4B-it-heretic-4bit` + `gpt-oss-20b-MXFP4-Q8`, Neo4j 5.x in Docker, M5 Pro 48 GB). Each one bit between Phase 1 and Phase 3.2 the first time through. The 5-second sanity tests are designed to catch them on a re-run.
+
+**Entry 1 — `wikipedia` dataset rejected with "loading scripts no longer supported".**
+*Symptom:* `python src/fetch_corpus.py` fails immediately at `load_dataset("wikipedia", "20220301.en", split="train[:200]", trust_remote_code=True)` with `ValueError: \`trust_remote_code\` is not supported anymore. ... Please ask the dataset author to remove it and convert it to a standard format like Parquet.` The `wikipedia.py` loading script gets downloaded but never executed.
+*Root cause:* HuggingFace `datasets` 3.x removed support for arbitrary loading scripts (security and reproducibility hardening). The `wikipedia` dataset is a script-based dataset that downloads + parses XML dumps at load time. Its replacement, `wikimedia/wikipedia` (maintained by the Wikimedia Foundation), publishes pre-processed Parquet snapshots starting from `20231101.en` and needs no `trust_remote_code`.
+*Fix:* Replace the loader call in `src/fetch_corpus.py`:
+```python
+ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]")
+```
+The schema is identical (`id`, `url`, `title`, `text`), so downstream code that does `r["title"]`, `r["text"]` still works without modification.
+
+**Entry 2 — Reasoning model returns `content=None`, crashes `json.loads`.**
+*Symptom:* `python src/query_graph.py "anything"` crashes with `TypeError: the JSON object must be str, bytes or bytearray, not NoneType` at the `json.loads(resp.choices[0].message.content)` line in `extract_seed_entities`. The HTTP call to oMLX succeeds; only the visible content is `None`.
+*Root cause:* `MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8` is a *reasoning model*. Reasoning models emit `reasoning_content` (chain-of-thought) before producing user-visible `content`, and `max_tokens` caps the **sum** of reasoning + content. With `max_tokens=150`, the reasoning trace consumes the entire budget and the model never reaches the visible-content phase, so `content` returns `None`. This is the same `content=None` failure mode documented in [[Week 2 - Rerank and Context Compression#7.5 Optimizations that transfer from lab-02 — reach through the wrapper|W2 §7.5]] for `02_compress_via_langchain.py`.
+*Fix:* Bump `max_tokens` to 3000 on any call to a reasoning model AND add a `None` guard so future budget exhaustion fails with a clear message instead of a deep `TypeError`:
+```python
+resp = omlx.chat.completions.create(
+    model=HAIKU, ..., max_tokens=3000,  # was 150
+    response_format={"type": "json_object"},
+)
+content = resp.choices[0].message.content
+if not content:
+    return []  # reasoning model exhausted budget; bump max_tokens or check finish_reason
+```
+
+**Entry 3 — Seed extraction returns `[]` for queries about ideologies, movements, or events.**
+*Symptom:* `python src/query_graph.py "What movements influenced anarchism?"` returns `{"answer": "No relevant entities found", "seeds": [], "edges_used": 0}`. Same query phrased as "Tell me about William Godwin" succeeds. The graph is correctly populated (3,952 entities, 2,859 edges); the seed extractor just refuses to emit anything.
+*Root cause:* The `EXTRACT_SYSTEM` prompt restricts entities to "concrete nouns: companies, people, places, products" — which excludes movements, ideologies, events, and concepts. Wikipedia's earliest articles (which dominate `train[:200]`) are largely about exactly those excluded categories (Anarchism, Enlightenment, Russian Civil War). The prompt categorically blocks the seeds the corpus actually contains.
+*Fix:* Loosen the seed extractor prompt in `query_graph.py:23`:
+```python
+"Extract 1-5 entities from the query as a JSON object {\"entities\": [...]}. "
+"Include any noun phrase a graph could store: people, places, products, "
+"organizations, movements, ideologies, events, concepts, time periods. "
+"Prefer specific surface forms over generic ones. "
+"If the query is generic ('tell me about X'), extract X."
+```
+The `{"entities": [...]}` envelope also matches `response_format={"type": "json_object"}` (the original prompt asked for a list, mismatching the format).
+
+**Entry 4 — Multi-word seed phrases match zero entities even when the graph contains relevant nodes.**
+*Symptom:* `python src/query_graph.py "Who were the early anarchist thinkers?"` returns `seeds: ["early anarchist thinkers"]` but `edges_used: 0`. Cypher inspection confirms the graph contains "anarchist movement", "anarchist doctrines", "Anarchists", "William Godwin" — all topically relevant. The `MATCH ... WHERE toLower(n.name) CONTAINS toLower($seed)` clause fails because no node name contains the literal phrase "early anarchist thinkers".
+*Root cause:* Whole-phrase substring matching is brittle for multi-word seeds. The seed extractor (correctly) preserves the user's phrasing, but the graph stores atomic concepts. There's no `CONTAINS` overlap between a 24-character descriptive phrase and 9-19-character canonical names.
+*Fix:* Token-level matching with a stop-word filter via `ANY(w IN $words WHERE ...)`:
+```python
+words = [w for w in seed.lower().split() if len(w) >= 4] or [seed.lower()]
+result = session.run(
+    f"""
+    MATCH (n:Entity)
+    WHERE ANY(w IN $words WHERE toLower(n.name) CONTAINS w)
+    WITH n LIMIT 5
+    MATCH path = (n)-[*1..{max_hops}]-(m)
+    ...
+    """,
+    words=words,
+)
+```
+The 4-character minimum drops the most common stop words ("the", "a", "of", "in") that would otherwise match every entity in the graph. After the fix the same query returns `edges_used: 11` and the synthesizer produces "The early anarchist thinkers were William Godwin and Wilhelm Weitling".
+
+**Entry 5 — `python src/build_graph.py` runs in the wrong venv and reports `ModuleNotFoundError: No module named 'neo4j'`.**
+*Symptom:* `python src/build_graph.py` fails with `ModuleNotFoundError`. Confirming the lab's venv has `neo4j 5.28.3` installed (`/path/to/lab/.venv/bin/python -c "import neo4j"` works) makes this seem impossible.
+*Root cause:* The shell's `python` resolves through PATH to a **different** venv (`~/.openharness-venv` in this case — installed by the OMC harness or similar tool that puts itself ahead of project venvs on PATH). The lab's `.venv/` is never activated despite living next to the script. `which python` returns the harness venv's path, not the lab's.
+*Fix:* Either activate the lab venv explicitly (`source .venv/bin/activate`) or use `uv run python src/...` from the project root — uv finds the local `.venv/` automatically and bypasses PATH-based interpreter selection. Long-term: add `cd $LAB && uv run` to your lab-startup alias so this never happens twice.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -554,7 +623,7 @@ GraphRAG ingestion cost is analogous to a materialised view vs an index. Materia
 | `ServiceUnavailable` on Neo4j connect | Docker container not ready | `docker logs neo4j-graphrag` — wait for "Started." line |
 | Entity extraction returns `[]` on many articles | Model returning markdown-wrapped JSON | Add `re.search(r'\{.*\}', content, re.DOTALL)` parse before `json.loads` |
 | Top entities are pronouns/fragments | Prompt not constraining enough | Add "Do not extract pronouns. Every entity must be a proper noun." to EXTRACT_SYSTEM |
-| `edges_used == 0` on every query | Seed-entity matcher failing | Check exact-vs-fuzzy match logic; lowercase both sides |
+| `edges_used == 0` on every query | Seed-entity matcher failing — see Bad-Case Entry 3 / 4 above | Loosen seed prompt + token-level CONTAINS |
 | GraphRAG recall *worse* than vector RAG on all 25 questions | Your eval set isn't multi-hop | Rewrite: each question should require joining facts from ≥ 2 articles |
 
 ---
@@ -634,6 +703,8 @@ The four phase scripts above give you the working code. This section dissects th
 
 ## Bad-Case Journal
 
+> The five entries below cover *architectural* failure modes that emerge as production GraphRAG scales — entity normalization, predicate vocabulary, hallucination grounding, traversal scoring, retrieval-shape mismatch. For *operational* failures encountered running this lab end-to-end (deprecated dataset loaders, reasoning-model token-budget exhaustion, prompt restrictiveness, fuzzy-match brittleness), see [[#Lab Run-Through Bad Cases (2026-04-30)]] above.
+
 **Entry 1 — Entity duplication: 3 versions of "William Shockley".**
 *Symptom:* graph contains nodes "William Shockley", "Shockley", "W. Shockley" as separate entities; relations distributed across all three; queries miss two-thirds of his facts.
 *Root cause:* extraction prompt did not normalize entity names. Model sometimes returned full name, sometimes surname only, sometimes initialled form. Each variant became a separate `MERGE` target.
@@ -658,6 +729,11 @@ The four phase scripts above give you the working code. This section dissects th
 *Symptom:* dev-set eval shows GraphRAG +18% recall over vector. User asks "Tell me about quantum computing" — GraphRAG returns a thin technical entity list; vector RAG returns a rich introductory passage. Users prefer vector RAG output.
 *Root cause:* dev set was biased toward multi-hop relational questions. Real user queries include broad topical questions where GraphRAG's entity-centric retrieval is the wrong shape.
 *Fix:* router. Use a small classifier (or LLM call) to categorize the query as "multi-hop / relational" (route to GraphRAG) or "topical / paraphrase / factoid" (route to vector). The hybrid pattern — both retrievers + a router — is what production systems ship.
+
+**Entry 6 — Same query returns different answers across runs (non-determinism).**
+*Symptom:* `python src/query_graph.py "Which companies did Steve Jobs co-found?"` returns a full answer with 29 graph edges on one run, then `"No relevant entities found in the graph"` with 0 edges on the next run. Same query, same model, `temperature=0.0`. Wall time on the failing run was 38 s vs 6 s on the working run.
+*Root cause:* The seed-extraction step uses `MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8` — a **reasoning model**. Reasoning models spend their `max_tokens` budget on internal `reasoning_content` (chain-of-thought) BEFORE emitting visible `content`. When the chain-of-thought happens to be long (stochastic, even at `temperature=0`), the budget runs out, `content=None`, the JSON parser returns `[]`, the seed list is empty, and the graph traversal returns nothing. The 38 s wall time is the smoking gun: the model spent its full 3000-token budget reasoning, then stopped before producing JSON. `temperature=0` does not eliminate this because reasoning lengths are not fully deterministic across runs.
+*Fix:* (1) Switch entity extraction to a **non-reasoning model** — in this lab, `MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit`. Non-reasoning models emit `content` deterministically at `temperature=0`. Drop `max_tokens` to 400 since gemma is fast and direct. (2) Add a regex fallback (`re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", query)`) for empty content — captures "Steve Jobs", "Apple", "NeXT" via capitalization without needing the LLM. (3) Log `finish_reason` on empty content so future failures aren't silent. **Lesson: never use a reasoning model for structured-output tasks where empty content = silent failure.** The reasoning capability is a liability when the contract is "produce valid JSON." Reserve reasoning models for tasks that benefit from chain-of-thought (math, code review, planning); use non-reasoning models for extraction, classification, and routing.
 
 ---
 
