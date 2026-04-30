@@ -315,6 +315,23 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** User memory is a slowly-changing dimension (SCD-2). Every contradiction archives the old row and writes a new one — identical to how a data warehouse tracks customer addresses. Archive-don't-delete isn't ops hygiene; it's SCD-2 by another name, and that framing lands with senior interviewers.
 
+### Week 3.7 — Agentic RAG (half-week insert, ~6–8h)
+> Detailed runbook: [[Week 3.7 - Agentic RAG]]
+
+**Theory (2–3h).**
+- Read: LangChain's `langgraph_agentic_rag.ipynb`, Singh et al. *Agentic Retrieval-Augmented Generation* survey (2025), CRAG (Yan et al., 2024), Adaptive-RAG, GeAR.
+- Master: the canonical 5-node graph (decide → retrieve → grade → rewrite → answer), where single-pass RAG breaks (ambiguous queries, low-confidence retrieval), the four named architectures (CRAG / Adaptive-RAG / Self-RAG / GeAR) and the tradeoffs between them.
+
+**Lab (4–5h) — `lab-03.7-agentic-rag`.**
+1. Run LangChain's official Agentic RAG notebook end-to-end against your Week 1 corpus + Qdrant + BGE-M3.
+2. Build a comparison harness scoring Week 3's single-pass pipeline vs the 5-node graph on the same 50-Q dev set; quantify the lift on ambiguous queries specifically.
+3. Implement one CRAG variant with a confidence threshold and web-search fallback.
+4. `RESULTS.md` includes a comparison matrix + decision tree — when does Agentic RAG help, when does the cost/latency exceed the quality gain.
+
+**Exit criteria.** 90-second answer to "what's wrong with single-pass RAG and what's the production fix?" — name the 5 nodes, cite a measured lift from your bench, name CRAG by author + year.
+
+**Infra bridge.** Agentic RAG = retry-with-backoff over a retrieval index. The "grade → rewrite → retry" loop is the same shape as a circuit breaker around an unreliable downstream service — same operational primitive, different failure signal.
+
 ---
 
 ## Phase 2 — Agent Design Patterns & Claude Code Source Study (Weeks 4–6)
@@ -382,6 +399,22 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** Multi-agent = distributed compute. Orchestrator = scheduler. Workers = executors. Communication = message bus. Don't forget the dead-letter queue.
 
+### Week 5.5 — Metacognition: Reflexion + Self-Critique (half-week insert, ~5–6h)
+> Detailed runbook: [[Week 5.5 - Metacognition]]
+
+**Theory (2h).**
+- Read: Reflexion (Shinn et al., 2023), Self-Refine (Madaan et al., 2023), Self-Consistency (Wang et al., 2023).
+- Master: why a ReAct loop alone keeps making the same mistake, the verifier-signal → episodic-memory → reflection-pass loop, when sampling diversity + majority vote is cheaper than a critic, and the failure mode where reflection makes the agent worse (overcorrection).
+
+**Lab (3h) — `lab-05.5-metacognition`.**
+1. Wrap your Week 4 ReAct agent with a Reflexion outer loop: verifier tags each trajectory pass/fail, failure stories get appended to an episodic memory and replayed on the next attempt.
+2. Implement Self-Consistency on top: sample N=5, majority-vote the answer, compare cost/quality vs Reflexion on the same task set.
+3. Add one ablation that intentionally injects a bad critic and shows the overcorrection failure mode in action.
+
+**Exit criteria.** Cold answer to "how would you handle an agent that keeps making the same mistake?" — name the loop, cite a paper, name one failure mode.
+
+**Infra bridge.** Reflexion's episodic memory is a post-mortem corpus. Production SRE runbooks and Reflexion's experience replay are the same primitive: write down what failed, retrieve when something similar happens, prevent the regression.
+
 ### Week 6 — Claude Code Source Dive
 > Detailed runbook: [[Week 6 - Claude Code Source Dive]]
 
@@ -408,6 +441,41 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 **Exit criteria.** You can sketch Claude Code's architecture on a whiteboard in 5 minutes. You can name three design decisions you'd copy and one you'd change.
 
 **Infra bridge.** Append-only session storage = event sourcing. 5-layer compaction = your tiered storage strategy (hot/warm/cold). Permission classifier = your data-access RBAC. You've shipped all of these before.
+
+### Week 6.5 — Hermes Agent Hands-On (half-week insert, ~6–8h)
+> Detailed runbook: [[Week 6.5 - Hermes Agent Hands-On]]
+
+**Theory (2h).**
+- Read: Hermes Agent README + skill-creation loop docs, Pi repo (the minimalist counter-thesis from W6), the Anthropic "model-coded skills" research notes.
+- Master: the extensibility-spectrum trade-off triangle — Claude Code (curated, 20+ surfaces) vs Pi (on-demand, 4 tools) vs Hermes (learned, auto-generated). Why each ships, where each breaks, the audit-trail problem unique to learned-skill systems.
+
+**Lab (4–6h) — `lab-06.5-hermes-handson`.**
+1. Run Hermes Agent locally against your oMLX or vMLX endpoint.
+2. Execute the same canonical task in three agents (Claude Code, Pi, Hermes); capture comparison notes.
+3. Observe at least one skill being created by Hermes; inspect the generated code on disk.
+4. Audit one learned skill — read the generated code, decide whether you'd trust it in production, write up the reasoning.
+5. `RESULTS.md` ships a 3×3 matrix (3 agents × 3 axes: extensibility, auditability, cost) + decision tree for "when would I ship which?"
+
+**Exit criteria.** 60-second answer to "what is Hermes Agent's skill-creation loop, and what is its biggest production risk?" grounded in your own observation, not theory.
+
+**Infra bridge.** Hermes' learned-skill cache is a build artifact — generated, persisted, versioned. Auditing a learned skill before promoting it = code review of an autogenerated migration. Same governance pattern, new surface.
+
+### Week 6.7 — Authoring Agent Skills (Anthropic Pattern) (half-week insert, ~5h)
+> Detailed runbook: [[Week 6.7 - Authoring Agent Skills]]
+
+**Theory (1.5h).**
+- Read: Anthropic's SKILL.md spec, the `~/.claude/skills/` discovery mechanism, the trigger-engineering pattern (description-field design).
+- Master: the loading mechanism (frontmatter routing, capability scoping), why the description field is harder than the body, what makes a trigger pattern fire reliably vs noisily, and the consumer-vs-author mental shift.
+
+**Lab (3.5h) — `lab-06.7-skill-authoring`.**
+1. Author three production-quality skills end-to-end — pick from `/benchmark`, `/canary`, `/compress`, `/grade`, or another reusable workflow you've actually wanted.
+2. Each skill ships with a SKILL.md, a working trigger pattern, and a verification step ("run this prompt, observe this behavior").
+3. Install all three globally to `~/.claude/skills/` and use them in real sessions for a week. Track: did the trigger fire when expected, did it misfire, did the description field need tuning.
+4. Write up the description-field iteration log — before/after pairs that show what made the skill go from useless or noisy to reliable.
+
+**Exit criteria.** You ship three skills, you can articulate the description-field design rule, and you can answer "what's the difference between a prompt and a skill?" without hand-waving.
+
+**Infra bridge.** A skill is the unit of repeatable agent capability. Same shape as a versioned IaC module — write it once, version it, install it globally, share it across a team. Skill authoring is to prompt engineering what Terraform modules are to one-off scripts.
 
 ---
 
@@ -442,6 +510,22 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** Tool calls are RPC. Your tool harness is an RPC client with retry, backoff, circuit-breaker, dead-letter-queue, and instrumentation. Frame it as such in interviews — it lands.
 
+### Week 7.5 — Computer Use and Browser Agents (half-week insert, ~5–6h)
+> Detailed runbook: [[Week 7.5 - Computer Use and Browser Agents]]
+
+**Theory (2h).**
+- Read: Anthropic Computer Use beta blog (Oct 2024), OpenAI Operator launch post (Jan 2025), browser-use README, Selenium/Playwright docs (one chapter each).
+- Master: the three generations of browser automation (deterministic DOM scripts → vision-language CUA → hybrid DOM-aware planners), why Generation 1 is structurally brittle, where the cost/latency curve flips, and the production safety controls (visual diff, action allowlist, cost ceiling).
+
+**Lab (3–4h) — `lab-07.5-computer-use`.**
+1. Write the same task three ways: a Playwright script (Gen 1), a browser-use agent (Gen 3 hybrid), and a pure Computer Use loop (Gen 2 vision-only).
+2. Measure cost, latency, and success rate on a 10-task suite that includes one CSS-class rename ablation to expose Gen 1's brittleness.
+3. Build a safety wrapper: action allowlist, per-step budget cap, screenshot diff alarm.
+
+**Exit criteria.** Cold answer to "when does computer use beat Playwright in production?" — name the breakpoint (cost-per-task vs human-maintenance), name one safety control you'd require before shipping.
+
+**Infra bridge.** CUA is RPA with an LLM as the recognizer. Same governance shape as RPA: every action is an audit-log event, every credential is a least-privilege principal, every page change is a regression candidate.
+
 ### Week 8 — The Schema Reliability Playbook (Your Signature Question)
 > Detailed runbook: [[Week 8 - Schema Reliability Bench]]
 
@@ -468,6 +552,22 @@ Final deliverable: a comparison table + the **canonical "5-layer defense" diagra
 **Exit criteria.** Five-minute uninterrupted explanation of "how do you guarantee a fixed schema" — with code, numbers, and tradeoff awareness. This single answer can move you up a level.
 
 **Infra bridge.** This is data-quality engineering applied to LLM output. Pydantic = your `OPA / Checkov`. The 5 layers = your data-quality SLA tiers (raw → bronze → silver → gold).
+
+### Week 8.5 — Voice AI Agents (half-week insert, ~5–6h)
+> Detailed runbook: [[Week 8.5 - Voice AI Agents]]
+
+**Theory (2h).**
+- Read: OpenAI Realtime API launch (Oct 2024), faster-whisper docs, ElevenLabs / Cartesia TTS architecture posts, the Anthropic / OpenAI agent + voice integration guides.
+- Master: cascaded pipeline (VAD → STT → LLM → TTS) vs end-to-end native-audio architecture, the latency budget (target <500ms total time-to-first-audio), interruption handling (barge-in detection), the cost-per-minute breakdown.
+
+**Lab (3–4h) — `lab-08.5-voice`.**
+1. Build a local cascaded pipeline — faster-whisper + Claude + ElevenLabs (or Coqui locally). Wire it to a microphone + speaker. Measure end-to-end latency on a 20-turn conversation.
+2. Compare against OpenAI Realtime API on the same script — capture latency + cost-per-minute deltas.
+3. Add barge-in handling: if the user starts speaking while the agent is talking, cut TTS and restart with the new audio.
+
+**Exit criteria.** 90-second answer to "design a customer-support voice agent" that names the architecture choice, the latency budget, the interruption handling, and the cost ceiling.
+
+**Infra bridge.** Voice = real-time pipeline with a hard latency SLA. Same operational shape as a low-latency trading or ad-bidding pipeline — every component has a budget, every queue is bounded, every fallback is pre-wired.
 
 ### Week 9 — Hallucination Detection & Mitigation
 > Detailed runbook: [[Week 9 - Faithfulness Checker]]
@@ -552,6 +652,22 @@ For each, spend ~2 hours: 30 min thinking, 60 min talking through architecture a
 - Did you state what would make you not build this with an LLM at all?
 
 **Exit criteria.** 5 recordings, each with self-critique notes. The infra-aware SRE agent (#5) is your interview-closer story.
+
+### Week 11.5 — Agent Security (half-week insert, ~5–6h)
+> Detailed runbook: [[Week 11.5 - Agent Security]]
+
+**Theory (2.5h).**
+- Read: Anthropic / Greshake et al. on indirect prompt injection, the OWASP LLM Top 10 (with focus on tool-poisoning and excessive agency), Llama Guard / Constitutional Classifier docs, firejail/Docker sandbox patterns.
+- Master: the four trust tiers (system prompt > developer-supplied tools > user message > retrieved/tool-output content), the five attack classes (direct/indirect injection, tool poisoning, exfil-via-side-channel, privilege escalation), the three defense layers (input validation, capability containment, output filtering).
+
+**Lab (3h) — `lab-11.5-agent-security`.**
+1. Take your Week 7 tool harness and write a 10-attack red-team suite — one entry per attack class above, plus three indirect-injection variants delivered via RAG.
+2. Implement each defense layer: pydantic-validated tool input, firejail sandbox for shell tools, Llama Guard or Constitutional Classifier on outputs.
+3. Run the attack suite before/after each defense — record the kill rate per layer. The goal is a layered-defense table, not a single perfect filter.
+
+**Exit criteria.** Cold-answer "design a permission system for an agent that writes files and sends emails" — name the trust tiers, name two attack classes, name two defenses, cite the Greshake paper or equivalent.
+
+**Infra bridge.** Agent security is RBAC + WAF + sandbox. Trust tiers = principals; tools = privileged operations; output filter = egress firewall. The composition is what's new; each primitive maps to something you've shipped.
 
 ### Week 12 — Mock Interviews + Portfolio Polish
 > Detailed runbook: [[Week 12 - Capstone and Mocks]]
@@ -1266,16 +1382,23 @@ New item earns 3/3 — what does it concern?
 ├── Embedding model / vector index / hybrid retrieval ─────────→ Week 1
 ├── Reranker / chunking / context compression / CAG ──────────→ Week 2
 ├── RAG eval methodology / RAGAS metrics / HyDE / fusion ─────→ Week 3
-├── Agentic RAG / iterative retrieval / GraphRAG ─────────────→ Week 2.5 or Week 3
+├── GraphRAG / multi-hop knowledge-graph retrieval ──────────→ Week 2.5
+├── Agentic RAG / CRAG / Adaptive-RAG / iterative retrieval ─→ Week 3.7
 ├── Cross-session memory / persistent agent memory ──────────→ Week 3.5
 ├── ReAct loop / scratchpad design / max-iter / errors ──────→ Week 4
-├── Multi-agent / Plan-and-Solve / Reflexion / patterns ──────→ Week 5
+├── Multi-agent / Plan-and-Solve / Orchestrator-Worker ──────→ Week 5
+├── Reflexion / Self-Refine / Self-Consistency / metacog ────→ Week 5.5
 ├── Claude Code / Aider / Codex CLI / source-leak analysis ──→ Week 6
+├── Hermes Agent / learned skills / Pi minimalism ───────────→ Week 6.5
+├── Authoring Claude Code skills / SKILL.md / triggers ──────→ Week 6.7
 ├── Tool use / MCP / function calling / permission systems ──→ Week 7
+├── Computer Use / browser agents / CUA / Playwright ────────→ Week 7.5
 ├── Structured output / constrained decoding / JSON schema ──→ Week 8
+├── Voice AI / Realtime API / Whisper + TTS pipelines ───────→ Week 8.5
 ├── Hallucination / faithfulness / verification / abstention →→ Week 9
 ├── LangGraph / LlamaIndex / framework comparison / Chain ───→ Week 10
 ├── System design pattern / SRE agent / enterprise platform ─→ Week 11
+├── Prompt injection / tool poisoning / agent sandbox ───────→ Week 11.5
 ├── Capstone polish / portfolio / job-hunt / interview ──────→ Week 12
 └── Doesn't fit any week ─────────────────────────────────────→ Add to G.6 wish list (potential Week 13+)
 ```
@@ -1405,14 +1528,23 @@ Useful modifiers you can add to any generation request:
 
 | Week | Runbook file | Core phases the runbook will contain |
 |---|---|---|
+| 2.5 | [[Week 2.5 - GraphRAG]] | Neo4j + Wikipedia subset; entity/relation extraction with local Gemma; 2-hop subgraph traversal; 25-Q multi-hop head-to-head vs Week 2 vector RAG; comparison matrix in `RESULTS.md` |
+| 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests |
+| 3.7 | [[Week 3.7 - Agentic RAG]] | LangChain official 5-node Agentic RAG notebook running end-to-end; head-to-head vs Week 3 single-pass on 50-Q dev set; one CRAG variant; decision tree for when Agentic RAG helps vs hurts |
 | 4 | [[Week 4 - ReAct From Scratch]] | (1) 150-line `react.py` with no framework; (2) 4 local tools (search, repl, read_file, write_file); (3) SQLite trace logging; (4) 15+ bad-case scenarios with a before/after diff per patch; (5) `RESULTS.md` with failure-mode table |
 | 5 | [[Week 5 - Pattern Zoo]] | 4 parallel implementations (ReAct, Plan-and-Solve, Reflexion, Orchestrator-Worker) on one task ("research + 1-page summary"); LLM-as-judge rubric scoring; cost/latency/quality 4-way comparison |
+| 5.5 | [[Week 5.5 - Metacognition]] | Reflexion outer loop on top of W4 ReAct agent; Self-Consistency N=5 ablation; one bad-critic injection showing the overcorrection failure mode; episodic-memory replay across attempts |
 | 6 | [[Week 6 - Claude Code Source Dive]] | Reading-only week. 8 subsystem study sheets filled in; one "Architecture Cheat Sheet" markdown that you can bring to interviews; 3 "what I would steal" design ideas |
+| 6.5 | [[Week 6.5 - Hermes Agent Hands-On]] | Hermes Agent running locally; same canonical task in 3 agents (Claude Code / Pi / Hermes); observe one skill creation + audit one learned skill; 3×3 comparison matrix (extensibility / auditability / cost) |
+| 6.7 | [[Week 6.7 - Authoring Agent Skills]] | Three production-quality skills authored end-to-end; SKILL.md + trigger pattern + verification step each; install globally + use for one week; description-field iteration log capturing trigger-tuning |
 | 7 | [[Week 7 - Tool Harness]] | Generic `Tool`/`ToolHarness` classes; retry + timeout + budget + idempotency; 20-scenario bad-case suite; local (Qwen3.6) vs cloud (Claude Haiku) reliability comparison |
+| 7.5 | [[Week 7.5 - Computer Use and Browser Agents]] | Same task three ways (Playwright / browser-use / Claude Computer Use); 10-task suite with one CSS-rename ablation; safety wrapper (action allowlist + budget cap + screenshot diff alarm) |
 | 8 | [[Week 8 - Schema Reliability Bench]] | **The signature-question lab.** 5-way comparison (naive prompt / provider-native / Outlines+xgrammar / Instructor+retry / post-validation+repair) across 4 local models + GPT-4o-mini, 100 prompts; draws the 5-layer defense diagram |
+| 8.5 | [[Week 8.5 - Voice AI Agents]] | Local cascaded pipeline (faster-whisper + Claude + ElevenLabs/Coqui); 20-turn latency measurement; OpenAI Realtime API head-to-head; barge-in handling implemented |
 | 9 | [[Week 9 - Faithfulness Checker]] | Claim-splitter prompt; NLI-based entailment scorer; SelfCheckGPT-lite (3× sample + BERTScore); abstention router; 30-Q hand-labeled test set |
 | 10 | [[Week 10 - Framework Shootout]] | Re-implement Week 4 loop in LangGraph, LlamaIndex agent worker, OpenAI Agents SDK pointing at local mlx server; LOC + traceability + testability decision matrix |
 | 11 | [[Week 11 - System Design]] | 5 × 2-hour whiteboard exercises (doc-QA / multi-agent triage / coding agent / financial-research / infra-aware); self-recorded; 6-point self-critique rubric |
+| 11.5 | [[Week 11.5 - Agent Security]] | 10-attack red-team suite extending W7 tool harness (5 attack classes + 3 indirect-injection variants); three defense layers (pydantic input validation / firejail sandbox / Llama Guard output filter); kill-rate-per-layer table |
 | 12 | [[Week 12 - Capstone and Mocks]] | Pick capstone (A/B/C), polish to portfolio bar; 30 mock-interview recordings; 10 job applications submitted with 1 tailored number each |
 
 ### How runbooks grow over the quarter
