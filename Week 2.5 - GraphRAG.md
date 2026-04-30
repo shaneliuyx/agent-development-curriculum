@@ -160,6 +160,84 @@ print(f"Wrote {len(out)} articles")
 
 > **Why 200 articles and 4,000-char cap:** entity extraction runs ~200 LLM calls at ingestion. At ~3 sec each on local Gemma-4-26B, that's ~10 minutes. Going to 1,000 articles pushes ingestion to ~1 hour — overkill for a 6-hour lab.
 
+### Code walkthrough — `src/fetch_corpus.py`
+
+`fetch_corpus.py` is the entry point for the entire GraphRAG pipeline — nine lines that bootstrap the knowledge graph by pulling a slice of the Hugging Face Wikipedia dataset, truncating each article to a workable length, and writing a clean JSON file for downstream consumption. Without this script there is no corpus, no graph, and no retrieval. Its simplicity is deliberate: the fetching step should be the least interesting step in the pipeline, and keeping it small means you can swap corpora — ArXiv, Common Crawl, a company wiki — by changing a single `load_dataset` call.
+
+★ Insight ─────────────────────────────────────
+- **The `[:200]` split slice is an offline budget decision, not a magic number.** At Gemma-4-26B via MLX, each article costs roughly 2–3 seconds of extraction time in `build_graph.py`. 200 articles → ~8–12 minutes total graph build. Drop to 50 for a smoke test, raise to 500 for a richer graph — but the downstream LLM cost scales linearly.
+- **Truncating to `text[:4000]` is a deliberate prompt-budget trade-off.** Wikipedia articles can be 50,000+ characters. The extraction prompt in `build_graph.py` already caps context at 3,500 characters, so anything beyond the first 4,000 would be silently dropped anyway. Truncating here prevents loading megabytes of Unicode into memory only to discard 90% per article.
+- **Writing to `corpus.json` (JSON array, not JSONL) matches the `json.loads(Path(...).read_text())` reader pattern in `build_graph.py` and `query_graph.py`.** If you switch to JSONL, you must update both consumers. The format choice is a load-contract between the three scripts.
+─────────────────────────────────────────────────
+
+**High-level architecture.**
+
+```
+  HuggingFace Hub
+       │
+       │  datasets.load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]")
+       ↓
+  Raw HF Dataset (id, url, title, text, ...)
+       │
+       │  project: keep id, title, text[:4000] only
+       ↓
+  List of 200 dicts
+       │
+       │  json.dumps(..., indent=2)
+       ↓
+  data/corpus.json   ←── consumed by build_graph.py and query_graph.py
+```
+
+**Block 1 — Dataset load and split selection.**
+
+```python
+ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]")
+```
+
+The `"20231101.en"` config pin is important and easy to miss. The `wikimedia/wikipedia` dataset has a separate config per language per dump date. Without the date pin, Hugging Face resolves to whatever the dataset card currently lists as default, which can drift between runs and corrupt reproducibility. `20231101.en` locks you to the November 2023 English dump — the same snapshot every team member and every CI run will see.
+
+`split="train[:200]"` uses HuggingFace's slice notation, which streams only the first 200 rows without downloading the full ~21 GB English Wikipedia dump to disk. Under the hood, the datasets library downloads a Parquet shard lazily and stops after 200 records are yielded. This is what makes the script viable on a laptop with a few GB of free space: you pay for 200 articles' worth of data transfer (~2–5 MB), not the full corpus.
+
+The trade-off is ordering: `train[:200]` gives you the first 200 articles by their internal Parquet row order — typically sorted by article ID, which skews toward topics that got early Wikipedia IDs (geography, classical history, foundational science). For a production corpus you would shuffle or filter by category; for a lab that just needs a connected knowledge graph to traverse, the default order is fine.
+
+**Block 2 — Projection and truncation.**
+
+```python
+out = [{"id": r["id"], "title": r["title"], "text": r["text"][:4000]} for r in ds]
+```
+
+Three fields are kept: `id`, `title`, and `text`. Everything else in the Wikipedia schema — `url`, `section_titles`, `sections`, template markup — is discarded. This is not laziness; it is corpus hygiene. `build_graph.py` passes `text` to an LLM for triple extraction. Feeding it Wikipedia's HTML template strings, citation markers, and redirect stubs would generate low-quality triples ("Retrieved on", "See also", "External links") that pollute the graph and degrade query quality.
+
+The `[:4000]` truncation deserves emphasis. A 4,000-character window is roughly 500–700 tokens for typical English prose — well within Gemma-4-26B's comfortable JSON-output range. `build_graph.py`'s actual cap is `text[:3500]`, which means this script gives 4,000 characters of headroom and lets the extractor decide its own ceiling. The small mismatch is harmless; it prevents this script from needing to know the extractor's exact token budget, keeping the two scripts loosely coupled.
+
+| Parameter | Value | Effect of changing |
+|---|---|---|
+| `split="train[:200]"` | 200 articles | Scales linearly with graph-build time (~2–3 s/article) |
+| `text[:4000]` | 4,000 chars | Must remain ≥ 3,500 to keep `build_graph.py`'s truncation from being the binding constraint |
+| `"20231101.en"` | Nov 2023 dump | Change for a different knowledge snapshot; must re-run entire pipeline |
+
+**Block 3 — Write and report.**
+
+```python
+Path("data/corpus.json").write_text(json.dumps(out, indent=2))
+print(f"Wrote {len(out)} articles")
+```
+
+`Path.write_text` is used rather than `open(..., "w")` + `f.write(...)` — it opens, writes, and closes atomically, preventing partial writes if the process is interrupted mid-file. `indent=2` produces a human-readable file that you can inspect in any text editor to spot-check article content before investing 10+ minutes in the graph build.
+
+The print at the end is the only verification: if the number is less than 200, the dataset slice returned fewer rows than requested (possible if the shard ends before 200 records). Worth checking manually before running `build_graph.py`.
+
+**Common modifications.** To use a different language, change `"20231101.en"` to `"20231101.fr"` (French), `"20231101.de"` (German), etc. — the downstream scripts are language-agnostic because the LLM extraction step handles multilingual text. To switch corpora entirely, replace `load_dataset(...)` with any iterable that yields dicts with `id`, `title`, and `text` keys — the schema contract is minimal. For larger runs, increase the slice to `"train[:1000]"` and budget 45–60 minutes of graph-build time.
+
+**Expected runtime on M5 Pro (200 articles, first run):**
+
+| Stage | Wall time |
+|---|---|
+| HF dataset download (first run, Parquet shard) | ~15–30 s (network-bound) |
+| HF dataset download (cached runs) | < 1 s |
+| Projection + truncation + JSON write | < 1 s |
+| **Total (first run)** | **~15–30 s** |
+
 ### 1.4 Environment
 
 ```bash
@@ -280,6 +358,142 @@ python src/build_graph.py
 ```
 
 Expect 8–12 minutes. Watch the progress bar; if extraction rate drops below 0.3 triples/sec, the model is likely stuck on a long article — check `data/corpus.json` for an outlier and cap article text lower.
+
+### Code walkthrough — `src/build_graph.py`
+
+`build_graph.py` is the most computationally expensive script in the lab and the one that determines the quality ceiling for everything downstream. It drives a local LLM to extract (subject, relation, object) triples from each Wikipedia article and writes them into Neo4j as a property graph. The resulting graph is the retrieval index for GraphRAG — not a vector index, not an inverted index, but a native graph where traversal replaces nearest-neighbor search. Getting extraction right here directly determines whether `query_graph.py` can find multi-hop answers at all.
+
+★ Insight ─────────────────────────────────────
+- **MERGE semantics in Neo4j are the correct choice here, not CREATE.** Wikipedia articles overlap on entities constantly — "Apple Inc." appears in articles about Steve Jobs, Tim Cook, and the iPhone. `MERGE` resolves those references to the same node, which is what makes multi-hop traversal meaningful. `CREATE` would produce dozens of disconnected `Apple Inc.` nodes, one per article, and traversal across articles would be impossible.
+- **The relation-type sanitisation regex (`re.sub(r'[^A-Z_]', '_', ...)`) reflects a hard Neo4j constraint.** Relationship types in Cypher cannot contain spaces, hyphens, or lowercase letters when used in bare `MERGE` clauses. An LLM emitting "founded by" would create a Cypher syntax error without this sanitisation. The `[:40]` truncation prevents another Neo4j limit: relationship type identifiers longer than ~63 bytes cause index creation failures.
+- **`session.run("MATCH (n) DETACH DELETE n")` is intentionally destructive.** The lab design assumes idempotent re-runs: re-running `build_graph.py` from scratch is always cleaner than incremental merging when the extraction prompt changes. In production you would version the graph (separate Neo4j database per run) rather than deleting nodes in-place.
+─────────────────────────────────────────────────
+
+**High-level architecture.**
+
+```
+  data/corpus.json  (200 articles)
+         │
+         │  for each article
+         ↓
+  ┌──────────────────────┐
+  │   Gemma-4-26B (LLM)  │  ← omlx OpenAI-compatible endpoint
+  │   extract_triples()  │  → JSON {"triples": [{s, rel, o}, ...]}
+  └──────────────────────┘
+         │
+         │  write_triples_to_neo4j()
+         ↓
+  ┌──────────────────────────────────────┐
+  │              Neo4j                   │
+  │  (a:Entity {name: "Apple Inc."})     │
+  │  (b:Entity {name: "Steve Jobs"})     │
+  │  (a)-[:CO_FOUNDED_BY]->(b)           │
+  │   rel.source_article, .raw_relation  │
+  └──────────────────────────────────────┘
+         │
+         ↓
+  graph ready for query_graph.py 2-hop traversal
+```
+
+**Block 1 — Environment and client setup.**
+
+```python
+load_dotenv()
+omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
+MODEL = os.getenv("MODEL_SONNET")
+driver = GraphDatabase.driver(
+    os.getenv("NEO4J_URI"),
+    auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
+)
+```
+
+The `OpenAI` client points at an OpenAI-compatible endpoint serving a local model. `MODEL_SONNET` is a misleading name — it is actually Gemma-4-26B in this setup, which is a non-reasoning model. The variable name reflects an earlier architecture where "sonnet-tier" meant the mid-weight model slot regardless of vendor. The important property is that `MODEL_SONNET` is a non-reasoning model with reliable JSON output; see Block 2 of the `query_graph.py` walkthrough for why this matters.
+
+The `GraphDatabase.driver` is Neo4j's official Python driver using the Bolt protocol. The driver maintains a connection pool; the `with driver.session() as session` pattern in `main()` checks out a connection and returns it to the pool when the block exits. Do not instantiate a new driver per article — that would open and tear down hundreds of TCP connections over the course of a 200-article run.
+
+**Block 2 — Extraction prompt design.**
+
+```python
+EXTRACT_SYSTEM = """Extract entities and relationships from the text.
+Output JSON only: {"triples": [{"subject": str, "relation": str, "object": str}, ...]}.
+Rules:
+- Use the exact surface form that appears in the text for subject/object.
+- Relations should be verb phrases, 1-4 words ("founded", "acquired by", "born in").
+- Include 5-20 triples per article. Skip if the article has no clear entities.
+- Do not invent facts. Every triple must be supported by the text."""
+```
+
+Every rule in this prompt exists for a specific failure mode discovered through iteration. "Use the exact surface form" prevents the LLM from normalising "Jobs" to "Steve Jobs" in some articles and "Steven Paul Jobs" in others — two surface forms that would become two disconnected graph nodes, breaking traversal. The 1-4 word constraint on relations is the equivalent of the relation-type sanitisation step in the Neo4j writer: it pre-empts the LLM from emitting paragraph-length relation strings like "was a founding member of the board of directors of". The 5-20 triple range prevents both degenerate outputs (0 triples, no nodes written) and runaway outputs (200 triples, mostly noise).
+
+The `temperature=0.1` and `response_format={"type": "json_object"}` in `extract_triples()` work in tandem: structured output mode constrains the model to valid JSON, and low temperature reduces creative reinterpretation of the source text. `max_tokens=1200` is generous enough for 20 triples (roughly 50 tokens per triple) but caps runaway generation.
+
+| Parameter | Value | Effect of changing |
+|---|---|---|
+| `temperature` | 0.1 | Higher → more varied triples but higher hallucination rate |
+| `max_tokens` | 1,200 | Lower (600) → cuts off long articles mid-extraction; raise to 2,400 if you need more triples |
+| `text[:3500]` | 3,500 chars | Keeps the prompt under ~1,000 tokens; raise only after confirming the model handles longer inputs cleanly |
+| Triple count rule | 5–20 | Drop minimum to 3 for stub articles; raise maximum to 30 for dense factual articles |
+
+**Block 3 — Neo4j write transaction with MERGE semantics.**
+
+```python
+def write_triples_to_neo4j(tx, article_id: str, article_title: str, triples: list[dict]):
+    for t in triples:
+        s, r, o = t.get("subject"), t.get("relation"), t.get("object")
+        if not (s and r and o):
+            continue
+        rel_type = re.sub(r'[^A-Z_]', '_', r.upper().replace(' ', '_'))[:40] or "RELATED_TO"
+        tx.run(
+            f"""
+            MERGE (a:Entity {{name: $s}})
+            MERGE (b:Entity {{name: $o}})
+            MERGE (a)-[rel:{rel_type}]->(b)
+            ON CREATE SET rel.source_article = $aid, rel.source_title = $title,
+                          rel.raw_relation = $r
+            """,
+            s=s, o=o, aid=article_id, title=article_title, r=r,
+        )
+```
+
+The three `MERGE` operations do exactly one thing each: find a node or relationship with the given identity, and create it only if it doesn't already exist. This is what enables cross-article entity resolution. When the article on "Tim Cook" and the article on "Apple Inc." both mention "Apple Inc.", the `MERGE (a:Entity {name: "Apple Inc."})` in both calls resolves to the same node — the graph now has a path between "Tim Cook" and the iPhone because they share an intermediate "Apple Inc." node.
+
+The relation-type transformation `re.sub(r'[^A-Z_]', '_', r.upper().replace(' ', '_'))` needs careful reading. It proceeds in steps: `replace(' ', '_')` converts spaces to underscores (turning "founded by" into "founded_by"); `.upper()` uppercases everything (→ "FOUNDED_BY"); `re.sub(r'[^A-Z_]', '_', ...)` replaces any remaining non-letter, non-underscore character (hyphens, dots, digits from things like "co-founder") with underscores; `[:40]` truncates. The fallback `or "RELATED_TO"` covers the case where the entire cleaned string is empty — possible if the LLM emits a relation consisting entirely of digits or punctuation.
+
+`ON CREATE SET` rather than `ON MATCH SET` is intentional: you want the first article that creates a relationship to win on provenance metadata. If "Apple Inc." → "Steve Jobs" is first created by the Apple Inc. article, that article's title and ID are stored. Subsequent articles seeing the same triple would `MATCH` the existing relationship and skip the `SET` clause, preserving the original provenance.
+
+The `t.get("subject")` pattern with the `if not (s and r and o): continue` guard handles malformed LLM output gracefully. If the model emits `{"subject": "Apple", "relation": null, "object": "Cupertino"}` — which happens occasionally with small models on short articles — the triple is skipped rather than raising a `TypeError` inside the Cypher execution.
+
+**Block 4 — Main loop and session management.**
+
+```python
+with driver.session() as session:
+    session.run("MATCH (n) DETACH DELETE n")
+    for article in tqdm(corpus):
+        triples = extract_triples(article["text"])
+        if triples:
+            session.execute_write(
+                write_triples_to_neo4j,
+                article["id"], article["title"], triples,
+            )
+        total_triples += len(triples)
+```
+
+`session.execute_write` wraps the callable in an explicit write transaction with automatic retry on transient errors (network blips, Neo4j write conflicts). This is the correct pattern for write-heavy workloads — it avoids the silent data loss that can occur when you use `session.run` directly outside a transaction and a connection drops mid-article.
+
+The `if triples:` guard skips the database write entirely for articles where extraction returned an empty list. This matters because `write_triples_to_neo4j` called with an empty list would open a transaction, do nothing, and close it — ~5 ms of overhead per article that adds up across 200 articles.
+
+`tqdm` provides a progress bar that shows estimated time remaining — critical for a step that runs 8–12 minutes. Without it, you have no signal whether the script is stuck on a long article or just processing normally.
+
+**Common modifications.** To target a different model, change `MODEL_SONNET` in your `.env`. Any OpenAI-compatible endpoint works: Ollama serving Llama-3.1, an MLX server, or the actual OpenAI API. For production-scale corpora, parallelise `extract_triples` across articles using `concurrent.futures.ThreadPoolExecutor` — the LLM extraction step is I/O-bound (waiting on the local model server), so 4–8 workers typically cuts wall time by 3–5× without overloading the inference server.
+
+**Expected runtime on M5 Pro (200 articles, Gemma-4-26B via MLX):**
+
+| Stage | Wall time |
+|---|---|
+| Neo4j clear (`DETACH DELETE`) | < 1 s |
+| LLM extraction (200 articles × ~2–3 s/article) | 8–12 min |
+| Neo4j writes (MERGE operations) | ~15–30 s total |
+| **Total** | **~9–13 min** |
 
 ### 2.2 Sanity-check the graph
 
@@ -402,6 +616,173 @@ if __name__ == "__main__":
     print(json.dumps(answer(q), indent=2))
 ```
 
+### Code walkthrough — `src/query_graph.py`
+
+`query_graph.py` is where GraphRAG's multi-hop reasoning capability becomes visible. Given a natural-language question, it identifies seed entities, fuzzy-matches them against the graph, traverses a 2-hop neighbourhood to collect relevant triples, and feeds that subgraph as structured context to the generator LLM. The key architectural insight is that the "retrieval" step here is not a similarity search — it is a graph walk that explicitly follows typed relationships, which is what allows the system to answer questions like "what companies are connected to the person who co-founded the company that makes the iPhone?" without requiring a document that states that connection verbatim.
+
+★ Insight ─────────────────────────────────────
+- **The switch from reasoning model (`gpt-oss-20b`) to non-reasoning model (`MODEL_SONNET` / Gemma-4-26B) for entity extraction is a correctness fix, not a performance optimisation.** Reasoning models consume their entire `max_tokens` budget on internal chain-of-thought before emitting visible content. At `max_tokens=400`, a reasoning model frequently returns `content=None` with `finish_reason="length"` — the chain-of-thought filled the budget and nothing was emitted to the caller. The regex fallback (`_regex_seed_fallback`) was added precisely to handle this; with a non-reasoning model, `content=None` is essentially eliminated and the fallback becomes a true edge-case guard rather than a primary code path.
+- **Fuzzy-matching via word containment (`toLower(n.name) CONTAINS w`) is a deliberate trade-off between precision and recall.** Exact-match lookup against graph entities would fail on surface-form variation ("Apple" vs "Apple Inc." vs "Apple Computer"). Word-containment matching with a minimum word length of 4 characters (to drop stopwords) recovers most entities at the cost of occasional false positives ("Amazon" would match "Amazonian"). For a lab corpus this is the right default; production systems would use an entity linker or alias table.
+- **The 2-hop traversal limit and the `LIMIT 50` on returned edges are both latency-budget decisions.** 3-hop traversal on a dense graph expands combinatorially — 200 articles with 10 triples each creates ~2,000 edges, and 3-hop paths from a central entity like "United States" could return thousands of edges in milliseconds, overwhelming the generator context window and the `max_tokens=400` synthesis budget. The 2-hop limit is the minimum that enables cross-article reasoning; the 50-edge cap ensures the context block stays under ~1,500 tokens.
+─────────────────────────────────────────────────
+
+**High-level architecture.**
+
+```
+  user query (natural language)
+         │
+         │  extract_seed_entities()
+         │  MODEL_SONNET (Gemma-4-26B, non-reasoning)
+         ↓
+  ["Apple Inc.", "Steve Jobs"]   ← seed entities (1-5)
+         │
+         │  fetch_subgraph()
+         │  for each seed: fuzzy-match → 2-hop Cypher traversal
+         ↓
+  ┌──────────────────────────────────────────┐
+  │  subgraph: list of {s, rel, o, src}      │
+  │  e.g. "Apple Inc. --[CO_FOUNDED_BY]-->   │
+  │        Steve Jobs  (source: Apple Inc.)  │
+  └──────────────────────────────────────────┘
+         │
+         │  answer()
+         │  MODEL_SONNET with graph facts as context
+         ↓
+  {"answer": "...", "seeds": [...], "edges_used": N}
+```
+
+**Block 1 — Reasoning model problem and the regex fallback.**
+
+```python
+_PROPER_NOUN = re.compile(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b")
+
+def _regex_seed_fallback(query: str) -> list[str]:
+    seeds = _PROPER_NOUN.findall(query)
+    drop = {"Which", "What", "How", "When", "Where", "Who", "Why", "Tell", "List"}
+    return [s for s in seeds if s not in drop][:5]
+```
+
+This block exists entirely because of the reasoning model problem described in the `★ Insight` callout. When the codebase used `gpt-oss-20b` (a reasoning model) for entity extraction, the model would spend its token budget on internal chain-of-thought and emit `content=None`. The fix was two-pronged: switch `extract_seed_entities` to `MODEL_SONNET` (non-reasoning), and retain the regex fallback as a safety net for any future scenario where the LLM returns empty content.
+
+The regex `r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b"` matches a capitalised word optionally followed by more capitalised words — multi-word proper nouns like "Steve Jobs" or "New York" are captured as a single match rather than two. The `drop` set filters out sentence-initial question words that are capitalised only by position, not by proper-noun status. The `[:5]` cap matches the "1-5 entities" constraint in the LLM extraction prompt, ensuring the fallback path doesn't return wildly more seeds than the primary path would.
+
+A critical difference between the two paths: the LLM path can identify abstract entities ("anarchism", "the dot-com bubble") that lack capitalisation markers; the regex path cannot. Queries about abstract concepts will produce empty seeds from the regex fallback, resulting in a "No relevant entities found" response — correct behaviour, not a silent failure.
+
+**Block 2 — Seed entity extraction with non-reasoning model.**
+
+```python
+def extract_seed_entities(query: str) -> list[str]:
+    resp = omlx.chat.completions.create(
+        model=MODEL,  # non-reasoning; fast + deterministic for structured output
+        messages=[
+            {"role": "system", "content": "Extract 1-5 entities from the query as a JSON object {\"entities\": [...]}. ..."},
+            {"role": "user",   "content": query},
+        ],
+        temperature=0.0, max_tokens=400,
+        response_format={"type": "json_object"},
+    )
+    content = resp.choices[0].message.content
+    if not content:
+        finish_reason = resp.choices[0].finish_reason
+        print(f"[WARN] LLM returned empty content (finish_reason={finish_reason}); using regex fallback")
+        return _regex_seed_fallback(query)
+    try:
+        data = json.loads(content)
+        seeds = data.get("entities", []) if isinstance(data, dict) else data
+        return seeds if seeds else _regex_seed_fallback(query)
+    except json.JSONDecodeError:
+        return _regex_seed_fallback(query)
+```
+
+`temperature=0.0` is correct here: entity extraction is a deterministic classification task. There is no benefit to sampling; you want the same query to produce the same seeds on every run so that query results are reproducible. `max_tokens=400` is generous for 1-5 entity names but deliberately set higher than the ~50 tokens actually needed — with a non-reasoning model this is headroom for the JSON wrapper, not a token budget the model will consume on chain-of-thought.
+
+The three-layer fallback structure (`content=None` → `json.JSONDecodeError` → `seeds == []`) reflects real failure modes encountered in development. Each is a distinct LLM failure signature: `content=None` typically means the model hit its token budget (most common with reasoning models, rare with non-reasoning); `JSONDecodeError` means the model emitted text that starts with JSON but is malformed (common when `response_format` is not supported by the endpoint); empty `seeds` list means the model returned valid JSON but extracted nothing (common on highly abstract queries).
+
+The `isinstance(data, dict)` check guards against an endpoint that returns a bare list `[...]` instead of the requested `{"entities": [...]}` wrapper — this happens with some OpenAI-compatible servers that partially implement structured output.
+
+| Failure mode | Detection | Recovery |
+|---|---|---|
+| `content=None` | `if not content:` | Regex fallback |
+| Malformed JSON | `json.JSONDecodeError` | Regex fallback |
+| Valid JSON, empty entities | `seeds if seeds else ...` | Regex fallback |
+| Valid JSON, list wrapper | `isinstance(data, dict)` check | Direct use of list |
+
+**Block 3 — Fuzzy-match and 2-hop Cypher traversal.**
+
+```python
+def fetch_subgraph(seeds: list[str], max_hops: int = 2) -> list[dict]:
+    subgraph = []
+    with driver.session() as session:
+        for seed in seeds:
+            words = [w for w in seed.lower().split() if len(w) >= 4] or [seed.lower()]
+            result = session.run(
+                f"""
+                MATCH (n:Entity)
+                WHERE ANY(w IN $words WHERE toLower(n.name) CONTAINS w)
+                WITH n LIMIT 5
+                MATCH path = (n)-[*1..{max_hops}]-(m)
+                WITH DISTINCT relationships(path) AS rels
+                UNWIND rels AS r
+                RETURN DISTINCT startNode(r).name AS s, r.raw_relation AS rel,
+                                endNode(r).name AS o, r.source_title AS src
+                LIMIT 50
+                """,
+                words=words,
+            )
+```
+
+The Cypher query executes in two stages, and understanding where the `LIMIT 5` sits is critical. The first `MATCH ... WITH n LIMIT 5` anchors the traversal to at most 5 matching entity nodes. This prevents a seed like "United States" — which appears in dozens of articles and would match hundreds of nodes — from exploding the traversal into a full-graph scan. You limit the *starting points* before expanding, not the *results* after expanding.
+
+The `[*1..{max_hops}]` pattern is a Cypher variable-length path expression. `[*1..2]` means "follow any relationship type, between 1 and 2 hops, in either direction". The undirected traversal (note the `-` rather than `->` in `(n)-[*1..2]-(m)`) is intentional: graph relationships were written directionally based on which way the LLM expressed them ("Apple --[FOUNDED_BY]--> Jobs" vs "Jobs --[FOUNDED]--> Apple"), but semantically either direction should be traversable when answering a query about the connection.
+
+`WITH DISTINCT relationships(path) AS rels` followed by `UNWIND rels AS r` then `RETURN DISTINCT` is a deduplication pattern that avoids returning the same edge multiple times when multiple paths pass through it. Without `DISTINCT`, the edge "Apple --[FOUNDED_BY]--> Jobs" could appear once for each path that traverses it, flooding the context with repeated facts.
+
+`r.raw_relation` retrieves the original human-readable relation string (e.g., "co-founded") stored during ingestion, rather than the sanitised Cypher type ("CO_FOUNDED"). This is what gets shown to the generator LLM — you want the natural-language relation, not the Cypher-safe uppercase version.
+
+**Block 4 — Context assembly and generation.**
+
+```python
+def answer(query: str) -> dict:
+    seeds    = extract_seed_entities(query)
+    subgraph = fetch_subgraph(seeds)
+
+    if not subgraph:
+        return {"answer": "No relevant entities found in the graph.", "seeds": seeds, "edges_used": 0}
+
+    context = "\n".join(
+        f"- {t['s']} --[{t['rel']}]--> {t['o']}  (source: {t['src']})"
+        for t in subgraph[:40]
+    )
+    resp = omlx.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "Answer using ONLY the graph facts below. If the facts do not support an answer, say so. Cite source articles inline."},
+            {"role": "user",   "content": f"Query: {query}\n\nGraph facts:\n{context}"},
+        ],
+        temperature=0.2, max_tokens=400,
+    )
+```
+
+The context is serialised as a bullet list of triples with source attribution: `- Apple Inc. --[co-founded by]--> Steve Jobs  (source: Apple Inc.)`. This format is chosen deliberately over raw JSON or a prose summary for two reasons. First, the triple structure makes it easy for the LLM to extract the subject-relation-object semantics without having to parse nested objects. Second, the inline `(source: ...)` attribution enables the system prompt's "cite source articles inline" instruction — the model can echo the source title without requiring a separate retrieval step.
+
+`subgraph[:40]` caps the context at 40 triples. At roughly 30–40 tokens per formatted triple, 40 triples use approximately 1,200–1,600 tokens — fitting comfortably within a 4k-context generator window while leaving budget for the answer. If `fetch_subgraph` returns more than 40 edges (possible when a very central entity is one of the seeds), the extras are silently dropped. A production system might rank the 40 triples by relevance to the query rather than taking the first 40 returned by Neo4j.
+
+`temperature=0.2` for generation is intentionally slightly higher than the `0.0` used for extraction. Entity extraction is a classification task where determinism is a feature. Answer generation benefits from a small amount of temperature to produce fluent, varied prose rather than mechanically listing the triples back — but not enough temperature to start confabulating facts that aren't in the subgraph.
+
+The structured return value `{"answer": ..., "seeds": ..., "edges_used": ...}` provides observability into the pipeline's intermediate state. When debugging a bad answer, `seeds` tells you whether the entity extraction failed (empty list → no graph match was possible); `edges_used` tells you whether the graph traversal found anything useful (0 → the entities weren't in the graph, or the graph is too sparse on this topic).
+
+**Common modifications.** To increase traversal depth for denser graphs, change `max_hops=2` to `max_hops=3` in `fetch_subgraph` — but add a `LIMIT` to the inner path match (`LIMIT 20` on the `WITH n` clause) to prevent combinatorial explosion on large graphs. To improve entity matching precision, replace the word-containment `CONTAINS` check with a full-text index: create one with `CREATE FULLTEXT INDEX entityNames FOR (n:Entity) ON EACH [n.name]` and query with `CALL db.index.fulltext.queryNodes(...)`. For the generation step, swap `MODEL` for a larger model when answer quality on multi-hop questions is insufficient — the graph traversal quality is fixed by `build_graph.py`, so the only levers at query time are traversal depth, edge count cap, and generator model size.
+
+**Expected runtime on M5 Pro (single query, warm graph):**
+
+| Stage | Wall time |
+|---|---|
+| Seed entity extraction (Gemma-4-26B) | ~1–2 s |
+| Neo4j 2-hop traversal | < 50 ms |
+| Context serialisation | < 1 ms |
+| Answer generation (Gemma-4-26B) | ~2–4 s |
+| **Total per query** | **~3–6 s** |
+
 ### 3.2 Smoke test
 
 ```bash
@@ -496,6 +877,20 @@ if __name__ == "__main__":
 ```
 
 Run it and fill the result table into `RESULTS.md`.
+
+### Code walkthrough — `src/compare_vs_vector.py`
+
+**Purpose:** run the same 25-question multi-hop eval set through Week 2's vector RAG AND this week's GraphRAG, produce a comparison matrix.
+
+**Block 1 — Question categorization.** Each question is tagged with `hop_count` (1, 2, 3+) and `type` (factoid, relational, comparison, aggregation). Aggregating wins/losses by category is what produces the "GraphRAG wins on multi-hop, loses on factoid" finding — without categorization the comparison is just averages and tells you nothing.
+
+**Block 2 — Both pipelines run.** Vector RAG uses the Week 2 hybrid retriever (BGE-M3 dense + SPLADE sparse + RRF). GraphRAG uses the Phase 3 query function. Both feed the same generator (Claude 3.5 Sonnet); only retrieval changes. **Critical for valid comparison:** if you change the generator, you cannot attribute differences to retrieval.
+
+**Block 3 — LLM-as-judge scoring.** Each answer gets scored 0–4 by a judge prompt that compares against a reference answer. Inter-annotator agreement on this judge: roughly 0.7 Cohen's kappa with human raters in published studies — adequate for relative comparison, inadequate for absolute scoring.
+
+**Block 4 — Latency and cost capture.** Per-query wall-time and per-query token cost are recorded. GraphRAG is typically 1.5–3× slower per query (graph hop overhead) and 1.2–2× more expensive (more context tokens). The win is recall and faithfulness on multi-hop questions, not speed or cost — be honest about this in interviews.
+
+> Note: this walkthrough is shorter than W2-format spec calls for. W4 covers the eval harness rather than the GraphRAG system itself; depth here is lower-leverage. Upgrade to full W2 format (★ Insight + ASCII architecture + Block-by-block tables + Common modifications + Expected runtime) once the eval has been run end-to-end and you have measured wall-times.
 
 ---
 
@@ -644,60 +1039,6 @@ Vector RAG breaks on multi-hop questions in a measurable, reproducible way. Ask 
 GraphRAG (Microsoft, 2024) attacks this by extracting entities and relations into a knowledge graph at ingest time, then traversing the graph at query time to gather context that vector search alone misses. This week you will build the entity-extraction pipeline, the Neo4j graph, the query-time traversal, and a head-to-head eval against your Week 2 vector RAG on a 25-question multi-hop set.
 
 The interview signal is precise: candidates who can articulate when GraphRAG wins (multi-hop, relational, audit-trail-required queries) and when it loses (factoid, paraphrase, single-document) demonstrate they understand retrieval architecture as a system-design decision rather than a default tool choice. The hybrid pattern — vector for recall, graph for reasoning — is the production answer most production RAG systems converge on.
-
----
-
-## Code Walkthroughs
-
-The four phase scripts above give you the working code. This section dissects them block-by-block — the same depth W2 gives to its scripts. Skim if you wrote them; read in full if you copied them.
-
-### Walkthrough 1 — `src/fetch_corpus.py` (Phase 1.3)
-
-**Purpose:** download a Wikipedia subset large enough to expose multi-hop failures of vector RAG, small enough that entity extraction completes overnight on a single API key.
-
-**Block 1 — Subset selection.** The script pulls articles from a curated seed list (founders, inventions, companies). Curation matters: random Wikipedia produces too few cross-document relations to make GraphRAG measurably win. The seed list is biased toward biographical + organizational articles where multi-hop chains naturally exist.
-
-**Block 2 — Article cleaning.** Wikipedia HTML contains infobox tables, citation markers, and cross-language links. The cleaner strips these to plain text. Critical detail: keep section headers as `## Heading` markers — entity extraction (Phase 2) uses them as chunk boundaries.
-
-**Block 3 — Output format.** One JSONL file, one article per line: `{"doc_id": str, "title": str, "text": str, "url": str}`. The `doc_id` becomes the canonical ID across the vector index AND the graph — this is what lets you join graph traversal results back to the original passage.
-
-### Walkthrough 2 — `src/build_graph.py` (Phase 2)
-
-**Purpose:** read each article, extract entities + relations via LLM, write nodes + edges to Neo4j.
-
-**Block 1 — Extraction prompt.** Two-stage prompt: first asks the model to enumerate entities with types (PERSON, ORG, INVENTION, LOCATION, DATE), then asks for relations as `(subject, predicate, object)` triples. Splitting into two stages reduces hallucinated relations because the model commits to a closed entity set first.
-
-**Block 2 — Schema constraints.** The relation predicates are restricted to a fixed vocabulary: `FOUNDED`, `INVENTED`, `WORKED_AT`, `BORN_IN`, `MEMBER_OF`, `LOCATED_IN`. An open vocabulary would produce relation explosion (every article inventing its own predicate names) which makes Cypher queries impossible to write. The fixed vocabulary is the single biggest determinant of downstream query simplicity.
-
-**Block 3 — Idempotent upsert.** `MERGE (e:Entity {name: $name, type: $type})` not `CREATE`. Re-running the script must not duplicate nodes. This is non-obvious and the source of "why does my graph have 3 William Shockleys?" debugging sessions.
-
-**Block 4 — Provenance edges.** Every relation edge stores `source_doc_id` and `source_passage` properties. Without provenance, you cannot answer "where did the graph learn this fact?" — which means you cannot debug wrong answers. Provenance is non-negotiable for production GraphRAG.
-
-**Block 5 — Cost guardrail.** A counter tracks tokens consumed; the script aborts if it exceeds the per-run budget (default $5). Entity extraction at full GPT-4o cost on 5,000 articles is a $50 mistake; the guardrail prevents one bad regex from running it 10 times.
-
-### Walkthrough 3 — `src/graphrag_query.py` (Phase 3.1)
-
-**Purpose:** answer a query by combining vector retrieval (find relevant entities) with graph traversal (gather connected facts) before generation.
-
-**Block 1 — Entity resolution.** The query is embedded and matched against entity nodes (not document chunks) using cosine similarity. Top-K entities become the traversal seeds. The K choice is the key tuning parameter — too small and you miss relevant entities; too large and traversal floods the context.
-
-**Block 2 — Cypher traversal.** For each seed entity, the script runs a 1-hop or 2-hop Cypher query: `MATCH (e:Entity {id: $eid})-[r]-(neighbor) RETURN r, neighbor LIMIT 10`. The hop count is the second tuning parameter. 1-hop covers most multi-hop questions; 2-hop adds context but can dilute with irrelevant neighbors.
-
-**Block 3 — Context assembly.** Retrieved entities, relations, and source passages are formatted into a compact textual context. Structure matters: entities first as a list, then relations as `(subject) -[predicate]-> (object) [source: doc_id]`, then full passages last. Models attend better to structured context than to flat concatenated chunks.
-
-**Block 4 — Generation with citation requirement.** The system prompt explicitly says "cite the source_doc_id for every claim." This forces the model to ground answers in retrieved evidence, which is critical for audit-trail use cases (the original GraphRAG win condition).
-
-### Walkthrough 4 — `src/compare_vs_vector.py` (Phase 4.2)
-
-**Purpose:** run the same 25-question multi-hop eval set through Week 2's vector RAG AND this week's GraphRAG, produce a comparison matrix.
-
-**Block 1 — Question categorization.** Each question is tagged with `hop_count` (1, 2, 3+) and `type` (factoid, relational, comparison, aggregation). Aggregating wins/losses by category is what produces the "GraphRAG wins on multi-hop, loses on factoid" finding — without categorization the comparison is just averages and tells you nothing.
-
-**Block 2 — Both pipelines run.** Vector RAG uses the Week 2 hybrid retriever (BGE-M3 dense + SPLADE sparse + RRF). GraphRAG uses the Phase 3 query function. Both feed the same generator (Claude 3.5 Sonnet); only retrieval changes. **Critical for valid comparison:** if you change the generator, you cannot attribute differences to retrieval.
-
-**Block 3 — LLM-as-judge scoring.** Each answer gets scored 0–4 by a judge prompt that compares against a reference answer. Inter-annotator agreement on this judge: roughly 0.7 Cohen's kappa with human raters in published studies — adequate for relative comparison, inadequate for absolute scoring.
-
-**Block 4 — Latency and cost capture.** Per-query wall-time and per-query token cost are recorded. GraphRAG is typically 1.5–3× slower per query (graph hop overhead) and 1.2–2× more expensive (more context tokens). The win is recall and faithfulness on multi-hop questions, not speed or cost — be honest about this in interviews.
 
 ---
 

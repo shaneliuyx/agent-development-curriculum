@@ -42,13 +42,31 @@ Phases are numbered and time-budgeted (`## Phase 1 — <name> (~2 hours)`). Each
 - Verification commands at the end of the phase
 - An expected metrics table (recall@K, latency, cost, etc — measured on M5 Pro hardware)
 
-### Section 5 — Code Walkthroughs (REQUIRED — block-by-block annotation per script)
+### Section 5 — Code Walkthroughs (REQUIRED — W2 format, block-by-block per script)
 
-For every phase script in §4, add a corresponding walkthrough that explains the script block-by-block. Each block gets:
-- A short heading describing what the block does
-- A 1–3 sentence explanation of *why* the block exists, including non-obvious gotchas a reader copy-pasting the code would miss
+For every phase script in §4, add a corresponding walkthrough that follows W2's `00_hybrid_ingest.py` walkthrough structure exactly. The reference is at `Week 2 - Rerank and Context Compression.md` — open it before writing any new walkthrough.
 
-This is the section most commonly skipped. It is the difference between a tutorial (here is code, run it) and a reference (here is code AND why it is shaped this way). W2's walkthroughs and W2.5's walkthroughs are the canonical examples.
+**Required walkthrough shape (mandatory order):**
+
+1. **Opening paragraph (~80 words).** Name the script, state what it builds, explain why this script is foundational to the chapter (not just what it does).
+
+2. **`★ Insight ───────` callout.** 2–3 bullets calling out the *non-obvious* design choices the script encodes — model superpower being exploited, infrastructure feature being used, deliberate trade-offs the script makes against pedagogical clarity vs production scale. Use the exact `★ Insight ─────────────────────────────────────` / `─────────────────────────────────────────────────` border from the W2 walkthrough.
+
+3. **High-level architecture (ASCII diagram or mermaid).** Before line-by-line: show the shape of what's being built. ASCII boxes + arrows are preferred over mermaid here because they're inline and don't require renderer-specific syntax. The W2 example shows a 2-vector point being assembled — copy that compositional shape.
+
+4. **Block-by-block analysis** with these exact heading conventions:
+   - `**Block 1 — <descriptive title>.**` followed by code excerpt
+   - 2–4 explanatory paragraphs per block answering **why**, not what. Cover gotchas a copy-paster would miss.
+   - Tables comparing flag/option choices when the block has tunable parameters (e.g., `use_fp16=False` row table from W2).
+   - Inline code excerpts shown verbatim, not summarized.
+
+5. **Common modifications.** A short paragraph listing what to change for different hardware tiers, corpus sizes, or backend swaps. The W2 example covers M1/M2 vs M3/M5 batch sizes and fp16 caveats.
+
+6. **Expected runtime table.** Concrete wall-time numbers per stage on the user's hardware (M5 Pro, 48 GB unified). When numbers aren't measured yet, mark them `~estimated` and update after the lab actually runs.
+
+**The non-negotiable bar:** every block must answer "why is this code shaped this way?" — a reader who copy-pastes the script must come away understanding the design choices, not just having a working script. If you cannot answer "why" for a block, you do not understand it well enough to walkthrough it; spike the code first, then write.
+
+This is the section most commonly skipped or written too thinly. W2's walkthroughs are the canonical example. Do NOT write walkthroughs that just describe what each block does in one sentence — that is a tutorial, not a reference, and fails the §5 requirement.
 
 ### Section 6 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
 
