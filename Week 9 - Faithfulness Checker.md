@@ -1640,3 +1640,35 @@ Week 10 shifts from evaluating LLM outputs to comparing the frameworks that orch
 ---
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** Faithfulness and factual accuracy are different failure modes requiring different mitigations. Factual accuracy asks whether a claim is true about the world — catching it requires an external knowledge oracle that is expensive and unavailable at inference time. Faithfulness asks whether a claim is grounded in retrieved context — and you always have that context at runtime. For RAG I instrument faithfulness because it is locally measurable. Factuality is a separate offline audit. Conflating the two leads to building the wrong checker.
+
+**Soundbite 2.** The pipeline decomposes an answer into atomic claims first, then scores each claim independently against retrieved context via NLI. Atomic = one verifiable assertion per claim — compound sentences produce ambiguous entailment labels and must be split. Each scored claim gets a label (supported / refuted / neutral) and an evidence span pointing back to source chunk, exactly like column-level lineage. A neutral label is the extrinsic hallucination signal: model added information context never mentioned. Both neutral and refuted drive same downstream action: flag the span, reduce faithfulness score.
+
+**Soundbite 3.** A faithfulness checker deployed as production guardrail sits between generation and delivery and enforces a per-answer SLO, not a binary pass/fail. I treat faithfulness score as a metric — alert on degradation, route low-confidence answers to human review queue rather than dropping. Abstention router upstream is the first line: checks context coverage before generation, refuses to produce an answer when coverage is below threshold. Prevents hallucinations rather than merely detecting them post-hoc. RAGAS eval tells you how the system is trending; runtime guardrail is what actually protects users.
+
+---
+
+## References
+
+- **Manakul et al. (2023).** *SelfCheckGPT.* EMNLP 2023. arXiv:2303.08896. Inter-sample consistency method.
+- **Farquhar et al. (2024).** *Detecting Hallucinations Using Semantic Entropy.* Nature 629, 625-630. Calibrated uncertainty via entropy clustering.
+- **Es et al. (2023).** *RAGAS.* arXiv:2309.15217. Faithfulness metric used as eval-time complement.
+- **Honovich et al. (2022).** *TRUE: Re-evaluating Factual Consistency Evaluation.* arXiv:2204.04991. Unified eval framework for faithfulness metrics.
+- **Mishra et al. (2021).** *Natural Instructions.* arXiv:2104.08773. Background on NLI task framing.
+- **Lakera AI (2026).** *LLM Hallucinations Guide.* lakera.ai. 2026 consensus on abstention-first safety.
+- **Anthropic (2024).** *Faithfulness Evaluation Cookbook.* docs.anthropic.com. Decompose-then-verify pipeline.
+
+---
+
+## Cross-References
+
+- **Builds on:** W3 RAG Evaluation — dev set, retrieval pipeline, recall@K from W3 are direct substrate for the 30-question test set in Phase 6; W9 scorer is instrumented on top of W3 retrieval output.
+- **Distinguish from:** W5.5 Metacognition — metacognition is *inline* self-correction within a forward pass / prompt chain. Faithfulness checking (W9) is *post-hoc external* validation: separate pipeline stage, separate model call, audits a completed answer against retrieved evidence. Key structural difference: independence — a metacognitive agent can still confirm own errors; an external faithfulness checker cannot, by design.
+- **Connects to:** W11 System Design — checker + abstention router become first-class runtime components; W11 treats faithfulness score as SLO with alert thresholds + human-review routing. W11.5 Agent Security — faithfulness is a correctness property; security is adversarial-robustness; distinct dimensions, separate instrumentation. A faithful answer to a poisoned context is still a security failure.
+- **Foreshadows:** W11 System Design (deploy NLI scorer + abstention router as production guardrail with SLO-based alerting); W12 Capstone (faithfulness checker is mandatory eval dimension for final agent system).

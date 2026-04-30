@@ -956,3 +956,36 @@ Parallelizing LLM-backed checks (faithfulness, relevance) recovers ~30% of the l
 ### Interview Soundbite
 
 "Offline RAGAS eval and inline guardrails are the same math at different deployment points. I use the offline benchmark to calibrate thresholds empirically — wherever 95% of my test set passes is my production gate. The guardrail enforces that threshold per request. Not alternatives; eval suite is the specification for the guardrail."
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** Offline eval and inline guardrails share the same scoring math but differ entirely in deployment shape. Offline RAGAS runs batch over a held-out dev set — 50 questions, four metrics aggregated into a table, regression signal across commits. Inline guardrails reposition that exact scoring logic on the live request path, per response, with a threshold acting as a hard gate before the user sees the answer. The two modes are not alternatives: offline eval is the calibration instrument; the guardrail is the enforcement mechanism.
+
+**Soundbite 2.** Three metrics catch three failure modes. Faithfulness catches generator drift — decomposes the answer into atomic claims and checks whether each is entailed by retrieved context, flagging hallucination where the model adds knowledge beyond evidence. Answer relevancy catches synthesis failures — generates reverse questions from the answer and measures cosine similarity to the original query, catching off-topic responses that are technically grounded but don't address what was asked. Context precision catches retrieval ranking failures — checks whether relevant chunks appear at top of context window, important because of Lost-in-the-Middle attention drop-off (Liu et al. 2023).
+
+**Soundbite 3.** I derive guardrail thresholds empirically from the offline benchmark, not by intuition. Run the full dev set, look at score distribution per metric, pick the value where 95% of passing examples clear the bar — for faithfulness that typically lands around 0.65–0.75 on a 50-question set. The chapter's baseline numbers (faithfulness 0.82, context recall 0.79, context precision 0.71) give a concrete starting ceiling; inline thresholds should sit below the median so a single weak response doesn't cause constant false-positive blocks. Offline suite is the specification; the guardrail enforces it.
+
+---
+
+## References
+
+- **Es et al. (2023).** *RAGAS: Automated Evaluation of Retrieval Augmented Generation.* arXiv:2309.15217. Defines four-metric framework; primary implementation reference.
+- **Maynez et al. (2020).** *On Faithfulness and Factuality in Abstractive Summarization.* ACL 2020. Intrinsic vs extrinsic hallucination taxonomy.
+- **Asai et al. (2023).** *Self-RAG.* arXiv:2310.11511. Inline reflection tokens as faithfulness check.
+- **Liu et al. (2023).** *Lost in the Middle.* arXiv:2307.03172. Why context precision matters.
+- **Gao et al. (2022).** *HyDE.* arXiv:2212.10496. Hypothetical document embeddings.
+- **Cormack, Clarke & Buettcher (2009).** *Reciprocal Rank Fusion.* SIGIR 2009. RRF k=60.
+- **Zheng et al. (2023).** *MT-Bench / Chatbot Arena.* arXiv:2306.05685. LLM-judge calibration; metric differences below 0.03 = noise on 50-question sets.
+- **LangChain EnsembleRetriever docs** — production RRF with k=60.
+
+---
+
+## Cross-References
+
+- **Builds on:** W1 Vector Retrieval, W2 Rerank — the retrieve-rerank-compress-synthesize pipeline RAGAS scores.
+- **Distinguish from:** generic NLP metrics — BLEU and ROUGE measure n-gram overlap against a reference, wrong signal for RAG. A RAG answer can score near zero on ROUGE while being faithful, complete, and responsive — paraphrase rather than copy. Faithfulness measures claim entailment; answer relevancy measures semantic alignment via reverse-question cosine. Neither requires string-matching a reference.
+- **Connects to:** W9 Faithfulness Checker (post-hoc validation operationalizing the faithfulness metric as a production service); W3.7 Agentic RAG (RAGAS provides eval baseline comparing single-pass vs 5-node agentic).
+- **Foreshadows:** W11 System Design (guardrail deployment as architecture decision; threshold calibration as SLO); W11.5 Agent Security (eval-as-test pattern from §3.X foundation for security guardrails).

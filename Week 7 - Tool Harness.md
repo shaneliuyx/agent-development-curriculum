@@ -2366,3 +2366,35 @@ if __name__ == "__main__":
 
 - **Builds on**: W7 §MCP Setup — A2A's wire format extends MCP's JSON-RPC conventions
 - **Foreshadows**: W11 Multi-Agent System Design — A2A agent cards become building blocks for agent registries, capability routing, trust hierarchies
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** JSON Schema beats free-form prompts for tool arguments because the model uses the schema to *fill* arguments, not just *decide* whether to call the tool. Setting `"additionalProperties": false` prevents invented fields; strict `"type": "integer"` catches string-for-int substitutions before the callable runs. A loose schema (`{}` or untyped `"object"`) tells the model "anything goes," producing subtle type mismatches that only surface at runtime. Schema is the type contract; description is the discovery surface. Both matter, and they do different jobs.
+
+**Soundbite 2.** Tool errors split into two categories: retryable infrastructure failures (timeout, ConnectionError, 503) and logic errors (wrong argument type, missing required field). Harness retries first category with exponential backoff — base 1s, doubling, capped at 30s — and does not retry second. Retrying a TypeError three times wastes three round-trips and returns same error. After retry exhaustion, error goes back into message history as `tool` role message — model reads, self-corrects, or escalates. Without max-repair budget (per-tool cap + global iteration cap), error recovery becomes infinite loop.
+
+**Soundbite 3.** Three protocols, three layers. MCP (Anthropic, Nov 2024; adopted by OpenAI/Google in 2025-26) handles one agent calling structured tools — owns wire format for schema, auth, dispatch. A2A (Google, April 2025, Linux Foundation) handles agent-to-agent coordination: agent card at `/.well-known/agent.json` is machine-readable manifest letting any peer discover capabilities before delegating a stateful task. NLWeb (Microsoft, May 2025) is read layer for the open web — `/nlweb` endpoint returning schema.org JSON-LD, agents query structured site content without HTML parsing. One-line stack: MCP for tools, A2A for agents, NLWeb for websites.
+
+---
+
+## References
+
+- **Schick et al. (2023).** *Toolformer.* NeurIPS 2023. arXiv:2302.04761. Self-supervised API call insertion.
+- **Anthropic (2024).** *Model Context Protocol Specification.* spec.modelcontextprotocol.io. Canonical wire-format reference.
+- **Google (2025).** *A2A Protocol Specification.* google.github.io/A2A/. Agent card, task lifecycle, JSON-RPC 2.0.
+- **Microsoft (2025).** *NLWeb.* github.com/microsoft/NLWeb. `/nlweb` endpoint returning schema.org JSON-LD.
+- **Anthropic (2024).** *Building Effective Agents — Tools.* Tool description quality, permission boundaries, contract vs governance.
+- **Gerred (2024).** *Claude Code Source Analysis — Tool Extensibility, Permissions.* Bk1 §§4.3-4.4, 4.7. Source-level walkthrough of `toolExecution.ts`, `useCanUseTool.tsx`.
+- **Braverman et al. (2025).** *PASTE: Speculative Tool Execution.* 30-50% p95 latency reduction at 2-3× compute cost.
+
+---
+
+## Cross-References
+
+- **Builds on:** W4 ReAct — tools are the "Act" side of Observe-Think-Act; harness is the production wrapper that makes that act reliable.
+- **Distinguish from:** Generic API integration — tool harness is not just an HTTP client. Distinguishing properties: schema-validated dispatch, `allow/deny/ask` permission model in code (not prompt), error-as-prompt feedback loop keeping failures on main execution path, per-tool + global budget caps. HTTP client has none of these.
+- **Connects to:** W7.5 Computer Use — CUA tools (screenshot, click, type) are widest-schema tools, analogous to Bash; same runtime-governance principles apply. W11.5 Agent Security — tool dispatch is primary security boundary; `useCanUseTool` predicate from W7 is enforcement point W11.5 stress-tests.
+- **Foreshadows:** W11 System Design — `Tool` dataclass with governance fields scales into production tool registry with versioning, capability routing, multi-tenant budget accounting. A2A agent card from §7.X becomes building block for agent registry. W12 Capstone — 20-scenario pass/fail matrix and local-vs-cloud reliability delta are empirical anchors capstone cites.

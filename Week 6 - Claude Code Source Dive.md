@@ -1530,3 +1530,36 @@ The interview signal: candidates who conflate "building an agent" with "writing 
 The patterns generalize beyond coding agents. A farm agent's harness is its sensor array, irrigation controls, and weather data feeds. A hotel agent's harness is its booking system, guest channels, and facility management APIs. The agent — the intelligence — is always the model. The harness changes per domain. The agent generalizes across them.
 
 When you finish W6, you should be able to take any Claude Code mechanism (subagent isolation, on-demand skill loading, context compression) and re-implement it in a non-coding domain. That portability is the proof you've understood harness engineering, not just memorized Claude Code's specific architecture.
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** Claude Code's architecture makes the harness/intelligence distinction concrete and measurable. Of ~512,000 lines of TypeScript, roughly 1.6% is AI decision logic — the loop that calls the model and parses output. The other 98.4% is deterministic infrastructure: permission gates, compaction, tool routing, session storage, hooks, subagent dispatch. The model decides; the harness executes and guards. Candidates who conflate "building an agent" with "writing prompt chains" are immediately distinguishable from those who can name what the 98.4% does.
+
+**Soundbite 2.** Claude Code loads skills on demand rather than prepending everything to the system prompt. Skills expand into prompt injections only when the tool router matches a call; hooks fire as OS subprocesses at tool-call boundaries. Always-on system prompts waste context on capabilities the current task never uses, break cache locality, inflate cost per turn. On-demand loading treats context as a budget — pay only for what you invoke, entrypoint stays small enough to cache stably.
+
+**Soundbite 3.** The Task tool spawns a fully isolated child agent with fresh context window and own permission scope. Parent explicitly controls what context the child receives — no implicit inheritance of full message history. Context management as architecture: instead of one ballooning window accumulating every subtask's tool results, get N focused windows whose outputs return as compact tool results. Isolation also means a child crash or runaway compaction event cannot corrupt parent session.
+
+---
+
+## References
+
+- **Anthropic (2024).** *Building effective agents.* Engineering blog, Sept 2024. Workflows-vs-agents distinction; smallest deterministic primitives.
+- **bits-bytes-nn (2026).** *Claude Code Architecture Analysis.* March 2026. Origin of 1.6%/98.4% measurement.
+- **VILA-Lab (2026).** *Dive-into-Claude-Code.* GitHub. Module-by-module breakdown; permission classifier decision tree.
+- **DEV.to (2026).** *Architecture Explained: Agent Loop, Tool System, Permission Model.* Authoritative 7-permission-mode enumeration.
+- **engineerscodex (2026).** *Diving into Claude Code's Source Code.* Substack. Why hooks run as separate OS processes; append-only session storage.
+- **claudefa.st (2026).** *Source Leak: Everything Found.* PROACTIVE/KAIROS feature flags; 5-layer compaction pipeline.
+- **shareAI-lab/learn-claude-code (2026).** GitHub. 12-session reverse-engineering. Source of harness-vs-intelligence framing.
+- **Pi Agent (Zechner, 2026).** GitHub. Minimalist counterpoint — 4 tools, no MCP, shortest system prompt.
+
+---
+
+## Cross-References
+
+- **Builds on:** W4 ReAct — Claude Code's query loop is a production-hardened ReAct. Observe-reason-act structure identical, but every loop edge replaced by a named subsystem (S2 gating action, S3 managing observation window, S6 recording trace).
+- **Distinguish from:** Prompt-chain orchestration libraries (LangChain workflows, n8n, Flowise) — impose rigid if-else decision graphs over LLM completions, closer to symbolic rule systems. Claude Code deliberately avoids workflow structure; provides harness mechanisms, lets model decide sequence. Distinction: harness constrains *environment*, workflow libraries constrain *reasoning path*.
+- **Connects to:** W6.5 Hermes (self-improving extreme: learned skills vs Claude Code's curated on-demand); W6.7 Authoring Agent Skills (writing skills that plug into the on-demand loading mechanism).
+- **Foreshadows:** W7 Tool Harness (cheat sheet from W6 = spec; W7 implements append-only session log + PreToolUse/PostToolUse hooks as working Python); W11.5 Agent Security (permission classifier + hook-as-code-gate are security primitives W11.5 stress-tests); W11 System Design (8-subsystem architecture is reference design for capstone system design interview).

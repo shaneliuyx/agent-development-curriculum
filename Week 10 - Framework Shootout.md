@@ -1571,3 +1571,35 @@ If all three print OK and RESULTS.md has zero `<fill>` placeholders, you are don
 ---
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** When I choose a framework, I start from three workload questions: does the agent loop and branch, or is the flow deterministic at design time? Does it need durable state across process restarts, or is in-session memory enough? Does it need human-in-the-loop pauses, or does it run unattended? Those map directly onto framework capabilities. LangGraph earns its scaffolding cost when you answer yes to any. For linear RAG pipelines you answer no to all three and LCEL is cleaner. Ops burden follows: a checkpointed LangGraph in production is a Postgres table you must back up + monitor; a stateless LCEL chain is not.
+
+**Soundbite 2.** LangChain's abstraction tax shows up in three places: state schema you must define upfront, explicit node-and-edge wiring, ChatOpenAI wrapper around your model client. For a simple one-shot agent that loops twice and stops, those 85 lines buy you less than a 15-line raw SDK call. The tax starts paying off the moment you need: durable checkpointing, conditional routing varying per run, human-in-the-loop interrupts, or LangSmith trace view. I do not reach for LangGraph until at least one of those four is on the requirements list.
+
+**Soundbite 3.** There is a distinction between throughput workloads and serving workloads that changes which framework applies even within the same library family. LlamaIndex's `ReActAgent` is excellent for serving — one user, one session, rich retrieval integration. Its `IngestionPipeline` is the throughput path — batch document chunking + embedding across a corpus. Using `ReActAgent` to process a thousand documents in a loop is wrong like using a web server to run a batch job. Knowing which half of the library family a framework was optimized for is how you avoid hitting its ceiling at the wrong moment.
+
+---
+
+## References
+
+- **LangChain / LangGraph documentation** — python.langchain.com / langchain-ai.github.io/langgraph. LCEL composition, state machine primitives, `SqliteSaver`/`PostgresSaver`, AgentExecutor deprecation in LangChain 1.0 (Oct 2025).
+- **LlamaIndex documentation** — docs.llamaindex.ai. `FunctionTool`, `QueryEngineTool`, `ReActAgent`, `FunctionCallingAgent`, AgentRunner/AgentWorker split, `ChatMemoryBuffer`.
+- **OpenAI Agents SDK** — openai.github.io/openai-agents-python/. `Agent`, `Runner`, `handoff`, `function_tool`, `OpenAIResponsesModel`, `AsyncOpenAI(base_url=...)` local routing pattern.
+- **Anthropic (2024).** *Building effective agents.* anthropic.com/research/building-effective-agents. Hand-rolled-first argument; five convergence organs.
+- **Yao et al. (2022).** *ReAct.* arXiv:2210.03629. Foundational loop every framework abstracts.
+- **Shinn et al. (2023).** *Reflexion.* arXiv:2303.11366. Self-critique above the tool-call loop.
+- **Microsoft (2025).** *Microsoft Agent Framework 1.0.* learn.microsoft.com. Enterprise-stack alternative; Entra ID identity-aware permissions, Teams connectors, Azure AI Foundry.
+
+---
+
+## Cross-References
+
+- **Builds on:** W4 ReAct (the hand-rolled loop all three frameworks replace — must have built it to understand what abstraction costs); W5 Pattern Zoo (frameworks pre-bake patterns A-H — this week measures the baking cost); W9 Faithfulness Checker (verification stage above any framework's loop).
+- **Distinguish from:** Generic "LangChain tutorial" — this chapter scores frameworks against a single measured workload across six concrete dimensions, not against feature lists. Also distinguish from LCEL-chain-as-agent mistake: LCEL is correct for linear RAG, incorrect for any loop.
+- **Connects to:** W5 Pattern Zoo (frameworks are packaged form of patterns; matrix tells you which framework handles which natively vs requires you to build); W11 System Design (framework lock-in is architectural decision at system scope — checkpointer backend, handoff topology, observability are first-class system design constraints).
+- **Foreshadows:** W12 Capstone (capstone requires picking a framework or rolling hand-written SDK calls and defending against the six-dimension matrix; 90-second answer drafted in Phase 6.3 is the spoken justification capstone evaluator asks for).

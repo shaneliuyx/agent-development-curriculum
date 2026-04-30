@@ -1,3 +1,18 @@
+---
+title: Week 8.5 - Voice AI Agents
+created: 2026-04-30
+updated: 2026-04-30
+tags:
+  - agent
+  - voice
+  - stt
+  - tts
+  - whisper
+  - realtime-api
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: Local-first — faster-whisper + Claude + ElevenLabs/Coqui. OpenAI Realtime API for comparison.
+---
+
 # Week 8.5 - Voice AI Agents
 
 ## Why This Week Matters

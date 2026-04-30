@@ -2414,3 +2414,21 @@ Each agent runs `agent_loop` as a long-lived process (or serverless trigger on m
 - Erlang actor model (the canonical reference for this coordination primitive)
 - Ray Actors (modern actor implementation in Python)
 - `shareAI-lab/learn-claude-code` — s07 task system + team coordination patterns
+
+
+---
+
+## Cross-References
+
+- **Builds on:** W4 ReAct From Scratch — Pattern A (ReAct) is the direct continuation of the W4 loop; Patterns B–H all extend, compose, or contrast with it. Every diagram this week assumes you can already read a ReAct trace.
+
+- **Distinguish from:**
+  - Pattern A (ReAct, linear loop) vs Pattern B (Plan-and-Solve): ReAct accumulates a scratchpad as it goes; Plan-and-Solve externalises a DAG *before* execution begins. Difference matters for long-horizon dependencies — ReAct's scratchpad fills with local context and loses the global plan.
+  - Pattern C (Reflexion) vs Pattern E (Writer-Reviewer Adversarial): Reflexion uses a same-family critic that shares the actor's training biases — anchoring amplification is the failure mode. Adversarial pattern breaks this with role separation, deterministic pre-gate, and reviewer with no memory of prior rounds.
+  - Pattern D (Orchestrator-Worker) vs Pattern A used hierarchically: Orchestrator-Worker dispatches fungible workers whose boundaries are emergent; hierarchical multi-agent assigns typed roles whose boundaries are part of the design. Confusing the two leads to fan-out architectures that silently degrade because workers over-reach scope.
+  - Pattern F (Swarm) vs Pattern G (State-Machine): Swarm agents negotiate turn order at runtime — no pre-specified graph, high observability cost, emergent critique quality. State-machine enumerates branches as typed edges in advance — fully testable, replayable, interruptible. Swarm's apparent collaboration costs 3-5× the latency and context.
+  - Pattern G (State-Machine, synchronous) vs Pattern H (Async Mailbox): state-machine and swarm both block each step on the previous step's output. Async mailbox abandons that — each agent runs on own cadence, communicating via durable per-agent queues. Pattern H is the only topology that survives heterogeneous infrastructure (LLM + non-LLM, GPU + serverless) and individual agent crashes.
+
+- **Connects to:** [[Week 3.7 - Agentic RAG]] — canonical 5-node Agentic RAG graph (decide → retrieve → grade → rewrite → answer) is Pattern G applied to retrieval, with Pattern D's fan-out on retrieve node; [[Week 5.5 - Metacognition]] — Reflexion (Pattern C) is the episodic critic loop W5.5 extends; [[Week 7 - Tool Harness]] — every pattern dispatches tools; W7's harness is the execution layer all 8 patterns share.
+
+- **Foreshadows:** [[Week 10 - Framework Shootout]] — CrewAI bakes in Pattern F, LangGraph bakes in Pattern G, AutoGen exposes Pattern H — framework choice IS pattern choice; [[Week 11 - System Design]] — production system design requires selecting + justifying patterns from A-H against task structural properties (linear → A, long-horizon decomposition → B, quality iteration → C/E, parallelism → D, typed specialists → A-hierarchical, emergent critique → F, enumerable branches → G, heterogeneous infra → H); [[Week 12 - Capstone]] — capstone requires composing at least three patterns into a working system with written justification.

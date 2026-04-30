@@ -1,3 +1,17 @@
+---
+title: Week 7.5 - Computer Use and Browser Agents
+created: 2026-04-30
+updated: 2026-04-30
+tags:
+  - agent
+  - computer-use
+  - browser-automation
+  - cua
+  - playwright
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: Claude Computer Use API (beta), browser-use lib, Playwright, Selenium
+---
+
 # Week 7.5 - Computer Use and Browser Agents
 
 ## Why This Week Matters

@@ -1476,3 +1476,35 @@ Most pragmatic shape for teams without GPU infra: run compute-light data-heavy s
 - MLX benchmarks: https://github.com/ml-explore/mlx-examples/tree/main/llms
 - Anthropic Message Batches: https://docs.anthropic.com/en/docs/build-with-claude/message-batches
 - Lambda Labs / RunPod GPU pricing
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** Three drift modes threaten production agent systems simultaneously. Prompt-rot occurs when a provider silently updates model weights, degrading a carefully calibrated prompt — detected by running a fixed canary eval set nightly and alerting when pass-rate drops more than three percentage points. Schema drift occurs when tool definitions evolve; treat every tool schema change as breaking, requiring a regression eval. Corpus drift occurs as the retrieval document set changes — detected by tracking retrieval hit-rate on a fixed query set monthly and alerting on drops above five percent.
+
+**Soundbite 2.** The local-vs-cloud decision hinges on four axes: latency, data-residency, cost-at-scale, cold-start complexity. Run locally — MLX, Ollama, quantized model — when inference must be sub-200ms, when data cannot leave the host (regulated PII, on-call tooling hitting internal APIs), or when per-token cloud cost exceeds unit economics at your QPS. Route to cloud when task requires frontier-model reasoning a quantized local cannot match, or when burst capacity needs hardware you cannot provision. For hybrid workloads, use a local small model as classifier+router, reserve the cloud call for synthesis — yields 60-80% cost reduction at scale.
+
+**Soundbite 3.** Cost ceilings are not optimization — they are a hard design constraint determining whether the architecture is buildable at all. Formula: `cost_per_request = (input_tokens + output_tokens) × price_per_token`; multiply by QPS for hourly spend. A 10-tool ReAct loop generating 20K tokens per query at 100 QPS can exceed revenue-per-user-action before the system ships. Cost ceilings force three real decisions: which sub-tasks route to a smaller model, where semantic caching eliminates redundant LLM calls, when the correct answer is to replace an LLM component with a deterministic classifier. A candidate who says "we'd optimize costs later" has not done this math.
+
+---
+
+## References
+
+- **Anthropic (2024, updated 2026).** *Building Effective Agents.* Canonical framework for production agent design; minimal-footprint principle; six recurring failure factors.
+- **Kwon et al. (2023).** *PagedAttention (vLLM).* SOSP 2023. arXiv:2309.06180. KV-cache paging; prefix caching cuts TTFT 50-80% on shared system-prompt prefixes.
+- **Pinecone (2024).** *Production RAG Case Studies.* pinecone.io/learn. Corpus drift as most common undetected failure; 1% random retrieval-sample logging.
+- **Replit Engineering Blog (2024).** Sandboxing architecture, context compaction; forcing function from GPT-4 to fine-tuned smaller models on high-volume tail.
+- **Ray Project (2024).** *Ray Serve docs.* docs.ray.io/en/latest/serve. Model routing, replica autoscaling, batching for LLM serving.
+- **KServe docs (2024).** kserve.github.io. K8s-native model serving for existing K8s clusters.
+- **Microsoft (2025-26).** *Agent Governance Toolkit.* github.com/microsoft/agent-governance-toolkit. Six governance dimensions.
+
+---
+
+## Cross-References
+
+- **Builds on:** W1-W10 — every prior week contributes a component: retrieval (W2-W3), memory + state (W3.5), tool harness (W6-W7), evals (W9), orchestration patterns (W5), cost + context management (W8).
+- **Distinguish from:** ML system design — no human-in-the-loop training loop; agent systems face inference-time drift from silent provider weight updates, not training-distribution shift; evals run as CI jobs, not retraining pipelines.
+- **Connects to:** W11.5 Agent Security — security is a system design concern; allowlist permission model, capability scoping, audit logging from this chapter are W11.5's implementation targets.
+- **Foreshadows:** W12 Capstone — six-gate rubric, five trade-off patterns, cheat sheet from this chapter are the evaluation scaffold for the capstone system design artifact.

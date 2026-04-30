@@ -1,3 +1,17 @@
+---
+title: Week 6.7 - Authoring Agent Skills (Anthropic Pattern)
+created: 2026-04-30
+updated: 2026-04-30
+tags:
+  - agent
+  - skills
+  - claude-code
+  - anthropic
+  - authoring
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: Claude Code skill authoring (~/.claude/skills/), SKILL.md frontmatter spec
+---
+
 # Week 6.7 - Authoring Agent Skills (Anthropic Pattern)
 
 ## Why This Week Matters
