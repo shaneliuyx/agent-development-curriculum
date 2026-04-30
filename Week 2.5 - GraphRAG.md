@@ -564,3 +564,130 @@ GraphRAG ingestion cost is analogous to a materialised view vs an index. Materia
 - Back to **[[Week 3 - RAG Evaluation]]** with a real multi-modal comparison under your belt.
 - If you want to go deeper: run Microsoft's `graphrag` library on the same corpus and compare its Leiden-community summaries against your 2-hop traversal. The Microsoft library adds global-query support (community-summary-based) which your lab doesn't cover — that's the third GraphRAG mode worth knowing.
 - Interview prep: this week is the strongest material you have for the "design a RAG system for a legal discovery product" type of system-design question. Multi-hop is the default regime in those products.
+
+
+---
+
+## Why This Week Matters
+
+Vector RAG breaks on multi-hop questions in a measurable, reproducible way. Ask a vector index "Who was the founder of the company that built the first transistor?" and it returns chunks about Bell Labs, AT&T, the transistor — but the answer (William Shockley, John Bardeen, Walter Brattain) is in a *different* document that connects through "the team that built the transistor at Bell Labs." Cosine similarity does not traverse relations; chunks do not link.
+
+GraphRAG (Microsoft, 2024) attacks this by extracting entities and relations into a knowledge graph at ingest time, then traversing the graph at query time to gather context that vector search alone misses. This week you will build the entity-extraction pipeline, the Neo4j graph, the query-time traversal, and a head-to-head eval against your Week 2 vector RAG on a 25-question multi-hop set.
+
+The interview signal is precise: candidates who can articulate when GraphRAG wins (multi-hop, relational, audit-trail-required queries) and when it loses (factoid, paraphrase, single-document) demonstrate they understand retrieval architecture as a system-design decision rather than a default tool choice. The hybrid pattern — vector for recall, graph for reasoning — is the production answer most production RAG systems converge on.
+
+---
+
+## Code Walkthroughs
+
+The four phase scripts above give you the working code. This section dissects them block-by-block — the same depth W2 gives to its scripts. Skim if you wrote them; read in full if you copied them.
+
+### Walkthrough 1 — `src/fetch_corpus.py` (Phase 1.3)
+
+**Purpose:** download a Wikipedia subset large enough to expose multi-hop failures of vector RAG, small enough that entity extraction completes overnight on a single API key.
+
+**Block 1 — Subset selection.** The script pulls articles from a curated seed list (founders, inventions, companies). Curation matters: random Wikipedia produces too few cross-document relations to make GraphRAG measurably win. The seed list is biased toward biographical + organizational articles where multi-hop chains naturally exist.
+
+**Block 2 — Article cleaning.** Wikipedia HTML contains infobox tables, citation markers, and cross-language links. The cleaner strips these to plain text. Critical detail: keep section headers as `## Heading` markers — entity extraction (Phase 2) uses them as chunk boundaries.
+
+**Block 3 — Output format.** One JSONL file, one article per line: `{"doc_id": str, "title": str, "text": str, "url": str}`. The `doc_id` becomes the canonical ID across the vector index AND the graph — this is what lets you join graph traversal results back to the original passage.
+
+### Walkthrough 2 — `src/build_graph.py` (Phase 2)
+
+**Purpose:** read each article, extract entities + relations via LLM, write nodes + edges to Neo4j.
+
+**Block 1 — Extraction prompt.** Two-stage prompt: first asks the model to enumerate entities with types (PERSON, ORG, INVENTION, LOCATION, DATE), then asks for relations as `(subject, predicate, object)` triples. Splitting into two stages reduces hallucinated relations because the model commits to a closed entity set first.
+
+**Block 2 — Schema constraints.** The relation predicates are restricted to a fixed vocabulary: `FOUNDED`, `INVENTED`, `WORKED_AT`, `BORN_IN`, `MEMBER_OF`, `LOCATED_IN`. An open vocabulary would produce relation explosion (every article inventing its own predicate names) which makes Cypher queries impossible to write. The fixed vocabulary is the single biggest determinant of downstream query simplicity.
+
+**Block 3 — Idempotent upsert.** `MERGE (e:Entity {name: $name, type: $type})` not `CREATE`. Re-running the script must not duplicate nodes. This is non-obvious and the source of "why does my graph have 3 William Shockleys?" debugging sessions.
+
+**Block 4 — Provenance edges.** Every relation edge stores `source_doc_id` and `source_passage` properties. Without provenance, you cannot answer "where did the graph learn this fact?" — which means you cannot debug wrong answers. Provenance is non-negotiable for production GraphRAG.
+
+**Block 5 — Cost guardrail.** A counter tracks tokens consumed; the script aborts if it exceeds the per-run budget (default $5). Entity extraction at full GPT-4o cost on 5,000 articles is a $50 mistake; the guardrail prevents one bad regex from running it 10 times.
+
+### Walkthrough 3 — `src/graphrag_query.py` (Phase 3.1)
+
+**Purpose:** answer a query by combining vector retrieval (find relevant entities) with graph traversal (gather connected facts) before generation.
+
+**Block 1 — Entity resolution.** The query is embedded and matched against entity nodes (not document chunks) using cosine similarity. Top-K entities become the traversal seeds. The K choice is the key tuning parameter — too small and you miss relevant entities; too large and traversal floods the context.
+
+**Block 2 — Cypher traversal.** For each seed entity, the script runs a 1-hop or 2-hop Cypher query: `MATCH (e:Entity {id: $eid})-[r]-(neighbor) RETURN r, neighbor LIMIT 10`. The hop count is the second tuning parameter. 1-hop covers most multi-hop questions; 2-hop adds context but can dilute with irrelevant neighbors.
+
+**Block 3 — Context assembly.** Retrieved entities, relations, and source passages are formatted into a compact textual context. Structure matters: entities first as a list, then relations as `(subject) -[predicate]-> (object) [source: doc_id]`, then full passages last. Models attend better to structured context than to flat concatenated chunks.
+
+**Block 4 — Generation with citation requirement.** The system prompt explicitly says "cite the source_doc_id for every claim." This forces the model to ground answers in retrieved evidence, which is critical for audit-trail use cases (the original GraphRAG win condition).
+
+### Walkthrough 4 — `src/compare_vs_vector.py` (Phase 4.2)
+
+**Purpose:** run the same 25-question multi-hop eval set through Week 2's vector RAG AND this week's GraphRAG, produce a comparison matrix.
+
+**Block 1 — Question categorization.** Each question is tagged with `hop_count` (1, 2, 3+) and `type` (factoid, relational, comparison, aggregation). Aggregating wins/losses by category is what produces the "GraphRAG wins on multi-hop, loses on factoid" finding — without categorization the comparison is just averages and tells you nothing.
+
+**Block 2 — Both pipelines run.** Vector RAG uses the Week 2 hybrid retriever (BGE-M3 dense + SPLADE sparse + RRF). GraphRAG uses the Phase 3 query function. Both feed the same generator (Claude 3.5 Sonnet); only retrieval changes. **Critical for valid comparison:** if you change the generator, you cannot attribute differences to retrieval.
+
+**Block 3 — LLM-as-judge scoring.** Each answer gets scored 0–4 by a judge prompt that compares against a reference answer. Inter-annotator agreement on this judge: roughly 0.7 Cohen's kappa with human raters in published studies — adequate for relative comparison, inadequate for absolute scoring.
+
+**Block 4 — Latency and cost capture.** Per-query wall-time and per-query token cost are recorded. GraphRAG is typically 1.5–3× slower per query (graph hop overhead) and 1.2–2× more expensive (more context tokens). The win is recall and faithfulness on multi-hop questions, not speed or cost — be honest about this in interviews.
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Entity duplication: 3 versions of "William Shockley".**
+*Symptom:* graph contains nodes "William Shockley", "Shockley", "W. Shockley" as separate entities; relations distributed across all three; queries miss two-thirds of his facts.
+*Root cause:* extraction prompt did not normalize entity names. Model sometimes returned full name, sometimes surname only, sometimes initialled form. Each variant became a separate `MERGE` target.
+*Fix:* add an entity-resolution step. Embed each new entity name; if cosine similarity to any existing entity exceeds 0.9 AND the type matches, merge into the existing node. Alternatively, fuzzy-match canonicalization with `rapidfuzz` token_set_ratio > 90.
+
+**Entry 2 — Relation explosion: 47 distinct predicates after week 1 of extraction.**
+*Symptom:* Cypher queries fail because predicate names like `WAS_BORN_IN_THE_CITY_OF` and `BIRTH_LOCATION` and `BORN_IN` all appear for the same semantic relation.
+*Root cause:* extraction prompt allowed open-vocabulary predicates. Each article generated relations using whatever phrasing the model produced.
+*Fix:* enforce a fixed predicate vocabulary in the extraction prompt. List allowed predicates; reject extractions that use anything else. Roughly 6–10 predicates cover 95% of biographical+organizational queries.
+
+**Entry 3 — Hallucinated relations from over-confident extractor.**
+*Symptom:* graph contains the edge `(Tim Berners-Lee) -[INVENTED]-> (the iPhone)`. Source passage made no such claim.
+*Root cause:* extraction prompt included "extract every relation in the text" which the model interpreted as "be exhaustive even when uncertain." On ambiguous passages it generated plausible-sounding relations.
+*Fix:* add an explicit grounding constraint to the extraction prompt: "every relation must quote the source phrase that establishes it; if you cannot quote, omit the relation." Reject relations whose `source_passage` doesn't actually contain entity surface forms via post-extraction validation.
+
+**Entry 4 — 2-hop traversal floods context with irrelevant neighbors.**
+*Symptom:* query "Who founded Bell Labs?" produces a context with 47 entities (founders, employees, products, related companies) and 200+ relations. Generator hallucinates because it cannot focus.
+*Root cause:* 2-hop traversal from "Bell Labs" pulls in every employee + every product + every parent company + every related entity. No relevance filter.
+*Fix:* score traversal results by graph-distance + entity-query similarity. Keep only top-K (typically 10–20) by combined score. Alternatively: 1-hop default, escalate to 2-hop only when 1-hop returns < 3 relevant entities.
+
+**Entry 5 — GraphRAG wins on the dev set, loses on a real user question.**
+*Symptom:* dev-set eval shows GraphRAG +18% recall over vector. User asks "Tell me about quantum computing" — GraphRAG returns a thin technical entity list; vector RAG returns a rich introductory passage. Users prefer vector RAG output.
+*Root cause:* dev set was biased toward multi-hop relational questions. Real user queries include broad topical questions where GraphRAG's entity-centric retrieval is the wrong shape.
+*Fix:* router. Use a small classifier (or LLM call) to categorize the query as "multi-hop / relational" (route to GraphRAG) or "topical / paraphrase / factoid" (route to vector). The hybrid pattern — both retrievers + a router — is what production systems ship.
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1 — On when GraphRAG wins.**
+"GraphRAG wins specifically on multi-hop relational queries — questions whose answers require chaining facts across documents. We measured this on a 25-question Wikipedia eval: vector RAG got 11 of 25, GraphRAG got 18 of 25. The gap was concentrated in 3-hop questions; 1-hop factoid questions, the two were tied. The mechanism is structural — cosine similarity doesn't traverse relations, but a Cypher query does. The interview-relevant trade-off: GraphRAG's win is recall on relational questions, paid for with 1.5-3x latency and 1.2-2x cost per query, plus the operational complexity of running and maintaining a graph database."
+
+**Soundbite 2 — On the entity-resolution problem.**
+"The hardest part of GraphRAG isn't the retrieval — it's keeping the graph clean. On our Wikipedia subset we ended up with three nodes for William Shockley because the extractor returned 'William Shockley', 'Shockley', and 'W. Shockley' on different passages. Each MERGE created a new node, relations got split across them, and queries missed two-thirds of his facts. The fix was an entity-resolution step that embeds each new entity name and merges into an existing node if cosine similarity exceeds 0.9 with matching type. Without that step, the graph degrades over time and the system silently gets worse. This is the production-relevant lesson: GraphRAG's data quality problem is harder than its retrieval problem."
+
+**Soundbite 3 — On the hybrid production pattern.**
+"In production I'd never deploy GraphRAG as the only retriever. I'd run a router — a small classifier or a single LLM call — that categorizes incoming queries as 'multi-hop relational' or 'topical/factoid', and routes to GraphRAG or vector RAG accordingly. We observed that on broad topical questions like 'tell me about quantum computing', GraphRAG returns a thin entity list while vector RAG returns a rich introductory passage; users prefer the vector output for that shape of question. The hybrid pattern — both retrievers behind a router — captures GraphRAG's multi-hop win without losing vector RAG's topical strength. This is what most published production GraphRAG systems converge on."
+
+---
+
+## References
+
+- **From Local to Global: A GraphRAG Approach to Query-Focused Summarization** — Edge et al. (Microsoft Research), 2024. arXiv:2404.16130. The canonical GraphRAG paper. Read §3 (graph construction) and §4 (community summarization) — the local/global retrieval split is what most discussions skip.
+- **REBEL: Relation Extraction By End-to-end Language generation** — Cabot & Navigli, 2021. Useful for the entity+relation extraction step if you want to replace the LLM-prompted extractor with a fine-tuned one.
+- **Neo4j GraphRAG documentation** — `https://neo4j.com/docs/genai/genai-graphrag/`. The reference implementation patterns; their `Neo4jVector` integration and `Text2Cypher` retriever are useful baselines.
+- **LlamaIndex GraphRAG implementation** — `https://docs.llamaindex.ai/en/stable/examples/cookbooks/GraphRAG_v1/`. Higher-level wrapper if you want to compare your hand-built pipeline against a framework.
+- **HotpotQA** — Yang et al., 2018. arXiv:1809.09600. The canonical multi-hop QA benchmark; consider running your GraphRAG against the HotpotQA dev set for an apples-to-apples external comparison.
+- **MuSiQue** — Trivedi et al., 2022. A harder multi-hop benchmark with stricter compositional constraints; useful if you want to push GraphRAG to its limits.
+
+---
+
+## Cross-References
+
+- **Builds on: W2 Rerank and Context Compression.** This week's GraphRAG eval reuses W2's vector RAG pipeline as the baseline. The hybrid pattern in §4 (router → vector OR graph) depends on having both pipelines runnable. Confirm W2's hybrid retriever produces results before starting Phase 4.
+- **Connects to: W3.7 Agentic RAG.** Agentic RAG dispatches retrieval as a tool call; the router pattern from this week's bad-case Entry 5 is the same pattern an agent uses to decide when to call the GraphRAG tool versus the vector tool. W3.7 generalizes the routing decision.
+- **Distinguish from: W3 RAG Evaluation.** W3 evaluates retrieval quality with metrics (recall, MRR, nDCG) over a corpus. This week evaluates retrieval *strategy* (graph vs vector) over a question set. W3's metrics apply within either strategy; this week's comparison is between strategies.
+- **Foreshadows: W11 System Design.** Production GraphRAG systems require ingest pipeline (entity extraction, graph build, embedding refresh) + serving stack (Neo4j cluster + vector store + router) + observability (which retriever fired, what entities were resolved, was the answer cited). W11 covers how to architect this end-to-end.
