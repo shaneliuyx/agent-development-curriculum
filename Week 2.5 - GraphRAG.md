@@ -1152,7 +1152,32 @@ for input_title in titles:
 ```
 The bug masquerades as "weighted sampling not strong enough" because ~13 % of candidates DO return correct pageviews (titles where input form is already canonical), so a few canonical entities still land. Easy to misread as a sampling/algorithm problem; real cause is always the title-resolution mismatch. Production lesson: any sampling/weighting layer that "almost works" — check the input data first; partial correctness produces noise that looks like sampling variance.
 
-**Entry 13 — `build_graph.py` LLM-extraction loop is sequential; wastes 5 of 6 inference-server slots.**
+**Entry 13 — `prop=pageviews` per-property continue limit silently zeroes ~80 % of weights even with title resolution fixed.**
+*Symptom:* After fixing the title-resolution bug (Entry 12), `zero-pageview=2355/3084` (down from 2682/3084) — 76 % zero rate. Steve Jobs and Mark Zuckerberg still missing from 150-article sample. Direct API probe with 50 canonical titles in one batch — Bill Gates / Elon Musk / Bezos / Microsoft / Google etc. — shows only 19/50 return pageview data; the other 31/50 silently appear in `query.pages` *without* a `pageviews` field. Same titles individually return correct pageviews when batched in groups of 5.
+*Root cause:* `prop=pageviews` has a hidden per-property limit of ~19 titles served per call, *regardless* of input batch size. The response includes `continue.pvipcontinue` (per-property continue token) to fetch the next slice of pageviews data. This is the standard MediaWiki continue-pagination mechanism applied per-property — same shape as `clcontinue` / `elcontinue` / etc. for other props — but per-property paginators are rarely documented and don't show up unless you batch >19 titles.
+*Fix:* Loop on `pvipcontinue` until the token disappears, accumulating pageviews into the canonical-title→total dict across rounds:
+```python
+pvipcontinue = None
+for round_idx in range(20):  # bounded — avoid infinite loop on API regression
+    params = dict(base_params)
+    if pvipcontinue:
+        params["pvipcontinue"] = pvipcontinue
+    body = _api_get(params)
+    for page in body.get("query", {}).get("pages", {}).values():
+        pv = page.get("pageviews")
+        if pv is None:
+            continue  # this title is in a later slice
+        canonical_to_total[page["title"]] = sum(
+            v for v in pv.values() if isinstance(v, int)
+        )
+    new_cont = body.get("continue", {}).get("pvipcontinue")
+    if not new_cont or new_cont == pvipcontinue:
+        break
+    pvipcontinue = new_cont
+```
+After the fix: 0/50 zero-pageview rate on the canonical-title test batch. Steve Jobs 853K, Zuckerberg 351K, Tim Cook 494K, Microsoft 314K, Google 1.1M, Facebook 1.4M — all correct. Trade-off: ~3× more API round-trips (typically 3 rounds per 50-title batch). Wall time for the pageview fetch grows ~6 min → ~18 min on a 3000-candidate pool. Acceptable cost for moving from 13 % pageview coverage to ~98 %.
+
+**Entry 14 — `build_graph.py` LLM-extraction loop is sequential; wastes 5 of 6 inference-server slots.**
 *Symptom:* `python src/build_graph.py` runs at ~3 s/article (~3-4 triples/s) on a 150-article corpus → ~450 s wall time, even though the local oMLX server has `max_concurrent_requests=8`. Server CPU shows ~12 % utilisation throughout.
 *Root cause:* The original loop calls `extract_triples(article["text"])` synchronously inside the `for article in tqdm(corpus)` loop. Each call blocks on the LLM round-trip while the other 7 server slots sit idle.
 *Fix:* `ThreadPoolExecutor(max_workers=6)` — 6 workers stays strictly under the server's 8-slot cap, leaving 2 slots for `query_graph.py` seed extraction or IDE autocomplete that fire concurrently. LLM calls run parallel; Neo4j writes stay serial on the single session (MERGE is sensitive to interleaved concurrent writes; the inference server is the bottleneck, not the database).
