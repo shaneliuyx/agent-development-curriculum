@@ -1,7 +1,7 @@
 ---
 tags: [agent-curriculum, debugging, bad-cases, ops-pattern-library]
 created: 2026-04-27
-updated: 2026-04-27
+updated: 2026-04-30
 ---
 
 > **Read order:** Diagnostic Heuristics → Entry Template → Entries → Cross-cutting patterns. The heuristics are pre-debugging discipline (how to think); the template is post-debugging discipline (how to log).
@@ -240,6 +240,138 @@ This may be worth promoting to a future heuristic ("**H8 — Preserve diagnostic
 
 ---
 
+## 2026-04-30 — Week 2.5 — GraphRAG seed-extraction → fuzzy-match cascade (`edges_used: 0`)
+
+**Symptom:** A working GraphRAG pipeline (3,952 entities, 2,859 edges in Neo4j, validated by `MATCH (n:Entity) RETURN n.name LIMIT 20`) returns `edges_used: 0` for queries the corpus clearly contains. `python src/query_graph.py "What movements influenced anarchism?"` → no seeds extracted. After loosening the seed prompt to allow movements/concepts: `seeds: ["early anarchist thinkers"]` for the next query — but still `edges_used: 0`. The graph has plenty of relevant nodes (`anarchist movement`, `anarchist doctrines`, `Anarchists`, `William Godwin`); the pipeline just won't connect query → graph. Two consecutive failures with two completely different root causes, both at zero retrieval depth, both presenting the same `edges_used: 0` symptom.
+
+**Why it's a bad case:** Cascade failure across pipeline stages — the *same* downstream symptom (`edges_used: 0`) had two different upstream causes on consecutive runs. Fixing the first cause exposed the second. This is the multi-stage-pipeline version of "the consumer is downstream of the bug" (heuristic [[#H3 — Look at the producer, not the consumer]]) — but extended: each pipeline stage can hide the next stage's bug. Until you fix Stage A, you can't observe Stage B's failure mode at all.
+
+**False leads:**
+
+1. **First instinct: "the graph wasn't built right."** Spent ~2 minutes running entity-count and sample-name Cypher queries to verify the graph populated correctly. It had — 3,952 nodes, 2,859 edges, samples included `Anarchism`, `William Godwin`, `Wilhelm Weitling`, `Paris Commune`. Drop this lead. The graph was always fine.
+
+2. **After fixing Stage A (seed prompt) → still `edges_used: 0` on a different query.** Briefly suspected the fix had regressed something. It hadn't — the new query ("Who were the early anarchist thinkers?") simply hit a *different* failure mode at the *next* stage (fuzzy-match Cypher). Without the Stage A fix, this Stage B bug would have been invisible.
+
+**Root cause:** Two distinct bugs, in series:
+
+**Stage A — Seed extraction prompt was too narrow.** `EXTRACT_SYSTEM` in `src/query_graph.py:23` restricted entities to "concrete nouns: companies, people, places, products" — categorically excluding the movements, ideologies, and concepts that dominate the early-Wikipedia article slice (`train[:200]` of `wikimedia/wikipedia` is heavy on philosophy and political theory). The seed extractor returned `[]` for any query about an excluded category, even when the corpus explicitly contained that category.
+
+**Stage B — Whole-phrase `CONTAINS` matching is brittle for descriptive seeds.** The `fetch_subgraph` Cypher query was:
+```cypher
+MATCH (n:Entity)
+WHERE toLower(n.name) CONTAINS toLower($seed)
+WITH n LIMIT 3
+MATCH path = (n)-[*1..2]-(m) ...
+```
+The seed extractor (correctly preserving the user's phrasing) returned `"early anarchist thinkers"` — a 24-character descriptive phrase. Graph nodes are atomic concepts: `anarchist movement` (18 chars), `anarchist doctrines` (19 chars), `Anarchists` (10 chars). No node name `CONTAINS` the literal phrase "early anarchist thinkers". Match count: 0 across the entire graph.
+
+**Fix:**
+
+Stage A — loosen the seed extractor prompt to cover the corpus's actual entity types and use the explicit JSON object envelope:
+```python
+"Extract 1-5 entities from the query as a JSON object {\"entities\": [...]}. "
+"Include any noun phrase a graph could store: people, places, products, "
+"organizations, movements, ideologies, events, concepts, time periods. "
+"Prefer specific surface forms over generic ones. "
+"If the query is generic ('tell me about X'), extract X."
+```
+
+Stage B — token-level matching with a stop-word filter, in `fetch_subgraph`:
+```python
+words = [w for w in seed.lower().split() if len(w) >= 4] or [seed.lower()]
+result = session.run(
+    f"""
+    MATCH (n:Entity)
+    WHERE ANY(w IN $words WHERE toLower(n.name) CONTAINS w)
+    WITH n LIMIT 5
+    MATCH path = (n)-[*1..{max_hops}]-(m)
+    ...
+    """,
+    words=words,
+)
+```
+The 4-character minimum drops the most common stop words ("the", "a", "of", "in", "is") that would match every entity. After both fixes, "Who were the early anarchist thinkers?" returns `edges_used: 11` and the synthesizer produces *"The early anarchist thinkers were William Godwin and Wilhelm Weitling."* — a multi-hop graph-grounded answer with citations, exactly the GraphRAG capability the lab is supposed to demonstrate.
+
+**Time cost:** ~25 minutes total. ~5 minutes verifying the graph was correctly built (Cypher queries). ~10 minutes diagnosing Stage A and writing the prompt fix. ~10 minutes diagnosing Stage B once Stage A unblocked it. With the lesson below, this is a 2-minute fix on re-encounter.
+
+**5-second sanity test:** When `edges_used == 0`, run these two probes in order before assuming the graph or the LLM is broken:
+
+```python
+# 1. Did the seed extractor return anything?
+seeds = extract_seed_entities(query)
+print("seeds:", seeds)
+# If [] — Stage A bug (prompt too narrow). Loosen seed extractor.
+# If ["multi word phrase"] — Stage B candidate; continue to probe 2.
+```
+
+```cypher
+// 2. Does the graph contain ANY entity matching ANY word from the seed?
+WITH split(toLower($seed), ' ') AS words
+UNWIND words AS w
+MATCH (n:Entity)
+WHERE size(w) >= 4 AND toLower(n.name) CONTAINS w
+RETURN w, count(DISTINCT n) AS matches
+```
+If probe 2 returns rows but the script returns `edges_used: 0`, the bug is in the Cypher predicate (Stage B). Fix the matcher. If probe 2 returns no rows, the seed truly has no overlap with graph content — that's a *corpus mismatch*, not a code bug.
+
+**Generalizes to:** Any multi-stage NLP pipeline where each stage can independently swallow the input.
+
+1. **Two-stage retrieval (retriever + reranker):** retriever returns 0 candidates → reranker is invisible. Always inspect each stage's output independently before debugging the next.
+
+2. **Tool-using agents (planner + tool dispatcher):** planner returns no tools → executor reports "no action taken." Same shape — the symptom appears at the *terminal* stage, but the bug is upstream. Heuristic [[#H3 — Look at the producer, not the consumer]] applies.
+
+3. **ETL pipelines (extractor + transformer + loader):** if the extractor returns an empty result set due to an over-restrictive filter, the transformer runs successfully on zero rows and the loader writes zero rows, all reporting success. This is the "silent failure on empty input" pattern — every stage operates on what it received and reports success on what it produced, but the input was already empty.
+
+**The diagnostic muscle:** when a multi-stage pipeline reports a downstream "no result" symptom, **probe each stage's input and output separately** before generating fix candidates for any single stage. The downstream stage's "0 results" is *evidence about its input*, not evidence about its own logic. This is heuristic [[#H3]] generalized: in pipelines, the producer chain extends backwards through every prior stage. Walk it.
+
+**Tags:** #graphrag #neo4j #cypher #multi-stage-pipeline #cascade-failure #lab-2-5 #wrong-hypothesis-chase #ops-pattern
+
+**Captured in curriculum at:** [[Week 2.5 - GraphRAG#Bad-Case Journal]] Entries 3 & 4
+**Lab artifact:** `lab-02-5-graphrag/src/query_graph.py` — `extract_seed_entities` (Stage A) + `fetch_subgraph` (Stage B)
+
+---
+
+## 2026-04-30 — Week 2.5 — Reasoning model exhausts max_tokens budget → empty seeds → non-deterministic answers
+
+**Symptom:** Same query produces different results across runs. `python src/query_graph.py "Which companies did Steve Jobs co-found?"` returned a full answer with 29 graph edges on one invocation, then `"No relevant entities found in the graph"` with 0 edges and `seeds: []` on the next invocation. `temperature=0.0` was set throughout. Wall time on the failing run was 38 seconds vs 6 seconds on the working run.
+
+**Diagnostic walk-through.**
+
+```bash
+# 1. Did the seed extractor produce empty output?
+# Yes — seeds: [] confirmed in JSON output of failing run.
+
+# 2. Did the LLM call return content=None?
+# Yes — added a finish_reason check; finish_reason="length" on failures.
+# This is the budget-exhaustion fingerprint.
+
+# 3. Why does the SAME query, same model, temperature=0 produce different outputs?
+# The HAIKU model is gpt-oss-20b — a REASONING model. It spends max_tokens
+# on internal reasoning_content (chain-of-thought) BEFORE emitting visible
+# content. Reasoning length is stochastic across runs even at temperature=0.
+# When chain-of-thought happens to be long enough to consume max_tokens=3000,
+# the model never gets to emit the JSON body, content=None, the fallback
+# returns [], and the downstream pipeline produces the empty-edges error.
+```
+
+**Root cause:** Reasoning models do not have a deterministic content-emission budget. The split between reasoning_content and content is non-deterministic across runs. `temperature=0` controls token sampling but not chain-of-thought *length*. Using a reasoning model for a structured-output task (extract entities → JSON) means you have a contract that says "produce valid JSON" wired to a model whose first behavior is "spend up to 3000 tokens thinking, *then* maybe produce JSON if I have budget left." The contract and the mechanism are mismatched.
+
+**Fix.** Three changes in `lab-02-5-graphrag/src/query_graph.py`:
+1. **Switch the entity-extraction call to a non-reasoning model.** Replaced `model=HAIKU` (`gpt-oss-20b`) with `model=MODEL` (`gemma-4-26B-A4B-it-heretic-4bit`). Non-reasoning models emit content directly; `temperature=0` is fully deterministic. Lowered `max_tokens` from 3000 to 400 (gemma is direct, doesn't need a reasoning budget).
+2. **Add a regex fallback** for empty content. `re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", query)` captures proper nouns ("Steve Jobs", "Apple", "NeXT") via capitalization and works without any LLM call. This is defense-in-depth: if the LLM does fail (network blip, model swap), the pipeline degrades gracefully instead of returning "no entities found."
+3. **Log finish_reason on empty content.** Future failures will surface immediately as `[WARN] LLM returned empty content (finish_reason=length)` rather than silently producing 0-edge results.
+
+**Verification.** Ran the same query three times after the fix. Output identical to four decimals: `seeds: ["Steve Jobs"]`, `edges_used: 14`, same answer text. Determinism restored.
+
+**The diagnostic muscle:** When a structured-output call returns `None` and the symptom is non-deterministic, the first probe should be `finish_reason`. If it's `"length"`, the model hit the budget. If `"stop"` with empty content, something else broke (model crash, prompt-injection-induced refusal). Most LLM SDKs default to suppressing `finish_reason` from logs — explicitly print it on every empty-content path.
+
+**Tags:** #reasoning-model #structured-output #non-determinism #graphrag #lab-2-5 #budget-exhaustion #ops-pattern
+
+**Captured in curriculum at:** [[Week 2.5 - GraphRAG#Bad-Case Journal]] Entry 6
+**Lab artifact:** `lab-02-5-graphrag/src/query_graph.py` — `extract_seed_entities()`, `_regex_seed_fallback()`
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.
@@ -256,6 +388,12 @@ This may be worth promoting to a future heuristic ("**H8 — Preserve diagnostic
 ### Version / commit mismatches (model class vs. weights, library vs. API)
 - 2026-04-27 — Week 1 — Nomic modeling code commit `7710840` vs upstream `46cf2de`
 - 2026-04-27 — Week 1 (separate) — `qdrant-client` v1.15 removed `.search()`, must use `.query_points(...).points`
+
+### Reasoning-model budget exhaustion (non-determinism in structured-output tasks)
+- 2026-04-30 — Week 2.5 — `gpt-oss-20b` reasoning model burns `max_tokens=3000` on chain-of-thought, returns `content=None`, `seeds=[]`, downstream sees 0 edges. Lesson: never use reasoning models for structured-output tasks where empty content = silent failure. Reserve reasoning models for tasks that benefit from chain-of-thought (math, code review, planning); use non-reasoning models for extraction, classification, routing.
+
+### Mismatched contract vs mechanism (model capability vs task shape)
+- 2026-04-30 — Week 2.5 — "Produce valid JSON" contract wired to a reasoning model. Contract requires deterministic emission; mechanism is "spend N tokens thinking, then maybe emit." Pattern generalizes: if the contract is "do X reliably with bounded latency," using a model whose first behavior is unbounded internal reasoning is a category mistake. Always check whether the chosen model is reasoning vs non-reasoning when the task is structured output.
 
 ---
 
