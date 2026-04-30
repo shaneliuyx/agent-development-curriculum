@@ -1,3 +1,17 @@
+---
+title: Week 5.5 - Metacognition (Reflexion + Self-Critique)
+created: 2026-04-30
+updated: 2026-04-30
+tags:
+  - agent
+  - metacognition
+  - reflexion
+  - self-critique
+  - verifier
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: Local-first MLX. Reflexion outer loop on top of W4 ReAct agent.
+---
+
 # Week 5.5 - Metacognition (Reflexion + Self-Critique)
 
 ## Why This Week Matters

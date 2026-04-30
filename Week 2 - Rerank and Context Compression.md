@@ -4346,3 +4346,51 @@ The retry cap of 4 attempts is sized for *transient* slowness, not server outage
 Open [[Week 3 - RAG Evaluation]] when this week's `RESULTS.md` is committed. Keep all 9 sweep collections — Week 3 uses them.
 
 — end —
+
+
+---
+
+## Interview Soundbites (Consolidated)
+
+**Soundbite 1 — On hybrid retrieval (RRF mechanics).**
+"Hybrid retrieval is the cheap-first alternative to reranking — BGE-M3's dense and sparse heads come from one forward pass, RRF fuses the rankings without score calibration, and you pay maybe 3-5 ms over dense-only. On BEIR-FiQA we measured roughly +6 pp recall over dense, capturing most of the reranker's lift at maybe 5% of the latency. Reranking still wins on absolute quality, but knowing the hybrid baseline tells you whether the cross-encoder's marginal gain is worth the budget for *this* corpus."
+
+**Soundbite 2 — On reranker fp16 (the 2.86× lever).**
+"Per-query reranker latency on M5 Pro went from 112ms (spec defaults) to 37.8ms — a 2.97× speedup that comes mostly from fp16 (-63%, dominant lever) and partly from batch=128 (-8%, kernel-launch reduction). 37.8ms is 5.3× under the 200ms p95 budget for synchronous RAG, leaving 162ms headroom for compression and LLM generation. The fp16 result validated for offline-eval throughput transfers cleanly to per-query latency — the cross-query batching optimization does not, because production sees one query at a time."
+
+**Soundbite 3 — On chunk size sweep findings.**
+"I swept a 9-cell chunk_size × overlap grid (256/512/1024 × 0/64/128) on MS MARCO and the winner was 256+128 at 0.786 recall@5 — beating chunk_size=1024 by 24.5 points. The intuition that bigger chunks carry more context doesn't survive contact with averaged embeddings: BGE-M3 pools the chunk into one vector, so a 100-token relevant span is ~40% of a 256-token chunk's signal but only ~10% of a 1024-token chunk's. Overlap turned out to be size-dependent — worth ~10 points at chunk_size=256 and zero at chunk_size=1024. Actionable takeaway: sweep, don't copy-paste."
+
+**Soundbite 4 — On the throughput-vs-serving library map.**
+"The lab-02b per-query libs aren't slow code; they're code shaped for online serving running an offline eval workload. When I dropped through to `qdrant-client.query_batch_points` and `CrossEncoder.predict(flat_pair_list)`, recall numbers stayed identical to four decimals while wall-time dropped 5-8× on retrieval. Real-world: pick the lib by API shape, not benchmarks. An API that takes a list of inputs is a throughput tool; an API that takes one string is a serving tool. Same model weights, same vectors, completely different wall-time profiles."
+
+**Soundbite 5 — On context compression quality gate.**
+"On MS MARCO with the aggressive 0.14 compression ratio, compressed-context answers won or tied 70% of head-to-head A/B comparisons against raw-context — above the 60% safety threshold. A methodological note: the first run reported 75% wins-or-ties, but 2 of 30 judges failed from reasoning-budget exhaustion. When I bumped max_tokens and re-ran cleanly, both formerly-failed queries became raw-wins — pulling the rate to 70%. Failures correlated with case difficulty, meaning filtering them inflated the metric. Honest production verdict is 70%, still ship-it, but with a thinner margin than the inflated number suggested."
+
+---
+
+## References
+
+- **Cormack, Clarke, Büttcher (2009).** *Reciprocal Rank Fusion.* SIGIR 2009. RRF k=60 default; rank-domain fusion beats score-domain across heterogeneous retrievers.
+- **Chen et al. (2024).** *BGE M3-Embedding.* arXiv:2402.03216. Single-model dense+sparse+ColBERT in one forward pass.
+- **Santhanam et al. (2022).** *ColBERTv2.* arXiv:2112.01488. Late-interaction precision ceiling; cross-attention beats bi-encoders by 5-15 nDCG points.
+- **Thakur et al. (2021).** *BEIR.* arXiv:2104.08663. FiQA-2018 + SciFact splits used in §1.4 as recall-ceiling-free benchmark.
+- **Formal et al. (2021).** *SPLADE.* arXiv:2107.05720. Why SPLADE++ outperforms BGE-M3's free sparse head as lexical signal.
+- **Bajaj et al. (2018).** *MS MARCO.* arXiv:1611.09268. Passage-ranking benchmark; one relevant passage per query, 10K eval subset.
+- **Sentence-Transformers `CrossEncoder` docs.** sbert.net. `predict()` parameters, batch_size as latency knob.
+- **LangChain Contextual Compression** — python.langchain.com/docs/how_to/contextual_compression/. `LLMChainExtractor` design.
+- **Arabzadeh et al. (2022).** *Shallow Pooling for Sparse Labels.* arXiv:2109.10086. Why recall@K diverges from hit-rate@K on multi-relevant corpora — the mislabeling ranx swap exposed in Phase 7.
+- **BAAI/bge-reranker-v2-m3 model card** — huggingface.co/BAAI/bge-reranker-v2-m3. XLM-RoBERTa base, MLX conversion blocked, multilingual benchmarks.
+
+---
+
+## Cross-References
+
+- **Builds on:** W1 Vector Retrieval Baseline — HNSW collection, BGE-M3 dense encode path, MS MARCO 10K eval harness, RESULTS.md format are all prerequisites assumed live before Phase 1.1.
+- **Distinguish from:**
+  - *Hybrid retrieval vs Agentic RAG* — hybrid is retrieval-stage fusion of two signal types over a static corpus; agentic RAG (W3.7) uses a planning loop to decide *when*/*what*/*whether* to retrieve. They compose: agentic loop can call hybrid retriever as tool.
+  - *Hybrid retrieval vs GraphRAG* — RRF fuses ranked lists from independent retrievers; GraphRAG (W2.5) traverses entity-relationship graph for multi-hop reasoning. GraphRAG answers "who is connected to whom"; hybrid answers "which passages are most relevant."
+  - *Context compression vs summarization* — compression here is extract-only (preserve original wording, drop irrelevant sentences); summarization paraphrases. Distinction: attribution safety. Extracted text is traceable to source passage; summary is not.
+  - *Reranking vs fine-tuning the retriever* — cross-encoder reranker re-scores at query time without modifying index; fine-tuning changes embedding space and requires re-indexing. Reranking wins when corpus changes frequently or reindexing latency budget is tight.
+- **Connects to:** W2.5 GraphRAG (hybrid retrieval feeds graph-augmented pipeline as dense/sparse baseline); W3 RAG Evaluation (nDCG, RAGAS, faithfulness metrics introduced here are W3 eval harness inputs); W3.7 Agentic RAG (two-stage funnel built here is the retrieval tool the agent calls).
+- **Foreshadows:** W9 Faithfulness Checker (LLM-as-judge compression eval pattern in §3.2 is direct precursor to faithfulness scoring pipeline); W11 System Design (production hybrid retrieval with latency budgets, candidate-pool sizing, fp16 lever are W11 interview answers); W12 Capstone (full rerank-compress stack is the retrieval backbone of the capstone system).

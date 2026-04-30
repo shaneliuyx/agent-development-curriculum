@@ -1724,3 +1724,35 @@ Before you move on, do a final check against the exit criteria at the top of thi
 And one last thing: **keep the signature recording on your phone.** Listen to it once on the morning of any interview. That five-minute answer is the week's real deliverable; everything else is scaffolding that helped you earn the right to say it.
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** When a model fails to produce valid structured output, failures fall into four families: syntactic breaks (missing braces, truncated JSON), missing required fields (model omits them under context pressure), type errors (numeric field as quoted string), hallucinated enum values (model invents plausible-sounding value outside the closed set). Last is hardest to catch without an explicit Literal type — output parses cleanly and fails only at validator time. All four become visible only if you have a validator running on every response.
+
+**Soundbite 2.** Schema reliability is a five-layer stack, not a single tool. L1 schema and prompt design — closed-set Literal enums, reasoning-before-answer ordering, one worked example — lifts naive validity from ~50% to 70% at zero runtime cost. L2 constrained decoding via Outlines or xgrammar pushes that to ~94% by masking invalid token logits to negative infinity at sampling time. L3 Instructor + Pydantic wraps L2 with error-feedback retry loop, reaching ~99%. L4 adds one-shot repair call for semantic violations the FSM cannot express. L5 is defensive parsing with dead-letter queue.
+
+**Soundbite 3.** Retry-with-feedback and constrained decoding solve different problems and belong at different layers. Constrained decoding is a sampling-time mechanism — makes schema violations structurally unreachable, never generate a bad token. Retry-with-feedback is a post-hoc loop — generates output, validates, on failure injects ValidationError as context and retries. Retry handles semantic rules FSM cannot express: cross-field invariants, regex patterns, relational constraints. But retries add latency and cost per failure; constrained decoding is often *faster* than unconstrained because it eliminates retries that would have been needed anyway.
+
+---
+
+## References
+
+- **Willard & Louf (2023).** *Efficient Guided Generation for LLMs.* arXiv:2307.09702. FSM-based logit-masking; foundational for Outlines.
+- **Outlines (dottxt-ai/outlines)** — github.com/dottxt-ai/outlines. Reference impl of FSM-guided generation; supports JSON Schema, Pydantic, regex.
+- **XGrammar (MLC-AI, 2024)** — github.com/mlc-ai/xgrammar. Up to 100× speedup over naive FSM via persistent parsing stack + context-independent token pre-checks.
+- **lm-format-enforcer** — github.com/noamgat/lm-format-enforcer. Lightweight constrained decoding for HF Transformers + llama.cpp.
+- **Instructor (Jason Liu)** — github.com/jxnl/instructor. Canonical Pydantic wrapper for LLM structured output; error-as-context retry across providers.
+- **BAML (Boundary ML)** — github.com/BoundaryML/baml. Schema-first LLM function definition language; typed clients + co-evolving prompt + schema.
+- **Liu et al. (2024).** *SLOT: Sample-efficient Structured Output.* arXiv:2505.04016. Near-zero overhead for common JSON Schema constraints.
+
+---
+
+## Cross-References
+
+- **Builds on:** W7 Tool Harness — tool call arguments are structured output; same reliability stack applies; Phoenix traces from W7 expose per-field failure rates motivating L2/L3.
+- **Distinguish from:** retry-on-error (band-aid that adds latency per failure, cannot prevent the failure) vs constrained decoding (mechanism that makes failure structurally unreachable). Retry belongs at L3-L4 for semantic rules FSM cannot express; not a substitute for L2.
+- **Connects to:** W9 Faithfulness Checker — field-level validation logic feeds the faithfulness eval harness; faithfulness checker is itself a structured output consumer depending on same Pydantic schemas. W7 Tool Harness — `tool_choice` forced-tool pattern is provider-native equivalent of strict JSON mode; understanding L2 explains why forcing a tool call is a schema-reliability primitive.
+- **Foreshadows:** W11 System Design — reliability SLAs require knowing which layers are deployed and per-layer validity rates; 25-cell benchmark matrix is empirical input. W12 Capstone — every structured output step gets explicit layer assignment + measured fallback.

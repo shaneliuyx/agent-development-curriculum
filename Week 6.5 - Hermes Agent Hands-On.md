@@ -503,3 +503,35 @@ Open [[Week 7 - Tool Harness]] when this lab's `RESULTS.md` is committed. The He
 > **Saturday Trend-Tracking note (Appendix G).** When you start the post-Week-12 ritual, Hermes Agent's GitHub releases page is one of the eight weekly sources to skim — the project is moving fast (1500+ commits in the first 7 weeks), and the 3-question triangulation filter will tell you when an update is worth a curriculum revisit. The likely revisit candidates are: changes to the skill-creation heuristic (updates Concept 1), changes to the audit/governance features (updates Concept 2), and new front-end integrations (interesting but Tier-2 mention only).
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** Hermes Agent's skill-creation loop is a generalization of the Voyager algorithm: after completing a complex multi-step task, the agent reflects on what it did, strips task-specific details to find the reusable pattern, writes executable Python, and persists it with an embedding index for retrieval. What separates this from a base model prompted to do the same is that the scaffolding runs unattended — skill versioning, conflict resolution between near-duplicate skills, and retrieval-time ranking are production-grade infrastructure, not demo glue. A base model can generate code on request; Hermes accumulates a library from experience.
+
+**Soundbite 2.** Running Hermes locally means orchestration is just Python on your laptop CPU while inference goes to your MLX endpoint on Apple Silicon. Orchestration layer is small by design — separation of concerns lets you swap inference tiers without touching the agent. Practical trade-off: local MLX at haiku-equivalent tier produces weak skill code; lab troubleshooting table makes this explicit — switch to 35B-A3B model or learned skills arrive with missing error handling and no type hints. Inference latency adds up across multi-call skill-creation loop, so expect 30-90 extra seconds post-task when heuristic fires on batch operations.
+
+**Soundbite 3.** Hermes earns its place for single-user personal productivity where accumulating capability over weeks matters and blast radius of a buggy learned skill is low — you'll notice and fix it. Frontier API models win wherever task is one-shot, latency-sensitive, or prompt envelope is unpredictable — instruction-following ceiling higher and you're not paying post-task reflection overhead. Hard line: regulated or multi-user production. Hermes' autonomy is a compliance liability there unless you enforce a weekly audit ritual with real teeth — operational discipline, not a technical guarantee. Workload-specific decision, not a capability race.
+
+---
+
+## References
+
+- **Wang et al. (2023).** *Voyager: An Open-Ended Embodied Agent with LLMs.* arXiv:2305.16291. Algorithmic ancestor of Hermes' skill-creation loop.
+- **NousResearch/hermes-agent.** GitHub, MIT license. ~95.6k stars (Apr 2026). Architecture, config schema, OpenAI-compatible provider abstraction.
+- **Hermes Agent official site** — hermes-agent.nousresearch.com. Cross-platform front-end docs (Telegram, Discord, Slack, etc.).
+- **0xNyk/awesome-hermes-agent.** Curated extensions catalog.
+- **alchaincyf/hermes-agent-orange-book.** Chinese-language deep-dive.
+- **Schick et al. (2023).** *Toolformer.* arXiv:2302.04761. Why fine-tuned models exhibit stronger tool-call reliability than instruction-tuned base.
+- **Microsoft Agent Governance Toolkit (2026).** Compliance risk taxonomy for autonomous code generation.
+
+---
+
+## Cross-References
+
+- **Builds on:** W0 Environment Setup (MLX endpoint, OpenAI-compatible config); W6 Claude Code Source Dive (curated-maximalism end of extensibility spectrum that W6.5 contrasts against); W4 ReAct (loop mechanics Hermes' skill-creation hook wraps around).
+- **Distinguish from:** API-based frontier models (Claude, GPT-4) — Hermes trades lower instruction-following ceiling + higher setup friction for zero recurring inference cost + accumulating skill library; frontier APIs offer higher single-call quality + zero ops overhead but no cross-session learning + per-token billing compounding with multi-step loops. Also distinguish from Pi (W6 callout): Pi scripts extensions on demand within session and does not persist; Hermes persists autonomously across sessions.
+- **Connects to:** W7 Tool Harness — MCP permission model + error handling read differently after watching Hermes generate skills that may lack error handling; W10 Framework Shootout — Hermes is one of the backends evaluated.
+- **Foreshadows:** W11 System Design — local-first deployment with Hermes as inference-decoupled orchestration; cost-curve ($5 VPS to GPU cluster) maps to W11's multi-tenancy and scaling. W12 Capstone — auditability gap and decision tree for Hermes vs curated alternative are live design constraints.

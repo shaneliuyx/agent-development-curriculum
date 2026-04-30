@@ -764,3 +764,36 @@ rm -rf ~/docker-data/{qdrant,phoenix}
 Your Anki deck, bad-case journal, and lab `RESULTS.md` files are git-tracked — never lost.
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1 — Why local-first matters for an agent stack.** Running inference locally on Apple Silicon eliminated the latency floor that makes iterative agent loops impractical at cloud prices. With oMLX serving Gemma 26B on `:8000`, warm-cache calls return in roughly 1.2 seconds — fast enough for a ReAct loop where the model calls tools 5–10 times per task. Cloud equivalents at that throughput would cost dollars per run, not fractions of a cent, which makes systematic bad-case journaling financially impossible.
+
+**Soundbite 2 — Why BGE-M3 runs on PyTorch MPS rather than MLX.** I investigated whether to port BGE-M3 to MLX and decided against it. BERT-style encoders do one forward pass per batch, so they gain almost nothing from MLX's fused autoregressive kernels. More importantly, 4-bit quantization — the technique that makes LLMs viable on 48 GB unified memory — degrades embedding geometry by 5–15% on MTEB MRR@10, because the output vector is the similarity target, not a 50k-way argmax that tolerates logit noise. BGE-M3 on MPS at fp32 already hits 85–95% of peak hardware throughput.
+
+**Soundbite 3 — Three-tier model routing as a cost-control primitive.** I mapped the oMLX model roster to haiku/sonnet/opus tiers before writing a single lab: gpt-oss-20B for fast single-hop retrieval checks, Gemma 26B for standard reasoning, Qwen 35B for architecture and deep analysis. Every script selects a tier by name, not by model ID, so swapping a backend model never touches application code. Cloud APIs are deferred until Weeks 7–8 where the curriculum explicitly needs them, capping total spend at roughly $8 across the full 12 weeks.
+
+---
+
+## References
+
+- **Apple MLX GitHub (ml-explore/mlx)** — https://github.com/ml-explore/mlx — primary framework repo; explains unified memory + fused attention kernels.
+- **mlx-community on HuggingFace** — https://huggingface.co/mlx-community — model hub for MLX-quantized LLMs.
+- **BAAI/bge-m3 model card** — https://huggingface.co/BAAI/bge-m3 — three embedding modes documentation.
+- **Qdrant documentation** — https://qdrant.tech/documentation/ — query_points API, vector config schema.
+- **Arize Phoenix** — https://docs.arize.com/phoenix — OTLP trace collector + UI.
+- **oMLX (omlx.app)** — macOS inference server wrapping mlx-lm with OpenAI-compatible HTTP.
+- **vMLX (vmlx.app)** — companion app for second isolated MLX inference process.
+- **uv package manager** — https://docs.astral.sh/uv/ — Python environment manager used throughout.
+
+---
+
+## Cross-References
+
+- **Builds on:** Familiarity with Python venvs (uv/pip), Docker basics, OpenAI Chat Completions API shape.
+- **Distinguish from:** MLX (Apple's array framework, used inside oMLX/vMLX) vs PyTorch+MPS (used for BGE-M3, different optimization profile) vs Ollama (cross-platform LLM runner, not used here) vs llama.cpp (CPU-first quantized; slower on Apple Silicon for large models).
+- **Connects to:** Every subsequent week — oMLX/vMLX endpoints, Qdrant collection, Phoenix collector, BGE-M3, BGE reranker are persistent infrastructure all labs build on.
+- **Foreshadows:** W11 System Design (three-tier routing → cost-aware dispatch), W12 Capstone (full-stack smoke test → production startup probe).

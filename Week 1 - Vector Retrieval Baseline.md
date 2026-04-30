@@ -887,3 +887,35 @@ Open [[Week 2 - Rerank and Context Compression]] when this week's `RESULTS.md` i
 
 
 
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** BGE-M3 is my default dense retrieval model because it produces a 1024-dimensional cosine vector in a single forward pass alongside a sparse lexical vector — semantic generalization without sacrificing exact-token recall. On the Week 1 MS MARCO 10K slice, BGE-M3 with HNSW m=16, ef_construct=128 hit recall@10 = 0.782 and MRR@10 = 0.613. 78% of queries had the gold passage in their top-10 — the ceiling the reranker inherits.
+
+**Soundbite 2.** The HNSW ablation compared m=16/ef=128 against m=8/ef=64 on identical vectors. Quality cost was modest: recall@10 dropped 0.782 → 0.761, MRR 0.613 → 0.591. Search time dropped 11.3s → 8.7s across 3K+ queries. Core HNSW tradeoff: halving graph density saves ~23% search time, costs ~2 recall points — worth it only if latency is the binding constraint.
+
+**Soundbite 3.** The baseline exists so every downstream improvement has a denominator. Adding cross-encoder reranker in W2 or hybrid BM25 fusion — I need recall@10=0.782 and MRR@10=0.613 to know what they actually mean for this corpus and query distribution. Without this number, "hybrid is better" is vague; with it, I can say whether a 2-point recall gain justifies the operational cost of a second retrieval path and an RRF merge step.
+
+---
+
+## References
+
+- **Chen et al. (2024).** *BGE-M3: Embedding for Multi-Linguality, Multi-Functionality, and Multi-Granularity.* arXiv:2402.03216. Single-model architecture producing dense + sparse + ColBERT-style vectors in one forward pass.
+- **Malkov & Yashunin (2018).** *Efficient and Robust Approximate Nearest Neighbor Search Using HNSW.* IEEE TPAMI. arXiv:1603.09320. Foundational HNSW paper.
+- **Qdrant HNSW Configuration Docs** — https://qdrant.tech/documentation/concepts/indexing/#vector-index — canonical reference for `m`, `ef_construct`, `ef`.
+- **Cormack, Clarke & Buettcher (2009).** *Reciprocal Rank Fusion.* SIGIR 2009. Derives the `k=60` constant.
+- **MS MARCO Passage Ranking Benchmark** — https://microsoft.github.io/msmarco/ — 8.8M-passage retrieval benchmark, 6,980 dev queries.
+- **BEIR (Thakur et al., 2021).** arXiv:2104.08663. Cross-domain retrieval benchmark.
+- **Anthropic Contextual Retrieval Blog (Sept 2024)** — https://www.anthropic.com/news/contextual-retrieval — 49% reduction in retrieval failures combining BM25 + dense.
+
+---
+
+## Cross-References
+
+- **Builds on:** W0 Environment Setup — Qdrant on `:6333`, MPS-enabled PyTorch, sentence-transformers, ir_datasets all from W0 smoke test.
+- **Distinguish from:** BM25/sparse retrieval (exact token + IDF, no learned representation) vs dense retrieval (fixed vector, generalizes paraphrases) vs "semantic search" (marketing term, usually means dense). W1 builds the dense baseline so W2's hybrid comparison has a clean control.
+- **Connects to:** W2 Rerank (recall@10=0.782 is the ceiling reranker cannot exceed), W3 RAG Eval (W1's embed→index→retrieve loop is the retrieval leg of the eval harness), W3.7 Agentic RAG (Qdrant collection becomes the retrieval tool target).
+- **Foreshadows:** W11 System Design — the (model, index) CollectionSpec pattern scales to multi-tenant deployments; HNSW tradeoffs measured here inform production config.

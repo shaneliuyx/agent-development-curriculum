@@ -1400,3 +1400,36 @@ The work is not.
 ---
 
 > *References: Anthropic "Building effective agents" (Sept 2024 + 2026 update). Claude Code architecture analyses: bits-bytes-nn March 2026, VILA-Lab GitHub Dive-into-Claude-Code, DEV.to "Architecture Explained: Agent Loop, Tool System, Permission Model," engineerscodex Substack. Libraries: Outlines (dottxt-ai), Instructor (jxnl), XGrammar (mlc-ai), Arize Phoenix. Embedding models: BGE-M3, Nomic-Embed-v2. Eval: RAGAS, TruLens. Local inference: oMLX, vMLX on Apple Silicon.*
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** A capstone qualifies as a portfolio artifact when it satisfies three conditions simultaneously: a measurable outcome ("87% of 40 test questions resolved correctly"), end-to-end execution shown in a 60-second GIF mapping one-to-one onto the architecture diagram, and evidence of security review — no hardcoded credentials, portfolio-safe model names, clear license, and a `.gitignore` covering `.env` + key patterns. All three must be true before the repo goes public. Any one missing is a hiring signal, not a polish gap.
+
+**Soundbite 2.** Two interview round types test different things. Technical rounds (take-home or live coding) assess whether you can build a specific mechanism — constrained decoding, retry harness, RAGAS eval runner. They reward lab work: actual numbers, runnable code, test suite. System design rounds assess whether you can reason about a full system under constraints — data flow, eval methodology, failure modes, cost, cold-start, when you would NOT use an LLM at all. W11 whiteboard designs prepare for system design; the six labs prepare for technical rounds.
+
+**Soundbite 3.** Portfolio narrative has three physical artifacts. First, `RESULTS.md` per lab with "Numbers Shipped" table — feeds `scripts/aggregate_results.py` and cover notes. Second, the Bad-Case Journal: every failure that taught you something lives there, and your best entry becomes the behavioral answer to "tell me about a system that failed in production." Third, the capstone architecture diagram: Mermaid flowchart in README is the claim; Phoenix trace screenshots in `results/traces/` are the proof. Hiring managers read these in order — claim first, evidence second.
+
+---
+
+## References
+
+- **Anthropic (Sept 2024, updated 2026).** *Building effective agents.* anthropic docs. Agent-loop + tool-use patterns; 2026 update covers MCP as universal tool protocol.
+- **bits-bytes-nn (March 2026).** *Dive into Claude Code — Architecture Analysis.* Source for Claude Code agent loop, permission model, session-log mechanism (Capstone B).
+- **VILA-Lab (2026).** *Dive-into-Claude-Code.* GitHub. Annotated source analysis; permission gate as deterministic code path (not prompt instruction).
+- **DEV.to (2026).** *Architecture Explained: Agent Loop, Tool System, Permission Model.* Companion to VILA-Lab.
+- **engineerscodex Substack (2026).** Production-engineering perspective on session-replay and append-only log.
+- **Orosz, G. (2024).** *Pragmatic Engineer* newsletter. Referral conversion rate data; design-doc README structure.
+- **Yan, E.** *Why I Write.* evanjy.com. Writing as external memory for thinking → README discipline + single-artifact portfolio model.
+- **hoeem (2026).** *Five Beginner Agent Archetypes.* Research/Content/Workflow/Personal-Knowledge/Operator taxonomy used in Phase 1 capstone self-classification.
+
+---
+
+## Cross-References
+
+- **Builds on:** ALL prior weeks (W0-W11.5) — every lab, RESULTS.md, bad-case entry, mock-prep recording made during W1-W11.5 is consumed here. W8 schema-reliability benchmark is direct source for public write-up. W11 system design recordings are direct prep for system design rounds.
+- **Distinguish from:** generic ML interview prep — agent interviews center on system design (eval methodology, tool reliability, context management, observability) rather than modeling (training, loss functions, hyperparameters). Six Appendix A categories map to production agent concerns, not academic ML.
+- **Connects to:** `Bad-Case Journal.md` — best entry becomes Card 4 in Lock-In Anki set + behavioral answer to "production failure" question. `Engineering Decision Patterns.md` — use both during mock prep; pattern library supplies tradeoffs section of every system design answer.
+- **Foreshadows:** post-curriculum — first 30/60/90-day plan in `RESULTS.md` is operational roadmap for the new role. Open-source contribution to Outlines, Instructor, Phoenix, Qdrant, or LangGraph is recommended next public artifact. Teaching (internal tech talk, second post at 6 months) is the final proof of mastery.

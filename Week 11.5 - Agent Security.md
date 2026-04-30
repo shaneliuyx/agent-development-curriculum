@@ -1,3 +1,18 @@
+---
+title: Week 11.5 - Agent Security
+created: 2026-04-30
+updated: 2026-04-30
+tags:
+  - agent
+  - security
+  - prompt-injection
+  - tool-poisoning
+  - sandbox
+  - permission-governance
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: LangChain + Claude + Pydantic schemas + firejail/Docker sandbox + Llama Guard
+---
+
 # Week 11.5 - Agent Security
 
 ## Why This Week Matters

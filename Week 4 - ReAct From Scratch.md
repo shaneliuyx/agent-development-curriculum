@@ -2425,3 +2425,35 @@ The Infra bridge for Week 5: multi-agent = distributed compute. The orchestrator
 ---
 
 — end —
+
+
+---
+
+## Interview Soundbites
+
+**Soundbite 1.** ReAct beats pure Chain-of-Thought because tool results are real, not simulated. CoT can reason about what a web search might return without ever performing one — it hallucinates evidence. ReAct makes external reality load-bearing: each tool result lands in the scratchpad as ground truth the model must account for on next reasoning step. The loop exits only when the model produces a final answer or a hard guard fires, so every conclusion is traceable to an actual function call, not a plausible fabrication.
+
+**Soundbite 2.** Three failure modes dominate. First, infinite tool loops: model never emits a bare text response, `tool_choice="required"` or missing max-iter guard lets it run until API wallet empties — fix is hard iteration ceiling + dead-letter. Second, tool hallucination: model calls a tool name never registered; fix is returning informative error string from `run_tool()` so model self-corrects rather than silently failing. Third, scratchpad bloat: without token-count guard, growing context eventually triggers prompt-too-long 400 mid-loop; minimal fix is FIFO eviction of oldest tool-result entries before each context assembly.
+
+**Soundbite 3.** Use ReAct when task requires iterative evidence gathering — web search, file reads, code execution, DB queries — where each result meaningfully changes what to do next. Prefer simple one-shot tool call when required tool + arguments are fully determined by user message alone: no intermediate reasoning, no branching on results. The distinguishing signal is whether the agent needs to read its own tool output before deciding what to call next. If yes → loop. If call graph is straight line → single dispatch is cheaper, faster, easier to test.
+
+---
+
+## References
+
+- **Yao et al. (2023).** *ReAct.* ICLR 2023. arXiv:2210.03629. Canonical loop formulation; §5 failure analysis.
+- **Schick et al. (2023).** *Toolformer.* arXiv:2302.04761. Why fine-tuned models emit tool calls inline rather than hallucinating outputs.
+- **Paranjape et al. (2023).** *ART.* arXiv:2303.09014. Reusable reasoning programs.
+- **Shinn et al. (2023).** *Reflexion.* arXiv:2303.11366. ReAct + episodic memory + self-critique → W5.5.
+- **Weng, Lilian (2023).** *LLM Powered Autonomous Agents.* lilianweng.github.io. Outer-controller framing + memory taxonomy.
+- **Anthropic (2024).** *Building effective agents.* Production vocabulary: augmented LLM vs agent.
+- **Wei et al. (2022).** *Chain-of-Thought Prompting.* arXiv:2201.11903. The baseline ReAct surpasses.
+
+---
+
+## Cross-References
+
+- **Builds on:** W1-W3 (retrieval primitives become `web_search` and `read_file` tools).
+- **Distinguish from:** Chain-of-Thought (synthetic reasoning, no external calls; ReAct makes tool results load-bearing); one-shot tool calls (single dispatch when tool + args fully determined; ReAct only when intermediate results change what to call).
+- **Connects to:** W5 Pattern Zoo (ReAct is one of 8 patterns); W5.5 Metacognition (Reflexion = ReAct + episodic scratchpad + self-critique); W7 Tool Harness (`run_tool()` and per-tool budget registry seed the production harness); W11.5 Agent Security (path-containment guards on `read_file`/`write_file`, subprocess sandbox on `python_repl`).
+- **Foreshadows:** W6 Context Governance (FIFO eviction → proper autocompact with reserved 20K-token summary); W11 System Design (production ReAct deployment — observability, escalation ladders, stop conditions); W12 Capstone (the loop in `src/react.py` is the runtime substrate).
