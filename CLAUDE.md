@@ -17,18 +17,116 @@ Reader profile in the frontmatter of `Agent Development 3-Month Curriculum.md`: 
 - `Engineering Decision Patterns.md` — cross-cutting design-decision library, indexed by pattern, not by week.
 - `tasks/`, `assets/diagrams/` — supporting non-prose.
 
-## Authoring conventions (inferred from existing chapters)
+## Required chapter structure (normative — every chapter MUST contain these 10 sections)
 
-Every chapter follows roughly this skeleton — match it when editing or creating:
+The reference chapter is `Week 2 - Rerank and Context Compression.md`. Every other chapter — main week, decimal supplement, future addition — MUST match this structure. A chapter that skips a required section is incomplete and SHOULD be flagged before commit.
 
-1. **Why This Week Matters** — ~150 words. Production motivation + interview signal.
-2. **Theory Primer** — long-form, ~1000 words. Cite original papers. Include real numbers, not vague claims.
-3. **Mechanism / Diagram** — mermaid diagrams preferred (vault is Obsidian; mermaid renders).
-4. **Lab** — runnable Python with real package versions. Numbered steps. End with verification commands and an expected metrics table.
-5. **Bad-Case Journal** — 3–5 entries per chapter. Format: *Symptom → Root cause → Fix*. New entries also belong in the global `Bad-Case Journal.md`.
-6. **Interview Soundbites** — 2–3 entries, ~70 words each, in user-voice, anchored to a measured outcome. These are the speak-aloud lines for mock interviews.
-7. **References** — peer-reviewed papers + canonical docs + production blog posts. Link to arXiv where applicable.
-8. **Cross-References** — `Builds on:` / `Distinguish from:` / `Consumed by:` lines connecting to other weeks. Maintain bidirectional links.
+### Section 1 — Why This Week Matters (REQUIRED, ~150 words)
+
+Production motivation + interview signal. Why does this matter in real systems? Why will an interviewer ask about it? Do **not** collapse to a one-line TL;DR. The 150-word length is intentional — it is the speak-aloud hook for the topic.
+
+### Section 2 — Theory Primer (REQUIRED, ~1000 words)
+
+Long-form explanatory prose. Cite original papers (arXiv links). Include real numbers, not vague claims ("hybrid recall@10 = 0.998 vs dense 0.993" not "hybrid is better"). Distinguish carefully from adjacent concepts that are commonly conflated.
+
+### Section 3 — Mechanism / Architecture Diagram (REQUIRED)
+
+Mermaid diagrams (Obsidian renders them natively). Every chapter has at least one diagram showing the system shape. Label every node and edge — unlabeled boxes are not diagrams.
+
+### Section 4 — Lab Phases (REQUIRED — numbered phases with runnable code)
+
+Phases are numbered and time-budgeted (`## Phase 1 — <name> (~2 hours)`). Each phase includes:
+- A goal statement
+- Setup commands (real package names, real versions)
+- Step-by-step numbered actions with **runnable Python** (not pseudocode)
+- Verification commands at the end of the phase
+- An expected metrics table (recall@K, latency, cost, etc — measured on M5 Pro hardware)
+
+### Section 5 — Code Walkthroughs (REQUIRED — block-by-block annotation per script)
+
+For every phase script in §4, add a corresponding walkthrough that explains the script block-by-block. Each block gets:
+- A short heading describing what the block does
+- A 1–3 sentence explanation of *why* the block exists, including non-obvious gotchas a reader copy-pasting the code would miss
+
+This is the section most commonly skipped. It is the difference between a tutorial (here is code, run it) and a reference (here is code AND why it is shaped this way). W2's walkthroughs and W2.5's walkthroughs are the canonical examples.
+
+### Section 6 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
+
+Each entry uses **exactly** this 3-field format:
+
+```
+**Entry N — <one-line symptom>.**
+*Symptom:* what the operator observes
+*Root cause:* what is actually broken
+*Fix:* concrete remediation, with code or config when applicable
+```
+
+Entries also belong in the global `Bad-Case Journal.md` cross-cutting library. Other chapters' interview soundbites cite specific entries — do not delete or rewrite entries without checking incoming references.
+
+### Section 7 — Interview Soundbites (REQUIRED — 2–3 entries, user-voice, ~70 words each)
+
+Written in first-person, anchored to a measured outcome from §4 or §6. Each soundbite is a speak-aloud answer to an interview question, ~70 words. Avoid hedging language. Avoid generic advice. Reference specific numbers and specific findings from this chapter.
+
+### Section 8 — References (REQUIRED)
+
+Peer-reviewed papers + canonical docs + production blog posts. Format:
+- **Author et al. (Year).** *Title.* Venue. arXiv:NNNN.NNNNN. One-line description of why this reference matters.
+
+Link to arXiv where applicable. Include at least one production blog post or canonical implementation repo so the reader can see how the concept ships in practice, not just how it is described in papers.
+
+### Section 9 — Cross-References (REQUIRED)
+
+Use these four labels in this order:
+
+- **Builds on:** explicit prerequisite chapters (the reader should have done these first).
+- **Distinguish from:** adjacent topics that are commonly conflated. **This section is high-leverage; do not skip it.** It is what makes a candidate sound senior in interviews.
+- **Connects to:** later chapters that use this material as a building block.
+- **Foreshadows:** chapters where this material reaches its full production shape (often W11 System Design or W12 Capstone).
+
+Cross-references must be bidirectional — if W7 says "Builds on: W4 ReAct", then W4 should say "Connects to: W7 Tool Harness". When you add a forward link, add the reverse link in the target chapter in the same edit.
+
+### Section 10 — Frontmatter (REQUIRED on new chapters)
+
+YAML frontmatter at the top of the file:
+
+```yaml
+---
+title: <chapter title>
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+tags:
+  - agent
+  - <topic-specific tags>
+audience: <who this chapter is for, copied from curriculum overview>
+stack: <hardware + model assumptions>
+---
+```
+
+Update `updated:` on every substantive edit. Tags should overlap with sibling chapters so Obsidian's graph view connects them.
+
+## Optional sections (use when relevant)
+
+- **Empirical findings subsection (§N.X.Y).** When you run experiments and produce measured results that contradict or refine the theory primer, add a numbered subsection (e.g., `### 2.2.1 Actual results — fp32 vs fp16 reranker on M5 Pro (2026-04-28 runs)`). W2 uses this pattern extensively for its rerank experiments. Date-tag the subsection.
+- **Mini-lab.** A 30-minute hands-on exercise that doesn't warrant a full Phase. Use `### Mini-Lab — <name>`.
+- **Production considerations.** When the chapter has a clear production deployment story, add a `## Production Considerations` section before §6 Bad-Case Journal. Cover sandboxing, cost ceilings, multi-tenancy, observability.
+
+## Pre-commit checklist (run mentally before every chapter commit)
+
+```
+[ ] §1  Why This Week Matters — ~150 words present
+[ ] §2  Theory Primer — ~1000 words, papers cited, real numbers
+[ ] §3  Mermaid diagram present and labeled
+[ ] §4  Lab phases numbered, time-budgeted, with runnable code
+[ ] §4  Expected metrics table present
+[ ] §5  Code walkthrough exists for every script in §4
+[ ] §6  Bad-Case Journal — 3–5 entries in exact 3-field format
+[ ] §6  New entries copied to global Bad-Case Journal.md
+[ ] §7  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
+[ ] §8  References — papers + docs + production examples
+[ ] §9  Cross-References — Builds on / Distinguish from / Connects to / Foreshadows
+[ ] §9  Reverse links added in linked chapters
+[ ] §10 Frontmatter updated
+```
 
 ## Hard rules from `Agent Development 3-Month Curriculum.md`
 
