@@ -147,18 +147,37 @@ Wait ~15 seconds for startup, then open `http://localhost:7474` in a browser. Lo
 ### 1.3 Pull the Wikipedia subset
 
 ```python
-# src/fetch_corpus.py
-from datasets import load_dataset
+# src/fetch_corpus.py — production-shaped corpus mechanism (excerpt; see lab repo for full source)
+import json, random, time
 from pathlib import Path
-import json
+import requests
 
-ds = load_dataset("wikipedia", "20220301.en", split="train[:200]", trust_remote_code=True)
-out = [{"id": r["id"], "title": r["title"], "text": r["text"][:4000]} for r in ds]
-Path("data/corpus.json").write_text(json.dumps(out, indent=2))
-print(f"Wrote {len(out)} articles")
+WIKI_API   = "https://en.wikipedia.org/w/api.php"
+USER_AGENT = "lab-02-5-graphrag/1.0 (educational; agent-prep curriculum)"
+
+# Domain-bounding parameter. Each entry is a Wikipedia category whose article
+# members we will pull (paginated). Switching domain (medicine, law, sports)
+# is the way to scale this — not adding hand-picked article titles.
+SEED_CATEGORIES = [
+    "American_technology_company_founders",
+    "Companies_based_in_Silicon_Valley",
+    "Software_companies_of_the_United_States",
+]
+PER_CATEGORY_PAGE      = 500   # max anon page size for categorymembers
+MAX_PAGES_PER_CATEGORY = 5     # cap pagination — bound worst-case round-trips
+MAX_ARTICLES           = 150
+SHUFFLE_SEED           = 42    # deterministic shuffle so reproducible across runs
+REQUEST_SLEEP          = 0.6   # ~100 req/min — under MediaWiki's 200/min anon limit
+
+# fetch_category_members + fetch_extract paginate via cmcontinue and retry on
+# 429 honoring Retry-After. After collecting + dedupe, random.Random(SHUFFLE_SEED)
+# shuffles the pool before MAX_ARTICLES truncation so the cap drops a uniform
+# random sample, not a Z-tail. Full source in lab-02-5-graphrag/src/fetch_corpus.py.
 ```
 
-> **Why 200 articles and 4,000-char cap:** entity extraction runs ~200 LLM calls at ingestion. At ~3 sec each on local Gemma-4-26B, that's ~10 minutes. Going to 1,000 articles pushes ingestion to ~1 hour — overkill for a 6-hour lab.
+> **Why this corpus mechanism beats `train[:200]`:** the slice-by-id approach pulls the first 200 Wikipedia articles by Parquet row order, which for the November 2023 dump is mostly chemistry/metallurgy articles (Anarchism, Antimony, Arsenic cluster). The graph then contains zero tech founders, and queries about Mark Zuckerberg or Apple Inc. miss because the corpus doesn't cover the domain. The category-walk mechanism is *domain-bounded* (you decide the categories — a legitimate scoping decision a stakeholder makes), but the specific entities that fall out are emergent, matching how real corpus pipelines actually behave. Adding `Companies_based_in_Seattle` would surface Microsoft + Amazon without re-engineering. See [[#Lab Run-Through Bad Cases (2026-04-30)]] entries 6–8 for the full failure / fix path.
+
+> **Why ~150 articles and 4,000-char cap:** entity extraction runs ~150 LLM calls at ingestion. With `MAX_WORKERS=6` threaded against `max_concurrent_requests=8` on the local oMLX server, ~10 minutes wall time on Gemma-4-26B. Going to 1,000 articles pushes ingestion past 1 hour — overkill for a 6-hour lab.
 
 ### Code walkthrough — `src/fetch_corpus.py`
 
@@ -1008,6 +1027,92 @@ The 4-character minimum drops the most common stop words ("the", "a", "of", "in"
 *Symptom:* `python src/build_graph.py` fails with `ModuleNotFoundError`. Confirming the lab's venv has `neo4j 5.28.3` installed (`/path/to/lab/.venv/bin/python -c "import neo4j"` works) makes this seem impossible.
 *Root cause:* The shell's `python` resolves through PATH to a **different** venv (`~/.openharness-venv` in this case — installed by the OMC harness or similar tool that puts itself ahead of project venvs on PATH). The lab's `.venv/` is never activated despite living next to the script. `which python` returns the harness venv's path, not the lab's.
 *Fix:* Either activate the lab venv explicitly (`source .venv/bin/activate`) or use `uv run python src/...` from the project root — uv finds the local `.venv/` automatically and bypasses PATH-based interpreter selection. Long-term: add `cd $LAB && uv run` to your lab-startup alias so this never happens twice.
+
+**Entry 6 — Query about Mark Zuckerberg returns 22 edges of chemistry trivia; corpus does not contain target entity.**
+*Symptom:* `python src/query_graph.py "Which companies are related to Mark Zuckerberg?"` returns a polite "the graph facts do not support an answer" with `edges_used: 22`. Diagnostic Cypher (`MATCH (n:Entity) WHERE toLower(n.name) CONTAINS 'zuckerberg' OR ... 'meta' RETURN n.name LIMIT 20`) returns 13 rows of chemistry: "metal", "metalloid", "alkali metals", "Metallurgical Laboratory of the University of Chicago", "post-transition metal".
+*Root cause:* Two failures stacked. First, `fetch_corpus.py` used `load_dataset(..., split="train[:200]")` — first 200 articles by Parquet row order, which for the November 2023 dump means low-ID articles dominated by chemistry/metallurgy ("Anarchism", "Antimony", "Arsenic" cluster). The corpus categorically does not contain Zuckerberg, Facebook, or Meta-the-company. Second, the seed-matching CONTAINS substring filter then matched "meta" (4 chars) to "metal" (5 chars), producing 22 false-positive edges from chemistry articles.
+*Fix:* Replace the slice-by-id corpus selection with a *domain-bounding mechanism* — Wikipedia category traversal via the `categorymembers` API. Curated `SEED_CATEGORIES` (e.g. `American_technology_company_founders`, `Companies_based_in_Silicon_Valley`) are scoping decisions a stakeholder makes; the specific entities that fall out are emergent, matching production corpus pipeline shape. Hardcoding the exact entity titles you intend to query (`SEED_TITLES = ["Mark Zuckerberg", "Apple Inc.", ...]`) gates the demo without teaching the production pattern.
+```python
+# fetch_corpus.py — domain-bounded mechanism
+SEED_CATEGORIES = [
+    "American_technology_company_founders",
+    "Companies_based_in_Silicon_Valley",
+    "Software_companies_of_the_United_States",
+]
+def fetch_category_members(category: str, limit: int = 200) -> list[str]:
+    params = {"action": "query", "list": "categorymembers",
+              "cmtitle": f"Category:{category}", "cmnamespace": 0,
+              "cmlimit": limit, "format": "json"}
+    return [m["title"] for m in _api_get(params)["query"]["categorymembers"]]
+```
+
+**Entry 7 — `meta` substring fuzzy-matches `metal`, `metalloid`, `metallurgy`.**
+*Symptom:* Even on a tech-domain corpus that does contain Meta Platforms, queries containing "Meta" route 22 edges through chemistry nodes because the substring `meta` (4 chars) appears inside `metal` (5 chars) and other word-internal positions. False-positive class predicted in W2.5 Walkthrough 3 Block 3 ★ Insight ("Amazon would match Amazonian"); chemistry corpus made it concrete.
+*Root cause:* `WHERE toLower(n.name) CONTAINS w` is unscored substring matching. Lucene-based matching (whole-word tokenisation with relevance scoring) is the standard fix used in production graph systems.
+*Fix:* Replace the CONTAINS filter with a Neo4j full-text index on `Entity.name`. Create the index in `build_graph.py` after the write phase, then query via `db.index.fulltext.queryNodes` in `query_graph.py`:
+```python
+# build_graph.py — after writing all nodes
+session.run("CREATE FULLTEXT INDEX entity_names IF NOT EXISTS "
+            "FOR (n:Entity) ON EACH [n.name]")
+
+# query_graph.py — in fetch_subgraph
+"""
+CALL db.index.fulltext.queryNodes("entity_names", $lucene)
+YIELD node, score WITH node, score ORDER BY score DESC LIMIT 5
+MATCH path = (node)-[*1..2]-(m) ...
+"""
+```
+The `_lucene_query()` helper escapes Lucene-reserved characters (`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`) and joins remaining tokens with `OR`. Avoid trailing `~` fuzzy operator — fuzzy on every term re-introduces the same false-positive class.
+
+**Entry 8 — Category walk hits MediaWiki rate limit at article ~80; alphabetical bias drops Z-tail entries (including Zuckerberg).**
+*Symptom:* `fetch_corpus.py` errors with `429 Client Error: Too Many Requests` after ~80 fetched articles. Even the articles that did succeed are all A-named (Acton, Adams, Adcock, Adler, Allen, Alperovitch...) — `Mark Zuckerberg` never gets fetched because he sits in the Z tail of `American_technology_company_founders` after the alphabetical sort that MediaWiki's `categorymembers` API returns by default.
+*Root cause:* Two compounding issues. (1) Anonymous MediaWiki API has burst tolerance + ~200/min sustained ceiling; 0.2 s between requests bursts above that and trips a 429 with a Retry-After header. (2) Without explicit shuffle, MAX_ARTICLES truncation deterministically drops Z-tail entries from each category — systematic bias that masquerades as a corpus-coverage problem.
+*Fix:* Three changes in `fetch_corpus.py`:
+1. Wrap the requests.get call with retry-on-429 that honors Retry-After:
+```python
+def _api_get(params: dict) -> dict:
+    backoff = 2.0
+    for attempt in range(1, MAX_RETRIES + 1):
+        resp = requests.get(WIKI_API, params=params, headers=headers, timeout=20)
+        if resp.status_code == 429:
+            wait = float(resp.headers.get("Retry-After", backoff))
+            time.sleep(wait); backoff *= 2; continue
+        resp.raise_for_status(); return resp.json()
+```
+2. Bump base sleep to 0.6 s (~100 req/min, well under sustained ceiling).
+3. Deterministic shuffle of the deduped title pool *before* MAX_ARTICLES truncation — `random.Random(42).shuffle(titles)`. Same input → same output, but the cap drops a uniform random sample instead of a Z-tail.
+4. **Paginate `categorymembers` via `cmcontinue`** — the per-request anonymous cap is 500 members, so categories with 1000+ members (like `American_technology_company_founders`) silently truncate at the API level. Without pagination, the shuffle samples from a pool that itself is biased toward early-alphabet entries. Add a `while cmcontinue` loop with `MAX_PAGES_PER_CATEGORY` worst-case bound:
+```python
+def fetch_category_members(category: str) -> list[str]:
+    titles, cmcontinue = [], None
+    for _ in range(MAX_PAGES_PER_CATEGORY):
+        params = {..., "cmlimit": 500, **({"cmcontinue": cmcontinue} if cmcontinue else {})}
+        body = _api_get(params)
+        titles.extend(m["title"] for m in body["query"]["categorymembers"])
+        cmcontinue = body.get("continue", {}).get("cmcontinue")
+        if not cmcontinue: break
+        time.sleep(REQUEST_SLEEP)
+    return titles
+```
+After all four fixes: full domain pool (~2000 members) deduped and randomly sampled to 150. Mark Zuckerberg appears in the sample with probability proportional to category size, not category alphabet position.
+
+**Entry 9 — `build_graph.py` LLM-extraction loop is sequential; wastes 5 of 6 inference-server slots.**
+*Symptom:* `python src/build_graph.py` runs at ~3 s/article (~3-4 triples/s) on a 150-article corpus → ~450 s wall time, even though the local oMLX server has `max_concurrent_requests=8`. Server CPU shows ~12 % utilisation throughout.
+*Root cause:* The original loop calls `extract_triples(article["text"])` synchronously inside the `for article in tqdm(corpus)` loop. Each call blocks on the LLM round-trip while the other 7 server slots sit idle.
+*Fix:* `ThreadPoolExecutor(max_workers=6)` — 6 workers stays strictly under the server's 8-slot cap, leaving 2 slots for `query_graph.py` seed extraction or IDE autocomplete that fire concurrently. LLM calls run parallel; Neo4j writes stay serial on the single session (MERGE is sensitive to interleaved concurrent writes; the inference server is the bottleneck, not the database).
+```python
+def _extract_one(article):
+    try: return article, extract_triples(article["text"]), None
+    except Exception as exc: return article, [], exc
+
+with ThreadPoolExecutor(max_workers=6) as executor:
+    futures = [executor.submit(_extract_one, a) for a in corpus]
+    for fut in tqdm(as_completed(futures), total=len(corpus)):
+        article, triples, exc = fut.result()
+        if exc is not None: errors.append((article["title"], exc)); continue
+        if triples: session.execute_write(write_triples_to_neo4j, ...)
+```
+Wall time drops from ~450 s to ~90-100 s (4-5× speedup). Going past `max_workers=8` does not help — extra threads idle in the server's queue.
 
 ---
 
