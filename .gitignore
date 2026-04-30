@@ -1,0 +1,14 @@
+# Obsidian per-vault settings + workspace state
+.obsidian/workspace*
+.obsidian/cache
+.obsidian/.DS_Store
+
+# macOS
+.DS_Store
+
+# Editor backups
+*.bak
+*~
+
+# Rendered output (if any)
+.tmp/
