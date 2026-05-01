@@ -190,8 +190,10 @@ The empirical record across 10 iterations against the same originally-failing qu
 6. **Chain-of-thought answer prompt unblocks factoid recall.** The single-shot "answer using only the facts" directive produces narrative summaries that skip matching edges. Branching by question type (LIST / RELATIONSHIP / FACTOID) and forcing enumeration before synthesis lifts factoid recall 0.15 absolute on the 32-Q eval.
 7. **Article truncation is the largest single recall leak on long bios.** Lift `text[:4000]` to `text[:50000]` and pair with sliding-window extraction. Bio events (dropouts, divorces, lawsuits) live past char 5000 and are silently dropped without this fix.
 8. **Sentence-aware sliding window is the right chunking primitive.** Fixed-char windows cut mid-sentence and degrade extraction at boundaries. Section-aware (Wikipedia `==` headers) is most semantic but requires re-fetching with `exsectionformat=wiki`. Sentence-aware fits in `build_graph.py` alone.
-9. **Open-vocab is a precision liability, not a recall liability.** Predicate variants (`FOUNDED` / `CO_FOUNDED` / `STARTED`) fragment same-fact edges. Hit rate is unaffected (multiple grounding paths help); precision suffers (answer prose may restate facts). Production GraphRAG converges on closed or canonicalized vocabularies.
-10. **The hybrid pattern is the production answer to "GraphRAG missed the answer."** Route relational queries to graph, factoid/two-hop to vector, refuse on out-of-domain. Pure-GraphRAG hit rate has a structural ceiling; HybridRAG (Sarmah et al. 2024) achieved 0.58 factual correctness against pure baselines on the same eval. Out of scope for this iteration but the next natural step.
+9. **Open-vocab is a precision liability, not a recall liability — but pair-aggregation neutralizes it at query time.** Predicate variants (`FOUNDED` / `CO_FOUNDED` / `STARTED`) fragment same-fact edges in the graph. Without aggregation, flat-edge LLM context restates the same fact 4× with redundant sources. Production GraphRAG (Microsoft, Neo4j LLM KG Builder) canonicalizes at extraction time, losing semantic nuance. The lighter-weight alternative (next bullet) keeps the variants in the graph and lets the LLM reason over them at query time.
+10. **Pair-aggregation in the LLM context collapses variant noise without losing nuance.** Group retrieved edges by `frozenset({s, o})` (undirected pair); each pair record carries a `relations:` list (multiple verb phrases for the same connection) and a `sources:` list (multiple corroborating articles). Cuts redundant context tokens and produces multi-source citations naturally. v9 graph "Who founded Microsoft?" → "Microsoft was founded by Paul Allen (sources: Bill Gates, Microsoft) and William Henry Gates III (sources: Bill Gates)." Two entities, multi-source citations, no flat-edge repetition.
+11. **Variant-aware prompting unlocks semantic precision the variants list encodes.** The variants list is the semantic disambiguator — `[founded, co-founded, was started by]` implies multiple founders; `[founded]` alone implies solo. Tell the LLM explicitly: "Use the variants for semantic precision: co-founded vs founded → multiple founders vs solo; acquired vs merged with → ownership vs corporate structure; married vs divorced → temporal state." Verified on v9: "Did Steve Jobs found Apple alone or with someone?" → "Steve Jobs co-founded Apple (sources: Tim Cook; Steve Jobs)." LLM picked `co-founded` specifically, not just the first variant.
+12. **The hybrid pattern is the production answer to "GraphRAG missed the answer."** Route relational queries to graph, factoid/two-hop to vector, refuse on out-of-domain. Pure-GraphRAG hit rate has a structural ceiling; HybridRAG (Sarmah et al. 2024) achieved 0.58 factual correctness against pure baselines on the same eval. Out of scope for this iteration but the next natural step.
 
 Sources for the patterns above:
 - LazyGraphRAG: setting a new standard for quality and cost — Microsoft Research, Nov 2024 ([blog](https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/))
@@ -1339,6 +1341,31 @@ i += 1
 ```
 Caught by a 22.8K-char unit test that timed out at 8s; production-shape integration tests would have caught it after a 40-min build. Lesson: any new chunker / windowing code gets a standalone unit test before the full pipeline runs against it.
 
+**Entry 19 — Open-vocab predicate fragmentation produces redundant LLM context; flat-edge format restates the same fact 4× with 4 different verb phrases.**
+*Symptom:* On the v9 graph, querying "Who founded Microsoft?" surfaces the founding fact 4-8 times in the LLM context (`founded` / `co-founded` / `was started by` / `established` etc.) — same triple from different source articles with different predicate strings. The LLM's answer prose then either restates the fact 4× with redundant sources, or picks one phrasing arbitrarily and ignores the rest. Multi-source corroboration evidence is wasted.
+*Root cause:* Open-vocabulary extraction (Leak 5) emits whatever verb phrase the LLM extractor chose for that article. Different articles use different phrasings for the same fact. Neo4j MERGE only collapses exact `(subject, predicate, object)` matches, so variants stay as distinct edges. Flat-edge LLM context format presents each variant as if it were a separate fact.
+*Fix:* Pair-aggregation at query time. Group `subgraph` edges by `frozenset({s, o})` (undirected pair), aggregate predicate variants and source articles per pair, present each pair to the LLM as one record with a `relations:` list and a `sources:` list. Update the answer-generation system prompt to (a) treat the variants list as evidence FOR the connection (not as separate facts) and (b) use variants for semantic disambiguation conditional on the question.
+```python
+pair_aggs = defaultdict(lambda: {"relations": [], "sources": set()})
+for t in subgraph[:200]:
+    key = frozenset({t["s"], t["o"]})
+    pair_aggs[key]["relations"].append(t["rel"])
+    pair_aggs[key]["sources"].add(t["src"])
+
+# Format: "- Apple ↔ Steve Jobs\n    relations: founded | co-founded | was started by\n    sources: Apple Inc., Steve Jobs, Tim Cook"
+```
+And in the system prompt:
+```
+Use the variants for semantic precision:
+- co-founded vs founded → multiple founders vs solo
+- acquired vs merged with → ownership vs corporate structure
+- married vs divorced → temporal state
+- served as CEO vs board member → role disambiguation
+```
+Verified end-to-end on the v9 graph: "Who founded Microsoft?" → "Microsoft was founded by Paul Allen (sources: Bill Gates, Microsoft) and William Henry Gates III (sources: Bill Gates)." Multi-source citation. "Did Steve Jobs found Apple alone or with someone?" → "Steve Jobs co-founded Apple (sources: Tim Cook; Steve Jobs)." Variant-aware disambiguation: LLM picked "co-founded" specifically for the alone-vs-with question.
+
+The pair-aggregation pattern is the lighter-weight alternative to closed-vocab extraction. Microsoft GraphRAG and Neo4j LLM Knowledge Graph Builder both canonicalize at extraction time, losing semantic nuance permanently. Pair-aggregation preserves all variants in the graph and disambiguates at query time conditional on the question — the graph stays maximally informative, the answer stays maximally precise.
+
 ---
 
 ### Design tree (2026-05-01 grill-me session)
@@ -1451,6 +1478,9 @@ The interview signal is precise: candidates who can articulate when GraphRAG win
 
 **Soundbite 5 — On phrase-first entity matching.**
 "The retrieval matcher in my lab uses a phrase-first contract: multi-word seeds run as Lucene `+token1 +token2` against a Neo4j fulltext index, requiring every named token to be present in the entity, but not adjacency. If that returns ≥1 match, traverse from there; if 0 matches, fall back to OR-over-tokens with a low-confidence warning. The reason: a query for 'Mark Zuckerberg' against a corpus that contains many `Mark *` people but not Zuckerberg specifically — the OR query fans out to Mark Pincus, Mark Russinovich, etc., and the LLM ends up hallucinating a relationship that doesn't exist in the graph. Phrase-AND requires the actual named entity. With that strategy, edges_used drops from 33 to 14 on a precise match because we anchor traversal to one node instead of five fan-out nodes — and the answer goes from inline prose with vague sources to a clean bullet list with provenance. The lesson is: in entity matching, recall is cheap, precision is what makes the answer trustworthy."
+
+**Soundbite 6 — On pair-aggregation as the open-vocab antidote.**
+"The standard production answer to predicate fragmentation is closed vocabulary — Microsoft GraphRAG, Neo4j's LLM Knowledge Graph Builder both canonicalize at extraction time. The problem: closed vocab destroys semantic nuance permanently. 'founded' and 'co-founded' collapse to the same predicate, so the graph can no longer tell solo founding from joint founding. My lab keeps open vocab and instead aggregates at query time: group retrieved edges by undirected entity pair, present the pair to the LLM as one record with a `relations:` list and a `sources:` list. The LLM treats the variants list as evidence FOR the connection AND as a semantic disambiguator — `[founded, co-founded, was started by]` implies multiple founders; `[founded]` alone implies solo. With a variant-aware prompt, the LLM picks the correct phrasing conditional on the question. Verified: 'Did Steve Jobs found Apple alone or with someone?' returns 'Steve Jobs co-founded Apple (sources: Tim Cook; Steve Jobs)' — the LLM specifically picked `co-founded` for the alone-vs-with question. Net result: open vocab preserves nuance, query-time aggregation collapses noise, multi-source citations come for free. Lighter than community summaries, equivalent on precision."
 
 ---
 
