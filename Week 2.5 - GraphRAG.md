@@ -165,7 +165,7 @@ SEED_CATEGORIES = [
 ]
 PER_CATEGORY_PAGE      = 500   # max anon page size for categorymembers
 MAX_PAGES_PER_CATEGORY = 5     # cap pagination — bound worst-case round-trips
-MAX_ARTICLES           = 150
+MAX_ARTICLES           = 400  # 16/25 canonical-entity coverage; 150 was 13/25
 SHUFFLE_SEED           = 42    # deterministic shuffle so reproducible across runs
 REQUEST_SLEEP          = 0.6   # ~100 req/min — under MediaWiki's 200/min anon limit
 
@@ -177,7 +177,7 @@ REQUEST_SLEEP          = 0.6   # ~100 req/min — under MediaWiki's 200/min anon
 
 > **Why this corpus mechanism beats `train[:200]`:** the slice-by-id approach pulls the first 200 Wikipedia articles by Parquet row order, which for the November 2023 dump is mostly chemistry/metallurgy articles (Anarchism, Antimony, Arsenic cluster). The graph then contains zero tech founders, and queries about Mark Zuckerberg or Apple Inc. miss because the corpus doesn't cover the domain. The category-walk mechanism is *domain-bounded* (you decide the categories — a legitimate scoping decision a stakeholder makes), but the specific entities that fall out are emergent, matching how real corpus pipelines actually behave. Adding `Companies_based_in_Seattle` would surface Microsoft + Amazon without re-engineering. See [[#Lab Run-Through Bad Cases (2026-04-30)]] entries 6–8 for the full failure / fix path.
 
-> **Why ~150 articles and 4,000-char cap:** entity extraction runs ~150 LLM calls at ingestion. With `MAX_WORKERS=6` threaded against `max_concurrent_requests=8` on the local oMLX server, ~10 minutes wall time on Gemma-4-26B. Going to 1,000 articles pushes ingestion past 1 hour — overkill for a 6-hour lab.
+> **Why MAX_ARTICLES=400 + 4,000-char cap:** entity extraction runs ~400 LLM calls at ingestion. With `MAX_WORKERS=6` threaded against `max_concurrent_requests=8` on the local oMLX server, ~30 minutes wall time on Gemma-4-26B (3.2 triples/sec sustained). Pageview fetch + article extracts add ~45 minutes; total fetch+build wall time ~75 minutes for the v9 configuration. At 400 articles the corpus contains 16 of 25 canonical tech entities (vs 13/25 at 150), with diminishing returns past ~250 because the pageview heavy tail flattens. Going to 1,000 articles pushes total wall time past 2 hours — overkill for a 6-hour lab unless you need the long-tail mid-tier coverage.
 
 ### Code walkthrough — `src/fetch_corpus.py`
 
@@ -376,7 +376,7 @@ Run it:
 python src/build_graph.py
 ```
 
-Expect 8–12 minutes. Watch the progress bar; if extraction rate drops below 0.3 triples/sec, the model is likely stuck on a long article — check `data/corpus.json` for an outlier and cap article text lower.
+Expect ~30 minutes for MAX_ARTICLES=400 (~12 minutes for 150). Watch the progress bar; if extraction rate drops below 0.3 triples/sec, the model is likely stuck on a long article — check `data/corpus.json` for an outlier and cap article text lower. Sustained throughput on M5 Pro + Gemma-4-26B with `MAX_WORKERS=6` is 3.2 triples/sec regardless of corpus size.
 
 ### Code walkthrough — `src/build_graph.py`
 
@@ -1274,6 +1274,12 @@ The interview signal is precise: candidates who can articulate when GraphRAG win
 
 **Soundbite 3 — On the hybrid production pattern.**
 "In production I'd never deploy GraphRAG as the only retriever. I'd run a router — a small classifier or a single LLM call — that categorizes incoming queries as 'multi-hop relational' or 'topical/factoid', and routes to GraphRAG or vector RAG accordingly. We observed that on broad topical questions like 'tell me about quantum computing', GraphRAG returns a thin entity list while vector RAG returns a rich introductory passage; users prefer the vector output for that shape of question. The hybrid pattern — both retrievers behind a router — captures GraphRAG's multi-hop win without losing vector RAG's topical strength. This is what most published production GraphRAG systems converge on."
+
+**Soundbite 4 — On the corpus-mechanism cascade.**
+"What I learned the hard way is that GraphRAG quality is fundamentally a corpus-engineering problem. The first version of my lab used `train[:200]` from the HuggingFace Wikipedia dataset — and the first 200 articles by row order are mostly chemistry, so my graph had `metalloid` and `Antimony` but zero tech founders. The Mark Zuckerberg query couldn't even start. Fixing this turned out to be a 5-layer cascade: replace the slice with a domain-bounded category walk → paginate `categorymembers` via `cmcontinue` to span the alphabet → switch from uniform shuffle to pageview-weighted A-ExpJ sampling because Wikipedia's category structure is heavy-tailed by attention → fix the title-resolution mismatch where `redirects=1` silently zeroed 13 % of weights → add per-property `pvipcontinue` pagination because `prop=pageviews` only returns ~19 titles per call. Each layer masqueraded as the previous layer's symptom. The empirical lesson — production retrieval pipelines fail at the corpus layer way more often than at the retrieval-algorithm layer."
+
+**Soundbite 5 — On phrase-first entity matching.**
+"The retrieval matcher in my lab uses a phrase-first contract: multi-word seeds run as Lucene `+token1 +token2` against a Neo4j fulltext index, requiring every named token to be present in the entity, but not adjacency. If that returns ≥1 match, traverse from there; if 0 matches, fall back to OR-over-tokens with a low-confidence warning. The reason: a query for 'Mark Zuckerberg' against a corpus that contains many `Mark *` people but not Zuckerberg specifically — the OR query fans out to Mark Pincus, Mark Russinovich, etc., and the LLM ends up hallucinating a relationship that doesn't exist in the graph. Phrase-AND requires the actual named entity. With that strategy, edges_used drops from 33 to 14 on a precise match because we anchor traversal to one node instead of five fan-out nodes — and the answer goes from inline prose with vague sources to a clean bullet list with provenance. The lesson is: in entity matching, recall is cheap, precision is what makes the answer trustworthy."
 
 ---
 
