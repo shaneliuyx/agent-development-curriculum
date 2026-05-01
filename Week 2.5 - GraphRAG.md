@@ -120,6 +120,89 @@ Cost asymmetry to notice: every request pays one haiku call + one Cypher query +
 
 ---
 
+## Production Design — Iterative Lessons (v1 → v10)
+
+The naive pipeline that this chapter scaffolds (slice 200 Wikipedia articles → extract triples → traverse) breaks in production-shape ways the moment a real query arrives. This section captures the design rationale, target metrics, and best practices distilled from running the lab end-to-end through 10 iterations against the originally-failing query "What is the relationship between Apple and NeXT?" and "Which companies are related to Mark Zuckerberg?". Read this section before Phase 1 — it tells you what each Phase is actually solving for.
+
+### Context — Why the v1 pipeline fails
+
+The original lab uses `load_dataset("wikipedia", "20220301.en", split="train[:200]")` for corpus selection. Three coupled failures:
+
+1. **Slice-by-id is not a domain selection mechanism.** Wikipedia articles are sorted by Parquet row order. The first 200 articles by row order are mostly chemistry (Anarchism, Antimony, Arsenic) — zero tech founders, zero canonical company entities. Querying about Mark Zuckerberg returns 22 chemistry edges via false-positive substring matching ("meta" → "metal"). The graph cannot answer the query because the corpus mechanism never targeted the domain.
+2. **Substring fuzzy matching at query time amplifies the corpus mismatch.** Without a phrase-aware matcher, single-token seeds match any entity containing those characters. Each false positive pollutes the LLM context with irrelevant edges; the LLM then either refuses (correctly) or hallucinates a connection (incorrectly).
+3. **Article truncation at 4000 chars drops 80% of long-bio content.** Even with the right corpus, biographical events (dropouts, divorces, lawsuits, donations) live in Wikipedia sections that sit past character 5000. Truncation silently strips them; extraction never sees them; queries about them fail because the facts were never promoted to triples.
+
+### Target — What we want the system to deliver
+
+| Property | Target |
+|---|---|
+| **Hit rate (corpus-bounded recall)** | If the answer text exists somewhere in the corpus (across one or many articles), the system surfaces the answer with a source citation. |
+| **Precision** | Refuse explicitly on out-of-domain queries (`The provided graph facts do not contain information about <topic>`). No hallucinated bridges. |
+| **Reproducibility** | Same input corpus + same SHUFFLE_SEED produces the same graph and the same answers across runs. No hardcoded entity titles. |
+| **Latency** | Single query: factoid ≤ 2 s, multi-hop ≤ 5 s on M5 Pro / Gemma-4-26B / local Neo4j. |
+| **Production realism** | Mechanism switches domains via configuration (categories, weights, hops); no hand-crafted entity lists. |
+
+Numerical targets to validate against (measured on the 32-question fair head-to-head against `tech_corpus_hnsw`):
+
+| Bucket | Recall target | v9 actual | v9.5 (CoT) actual |
+|---|---|---|---|
+| factoid | ≥ 0.80 | 0.71 | **0.86** |
+| relational | ≥ 0.70 (graph's signature win) | 0.75 | 0.75 |
+| two_hop | ≥ 0.60 | 0.62 | 0.60 |
+| multi_hop | ≥ 0.50 | 0.30 | 0.29 (still under, work in progress) |
+| out_of_domain | refusal rate ≥ 0.95 | refused | refused |
+
+### Design considerations — the 5-leak analysis
+
+Each iteration of the corpus-mechanism / retrieval / answer-generation stack revealed a downstream leak. The leaks are loosely coupled but each must be fixed before the next becomes visible.
+
+| # | Leak | Where it leaks | Fix iteration |
+|---|---|---|---|
+| **1** | Article truncation drops most of long Wikipedia bios | `fetch_corpus.py` at `text[:4000]` | v10: bump to 50000 chars |
+| **2** | Per-article triple cap (5-20) ranks corporate relations over bio events | `build_graph.py` extraction prompt | v10: sliding-window with 10-15 cap per window |
+| **3** | Extraction prompt examples bias predicate extraction toward affiliation/ownership | `EXTRACT_SYSTEM` example list | v10: enumerate predicate categories explicitly (corporate / biographical / education / employment) |
+| **4** | Entity surface-form fragmentation ("Apple" vs "Apple Inc." vs "Apple Computer") splits edges | Neo4j `MERGE` on raw name string | Out of scope — production fix is entity-resolution embedding |
+| **5** | Open-vocab predicate fragmentation ("founded" / "co-founded" / "started" / "launched") | LLM extraction without canonicalization | Out of scope — production fix is closed vocabulary or LLM-canonicalized predicates |
+
+The user-driven design tree (2026-05-01 grill-me session) committed to fixing **Leaks 1 + 2** in this iteration, accepting the cost of ~3-4× build wall time (~12 min → ~40 min) for the projected ~3-5× triple-density gain. Leaks 4 + 5 are documented as known limits; production GraphRAG systems converge on closed vocabularies + entity resolution at scale (Microsoft GraphRAG, Neo4j LLM Knowledge Graph Builder both ship constrained vocabularies).
+
+### Rationale — why GraphRAG over alternatives, why this corpus mechanism
+
+| Decision | Choice made | Why this over alternatives |
+|---|---|---|
+| **Backend** | GraphRAG (this lab) | The lab tests cross-article relational reasoning ("Apple ↔ NeXT bridge via Steve Jobs's article"). Vector RAG can match a passage that literally states a connection but cannot synthesize across articles. The W2 baseline is the right anchor: the goal is to identify *when GraphRAG wins*, not assert it always wins. |
+| **Corpus mechanism** | Domain-bounded category walk + pageview-weighted A-ExpJ sample | Slice-by-id (`train[:200]`) gates the demo on which articles happen to have low Wikipedia IDs; hardcoded `SEED_TITLES` gates the demo on the engineer's hand-picked entities. Category walk + importance weighting bounds the domain (a stakeholder decision) while letting specific entities fall out of the mechanism (production-shape). |
+| **Sampling** | Pageview-weighted A-ExpJ over the deduped category pool | Uniform random sampling across a heavy-tailed pool buries canonical entities at ~10% inclusion. Pageview-weighted sampling concentrates the budget on the entities users actually query while leaving room for long-tail discovery. |
+| **Seed matcher** | Lucene phrase-first (`+token1 +token2`) with OR-fallback | `CONTAINS` substring matching produces "meta" → "metal" false positives. Quoted phrase matching is too strict (misses "Jack Patrick Dorsey" via "Jack Dorsey"). Required-AND `+token` requires every token to be present without enforcing adjacency — the right balance. |
+| **Answer generation** | Chain-of-thought prompt branching by question type | Single-shot directives produce narrative summaries that miss matching edges. The CoT pattern (identify question type → enumerate matching facts → synthesize → cite) lifts factoid recall 0.71 → 0.86 in measured eval. Pattern is published in Microsoft GraphRAG, LangChain GraphCypherQAChain, and Singh et al. (2025) survey. |
+| **Hop budget** | `max_hops=5`, edge cap `LIMIT 200`, prompt edge cap `subgraph[:200]` | Bridge-style queries can require 2-3 hops (Stanford → Person → Company). Shallower limits leave bridges unfound. Deeper limits without edge caps explode context. |
+| **Out-of-scope (deferred)** | Hybrid fallback to vector RAG, LazyGraphRAG, active corpus expansion | All three are production-validated patterns (HybridRAG arXiv 2408.04948; Microsoft LazyGraphRAG 2024). Each is a real follow-up; staying scoped to "increase pure-GraphRAG hit rate" for this iteration. |
+
+### Best practices — distilled from v1 → v10
+
+The empirical record across 10 iterations against the same originally-failing queries:
+
+1. **Slice-by-id is never a corpus mechanism.** Use a domain-bounded selection that produces an emergent set of articles. Wikipedia's `categorymembers` API + `pvipcontinue`-paginated `prop=pageviews` is enough for Wikipedia-style corpora.
+2. **Importance-weighted sampling beats uniform sampling on heavy-tailed domains.** Wikipedia is heavy-tailed by attention; pageview-weighted A-ExpJ (Efraimidis & Spirakis 2006) matches the prior. PageRank is the production-grade alternative for reproducibility (deterministic on a fixed dump).
+3. **Title-resolution mismatches silently zero pageviews.** With `redirects=1`, the API normalizes titles ("Apple Inc." → "Apple Inc"). Walk the response's `normalized` + `redirects` arrays to map input → canonical before lookup. Without this, ~13% of inputs return correct pageviews.
+4. **`prop=pageviews` has a hidden ~19-titles-per-call limit.** Loop on `pvipcontinue` until the token disappears. Without this, ~80% of input titles silently return weight 0 even with title-resolution fixed.
+5. **Phrase-first seed matching wins on precision; OR fallback preserves recall.** `+token1 +token2` Lucene query enforces all-tokens-present without adjacency. If phrase returns 0 nodes, fall back to OR — flag the strategy in the diagnostic dict so callers know precision is reduced.
+6. **Chain-of-thought answer prompt unblocks factoid recall.** The single-shot "answer using only the facts" directive produces narrative summaries that skip matching edges. Branching by question type (LIST / RELATIONSHIP / FACTOID) and forcing enumeration before synthesis lifts factoid recall 0.15 absolute on the 32-Q eval.
+7. **Article truncation is the largest single recall leak on long bios.** Lift `text[:4000]` to `text[:50000]` and pair with sliding-window extraction. Bio events (dropouts, divorces, lawsuits) live past char 5000 and are silently dropped without this fix.
+8. **Sentence-aware sliding window is the right chunking primitive.** Fixed-char windows cut mid-sentence and degrade extraction at boundaries. Section-aware (Wikipedia `==` headers) is most semantic but requires re-fetching with `exsectionformat=wiki`. Sentence-aware fits in `build_graph.py` alone.
+9. **Open-vocab is a precision liability, not a recall liability.** Predicate variants (`FOUNDED` / `CO_FOUNDED` / `STARTED`) fragment same-fact edges. Hit rate is unaffected (multiple grounding paths help); precision suffers (answer prose may restate facts). Production GraphRAG converges on closed or canonicalized vocabularies.
+10. **The hybrid pattern is the production answer to "GraphRAG missed the answer."** Route relational queries to graph, factoid/two-hop to vector, refuse on out-of-domain. Pure-GraphRAG hit rate has a structural ceiling; HybridRAG (Sarmah et al. 2024) achieved 0.58 factual correctness against pure baselines on the same eval. Out of scope for this iteration but the next natural step.
+
+Sources for the patterns above:
+- LazyGraphRAG: setting a new standard for quality and cost — Microsoft Research, Nov 2024 ([blog](https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/))
+- HybridRAG — Sarmah et al., 2024 ([arXiv 2408.04948](https://arxiv.org/html/2408.04948v1))
+- PageRank on Wikipedia — Thalhammer & Rettinger, 2016 ([Springer](https://link.springer.com/chapter/10.1007/978-3-319-47602-5_41))
+- A-ExpJ weighted reservoir sampling — Efraimidis & Spirakis, 2006
+- Microsoft GraphRAG — [microsoft.github.io/graphrag](https://microsoft.github.io/graphrag/)
+- Singh et al., 2025 — Agentic Retrieval-Augmented Generation survey (referenced in W3.7)
+
+---
+
 ## Phase 1 — Neo4j + Corpus Setup (~45 minutes)
 
 ### 1.1 Lab scaffold
@@ -1195,17 +1278,105 @@ with ThreadPoolExecutor(max_workers=6) as executor:
 ```
 Wall time drops from ~450 s to ~90-100 s (4-5× speedup). Going past `max_workers=8` does not help — extra threads idle in the server's queue.
 
+**Entry 15 — Single-shot answer prompt skips matching facts in dense subgraph; factoid recall stuck at 0.71 even when graph has the edge.**
+*Symptom:* On the v8.5 25-question fair head-to-head, GraphRAG factoid recall plateaued at 0.71 — same as VectorRAG — even though the graph manifestly contains the right edges. "Where did Bill Gates go to university?" returned a narrative answer about Microsoft's founding instead of citing the `Bill Gates --[attended]--> Harvard` edge that exists in the graph. The retriever surfaces 50+ edges; the LLM picks one for narrative coherence and skips the rest.
+*Root cause:* The original answer-generation prompt was a single-shot directive: "Answer using ONLY the graph facts below. If the facts do not support an answer, say so." It does not instruct the LLM to enumerate matching facts before synthesizing prose, so on questions whose answer is one specific edge among 50+ neighborhood edges, the LLM may miss it because it produces a narrative summary rather than a fact extraction.
+*Fix:* Replace with a chain-of-thought prompt that branches by question type and forces enumeration before synthesis. Pattern derived from Microsoft GraphRAG, LangChain GraphCypherQAChain, and Singh et al. (2025) survey of agentic RAG.
+```python
+SYSTEM_PROMPT = """You are a fact synthesizer for a knowledge graph. Answer using ONLY the graph facts below.
+
+REQUIRED PROCESS:
+1. Identify the question type:
+   - LIST/ENUMERATION ('what companies', 'which X', 'list all', 'who founded')
+   - RELATIONSHIP ('what is the relationship between X and Y')
+   - FACTOID ('who is the CEO of X', 'where is X based')
+2. Extract matching facts. For LIST: extract EVERY fact that matches — do not skip.
+   For RELATIONSHIP: find every edge connecting the named entities.
+   For FACTOID: find the most-direct edge.
+3. Synthesize. LIST → bulleted list with one citation per item. RELATIONSHIP → state
+   each connecting edge. FACTOID → 1-2 sentence direct answer.
+4. Cite every claim. (source: <article>). Multiple sources: (source: A; source: B).
+5. Refuse on absence: 'The provided graph facts do not contain information about <topic>.'"""
+```
+Empirical impact on the v9 32-question fair head-to-head: factoid bucket recall jumped from 0.71 → 0.86, surpassing VectorRAG. Relational stable at 0.75 (graph 2× vector). Two-hop and multi-hop unchanged — confirming the fix targets exactly the "answer prompt skipped a matching edge" failure mode.
+
+**Entry 16 — Article truncation at 4000 chars silently drops 80% of long-bio Wikipedia articles; bio-event facts (dropouts, divorces, lawsuits) never reach the extractor.**
+*Symptom:* GraphRAG fails on bio-event questions like "What companies have been founded by Harvard dropouts?" expected `[Microsoft, Facebook]`. Mark Zuckerberg AND Bill Gates ARE in the corpus + graph as entities; their `dropped_out_of` triples are not. Inspecting the build-time extraction reveals the LLM never saw the dropout sentences — they live in the `Education` or `Personal life` Wikipedia sections, both of which sit past character 5000 in their bios. Article truncation at `text[:4000]` chopped them out before extraction.
+*Root cause:* `fetch_corpus.py` truncates at `ARTICLE_TEXT_CHARS = 4000` and `build_graph.py` further truncates input to `text[:3500]`. Mark Zuckerberg's Wikipedia article is ~22000 chars — the extractor only saw the first 17%, which is the lead paragraph + early-career section. Bio-event facts that live in later sections (Education, Personal life, Awards, Lawsuits) are silently dropped at fetch time.
+*Fix:* Lift `ARTICLE_TEXT_CHARS` to 50000 in `fetch_corpus.py` (covers ~99% of tech-founder Wikipedia bios in full) and remove the `text[:3500]` cap in `build_graph.py`'s extraction call. Long articles still need windowing — see Entry 17.
+
+**Entry 17 — Per-article triple cap of 5-20 hides bio events behind corporate relations even when full article reaches the extractor.**
+*Symptom:* Even with `ARTICLE_TEXT_CHARS` lifted, single-pass extraction over a long bio (~20K chars) yields only the same ~10-15 most-prominent triples — corporate / affiliation relations dominate ("founded", "acquired by", "led"). The article contains 30+ extractable facts including bio events, but the extractor budget is bounded.
+*Root cause:* The extraction prompt instructs "Include 5-20 triples per article". The LLM ranks candidate triples and emits the top 5-20 — and corporate relations rank higher than bio events because the example list (`founded / acquired by / born in`) primes the model toward affiliation/ownership predicates. Education / dropout / divorce / donation / testimony events fall outside the example shape and lose the ranking competition.
+*Fix:* Split the article into sentence-aware sliding windows (~3000 chars per window, ~500 char overlap) and extract per window with a 10-15 triple cap. Long bios produce 5-10 windows × 10-15 triples = 50-150 total triples per article, ~3-5× v9 density. Update the extraction prompt to enumerate predicate categories explicitly:
+```python
+EXTRACT_SYSTEM = """Extract entities and relationships from the text segment.
+Output JSON only: {"triples": [{"subject", "relation", "object"}, ...]}.
+
+Rules:
+- Use the exact surface form from the text.
+- Relations are 1-4-word verb phrases. Include BOTH:
+  * Corporate: "founded", "acquired by", "co-founded", "led", "merged with"
+  * Biographical events: "dropped out of", "graduated from", "married", "donated to"
+  * Education / employment: "attended", "earned a degree from", "worked at"
+- Include 10-15 triples per text segment.
+- Do not invent facts."""
+```
+Build-time cost grows from ~12 min (400 articles × 1 call) to ~40 min (400 articles × ~7 windows × 1 call) at MAX_WORKERS=6. Trade-off accepted in the design tree because hit-rate gains on bio-event questions outweigh the extra build wall time.
+
+**Entry 18 — Sentence-aware sliding window infinite-loops if `(overlap_carry + new_sentence) > target_chars`.**
+*Symptom:* `_chunk_by_sentences` hangs indefinitely on certain article lengths during build. Process consumes no CPU, makes no progress; tqdm progress bar frozen.
+*Root cause:* The overlap-carry branch in the chunker emitted the current window, set `current = overlap_suffix`, then `continue`d to the next loop iteration WITHOUT advancing `i` and WITHOUT appending the triggering sentence. If `len(overlap_suffix) + len(sent) > target_chars`, the same sentence triggered overflow again, re-emitting the same overlap-as-window forever.
+*Fix:* Drop the `continue` in the overlap-carry branch and fall through to the append-and-advance code. Every iteration must always append `sent` to `current` and increment `i`, guaranteeing progress regardless of overlap state:
+```python
+if current and current_chars + sent_chars > target_chars:
+    windows.append(" ".join(current))
+    # ... build overlap suffix → current ...
+    # NO continue — fall through to append + advance below.
+current.append(sent)
+current_chars += sent_chars + 1
+i += 1
+```
+Caught by a 22.8K-char unit test that timed out at 8s; production-shape integration tests would have caught it after a 40-min build. Lesson: any new chunker / windowing code gets a standalone unit test before the full pipeline runs against it.
+
+---
+
+### Design tree (2026-05-01 grill-me session)
+
+The path from "GraphRAG missed Apple/NeXT and Mark Zuckerberg" to v10's sliding-window extraction was decided in a structured interview. Each branch resolved a coupled decision before moving to the next. Recording it here for future readers.
+
+1. **What does "corpus has the answer" mean? Text-level or graph-level?**
+   - Picked: **text-level**. Cross-article relationship discovery. Means binding constraint is extraction recall, not traversal depth.
+2. **Where does relationship structure get built — index time or query time?**
+   - Picked: **index time**. Stays GraphRAG-shaped; no query-time re-extraction.
+3. **Open vocabulary or closed?**
+   - Kept: **open vocab**. (Caveat: predicate fragmentation IS a real cost — production GraphRAG systems use closed or LLM-canonicalized vocabularies. Out of scope for this lab.)
+4. **Hybrid fallback to vector RAG on graph miss?**
+   - Picked: **no hybrid**. Pure GraphRAG. (Caveat: HybridRAG is the standard production pattern — see Soundbite 3.)
+5. **Among Leak 1 (truncation), Leak 2 (triple cap), Leak 3 (prompt biases), Leak 4 (entity surface-form fragmentation), Leak 5 (open-vocab fragmentation) — which fix first?**
+   - Picked: **Leaks 1 + 2** (truncation + triple cap together). Highest-leverage upstream fixes.
+6. **Sliding window strategy: fixed-char / sentence-aware / Wikipedia-section-aware?**
+   - Picked: **sentence-aware** (~3000 char windows, ~500 char overlap). Fits in `build_graph.py` alone, no re-fetch.
+7. **Per-window triple cap?**
+   - Picked: **moderate (10-15 per window)**. Matches Microsoft GraphRAG default. Best signal-to-noise.
+8. **Cross-window deduplication policy?**
+   - Picked: **MERGE-only on exact match (accept variants)**. Hit-rate-positive; precision optimization deferred.
+9. **Success metric — re-run existing eval, add cherry-picked questions, or both?**
+   - Picked: **α + γ**. Re-run existing 32-Q eval (no cherry-pick) AND track build-time proxy metrics (total triples, unique predicates, avg triples/article).
+10. **Build-time budget?**
+    - Picked: **~40 min wall**. Vs current ~12 min. 3-4× cost for projected 3-5× triple density.
+
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `ServiceUnavailable` on Neo4j connect | Docker container not ready | `docker logs neo4j-graphrag` — wait for "Started." line |
-| Entity extraction returns `[]` on many articles | Model returning markdown-wrapped JSON | Add `re.search(r'\{.*\}', content, re.DOTALL)` parse before `json.loads` |
-| Top entities are pronouns/fragments | Prompt not constraining enough | Add "Do not extract pronouns. Every entity must be a proper noun." to EXTRACT_SYSTEM |
-| `edges_used == 0` on every query | Seed-entity matcher failing — see Bad-Case Entry 3 / 4 above | Loosen seed prompt + token-level CONTAINS |
-| GraphRAG recall *worse* than vector RAG on all 25 questions | Your eval set isn't multi-hop | Rewrite: each question should require joining facts from ≥ 2 articles |
+| Symptom                                                     | Likely cause                                                 | Fix                                                                                  |
+| ----------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `ServiceUnavailable` on Neo4j connect                       | Docker container not ready                                   | `docker logs neo4j-graphrag` — wait for "Started." line                              |
+| Entity extraction returns `[]` on many articles             | Model returning markdown-wrapped JSON                        | Add `re.search(r'\{.*\}', content, re.DOTALL)` parse before `json.loads`             |
+| Top entities are pronouns/fragments                         | Prompt not constraining enough                               | Add "Do not extract pronouns. Every entity must be a proper noun." to EXTRACT_SYSTEM |
+| `edges_used == 0` on every query                            | Seed-entity matcher failing — see Bad-Case Entry 3 / 4 above | Loosen seed prompt + token-level CONTAINS                                            |
+| GraphRAG recall *worse* than vector RAG on all 25 questions | Your eval set isn't multi-hop                                | Rewrite: each question should require joining facts from ≥ 2 articles                |
 
 ---
 
