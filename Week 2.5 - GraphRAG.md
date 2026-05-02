@@ -389,15 +389,82 @@ NEO4J_PASSWORD=graphrag-lab
 Save as `src/build_graph.py`:
 
 ```python
-"""Extract (entity, relationship, entity) triples from each article
-and write them to Neo4j. Ingestion is the expensive part of GraphRAG —
-budget 8–12 minutes for 200 articles on local Gemma-4-26B."""
-import os, json, re, time
+"""Extract (entity, relationship, entity) triples from each article and
+write them to Neo4j.
+
+v12 — Wikidata QID linking at extraction time.
+
+Builds on v11 (sentence-aware sliding-window extraction + active-voice
+prompt + index-lifecycle fix). v11's main remaining bottleneck was
+multi-hop recall ceiling at 0.21-0.34, diagnosed as entity surface-form
+fragmentation (Bad-Case Journal Entry 10): "Reid Hoffman" and "Reid
+Garrett Hoffman" became separate nodes, splitting edges and breaking
+2-hop chains traversing the person.
+
+v12 fix: resolve every extracted entity-name to its canonical Wikidata
+QID via wbsearchentities API, then MERGE on QID instead of name. Two
+articles mentioning the same person under different surface forms now
+write to ONE node — restoring the multi-hop chain.
+
+  Article A: "Reid Hoffman, was_employee_of, PayPal"
+             → resolve "Reid Hoffman" → Q211098
+             → MERGE (a:Entity {qid: "Q211098"})
+  Article B: "Reid Garrett Hoffman, co_founded, LinkedIn"
+             → resolve "Reid Garrett Hoffman" → Q211098
+             → MERGE matches SAME node (qid match)
+  Result: PayPal ← Q211098 → LinkedIn — 2-hop chain reconstructed.
+
+Build budget delta: ~2 min added on first run (~13K unique entity-names
+× ~10ms cached API call). Subsequent runs hit disk cache, instant.
+
+Earlier-version backstory (v10): truncated each article to 3500 chars
+and asked the LLM for 5-20 triples. This silently dropped ~80% of long
+Wikipedia articles (Education, Personal Life, Awards sections past
+char 5000) and capped GraphRAG hit rate on bio-event questions. v10
+moved to:
+  - Sentence-aware sliding windows (~3000 chars, ~500 char overlap)
+  - 10-15 triples per window (aggregate ~70-100 for long bios, 3-5× v9)
+  - Per-article progress logs with window count + triple density
+  - End-of-build proxy metrics so operator distinguishes
+    "extraction worked / retrieval bottlenecked" from
+    "extraction broken upstream"
+
+Build budget: ~40 min wall on M5 Pro / Gemma-4-26B / MAX_WORKERS=6
+for 400 articles × ~7 windows each = ~2800 LLM extraction calls,
+plus ~2 min for QID resolution on first build."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from openai import OpenAI
-from neo4j import GraphDatabase
-from tqdm import tqdm
+
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
+from openai import OpenAI
+from tqdm import tqdm
+
+# Sentence-aware chunker — canonical impl in shared/rag_hybrid/chunking.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
+from rag_hybrid.chunking import sentence_window_chunks  # noqa: E402
+
+# Local v12 module — Wikidata QID resolver with disk-backed cache.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wikidata_qid import QIDResolver  # noqa: E402
+
+# LLM-server max_concurrent_requests = 8. Keep workers strictly under that
+# so query_graph.py / IDE autocomplete / ad-hoc queries don't queue behind
+# the build. Raising past 8 idles threads in server-side queue.
+MAX_WORKERS = 6
+
+# Sliding-window chunking parameters.
+WINDOW_CHARS = 3000
+WINDOW_OVERLAP_CHARS = 500
+MIN_WINDOW_CHARS = 200  # tail windows shorter than this are dropped (low signal)
 
 load_dotenv()
 omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
@@ -407,73 +474,263 @@ driver = GraphDatabase.driver(
     auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
 )
 
-EXTRACT_SYSTEM = """Extract entities and relationships from the text.
+EXTRACT_SYSTEM = """Extract entities and relationships from the text segment.
 Output JSON only: {"triples": [{"subject": str, "relation": str, "object": str}, ...]}.
+
 Rules:
 - Use the exact surface form that appears in the text for subject/object.
-- Relations should be verb phrases, 1-4 words ("founded", "acquired by", "born in").
-- Include 5-20 triples per article. Skip if the article has no clear entities.
-- Do not invent facts. Every triple must be supported by the text."""
+- **Always emit triples in ACTIVE voice.** If the source text is passive ("Apple was acquired by NeXT"), invert subject/object so the agent is the subject: emit subject="NeXT", relation="acquired", object="Apple". Applies to all by-suffix passives ("X was founded by Y", "X was published by Y", "X was sold to Y"). For passives where the subject is genuinely the patient ("John was awarded the Nobel Prize", "John was named CEO"), keep subject=John — the relationship describes John, not the agent. Use linguistic judgment per triple, not a fixed list.
+- Relations are 1-4-word verb phrases. Include BOTH:
+  * Corporate / affiliation relations: "founded", "acquired by", "co-founded",
+    "led", "merged with", "invested in", "joined", "left".
+  * Biographical / life events: "dropped out of", "graduated from", "married",
+    "divorced", "donated to", "was sued by", "testified before", "moved to",
+    "served as", "studied at".
+  * Education / employment: "attended", "earned a degree from", "worked at",
+    "interned at", "served on the board of".
+- Include 10-15 triples per text segment. Skip if the segment has no clear entities.
+- Do not invent facts. Every triple must be supported by the segment text.
+- A single segment may repeat facts that appeared in earlier segments — that's
+  fine, MERGE will dedupe."""
 
 
 def extract_triples(text: str) -> list[dict]:
+    """Run one extraction call on a single text window."""
     resp = omlx.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": EXTRACT_SYSTEM},
-            {"role": "user",   "content": text[:3500]},
+            {"role": "user",   "content": text},
         ],
-        temperature=0.1, max_tokens=1200,
+        temperature=0.1,
+        max_tokens=1500,  # bumped from 1200 to fit 10-15 triples per window
         response_format={"type": "json_object"},
     )
     try:
         return json.loads(resp.choices[0].message.content).get("triples", [])
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, AttributeError, TypeError):
         return []
 
 
-def write_triples_to_neo4j(tx, article_id: str, article_title: str, triples: list[dict]):
+def write_triples_to_neo4j(
+    tx,
+    article_id: str,
+    article_title: str,
+    triples: list[dict],
+    qid_map: dict[str, str | None],
+):
     """Each entity is a node, each triple creates a relationship.
-    MERGE prevents duplicates across articles (e.g. 'Apple Inc.' in two articles
-    resolves to the same node)."""
+
+    v12: MERGE on Wikidata QID when resolvable, else fall back to name MERGE.
+    Two surface forms of the same canonical entity (e.g. "Reid Hoffman" /
+    "Reid Garrett Hoffman" both → Q211098) write to ONE node — restoring
+    multi-hop chains that v11 broke across alias boundaries.
+
+    Implementation uses `apoc.merge.node` for clean dynamic-key MERGE: pass
+    `{qid: <Q-id>}` when QID is resolvable, else `{name: <surface form>}`.
+    APOC handles the conditional MERGE without Cypher branching gymnastics.
+
+    `qid_map` is built upstream by the worker (one resolver call per unique
+    entity name in the article), so this function does no API I/O.
+    """
     for t in triples:
         s, r, o = t.get("subject"), t.get("relation"), t.get("object")
         if not (s and r and o):
             continue
         rel_type = re.sub(r'[^A-Z_]', '_', r.upper().replace(' ', '_'))[:40] or "RELATED_TO"
+
+        s_qid = qid_map.get(s)
+        o_qid = qid_map.get(o)
+
+        # Build identity properties dynamically. When QID present, MERGE on
+        # qid only; the surface form goes into `aliases` so we can audit
+        # which forms collapsed into the canonical node. When QID absent,
+        # MERGE on name (pre-v12 fallback path).
+        s_keys = {"qid": s_qid} if s_qid else {"name": s}
+        o_keys = {"qid": o_qid} if o_qid else {"name": o}
+
+        s_on_create = ({"name": s, "aliases": [s]} if s_qid else {})
+        o_on_create = ({"name": o, "aliases": [o]} if o_qid else {})
+
         tx.run(
             f"""
-            MERGE (a:Entity {{name: $s}})
-            MERGE (b:Entity {{name: $o}})
+            CALL apoc.merge.node(['Entity'], $s_keys, $s_on_create, {{}}) YIELD node AS a
+            CALL apoc.merge.node(['Entity'], $o_keys, $o_on_create, {{}}) YIELD node AS b
+            FOREACH (_ IN CASE WHEN $s_qid IS NOT NULL AND NOT $s_name IN coalesce(a.aliases, []) THEN [1] ELSE [] END |
+                SET a.aliases = coalesce(a.aliases, []) + $s_name
+            )
+            FOREACH (_ IN CASE WHEN $o_qid IS NOT NULL AND NOT $o_name IN coalesce(b.aliases, []) THEN [1] ELSE [] END |
+                SET b.aliases = coalesce(b.aliases, []) + $o_name
+            )
             MERGE (a)-[rel:{rel_type}]->(b)
-            ON CREATE SET rel.source_article = $aid, rel.source_title = $title,
-                          rel.raw_relation = $r
+            ON CREATE SET rel.source_article = $aid,
+                          rel.source_title   = $title,
+                          rel.raw_relation   = $r
             """,
-            s=s, o=o, aid=article_id, title=article_title, r=r,
+            s_keys=s_keys, o_keys=o_keys,
+            s_on_create=s_on_create, o_on_create=o_on_create,
+            s_qid=s_qid, o_qid=o_qid,
+            s_name=s, o_name=o,
+            aid=article_id, title=article_title, r=r,
         )
 
 
-def main():
+def _extract_one(
+    article: dict,
+    resolver: QIDResolver | None = None,
+) -> tuple[dict, list[dict], dict[str, str | None], int, Exception | None]:
+    """Worker — runs sliding-window extraction over one article, then
+    resolves every unique entity-name to its Wikidata QID.
+
+    Returns (article, all_triples, qid_map, n_windows, exc).
+    Exception captured rather than raised so a single failure does not
+    kill the pool."""
+    try:
+        windows = sentence_window_chunks(
+            article["text"],
+            target_chars=WINDOW_CHARS,
+            overlap_chars=WINDOW_OVERLAP_CHARS,
+            min_window_chars=MIN_WINDOW_CHARS,
+        )
+        all_triples: list[dict] = []
+        for window in windows:
+            triples = extract_triples(window)
+            all_triples.extend(triples)
+
+        qid_map: dict[str, str | None] = {}
+        if resolver is not None:
+            unique_names: set[str] = set()
+            for t in all_triples:
+                if t.get("subject"):
+                    unique_names.add(t["subject"])
+                if t.get("object"):
+                    unique_names.add(t["object"])
+            qid_map = resolver.resolve_batch(unique_names)
+
+        return article, all_triples, qid_map, len(windows), None
+    except Exception as exc:  # noqa: BLE001
+        return article, [], {}, 0, exc
+
+
+def main() -> None:
     corpus = json.loads(Path("data/corpus.json").read_text())
     t0 = time.time()
     total_triples = 0
+    errors: list[tuple[str, Exception]] = []
+    triples_per_article: list[int] = []
+    windows_per_article: list[int] = []
+    predicate_counts: Counter[str] = Counter()
+    article_chars = [len(a.get("text", "")) for a in corpus]
+
+    # v12: shared QID resolver across all workers. Disk-backed cache so
+    # rebuilds don't re-pay the API cost.
+    resolver = QIDResolver(Path("data/wikidata_qid_cache.json"))
+
+    print(
+        f"Build start: {len(corpus)} articles, "
+        f"avg {sum(article_chars) // max(len(article_chars), 1)} chars/article, "
+        f"max {max(article_chars) if article_chars else 0} chars, "
+        f"window={WINDOW_CHARS}c overlap={WINDOW_OVERLAP_CHARS}c, "
+        f"MAX_WORKERS={MAX_WORKERS}, "
+        f"qid_cache_seeded={len(resolver.cache)}"
+    )
 
     with driver.session() as session:
-        # Clear previous runs — safe for a lab, not safe for production
+        # Clear previous runs — safe for a lab, not safe for production.
         session.run("MATCH (n) DETACH DELETE n")
+        # Create the full-text index BEFORE extraction, not after.
+        # IF NOT EXISTS makes CREATE idempotent — safe on fresh DB or rebuild.
+        session.run(
+            "CREATE FULLTEXT INDEX entity_names IF NOT EXISTS "
+            "FOR (n:Entity) ON EACH [n.name]"
+        )
+        # v12: range index on qid for fast MERGE during build.
+        session.run(
+            "CREATE INDEX entity_qid IF NOT EXISTS "
+            "FOR (n:Entity) ON (n.qid)"
+        )
+        session.run(
+            "CREATE INDEX entity_name IF NOT EXISTS "
+            "FOR (n:Entity) ON (n.name)"
+        )
 
-        for article in tqdm(corpus):
-            triples = extract_triples(article["text"])
-            if triples:
-                session.execute_write(
-                    write_triples_to_neo4j,
-                    article["id"], article["title"], triples,
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(_extract_one, article, resolver)
+                for article in corpus
+            ]
+            done = 0
+            for fut in tqdm(as_completed(futures), total=len(corpus), desc="articles"):
+                article, triples, qid_map, n_windows, exc = fut.result()
+                done += 1
+                if exc is not None:
+                    errors.append((article["title"], exc))
+                    tqdm.write(
+                        f"  [{done}/{len(corpus)}] ERROR {article['title']!r}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if triples:
+                    session.execute_write(
+                        write_triples_to_neo4j,
+                        article["id"], article["title"], triples, qid_map,
+                    )
+                total_triples += len(triples)
+                triples_per_article.append(len(triples))
+                windows_per_article.append(n_windows)
+                predicate_counts.update(t.get("relation", "") for t in triples if t.get("relation"))
+                elapsed = time.time() - t0
+                rate = done / max(elapsed, 1e-6)
+                eta_s = (len(corpus) - done) / max(rate, 1e-6)
+                qid_mapped = sum(1 for v in qid_map.values() if v is not None)
+                tqdm.write(
+                    f"  [{done:>3}/{len(corpus)}] "
+                    f"chars={len(article.get('text', '')):>5} "
+                    f"windows={n_windows:>2} "
+                    f"triples={len(triples):>3} "
+                    f"qid={qid_mapped}/{len(qid_map)} "
+                    f"total_triples={total_triples:>5} "
+                    f"rate={rate * 60:.1f}/min ETA={eta_s/60:.1f}min  "
+                    f"{article['title']!r}"
                 )
-            total_triples += len(triples)
+
+    resolver.save()
 
     elapsed = time.time() - t0
-    print(f"\nIngested {len(corpus)} articles → {total_triples} triples in {elapsed:.0f}s")
-    print(f"Average extraction rate: {total_triples/elapsed:.1f} triples/sec")
+    rs = resolver.stats()
+    print()
+    print("=" * 72)
+    print("INGEST SUMMARY")
+    print("=" * 72)
+    print(f"Articles ingested:           {len(corpus)}")
+    print(f"Total triples extracted:     {total_triples}")
+    if triples_per_article:
+        avg_t = sum(triples_per_article) / len(triples_per_article)
+        avg_w = sum(windows_per_article) / len(windows_per_article)
+        print(f"Triples per article (avg):   {avg_t:.1f}")
+        print(f"Triples per article (max):   {max(triples_per_article)}")
+        print(f"Windows per article (avg):   {avg_w:.1f}")
+        print(f"Windows per article (max):   {max(windows_per_article)}")
+    print(f"Unique relation predicates:  {len(predicate_counts)}")
+    print(f"Top 10 predicates:           {predicate_counts.most_common(10)}")
+    print(f"Wall time:                   {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+    print(f"Extraction rate:             {total_triples / elapsed:.1f} triples/sec  (MAX_WORKERS={MAX_WORKERS})")
+    print()
+    print("WIKIDATA QID RESOLUTION")
+    print("-" * 72)
+    print(f"Unique entity names seen:    {rs['cache_size']}")
+    print(f"Names mapped to QID:         {rs['names_mapped']}  ({rs['qid_coverage'] * 100:.1f}%)")
+    print(f"Names without QID:           {rs['names_unmapped']}  (fall back to name MERGE)")
+    print(f"API calls:                   {rs['api_calls']}")
+    print(f"Cache hits:                  {rs['cache_hits']}  ({rs['cache_hit_rate'] * 100:.1f}%)")
+    print(f"API errors:                  {rs['api_errors']}")
+    print(f"Cache file:                  data/wikidata_qid_cache.json")
+    if errors:
+        print(f"\nExtraction errors ({len(errors)}):")
+        for title, exc in errors[:10]:
+            print(f"  {title!r}: {type(exc).__name__}: {exc}")
+        if len(errors) > 10:
+            print(f"  ... and {len(errors) - 10} more")
 
 
 if __name__ == "__main__":
@@ -486,18 +743,16 @@ Run it:
 python src/build_graph.py
 ```
 
-Expect ~30 minutes for MAX_ARTICLES=400 (~12 minutes for 150). Watch the progress bar; if extraction rate drops below 0.3 triples/sec, the model is likely stuck on a long article — check `data/corpus.json` for an outlier and cap article text lower. Sustained throughput on M5 Pro + Gemma-4-26B with `MAX_WORKERS=6` is 3.2 triples/sec regardless of corpus size.
+Expect ~40 minutes for 400 articles on M5 Pro + Gemma-4-26B with `MAX_WORKERS=6`. The per-article progress lines show window count, triple count, and QID resolution rate. On first run, add ~2 minutes for Wikidata QID lookups; subsequent runs are instant (disk cache).
 
 ### Code walkthrough — `src/build_graph.py`
 
-`build_graph.py` is the most computationally expensive script in the lab and the one that determines the quality ceiling for everything downstream. It drives a local LLM to extract (subject, relation, object) triples from each Wikipedia article and writes them into Neo4j as a property graph. The resulting graph is the retrieval index for GraphRAG — not a vector index, not an inverted index, but a native graph where traversal replaces nearest-neighbor search. Getting extraction right here directly determines whether `query_graph.py` can find multi-hop answers at all.
-
-> **v12 update.** `build_graph.py` now resolves every extracted entity-name to its canonical Wikidata QID before MERGE, via `QIDResolver.resolve_batch()` from `src/wikidata_qid.py`. The MERGE clause keys on `qid` when resolvable (collapsing aliases like `Reid Hoffman` and `Reid Garrett Hoffman` into ONE node), and falls back to name-based MERGE for entities not in Wikidata. See the dedicated **Code walkthrough — `src/wikidata_qid.py`** section below for the resolver internals; the pre-v12 walkthrough below still describes the extraction loop and Cypher MERGE shape, just with the `qid_map` parameter and dynamic-key MERGE pattern added on top.
+`build_graph.py` is the most computationally expensive script in the lab and the one that determines the quality ceiling for everything downstream. It drives a local LLM over sentence-aware sliding windows of each Wikipedia article to extract (subject, relation, object) triples, resolves every extracted entity-name to its canonical Wikidata QID via `QIDResolver`, and writes the resolved triples into Neo4j as a property graph. The resulting graph is the retrieval index for GraphRAG — not a vector index, not an inverted index, but a native graph where traversal replaces nearest-neighbor search. Getting extraction right here directly determines whether `query_graph.py` can find multi-hop answers at all.
 
 ★ Insight ─────────────────────────────────────
-- **MERGE semantics in Neo4j are the correct choice here, not CREATE.** Wikipedia articles overlap on entities constantly — "Apple Inc." appears in articles about Steve Jobs, Tim Cook, and the iPhone. `MERGE` resolves those references to the same node, which is what makes multi-hop traversal meaningful. `CREATE` would produce dozens of disconnected `Apple Inc.` nodes, one per article, and traversal across articles would be impossible.
-- **The relation-type sanitisation regex (`re.sub(r'[^A-Z_]', '_', ...)`) reflects a hard Neo4j constraint.** Relationship types in Cypher cannot contain spaces, hyphens, or lowercase letters when used in bare `MERGE` clauses. An LLM emitting "founded by" would create a Cypher syntax error without this sanitisation. The `[:40]` truncation prevents another Neo4j limit: relationship type identifiers longer than ~63 bytes cause index creation failures.
-- **`session.run("MATCH (n) DETACH DELETE n")` is intentionally destructive.** The lab design assumes idempotent re-runs: re-running `build_graph.py` from scratch is always cleaner than incremental merging when the extraction prompt changes. In production you would version the graph (separate Neo4j database per run) rather than deleting nodes in-place.
+- **MERGE-on-QID is the correct deduplication key, not name.** Wikipedia articles refer to the same person under multiple surface forms: "Reid Hoffman", "Reid Garrett Hoffman", "Hoffman". v11 MERGEd on name, silently creating two separate nodes for the same person, breaking every 2-hop chain that passed through that entity. v12 resolves each name to its Wikidata QID (`Q211098`) and MERGEs on QID — two articles using different surface forms now write to ONE node. This is the production-grade entity resolution pattern: canonical-ID linking, not embedding similarity.
+- **`apoc.merge.node` enables conditional-key MERGE without Cypher branching.** The decision of "MERGE on qid if present, else MERGE on name" would require a Cypher `CASE` branch if written inline — APOC's `apoc.merge.node(labels, identity_props, on_create_props)` takes the identity map as a parameter, letting Python pre-compute either `{qid: Q211098}` or `{name: "surface form"}` without any branching in the Cypher string. Clean, dynamic, no syntax gymnastics.
+- **Index-before-extraction (with `IF NOT EXISTS`) is the crash-recovery contract.** Earlier versions dropped and recreated the full-text index AFTER the 40-minute extraction loop. A crash mid-loop left the graph queryable via Cypher but un-searchable via `db.index.fulltext.queryNodes`, silently. v12 creates all three indexes (fulltext entity_names, range entity_qid, range entity_name) BEFORE extraction starts; `IF NOT EXISTS` makes each CREATE idempotent. Any crash leaves the graph in a state where re-running is safe.
 ─────────────────────────────────────────────────
 
 **High-level architecture.**
@@ -505,179 +760,219 @@ Expect ~30 minutes for MAX_ARTICLES=400 (~12 minutes for 150). Watch the progres
 ```
   data/corpus.json  (400 articles)
          │
-         │  for each article
+         │  _extract_one() — one worker per article
          ↓
-  ┌──────────────────────┐
-  │   Gemma-4-26B (LLM)  │  ← omlx OpenAI-compatible endpoint
-  │   extract_triples()  │  → JSON {"triples": [{s, rel, o}, ...]}
-  └──────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │   sentence_window_chunks()                   │
+  │   WINDOW_CHARS=3000, OVERLAP=500             │
+  │   → ~7 windows/article (400-char overlap)    │
+  │             │                                │
+  │   extract_triples(window)                    │
+  │   Gemma-4-26B, T=0.1, max_tokens=1500        │
+  │   → JSON {"triples": [{s, rel, o}, ...]}     │
+  │             │                                │
+  │   resolver.resolve_batch(unique_names)       │
+  │   QIDResolver → Wikidata wbsearchentities    │
+  │   → {name → qid_or_None}                    │
+  └──────────────────────────────────────────────┘
          │
-         │  write_triples_to_neo4j()
+         │  write_triples_to_neo4j(qid_map)
          ↓
-  ┌──────────────────────────────────────┐
-  │              Neo4j                   │
-  │  (a:Entity {name: "Apple Inc."})     │
-  │  (b:Entity {name: "Steve Jobs"})     │
-  │  (a)-[:CO_FOUNDED_BY]->(b)           │
-  │   rel.source_article, .raw_relation  │
-  └──────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────┐
+  │                     Neo4j                           │
+  │  apoc.merge.node(['Entity'], {qid: "Q211098"})      │
+  │  ← canonical node for "Reid Hoffman" AND            │
+  │    "Reid Garrett Hoffman" → same node               │
+  │  (a)-[:CO_FOUNDED]->(b)                             │
+  │   rel.source_article, .source_title, .raw_relation  │
+  └─────────────────────────────────────────────────────┘
          │
          ↓
-  graph ready for query_graph.py 2-hop traversal
+  graph ready for query_graph.py traversal
 ```
 
-**Block 1 — Environment and client setup.**
+**Block 1 — Module-level constants.**
 
 ```python
-load_dotenv()
-omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
-MODEL = os.getenv("MODEL_SONNET")
-driver = GraphDatabase.driver(
-    os.getenv("NEO4J_URI"),
-    auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
-)
+MAX_WORKERS = 6
+
+WINDOW_CHARS = 3000
+WINDOW_OVERLAP_CHARS = 500
+MIN_WINDOW_CHARS = 200
 ```
 
-The `OpenAI` client points at an OpenAI-compatible endpoint serving a local model. `MODEL_SONNET` is a misleading name — it is actually Gemma-4-26B in this setup, which is a non-reasoning model. The variable name reflects an earlier architecture where "sonnet-tier" meant the mid-weight model slot regardless of vendor. The important property is that `MODEL_SONNET` is a non-reasoning model with reliable JSON output; see Block 2 of the `query_graph.py` walkthrough for why this matters.
+These four constants control throughput, coverage, and noise simultaneously. `MAX_WORKERS=6` is set to one below the LLM server's `max_concurrent_requests=8` — leaving two slots for `query_graph.py`, IDE completions, and ad-hoc queries so the build doesn't monopolise the inference server. Raising to 8 gives a modest speedup on isolated builds but starves other callers. Raising past 8 idles threads in the server-side queue with no throughput gain.
 
-The `GraphDatabase.driver` is Neo4j's official Python driver using the Bolt protocol. The driver maintains a connection pool; the `with driver.session() as session` pattern in `main()` checks out a connection and returns it to the pool when the block exits. Do not instantiate a new driver per article — that would open and tear down hundreds of TCP connections over the course of a 200-article run.
+`WINDOW_CHARS=3000` is the target window size after v9's `text[:3500]` truncation was diagnosed as silently dropping the back 80% of long Wikipedia articles (Education, Personal Life, Awards sections never extracted). A 3000-char window covers roughly 1-3 paragraphs, which is the right granularity for Wikipedia's section structure — enough context for the LLM to form coherent triples without stranding distant facts in the same prompt. `WINDOW_OVERLAP_CHARS=500` gives each window ~500 characters of overlap with the previous window, so entities that straddle a paragraph boundary appear in both windows and get extracted by at least one.
 
-**Block 2 — Extraction prompt design.**
+`MIN_WINDOW_CHARS=200` drops tail windows shorter than one paragraph — typically the last fragment of a section after the overlap carve-out. These fragments are too short for the LLM to form meaningful triples from and would add noise rather than signal.
+
+| Constant | Value | Effect of changing |
+|---|---|---|
+| `MAX_WORKERS` | 6 | Raise to 8 for isolated builds; lower to 4 if server shows queue contention |
+| `WINDOW_CHARS` | 3,000 | Lower (1,500) → finer granularity, more windows, higher total LLM cost; raise (5,000) → fewer windows, may crowd out section-boundary entities |
+| `WINDOW_OVERLAP_CHARS` | 500 | Lower to 0 for speed (no duplicate coverage); raise to 1,000 for dense interleaved facts |
+| `MIN_WINDOW_CHARS` | 200 | Set to 0 to keep all tail fragments; set to 500 to skip short stubs |
+
+**Block 2 — EXTRACT_SYSTEM prompt.**
 
 ```python
-EXTRACT_SYSTEM = """Extract entities and relationships from the text.
-Output JSON only: {"triples": [{"subject": str, "relation": str, "object": str}, ...]}.
-Rules:
-- Use the exact surface form that appears in the text for subject/object.
-- Relations should be verb phrases, 1-4 words ("founded", "acquired by", "born in").
-- Include 5-20 triples per article. Skip if the article has no clear entities.
-- Do not invent facts. Every triple must be supported by the text."""
+EXTRACT_SYSTEM = """...
+- **Always emit triples in ACTIVE voice.** ...
+- Relations are 1-4-word verb phrases. Include BOTH:
+  * Corporate / affiliation relations: ...
+  * Biographical / life events: ...
+  * Education / employment: ...
+- Include 10-15 triples per text segment. ...
+- A single segment may repeat facts that appeared in earlier segments —
+  that's fine, MERGE will dedupe."""
 ```
 
-Every rule in this prompt exists for a specific failure mode discovered through iteration. "Use the exact surface form" prevents the LLM from normalising "Jobs" to "Steve Jobs" in some articles and "Steven Paul Jobs" in others — two surface forms that would become two disconnected graph nodes, breaking traversal. The 1-4 word constraint on relations is the equivalent of the relation-type sanitisation step in the Neo4j writer: it pre-empts the LLM from emitting paragraph-length relation strings like "was a founding member of the board of directors of". The 5-20 triple range prevents both degenerate outputs (0 triples, no nodes written) and runaway outputs (200 triples, mostly noise).
+Every rule encodes a specific failure mode encountered in v9-v11 builds. The active-voice rule exists because Wikipedia's passive voice was silently reversing agent/patient: Steve Jobs's article says "Apple was acquired by NeXT", and the v9 LLM emitted that as `(Apple, "acquired by", NeXT)` — semantically backwards. The active-voice rule inverts subject/object for by-suffix passives while carving out genuine patient relations ("John was awarded the Nobel Prize" correctly keeps subject=John). The rule uses open-vocab linguistic judgment rather than a static verb list, so it handles any new passive verb form the LLM encounters.
 
-The `temperature=0.1` and `response_format={"type": "json_object"}` in `extract_triples()` work in tandem: structured output mode constrains the model to valid JSON, and low temperature reduces creative reinterpretation of the source text. `max_tokens=1200` is generous enough for 20 triples (roughly 50 tokens per triple) but caps runaway generation.
+The "Include BOTH corporate/affiliation AND biographical/life events" rule corrects v9's example-list bias. The original examples were `"founded", "acquired by", "born in"` — all affiliation/ownership predicates. The LLM learned from those examples to skip biographical events, silently missing facts like "dropped out of Harvard" or "married Priscilla Chan" that are essential for certain multi-hop queries. Explicitly naming both categories doubled the biographical-event coverage from the same source text.
+
+The `10-15 triples per window` target (up from v9's `5-20 per article`) is calibrated to the per-window scope. A 3000-char window of a Wikipedia biography section typically contains 10-20 extractable facts. The v9 range `5-20` applied to an entire article was too permissive at the bottom (5 triples from a 10-window article = extraction failure) and too strict at the top (capped at 20 total when the article had 70+). Per-window targets aggregate to ~70-100 triples per long article, a 3-5× density improvement.
+
+The final note "MERGE will dedupe" is for the LLM's benefit, not the programmer's. Without it, models occasionally self-censor repeated facts across windows ("I already said this") — but the prompt-context doesn't carry window history, so this self-censorship is based on the model's prior training patterns, not actual duplicate knowledge. Telling the model dedup is handled downstream encourages it to extract any fact it sees, whether or not it guesses the fact was in an earlier window.
 
 | Parameter | Value | Effect of changing |
 |---|---|---|
-| `temperature` | 0.1 | Higher → more varied triples but higher hallucination rate |
-| `max_tokens` | 1,200 | Lower (600) → cuts off long articles mid-extraction; raise to 2,400 if you need more triples |
-| `text[:3500]` | 3,500 chars | Keeps the prompt under ~1,000 tokens; raise only after confirming the model handles longer inputs cleanly |
-| Triple count rule | 5–20 | Drop minimum to 3 for stub articles; raise maximum to 30 for dense factual articles |
+| `temperature` | 0.1 | Higher → more creative triples, higher hallucination rate |
+| `max_tokens` | 1,500 | Lower (800) → cuts off at 8-10 triples; raise to 2,000 for denser windows |
+| Triple count rule | 10–15/window | Lower minimum to 5 for stub-article windows; raise maximum to 20 for very dense factual passages |
 
-**Block 3 — Neo4j write transaction with MERGE semantics.**
+**Block 3 — `extract_triples()` — single window extraction.**
 
 ```python
-def write_triples_to_neo4j(tx, article_id: str, article_title: str, triples: list[dict]):
-    for t in triples:
-        s, r, o = t.get("subject"), t.get("relation"), t.get("object")
-        if not (s and r and o):
-            continue
-        rel_type = re.sub(r'[^A-Z_]', '_', r.upper().replace(' ', '_'))[:40] or "RELATED_TO"
-        tx.run(
-            f"""
-            MERGE (a:Entity {{name: $s}})
-            MERGE (b:Entity {{name: $o}})
-            MERGE (a)-[rel:{rel_type}]->(b)
-            ON CREATE SET rel.source_article = $aid, rel.source_title = $title,
-                          rel.raw_relation = $r
-            """,
-            s=s, o=o, aid=article_id, title=article_title, r=r,
+def extract_triples(text: str) -> list[dict]:
+    resp = omlx.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": EXTRACT_SYSTEM},
+            {"role": "user",   "content": text},
+        ],
+        temperature=0.1,
+        max_tokens=1500,
+        response_format={"type": "json_object"},
+    )
+    try:
+        return json.loads(resp.choices[0].message.content).get("triples", [])
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
+```
+
+The function signature changed from v9: `text[:3500]` truncation is gone. The caller (`_extract_one`) now hands pre-chunked windows; truncation was the root cause of the 80% article-coverage loss diagnosed in Bad-Case Journal Entry 10. The function only sees one window at a time — it has no memory of previous windows for the same article. That statelessness is intentional: it keeps `extract_triples` simple and makes parallelism safe (no shared mutable state between window calls).
+
+The `except (json.JSONDecodeError, AttributeError, TypeError)` broadens v9's `except json.JSONDecodeError`. The `AttributeError` case handles `resp.choices[0].message.content = None`, which occurs when a reasoning model exhausts its token budget on chain-of-thought before emitting visible content. The `TypeError` handles the rare case where the model returns a non-string content field. All three exceptions produce the same recovery: return an empty list and let the caller continue with the next window.
+
+**Block 4 — `write_triples_to_neo4j()` — QID-keyed MERGE with APOC.**
+
+```python
+def write_triples_to_neo4j(tx, ..., qid_map: dict[str, str | None]):
+    ...
+    s_keys = {"qid": s_qid} if s_qid else {"name": s}
+    o_keys = {"qid": o_qid} if o_qid else {"name": o}
+    s_on_create = ({"name": s, "aliases": [s]} if s_qid else {})
+    ...
+    tx.run(
+        f"""
+        CALL apoc.merge.node(['Entity'], $s_keys, $s_on_create, {{}}) YIELD node AS a
+        CALL apoc.merge.node(['Entity'], $o_keys, $o_on_create, {{}}) YIELD node AS b
+        FOREACH (_ IN CASE WHEN $s_qid IS NOT NULL AND NOT $s_name IN coalesce(a.aliases, []) ...
+            SET a.aliases = coalesce(a.aliases, []) + $s_name
         )
+        MERGE (a)-[rel:{rel_type}]->(b)
+        ON CREATE SET rel.source_article = $aid, ...
+        """,
+        ...
+    )
 ```
 
-The three `MERGE` operations do exactly one thing each: find a node or relationship with the given identity, and create it only if it doesn't already exist. This is what enables cross-article entity resolution. When the article on "Tim Cook" and the article on "Apple Inc." both mention "Apple Inc.", the `MERGE (a:Entity {name: "Apple Inc."})` in both calls resolves to the same node — the graph now has a path between "Tim Cook" and the iPhone because they share an intermediate "Apple Inc." node.
+The `qid_map` parameter is the v12 addition. When QID is present, `s_keys = {"qid": s_qid}` — the MERGE identity is the Wikidata canonical ID, not the surface form. Two articles that mention the same entity under different surface forms both produce `{"qid": "Q211098"}` as their identity map and therefore write to the same node. When QID is absent (entity not in Wikidata, or Wikidata lookup failed), `s_keys = {"name": s}` falls back to the pre-v12 name-based MERGE path — this is a graceful degradation, not a failure.
 
-The relation-type transformation `re.sub(r'[^A-Z_]', '_', r.upper().replace(' ', '_'))` needs careful reading. It proceeds in steps: `replace(' ', '_')` converts spaces to underscores (turning "founded by" into "founded_by"); `.upper()` uppercases everything (→ "FOUNDED_BY"); `re.sub(r'[^A-Z_]', '_', ...)` replaces any remaining non-letter, non-underscore character (hyphens, dots, digits from things like "co-founder") with underscores; `[:40]` truncates. The fallback `or "RELATED_TO"` covers the case where the entire cleaned string is empty — possible if the LLM emits a relation consisting entirely of digits or punctuation.
+`apoc.merge.node(labels, identity_props, on_create_props, on_match_props)` replaces the v9 inline `MERGE (a:Entity {name: $s})`. APOC's version accepts a parameter map as the identity key — exactly what's needed for conditional-key logic. The alternative, inline Cypher branching (`CASE WHEN $s_qid IS NOT NULL THEN MERGE ... ELSE MERGE ... END`), is not valid Cypher syntax in standard Neo4j. APOC is the correct tool here.
 
-`ON CREATE SET` rather than `ON MATCH SET` is intentional: you want the first article that creates a relationship to win on provenance metadata. If "Apple Inc." → "Steve Jobs" is first created by the Apple Inc. article, that article's title and ID are stored. Subsequent articles seeing the same triple would `MATCH` the existing relationship and skip the `SET` clause, preserving the original provenance.
+The `aliases` list and "first writer wins" for `name`: when a QID-keyed node is created (`ON CREATE`), `name` is set to the first surface form encountered and `aliases` is seeded with that form. On subsequent writes (`ON MATCH`), the `FOREACH` block appends the new surface form to `aliases` only if it's not already present (idempotent). This means the canonical `name` property holds the first-seen surface form (typically the article's own title), while `aliases` accumulates every variant seen across all articles. Operators can audit which surface forms collapsed into a canonical node by querying `n.aliases`.
 
-The `t.get("subject")` pattern with the `if not (s and r and o): continue` guard handles malformed LLM output gracefully. If the model emits `{"subject": "Apple", "relation": null, "object": "Cupertino"}` — which happens occasionally with small models on short articles — the triple is skipped rather than raising a `TypeError` inside the Cypher execution.
-
-**Block 4 — Main loop and session management.**
+**Block 5 — `_extract_one()` worker — sliding windows + QID resolution.**
 
 ```python
-with driver.session() as session:
-    session.run("MATCH (n) DETACH DELETE n")
-    for article in tqdm(corpus):
-        triples = extract_triples(article["text"])
-        if triples:
-            session.execute_write(
-                write_triples_to_neo4j,
-                article["id"], article["title"], triples,
-            )
-        total_triples += len(triples)
+def _extract_one(article, resolver=None):
+    windows = sentence_window_chunks(
+        article["text"],
+        target_chars=WINDOW_CHARS,
+        overlap_chars=WINDOW_OVERLAP_CHARS,
+        min_window_chars=MIN_WINDOW_CHARS,
+    )
+    all_triples = []
+    for window in windows:
+        all_triples.extend(extract_triples(window))
+
+    qid_map = {}
+    if resolver is not None:
+        unique_names = {t["subject"] for t in all_triples if t.get("subject")}
+                     | {t["object"]  for t in all_triples if t.get("object")}
+        qid_map = resolver.resolve_batch(unique_names)
+
+    return article, all_triples, qid_map, len(windows), None
 ```
 
-`session.execute_write` wraps the callable in an explicit write transaction with automatic retry on transient errors (network blips, Neo4j write conflicts). This is the correct pattern for write-heavy workloads — it avoids the silent data loss that can occur when you use `session.run` directly outside a transaction and a connection drops mid-article.
+The per-article worker pattern has two phases: extract all windows (LLM-bound, sequential within the article), then resolve all unique entity-names in one batch (I/O-bound, parallel across names via `QIDResolver.resolve_batch`). The batching matters: ~70-100 triples per article yields ~140-200 entity mentions; after dedup that's typically 50-300 unique names. `resolve_batch` fans those out to 16 concurrent Wikidata HTTPS calls instead of 50-300 sequential ones — the resolution phase takes ~5-10s/article with batching vs ~10-30s with serial resolution.
 
-The `if triples:` guard skips the database write entirely for articles where extraction returned an empty list. This matters because `write_triples_to_neo4j` called with an empty list would open a transaction, do nothing, and close it — ~5 ms of overhead per article that adds up across 200 articles.
+The exception catch `except Exception as exc` returns the error in the tuple instead of raising it. This is the correct pattern for a thread-pool worker: an exception in one article's worker must not kill the entire pool and abort the other 399 articles. The main loop checks `if exc is not None:` and logs the error without stopping. This degrades gracefully — one extraction failure means one article with zero triples, not a full build abort.
 
-`tqdm` provides a progress bar that shows estimated time remaining — critical for a step that runs 8–12 minutes. Without it, you have no signal whether the script is stuck on a long article or just processing normally.
+`sentence_window_chunks` (from `shared/rag_hybrid/chunking.py`) produces sentence-boundary-aware windows, meaning no window splits mid-sentence. This matters for extraction quality: a window that cuts off "Steve Jobs, co-founder of Apple Inc., was born in" at the truncation boundary would produce a malformed triple with no object. Sentence-aware chunking eliminates this class of extraction noise.
 
-**Common modifications.** To target a different model, change `MODEL_SONNET` in your `.env`. Any OpenAI-compatible endpoint works: Ollama serving Llama-3.1, an MLX server, or the actual OpenAI API. For production-scale corpora, parallelise `extract_triples` across articles using `concurrent.futures.ThreadPoolExecutor` — the LLM extraction step is I/O-bound (waiting on the local model server), so 4–8 workers typically cuts wall time by 3–5× without overloading the inference server.
+**Block 6 — `main()` — index lifecycle, thread pool, summary metrics.**
 
-**Expected runtime on M5 Pro (400 articles, Gemma-4-26B via MLX):**
+```python
+def main():
+    resolver = QIDResolver(Path("data/wikidata_qid_cache.json"))
+    ...
+    with driver.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
+        session.run("CREATE FULLTEXT INDEX entity_names IF NOT EXISTS ...")
+        session.run("CREATE INDEX entity_qid IF NOT EXISTS ...")
+        session.run("CREATE INDEX entity_name IF NOT EXISTS ...")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(_extract_one, article, resolver) ...]
+            for fut in tqdm(as_completed(futures), ...):
+                article, triples, qid_map, n_windows, exc = fut.result()
+                ...
+                session.execute_write(write_triples_to_neo4j, ..., qid_map)
+    resolver.save()
+```
+
+The `QIDResolver` is instantiated once and shared across all workers. Thread-safety is handled inside the resolver (a `threading.Lock` guards cache writes). Sharing one resolver means the disk cache is populated by the first worker to encounter an entity name, and all subsequent workers get a cache hit — the alternative (one resolver per worker, merged at the end) would require ~6× the Wikidata API calls on the first run.
+
+The three index CREATEs before extraction form the crash-recovery contract (see `★ Insight` above). The ordering matters: the `DETACH DELETE` runs first (clean state), then all three indexes are created. The `entity_qid` range index is new in v12 — during the build, each `apoc.merge.node(['Entity'], {qid: "Q211098"}, ...)` call does a property lookup against all Entity nodes. Without a range index on `qid`, that's a full label scan per triple. With the index, it's a log-time lookup. At 400 articles × ~80 triples × 2 entities = ~64K MERGE-by-qid operations, the index reduces build time by 5-10 minutes.
+
+`as_completed(futures)` processes articles in completion order rather than submission order. This means the `tqdm` progress bar advances as fast as the fastest worker, not in the serial order articles were submitted. The per-article `tqdm.write` log line (chars/windows/triples/qid/rate/ETA) is the primary observability mechanism during the 40-minute build — each line is one article's summary, and the operator can spot anomalies (e.g., an article with 0 triples across 12 windows signals a prompt failure).
+
+**Common modifications.**
+
+| Change | When |
+|---|---|
+| Lower `MAX_WORKERS` to 2-3 | Small hardware (≤16 GB unified), or if oMLX server shows queue saturation |
+| Raise `WINDOW_CHARS` to 5,000 | Dense reference articles (encyclopedias, legal docs) where entity relationships span longer sections |
+| Set `resolver=None` in `_extract_one` | Disable QID resolution for a fast test run (no Wikidata calls, name-based MERGE only) |
+| Replace `QIDResolver` with internal KB | Enterprise: swap Wikidata calls for an internal CRM/ERP API. The resolver interface (`resolve_batch`) stays the same. |
+| Swap Gemma-4-26B for a cloud model | Change `MODEL_SONNET` in `.env` — any OpenAI-compatible endpoint works |
+
+**Expected runtime on M5 Pro (400 articles, Gemma-4-26B, MAX_WORKERS=6):**
 
 | Stage | Wall time |
 |---|---|
-| Neo4j clear (`DETACH DELETE`) | < 1 s |
-| LLM extraction (400 articles × ~2–3 s/article) | 16–24 min |
-| Neo4j writes (MERGE operations) | ~15–30 s total |
-| **Total** | **~17–25 min** |
-
-#### 2.1.1 Walkthrough update — v11 fixes (2026-05-01)
-
-Two `build_graph.py` changes landed in v11 (commit `a44f3c8`): the index-lifecycle bug fix and the active-voice extraction rule. Both alter behavior on FUTURE corpus rebuilds; existing graph state is unaffected (use `normalize_passive_triples.py` for the existing graph — see §2.3 below).
-
-**Fix 1 — Index lifecycle. CREATE moved BEFORE extraction.**
-
-```python
-# v9: DROP-then-extract-then-CREATE — mid-loop crash leaves graph
-# queryable but un-searchable.
-# v11: CREATE-then-extract — IF NOT EXISTS makes the index idempotent;
-# the index is always present in a known good state after the script
-# runs, even on extraction crash.
-with driver.session() as session:
-    session.run("MATCH (n) DETACH DELETE n")
-    session.run(
-        "CREATE FULLTEXT INDEX entity_names IF NOT EXISTS "
-        "FOR (n:Entity) ON EACH [n.name]"
-    )
-    # ... extraction loop ...
-    # No CREATE here anymore — moved up.
-```
-
-The pre-fix sequence was: `DROP INDEX → 40-min LLM extraction loop → CREATE INDEX`. If extraction crashed mid-loop (OOM, network blip, ctrl-C, oMLX server restart), the DROP had already executed but CREATE never ran. The graph remained queryable via Cypher but `query_graph.py`'s `db.index.fulltext.queryNodes("entity_names", ...)` calls failed with `no such fulltext schema index: entity_names`. Operator had to recreate the index manually before queries worked again — and the failure was silent (no warning, no log) until someone tried to query.
-
-The forward-fix exploits CREATE FULLTEXT INDEX's `IF NOT EXISTS` semantic, which makes the operation idempotent. On a fresh DB, CREATE makes the index. On a rebuild against an existing DB, CREATE is a no-op. Either way the index is present after the script completes its initial setup, so any extraction crash leaves the graph in a recoverable state — the operator just re-runs the extraction loop without needing to manually fix the index.
-
-**Fix 3a — Active-voice extraction rule.**
-
-```diff
- EXTRACT_SYSTEM = """Extract entities and relationships from the text segment.
- Output JSON only: {"triples": [{"subject": str, "relation": str, "object": str}, ...]}.
-
- Rules:
- - Use the exact surface form that appears in the text for subject/object.
-+- **Always emit triples in ACTIVE voice.** If the source text is passive
-+  ("Apple was acquired by NeXT"), invert subject/object so the agent is
-+  the subject: emit subject="NeXT", relation="acquired", object="Apple".
-+  Applies to all by-suffix passives ("X was founded by Y", "X was published
-+  by Y", "X was sold to Y"). For passives where the subject is genuinely
-+  the patient ("John was awarded the Nobel Prize", "John was named CEO"),
-+  keep subject=John — the relationship describes John, not the agent. Use
-+  linguistic judgment per triple, not a fixed list.
- - Relations are 1-4-word verb phrases. Include BOTH:
-```
-
-The ~190 reversed-direction triples in the v9-v10 graph (top: WAS_ACQUIRED_BY 54, WAS_FOUNDED_BY 39, FOUNDED_BY 35, WAS_SOLD_TO 33, PUBLISHED_BY 32) all stem from the LLM extracting passive-voice relations literally from source text. Apple's Wikipedia page contains the sentence "Apple acquired NeXT in 1996" — fine. But Steve Jobs's page contains "the company [Apple] was acquired by NeXT" (because the Jobs article narrates from his POV), and the LLM emitted that as `(Apple, "acquired by", NeXT)` preserving text order. Result: graph stores `Apple Inc. -[ACQUIRED_BY]-> NeXT` which reads as "Apple was acquired by NeXT" — semantically backwards.
-
-The active-voice rule is **open-vocab compatible** — it doesn't enumerate verbs (no static `WAS_X_BY → X` table). The LLM applies linguistic judgment per triple. Cases where the subject is genuinely the patient ("John was awarded the Nobel Prize", "Larry Page was a member of Stanford") explicitly carve out, so the rule doesn't over-flip.
-
-The rule adds ~30 prompt tokens × 2800 windows on a 400-article rebuild = ~84K extra prompt tokens. Free on local oMLX (gemma-4-26B); ~1¢ on cloud APIs. Bad-Case Journal Entry 8 (index lifecycle) and entry 10 (multi-hop ceiling diagnostics) both reference this fix.
-
-**Common modifications.** None — both fixes are correctness changes, not tuning levers. To revert: `git checkout 264813e -- lab-02-5-graphrag/src/build_graph.py`. To verify the active-voice rule is taking effect on next build: post-build, run `MATCH ()-[r]->() WHERE type(r) ENDS WITH '_BY' RETURN type(r), count(*) ORDER BY count(*) DESC` — expected count of WAS_*_BY / *_BY predicates should drop dramatically vs the prior build.
+| Neo4j clear + index CREATE | < 5 s |
+| QID resolver init (load disk cache) | < 0.5 s |
+| LLM extraction (~400 articles × ~7 windows × ~3 s/window) | ~35-40 min |
+| QID resolution, first run (~13K names, 16-way parallel Wikidata) | ~2 min |
+| QID resolution, rebuild (disk cache, all hits) | < 0.5 s |
+| Neo4j writes (APOC MERGE operations) | ~2-4 min |
+| **Total (first run)** | **~40 min** |
+| **Total (rebuild with warm cache)** | **~38 min** |
 
 #### 2.3 Mini-Lab — `src/normalize_passive_triples.py` (v11 follow-up, 2026-05-01)
 
@@ -1039,18 +1334,20 @@ driver = GraphDatabase.driver(
 
 
 def extract_seed_entities(query: str) -> list[str]:
-    """Use haiku to pick 1-5 candidate entities from the query."""
+    """Use MODEL (non-reasoning) to pick 1-5 candidate entities from the query."""
     resp = omlx.chat.completions.create(
-        model=HAIKU,
+        model=MODEL,  # non-reasoning; HAIKU (gpt-oss-20b) is a reasoning model
+                      # that burns max_tokens on chain-of-thought and returns
+                      # content=None — see Bad-Case Journal Entry N.
         messages=[
             {"role": "system", "content": "Extract 1-5 named entities from the query as a JSON list of strings. Entities are concrete nouns: companies, people, places, products."},
             {"role": "user",   "content": query},
         ],
-        temperature=0.0, max_tokens=150,
+        temperature=0.0, max_tokens=2000,  # uniform ceiling across all call sites
         response_format={"type": "json_object"},
     )
     try:
-        data = json.loads(resp.choices[0].message.content)
+        data = json.loads(resp.choices[0].message.content or "")
         return data.get("entities", []) if isinstance(data, dict) else data
     except json.JSONDecodeError:
         return []
@@ -1569,6 +1866,145 @@ Decomposition runs AFTER default `fetch_subgraph` (1-hop priority + multi-hop fi
 | **Total per query** | **~7-15 s** (multi_hop dominates) |
 
 Latency cost: ~2× higher than v10c because every query now pays the decomposition classifier (~3-5s). Mitigation: regex pre-filter or off-by-default. The +0.05 ALL recall lift + +0.25 relational lift justify the cost on this corpus + eval.
+
+#### 3.1.3 Walkthrough update — relational bridge + PPR fallback + query-type router (post-v11)
+
+After v11, two additional retrieval strategies were added and integrated via a priority-chain router in `answer()`. The relational bridge targets two-entity relationship questions; Personalized PageRank (PPR) acts as a last-resort fallback when all structured paths return zero edges. The router prevents PPR from flooding targeted decomposition output — the key empirical finding that fixed the v13 regression.
+
+★ Insight ─────────────────────────────────────
+- **PPR must be gated, not unconditional.** Adding PPR unconditionally regressed multi_hop recall (Q20 0.60→0.20, Q23 1.00→0.33): for queries where decomposition already found targeted edges, PPR's 200 additional edges from globally high-PageRank neighbors buried the decomposition output in LLM context. The fix is the gate: `if not matches_per_seed.get("__decomposition__"): run PPR`. Bridge and PPR are complementary (bridge enriches; it doesn't replace), but decomposition and PPR are competing (decomposition is a full targeted retrieval; PPR is noise on top of it).
+- **Relational bridge uses shared-neighbor intersection, not hardcoded predicates.** For a two-entity relationship query ("what connects Apple and Pixar?"), the bridge fetches each entity's 1-hop neighborhood and intersects by shared neighbor names in Python. No edge-type specification required — works for founders, investors, board members, alumni, or any other bridge relation. The intersection pattern generalizes to any domain without prompt tuning.
+- **PPR propagates through ALL edge types via GDS wildcard projection.** The GDS graph is projected with `type='*', orientation='UNDIRECTED'` — every edge type participates. This is exactly the property that makes PPR complementary to decomposition's targeted regex matching: an education edge `"received a bachelor of science degree from Stanford"` and a simple `"attended Stanford"` both reach the same alumni nodes because ALL edges are included, with no regex needed.
+─────────────────────────────────────────────────
+
+**Block 8 — Relational bridge (`_find_bridge_edges`).**
+
+```python
+def _find_bridge_edges(e1: str, e2: str) -> list[dict]:
+    def _get_neighbor_edges(session, lucene):
+        rows = session.run("""
+            CALL db.index.fulltext.queryNodes("entity_names", $lucene) YIELD node, score
+            WITH node ORDER BY score DESC LIMIT 3
+            MATCH (node)-[r]-(m:Entity)
+            RETURN m.name AS name, startNode(r).name AS s, r.raw_relation AS rel,
+                   endNode(r).name AS o, r.source_title AS src
+            LIMIT 150
+        """, lucene=lucene)
+        buckets = defaultdict(list)
+        for row in rows:
+            buckets[row["name"]].append({"s": row["s"], ...})
+        return dict(buckets)
+
+    nbrs_a = _get_neighbor_edges(session, l1)
+    nbrs_b = _get_neighbor_edges(session, l2)
+    shared = set(nbrs_a.keys()) & set(nbrs_b.keys())
+    bridge = []
+    for intermediate in sorted(shared):
+        bridge.extend(nbrs_a[intermediate])
+        bridge.extend(nbrs_b[intermediate])
+    return bridge
+```
+
+The bridge fires when: the query contains a relationship keyword ("relationship", "connection", "connected", "related", "between", "link"), exactly 2 seeds are extracted, and decomposition returned no plan. The condition is tight by design — all three guards must be satisfied. The `_RELATIONAL_KWS` frozenset at module level is the first filter; `len(seeds) == 2` is the second; `decomp_plan is None` is the third (if decomposition already handled the query, bridge would be redundant).
+
+The bucket structure (`dict[neighbor_name, list[edges]]`) groups edges by the intermediate entity's name. The Python-side set intersection then identifies which intermediaries appear in both neighborhoods. This is more efficient than a Cypher `MATCH (a)-[]-(m:Entity)-[]-(b)` two-hop query because it avoids Cypher's combinatorial path enumeration for dense nodes — fetch each side independently (bounded by LIMIT 150 each), intersect in Python. The result is prepended to `subgraph` so bridge edges appear early in LLM context before the 1-hop/multi-hop fill.
+
+**Block 9 — PPR retrieval (`_ppr_retrieve`).**
+
+```python
+def _ppr_retrieve(seeds: list[str], top_k: int = 60) -> list[dict]:
+    if not _ensure_gds_projection():
+        return []
+    # Step 1: resolve seed names → exact graph node names via full-text index
+    seed_node_names = [...]
+    # Step 2: run PPR from those nodes via gds.pageRank.stream
+    ppr_rows = session.run("""
+        MATCH (seed:Entity) WHERE seed.name IN $names
+        WITH collect(seed) AS seeds
+        CALL gds.pageRank.stream($graph, {
+            maxIterations: 20,
+            dampingFactor: 0.85,
+            sourceNodes: seeds
+        })
+        YIELD nodeId, score
+        RETURN gds.util.asNode(nodeId).name AS name, score
+        ORDER BY score DESC LIMIT $top_k
+    """, names=seed_node_names, graph=_GDS_GRAPH, top_k=top_k)
+    top_names = [r["name"] for r in ppr_rows]
+    # Step 3: collect all edges among the top-K nodes
+    edges = session.run("""
+        MATCH (a:Entity)-[r]-(b:Entity)
+        WHERE a.name IN $names AND b.name IN $names
+        RETURN DISTINCT startNode(r).name AS s, r.raw_relation AS rel, ...
+        LIMIT 200
+    """, names=top_names)
+```
+
+PPR is a graph-native retrieval that propagates relevance scores from seed nodes through the entire graph via random walks. The `dampingFactor=0.85` (standard PageRank default) means an 85% chance of following an edge at each step and a 15% chance of teleporting back to the seed — this dampening bounds how far scores propagate from the seeds, preventing global hubs (Apple Inc., United States) from dominating every query.
+
+The `_ensure_gds_projection()` guard checks whether the in-memory GDS graph projection already exists before trying to create it. GDS projections are created once and persist in Neo4j's in-memory catalog until the server restarts or the projection is explicitly dropped. Re-creating the projection on every query would be wasteful (~200ms per projection vs ~5ms for the existence check). The function returns `False` gracefully when GDS isn't installed — PPR is silently skipped, and the rest of the retrieval pipeline proceeds normally.
+
+The three-step pattern (resolve seeds → PPR stream → edge collection among top-K) is necessary because `gds.pageRank.stream` works on GDS node IDs, not entity names. The resolution step bridges the name-based LLM world and the ID-based GDS world. The final edge collection only includes edges where BOTH endpoints are in the top-K set — this prevents "one-sided" edges (high-PPR node A connected to low-PPR node B that's irrelevant to the query) from polluting the context.
+
+**Block 10 — Priority-chain router in `answer()`.**
+
+```python
+def answer(query):
+    seeds = extract_seed_entities(query)
+    subgraph, matches_per_seed = fetch_subgraph(seeds)
+
+    # Tier 1: structured decomposition (bridge / intersection plans)
+    decomp_plan = _decompose_multihop(query)
+    if decomp_plan:
+        decomp_edges = _execute_decomposition(decomp_plan)
+        if decomp_edges:
+            subgraph = decomp_edges + subgraph  # prepend: decomp edges surface early
+            matches_per_seed["__decomposition__"] = {...}
+
+    # Tier 2: relational bridge (two-entity relationship questions)
+    if len(seeds) == 2 and decomp_plan is None and any(kw in query.lower() for kw in _RELATIONAL_KWS):
+        bridge_edges = _find_bridge_edges(seeds[0], seeds[1])
+        if bridge_edges:
+            subgraph = bridge_edges + subgraph
+            matches_per_seed["__bridge__"] = {"edges_added": len(bridge_edges)}
+
+    # Tier 3: PPR — skip when decomposition fired; allow when bridge fired or no structured method succeeded
+    if not matches_per_seed.get("__decomposition__"):
+        ppr_edges = _ppr_retrieve(seeds)
+        if ppr_edges:
+            subgraph = ppr_edges + subgraph
+            matches_per_seed["__ppr__"] = {"edges_added": len(ppr_edges)}
+```
+
+The routing logic encodes three empirical findings:
+
+**Decomposition + PPR is harmful.** When decomposition fires and finds targeted bridge edges, PPR's 200 additional edges from global PageRank neighbors introduce noise that buries the decomposition output. The LLM's "lost in the middle" effect means context order matters — PPR edges prepended before decomposition output would push the targeted edges down past the attention horizon. The gate `if not __decomposition__` is the correct boundary.
+
+**Bridge + PPR is beneficial.** The relational bridge finds shared intermediate entities; PPR propagates relevance through ALL edge types (including education edges, investment edges, etc.) and reaches nodes the bridge may have missed. For Q18 "What is the relationship between Apple and Pixar?" — bridge found shared board members; PPR found additional shared-company relationships through the PPR top-60. Result: 0.00 without PPR → 1.00 with PPR (v14 empirical finding). The gate allows PPR alongside bridge by checking `__decomposition__` only.
+
+**Prepend ordering is the attention contract.** All three retrieval paths prepend their results (`subgraph = new_edges + subgraph`). The final context order is: PPR edges → bridge edges → decomp edges → default fetch_subgraph edges. This is intentionally reversed from the collection order, because each layer is more targeted than the one above it. The LLM sees the most targeted edges (decomp) first, followed by complementary enrichment (bridge/PPR), followed by the broad baseline (default fetch). This ordering empirically prevents the "canonical 1-hop edges buried at the end" failure from the v10 regression.
+
+**Common modifications.**
+- Disable PPR when GDS is not installed: `_ppr_retrieve` already returns `[]` gracefully if `_ensure_gds_projection` fails.
+- Adjust PPR `top_k`: raise from 60 to 120 for sparse graphs (more nodes needed to find connecting edges); lower to 30 for dense graphs (reduce noise).
+- Add PPR to the decomposition path: carefully — the empirical finding is that decomp+PPR hurts on this corpus. Re-evaluate on your specific eval set before enabling.
+- Regex pre-filter for decomposition: add a fast check (`if not any(kw in query.lower() for kw in _MULTIHOP_KWS): return None`) before the LLM call to skip the 3-5s classifier cost on obviously simple queries.
+
+**Updated runtime table (post-v11 with PPR + bridge, M5 Pro warm graph):**
+
+| Stage | Wall time |
+|---|---|
+| Seed entity extraction | ~1-2 s |
+| Default `fetch_subgraph` two-pass | ~20-100 ms |
+| `_decompose_multihop` LLM classifier | ~3-5 s (every query) |
+| `_execute_decomposition` (when plan) | ~50-200 ms |
+| `_find_bridge_edges` (when 2 seeds + relational kw) | ~30-80 ms |
+| `_ppr_retrieve` (when decomp didn't fire) | ~100-300 ms (~estimated) |
+| Per-edge dedup + context serialisation | ~1-5 ms |
+| Answer generation | ~3-7 s (relational), ~5-15 s (multi_hop) |
+| **Total per query** | **~7-15 s** |
+
+PPR adds ~100-300ms when it fires (GDS projection is in-memory; the cost is the stream + edge collection, not projection creation). The dominant latency remains the decomposition classifier LLM call — every query pays this regardless of whether a plan is found.
 
 ### 3.2 Smoke test
 
