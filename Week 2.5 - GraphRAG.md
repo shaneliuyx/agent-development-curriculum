@@ -339,11 +339,11 @@ Three fields are kept: `id`, `title`, and `text`. Everything else in the Wikiped
 
 The `[:4000]` truncation deserves emphasis. A 4,000-character window is roughly 500–700 tokens for typical English prose — well within Gemma-4-26B's comfortable JSON-output range. `build_graph.py`'s actual cap is `text[:3500]`, which means this script gives 4,000 characters of headroom and lets the extractor decide its own ceiling. The small mismatch is harmless; it prevents this script from needing to know the extractor's exact token budget, keeping the two scripts loosely coupled.
 
-| Parameter | Value | Effect of changing |
-|---|---|---|
-| `split="train[:200]"` | 200 articles | Scales linearly with graph-build time (~2–3 s/article) |
-| `text[:4000]` | 4,000 chars | Must remain ≥ 3,500 to keep `build_graph.py`'s truncation from being the binding constraint |
-| `"20231101.en"` | Nov 2023 dump | Change for a different knowledge snapshot; must re-run entire pipeline |
+| Parameter             | Value         | Effect of changing                                                                          |
+| --------------------- | ------------- | ------------------------------------------------------------------------------------------- |
+| `split="train[:200]"` | 200 articles  | Scales linearly with graph-build time (~2–3 s/article)                                      |
+| `text[:4000]`         | 4,000 chars   | Must remain ≥ 3,500 to keep `build_graph.py`'s truncation from being the binding constraint |
+| `"20231101.en"`       | Nov 2023 dump | Change for a different knowledge snapshot; must re-run entire pipeline                      |
 
 **Block 3 — Write and report.**
 
@@ -358,7 +358,7 @@ The print at the end is the only verification: if the number is less than 200, t
 
 **Common modifications.** To use a different language, change `"20231101.en"` to `"20231101.fr"` (French), `"20231101.de"` (German), etc. — the downstream scripts are language-agnostic because the LLM extraction step handles multilingual text. To switch corpora entirely, replace `load_dataset(...)` with any iterable that yields dicts with `id`, `title`, and `text` keys — the schema contract is minimal. For larger runs, increase the slice to `"train[:1000]"` and budget 45–60 minutes of graph-build time.
 
-**Expected runtime on M5 Pro (200 articles, first run):**
+**Expected runtime on M5 Pro (400 articles, first run):**
 
 | Stage | Wall time |
 |---|---|
@@ -503,7 +503,7 @@ Expect ~30 minutes for MAX_ARTICLES=400 (~12 minutes for 150). Watch the progres
 **High-level architecture.**
 
 ```
-  data/corpus.json  (200 articles)
+  data/corpus.json  (400 articles)
          │
          │  for each article
          ↓
@@ -617,14 +617,14 @@ The `if triples:` guard skips the database write entirely for articles where ext
 
 **Common modifications.** To target a different model, change `MODEL_SONNET` in your `.env`. Any OpenAI-compatible endpoint works: Ollama serving Llama-3.1, an MLX server, or the actual OpenAI API. For production-scale corpora, parallelise `extract_triples` across articles using `concurrent.futures.ThreadPoolExecutor` — the LLM extraction step is I/O-bound (waiting on the local model server), so 4–8 workers typically cuts wall time by 3–5× without overloading the inference server.
 
-**Expected runtime on M5 Pro (200 articles, Gemma-4-26B via MLX):**
+**Expected runtime on M5 Pro (400 articles, Gemma-4-26B via MLX):**
 
 | Stage | Wall time |
 |---|---|
 | Neo4j clear (`DETACH DELETE`) | < 1 s |
-| LLM extraction (200 articles × ~2–3 s/article) | 8–12 min |
+| LLM extraction (400 articles × ~2–3 s/article) | 16–24 min |
 | Neo4j writes (MERGE operations) | ~15–30 s total |
-| **Total** | **~9–13 min** |
+| **Total** | **~17–25 min** |
 
 #### 2.1.1 Walkthrough update — v11 fixes (2026-05-01)
 
