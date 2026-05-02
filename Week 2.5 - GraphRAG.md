@@ -183,7 +183,7 @@ The user-driven design tree (2026-05-01 grill-me session) committed to fixing **
 | **Hop budget**              | `max_hops=5`, edge cap `LIMIT 200`, prompt edge cap `subgraph[:200]` | Bridge-style queries can require 2-3 hops (Stanford → Person → Company). Shallower limits leave bridges unfound. Deeper limits without edge caps explode context.                                                                                                                                                                           |
 | **Out-of-scope (deferred)** | Hybrid fallback to vector RAG, LazyGraphRAG, active corpus expansion | All three are production-validated patterns (HybridRAG arXiv 2408.04948; Microsoft LazyGraphRAG 2024). Each is a real follow-up; staying scoped to "increase pure-GraphRAG hit rate" for this iteration.                                                                                                                                    |
 
-### Best practices — distilled from v1 → v10
+### Best practices — distilled from v1 → v23
 
 The empirical record across 10 iterations against the same originally-failing queries:
 
