@@ -1085,6 +1085,124 @@ The Cypher dynamically creates a new relationship of the active type via `apoc.c
 | Apply phase total | ~1.5 s |
 | **Total wall time** | **~10-12 min** (judge phase dominates) |
 
+#### 2.4 Mini-Lab — `src/infer_reverse_edges.py` (directional-traversal gap fix, 2026-05-01)
+
+`infer_reverse_edges.py` closes the directional half of Leak 5 — the multi-hop ceiling that sat at 0.21 before v12. When extraction surfaces `Apple --[acquired]--> NeXT` but a question starts from NeXT's perspective, Cypher's directional traversal finds nothing: no outgoing edge was extracted from NeXT. This script scans every forward predicate in the graph, runs one LLM call per predicate to classify it as INVERSIBLE / SYMMETRIC / STATE-OF-BEING, and bulk-creates reverse edges for all INVERSIBLE predicates via `apoc.create.relationship`. An `inferred_reverse_of` audit property on every created edge keeps them distinguishable from extracted triples.
+
+★ Insight ─────────────────────────────────────
+- **Direction asymmetry is a retrieval bug, not a graph-correctness bug.** The extracted edge is correct — `Apple acquired NeXT` is a true statement stored with the right polarity. The problem is that Cypher traversal is directional: `MATCH (n:Entity {name:"NeXT"})-[r]->(m)` finds nothing because no outgoing edge was extracted from NeXT. Adding `NeXT --[ACQUIRED_BY]--> Apple` is not data duplication; it is traversal convenience with an audit trail. The `inferred_reverse_of` property keeps inferred edges explicitly second-class so they can be bulk-deleted without touching extracted data (`MATCH ()-[r]->() WHERE r.inferred_reverse_of IS NOT NULL DETACH DELETE r`).
+- **Three decision categories prevent graph pollution.** A naive `add_inverse(all)` policy would create `Seattle --[WAS_BORN_IN_BY]--> Bill Gates` alongside `NeXT --[ACQUIRED_BY]--> Apple`. The SYMMETRIC bucket (`married_to`, `merged_with`) and STATE-OF-BEING bucket (`was_born_in`, `was_president_of`) eliminate the garbage cases. Only INVERSIBLE predicates — those where the object is also a meaningful focal entity for the relation — get a reverse edge. The judge prompt encodes eight worked examples spanning all three categories; without explicit SYMMETRIC and STATE-OF-BEING exemplars the LLM over-generates in the INVERSIBLE bucket.
+- **Per-predicate judge, not per-triple.** One LLM call per unique predicate type keeps cost proportional to vocabulary size (~30-50 calls for a 400-article graph), not graph density (thousands of triples). `min-count=5` further restricts to predicates appearing at least 5 times — the same Pareto logic as `normalize_passive_triples.py`: ~35 LLM calls cover ~85% of triples.
+─────────────────────────────────────────────────
+
+**High-level flow:**
+
+```
+Discover (Cypher)               ┌─→ Judge once per predicate
+  all forward predicates        │   (gemma-4-26B JSON-mode)
+  WHERE r.inferred_reverse_of   │        ↓
+        IS NULL                 │   {add_inverse: bool,
+  AND count >= min_count        │    inverse_relation: str|null,
+  → list[{rel_type, count,      │    rationale: str}
+          sample_s, sample_raw, │        ↓
+          sample_o}]            │   INVERSIBLE: bulk-create via
+                                │     apoc.create.relationship(b, $new_type,
+                                │       {inferred_reverse_of: $forward_rel}, a)
+                                └─→ SYMMETRIC / STATE-OF-BEING: skip
+```
+
+**Block 1 — Discover forward predicates with idempotency guard.**
+
+```python
+def discover_forward_predicates(session, min_count: int = 5) -> list[dict]:
+    rows = list(session.run("""
+        MATCH (a:Entity)-[r]->(b:Entity)
+        WHERE r.inferred_reverse_of IS NULL
+        WITH type(r) AS rel_type,
+             head(collect({s: a.name, raw: r.raw_relation, o: b.name})) AS sample,
+             count(*) AS n
+        WHERE n >= $min_count
+        RETURN rel_type, sample, n
+        ORDER BY n DESC
+    """, min_count=min_count))
+```
+
+`WHERE r.inferred_reverse_of IS NULL` is the idempotency guard — it excludes relationships that were themselves created by a previous run of this script. Without this filter, the second run would discover `ACQUIRED_BY` (already an inferred reverse), judge it as INVERSIBLE (`acquired_by` → `acquired`), and create a tertiary reverse-of-a-reverse. The filter ensures only extracted predicates feed the judge.
+
+The `head(collect({s: a.name, raw: r.raw_relation, o: b.name}))` pattern picks one representative triple per predicate type. The LLM sees this one sample and reasons about the predicate class, not the individual instance. `raw_relation` (the original natural-language string before Cypher-safe normalization) is used rather than `type(r)` because `ACQUIRED` as a Cypher rel type is less informative than `"acquired"` as a natural-language string — the LLM's linguistic judgment depends on the surface form.
+
+**Block 2 — LLM judge with eight worked examples spanning all three categories.**
+
+```python
+_JUDGE_SYSTEM = """...
+A) INVERSIBLE — forward relation has a clean inverse phrasing.
+   Output: {"add_inverse": true, "inverse_relation": "<active inverse>"}
+
+B) SYMMETRIC — relation is reciprocal; querying from either side sees the same fact.
+   Output: {"add_inverse": false, "inverse_relation": null, "rationale": "symmetric"}
+
+C) STATE-OF-BEING / NOT-INVERSIBLE — subject is the natural focal entity; inverse is awkward.
+   Output: {"add_inverse": false, "inverse_relation": null, "rationale": "state-of-being"}
+
+Triple: subject="Apple Inc.", relation="acquired", object="NeXT"
+{"add_inverse": true, "inverse_relation": "acquired_by"}
+
+Triple: subject="Brad Pitt", relation="married to", object="Angelina Jolie"
+{"add_inverse": false, ..., "rationale": "symmetric — querying either side returns the same fact"}
+
+Triple: subject="Bill Gates", relation="was born in", object="Seattle"
+{"add_inverse": false, ..., "rationale": "state-of-being on subject — ..."}
+..."""
+```
+
+Eight worked examples cover: three INVERSIBLE (acquired, co-founded, invested in), two SYMMETRIC (married to, merged with), and three STATE-OF-BEING (was born in, was president of, was awarded). The coverage matters: without SYMMETRIC and STATE-OF-BEING examples the LLM over-generates INVERSIBLE — `merged_with` → `merged_with_by` is the canonical false positive these examples prevent. Empirical distribution on a 400-article graph (predicates with count >= 5): roughly 40% INVERSIBLE, 25% SYMMETRIC, 35% STATE-OF-BEING.
+
+The `"Use false branch when in doubt"` instruction biases toward conservative skipping. A missing reverse edge is a retrieval miss for queries starting from that direction; an awkward reverse edge pollutes the graph with semantically thin focal points for future multi-hop traversals. Under-generation is the safer failure mode.
+
+**Block 3 — APOC bulk-create of reverse edges with Python fallback.**
+
+```python
+def add_reverse_edges(session, forward_rel_type: str, inverse_relation: str) -> int:
+    new_rel = _safe_rel_type(inverse_relation)
+    try:
+        result = session.run(f"""
+            MATCH (a:Entity)-[r:{forward_rel_type}]->(b:Entity)
+            WHERE r.inferred_reverse_of IS NULL
+            WITH r, a, b
+            CALL apoc.create.relationship(b, $new_type, {{
+                raw_relation:        $inverse_raw,
+                source_title:        r.source_title,
+                inferred_reverse_of: $forward_rel
+            }}, a) YIELD rel
+            RETURN count(rel) AS n
+        """, new_type=new_rel, inverse_raw=inverse_relation, forward_rel=forward_rel_type)
+        return result.single()["n"]
+    except Exception as e:
+        if "apoc" not in str(e).lower():
+            raise
+        # Manual per-edge fallback ...
+```
+
+`apoc.create.relationship(b, $new_type, props, a)` — the subject/object order is the flip: `b` (original object, e.g. NeXT) becomes the new source; `a` (Apple Inc.) becomes the new target. Three properties written to the new edge: `raw_relation` (the natural-language inverse string, e.g. `"acquired_by"`), `source_title` (provenance inherited from the forward edge), and `inferred_reverse_of` (the Cypher-safe forward rel type — the audit trail that powers the rollback query).
+
+The second `WHERE r.inferred_reverse_of IS NULL` inside `add_reverse_edges` means the function is safe to call multiple times for the same predicate. The `_SAFE_REL_TYPE.match(new_rel)` check before the Cypher call catches LLM outputs that are not valid Cypher relationship-type strings (e.g. `"acquired by"` with a space) — `_safe_rel_type()` normalizes via `re.sub(r"[^A-Z_]", "_", ...)` before the check.
+
+**Common modifications.**
+- Run with `--dry-run` first: prints all INVERSIBLE / SKIP decisions without writing. Inspect before applying — especially useful to catch false positives like `COLLABORATED_WITH` being classified INVERSIBLE when it is actually symmetric.
+- Tune `--min-count`: default 5 covers high-count predicates; set to 1 for full long-tail coverage at ~3-5× LLM cost. For a 400-article graph, min-count=5 covers ~85% of triples in ~35 LLM calls; min-count=1 adds ~100 more calls for ~150 additional long-tail triples.
+- Roll back cleanly: `MATCH ()-[r]->() WHERE r.inferred_reverse_of IS NOT NULL DETACH DELETE r` removes all inferred edges without touching extracted data (extracted edges have no `inferred_reverse_of` property).
+- Rerun is idempotent: `WHERE r.inferred_reverse_of IS NULL` in both Discover and Apply phases means re-running produces zero new edges if the graph hasn't changed.
+
+**Expected runtime on M5 Pro / current graph (400 articles):**
+
+| Stage | Wall time |
+|---|---|
+| `discover_forward_predicates` (Cypher) | ~0.5 s |
+| Judge call per unique predicate (~35 × 3-5 s, min-count=5) | ~2-3 min |
+| `add_reverse_edges` per INVERSIBLE predicate (APOC) | < 50 ms each |
+| Apply phase total | ~1 s |
+| **Total wall time** | **~3-4 min** (judge phase dominates) |
+
 ### Code walkthrough — `src/wikidata_qid.py` (v12 — canonical-ID linking)
 
 `wikidata_qid.py` is the v12 entity-resolution module — a 150-line standalone utility that resolves entity-name strings to their canonical Wikidata QIDs via the `wbsearchentities` API. It exists because the v11 multi-hop ceiling was diagnosed (Bad-Case Journal Entry 10) as caused by entity surface-form fragmentation: `"Reid Hoffman"` and `"Reid Garrett Hoffman"` became separate `Entity` nodes, splitting edges across both. `build_graph.py` calls `QIDResolver.resolve_batch(unique_names)` after extraction; the returned `{name → qid}` map drives a `MERGE`-on-QID Cypher path that collapses all aliases of one canonical entity into a single node. v11.5 attempted post-hoc cosine clustering with BGE-M3 and produced catastrophic false positives (`Bill Gates ↔ Bill Thompson` at sim 0.93); v12 abandoned that approach for canonical-ID linking, which is the production-grade pattern.
@@ -2210,7 +2328,7 @@ if __name__ == "__main__":
 
 Run it and fill the result table into `RESULTS.md`.
 
-### Code walkthrough — `src/compare_vs_vector.py`
+### Code walkthrough — `src/compare.py`
 
 **Purpose:** run the same 32-question categorized eval set (7 factoid / 8 two_hop / 4 relational / 10 multi_hop / 3 out_of_domain) through Week 2's vector RAG AND this week's GraphRAG, produce a comparison matrix with both substring + LLM-judge scoring.
 
