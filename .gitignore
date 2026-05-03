@@ -12,3 +12,7 @@
 
 # Rendered output (if any)
 .tmp/
+
+# OMC runtime state — session-local, do not track
+.omc/state/
+.omc/project-memory.json
