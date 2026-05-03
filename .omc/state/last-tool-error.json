@@ -1,7 +1,0 @@
-{
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"/Users/yuxinliu/Documents/Obsidian Vault/Agent Development Curriculum/Week 2 - Rerank and Context Compression.md\"}",
-  "error": "File content (279.8KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
-  "timestamp": "2026-04-30T09:35:03.044Z",
-  "retry_count": 10
-}
