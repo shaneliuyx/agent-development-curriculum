@@ -1,11 +1,14 @@
 ---
 title: "Week 5 — The Pattern Zoo"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-5, patterns, multi-agent, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-05-pattern-zoo"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 4 lab complete (ReAct loop from scratch working)"
+audience: "Cloud infrastructure engineer (3 yrs), building multi-agent systems with pattern literacy and measured trade-offs"
+stack: "MacBook M5 Pro, 48 GB unified memory; oMLX local (Sonnet/Haiku); Python 3.11+; frameworks: CrewAI, LangGraph, AutoGen for comparison"
 ---
 
 # Week 5 — The Pattern Zoo
@@ -29,6 +32,16 @@ By the end of the week you should be able to answer "how do you choose an agent 
 - [ ] `RESULTS.md` filled with real numbers, pattern analysis, and a "which pattern won and why"
 - [ ] You can answer out loud: "When does Reflexion make an agent *worse*?" with a concrete mechanism
 - [ ] You can articulate why the writer–reviewer adversarial loop is **not** Reflexion — three structural differences (role specialisation, binary verdict + deterministic gate, independent reviewer context)
+
+---
+
+## Why This Week Matters
+
+Week 4 taught you the *one* agent loop that works. This week asks the hard question: when does that one loop fail, and what different shape do you build instead? The answer is: it depends. ReAct wins on simple factual retrieval. Reflexion wins when the first attempt is confident but wrong and needs critique to self-correct. Plan-and-Solve wins on multi-step decomposable tasks. Orchestrator-Worker wins when you can parallelize. Writer–Reviewer wins when you have asymmetric token budgets (cheap writer, expensive critic).
+
+The interview signal is unmistakable: a candidate who rattles off pattern names (ReAct, Reflexion, multi-agent) sounds like they skimmed Medium. A candidate who says "ReAct handles factoid retrieval in ~100 tokens; Reflexion adds 40% overhead but fixes 60% of confident errors on math; here's the trade-off chart" sounds like they *built* and *measured* the patterns. This week, you measure.
+
+By the end, you will own a comparison matrix with real numbers: success rate, token cost, wall time, and quality per pattern on the same task. You will be able to answer "when does pattern X beat pattern Y?" with data, not intuition.
 
 ---
 
@@ -212,6 +225,25 @@ flowchart TD
 
 > **Analogy (Infra):** A single-threaded streaming pipeline. Each stage depends on the previous output. No parallelism. The scratchpad is your in-memory state that accumulates across iterations — like a running `GROUP BY` that grows with each row.
 
+#### Pattern A — walkthrough
+
+ReAct is the linear baseline: a single LLM agent in a loop that interleaves thinking and tool calls until it produces a final answer. No parallelism, no critic, no replanner — just `reason → act → observe → repeat`, plus a deterministic post-loop gate.
+
+`★ Insight ─────────────────────────────────────`
+- **One LLM, one loop, one scratchpad.** Every part of the diagram traces back to the W4 ReAct implementation. If you understand W4, Pattern A is a thin re-skin of that loop with the addition of a deterministic post-loop quality gate (`PARSE`).
+- **The `PARSE` push-back distinguishes "Pattern A as a finished system" from "raw W4 ReAct".** Without it, you trust the LLM's first text response as the final answer. With it, a deterministic check on the structured output (e.g. `citations ≥ 3`) sends the agent back through the loop with a corrective message.
+- **Termination is a soft contract.** The agent decides when to emit a non-tool-call response. The post-loop gate may push back, but only the LLM can choose to *stop* calling tools — fundamentally different from Patterns B/D where termination is structurally forced by the DAG/orchestrator.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one company-research request.**
+1. **`User → SYS → LLM1`** — assemble system prompt + tools schema + user message; first LLM call.
+2. **`LLM1 → DISP`** — model emits a `tool_call`. Dispatch to one of `web_search` or `extract_text`.
+3. **`DISP → WS / EX → SCRATCH`** — execute tool, append result to scratchpad.
+4. **`SCRATCH → LLM1` (loop)** — while `iter < MAX_ITER`, return to LLM1 with the updated scratchpad in context.
+5. **`LLM1 → PARSE`** — model eventually emits a non-tool-call text response containing the structured report.
+6. **`PARSE → PUSH (citations < 3)`** — gate fails; append "need more sources" to scratchpad and re-enter LLM1.
+7. **`PARSE → OUT (citations ≥ 3)`** — gate passes; return CompanyReport.
+
 ---
 
 ### Pattern B — Plan-and-Solve (DAG Scheduler)
@@ -242,6 +274,25 @@ flowchart TD
 
 > **Analogy (Infra):** An Argo Workflow. The planner writes the DAG definition (task nodes + ordering). The executor runs each node. The replanner is your `on_failure_callback` — it rewrites the remaining DAG when a node fails. Plan is written once upfront; execution is deterministic.
 
+#### Pattern B — walkthrough
+
+Plan-and-Solve replaces the open-ended ReAct loop with a two-phase architecture: a Planner LLM emits a structured DAG of steps upfront, then an executor runs each node in dependency order. A Replanner is wired in as the on-failure callback.
+
+`★ Insight ─────────────────────────────────────`
+- **The plan is data, not control flow.** The Planner LLM emits JSON; the executor is plain Python that walks the DAG. This means the plan can be inspected, version-controlled, and replayed — properties Pattern A cannot give you because its "plan" is implicit in the scratchpad.
+- **Replanner is `on_failure`, not "always replan".** The DAG is built once. Only when a node fails or returns empty does the Replanner LLM get invoked to revise the *remaining* DAG. This bounds the cost — a successful run pays for one Planner call total.
+- **Synthesis is an explicit terminal step.** Unlike Pattern A where "the final report" emerges when the LLM stops calling tools, Plan-and-Solve has a named `Step N: synthesize` node. Makes "did the system finish?" a binary question.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one company-research request.**
+1. **`User → PLAN`** — Planner LLM (opus) reads the user query and emits a JSON `steps` array.
+2. **`PLAN → DAG`** — array becomes an in-memory ordered graph of step nodes.
+3. **`Step 1` (web_search background)** runs. On success → next node. On error/empty → `DLQ1` (Replanner) revises the remaining DAG.
+4. **`Step 2` (extract_text URL)** runs. On error/empty → `DLQ2` (Replanner) revises the DAG.
+5. **`Step 3` (web_search financials)** runs.
+6. **`Step N` (synthesize)** — Haiku LLM merges step outputs into the final CompanyReport.
+7. Return.
+
 ---
 
 ### Pattern C — Reflexion (Quality Loop with Critic)
@@ -269,6 +320,25 @@ flowchart TD
 ```
 
 > **Analogy (Infra):** A pipeline with a downstream quality gate that writes rejection reasons back to the source. Like a Terraform test that, on failure, appends a failure note to the model's input table and re-triggers the model run. The critic is the test. The critique history is the enriched input. The risk: if your test is wrong, re-runs produce worse output.
+
+#### Pattern C — walkthrough
+
+Reflexion adds an outer quality loop around a ReAct inner loop. A Critic LLM reads each draft, emits a score and weakness list; failed drafts re-enter the actor with the critique injected into context.
+
+`★ Insight ─────────────────────────────────────`
+- **Two loops, two budgets.** Inner loop is the W4 ReAct loop with its own `MAX_ITER`. Outer loop is the critique loop with its own `MAX_OUTER`. Both budgets must be set; either alone is insufficient.
+- **Critique is appended, not replacing.** History accumulates — iteration N sees critiques from 1..N-1. This is what makes Reflexion strictly different from "retry with a different prompt": the agent learns from its own past critiques.
+- **Best-of-N return semantics.** When `MAX_OUTER` is exhausted without hitting `score ≥ 8`, the system returns the *best* report seen across all iterations, not the last one. Otherwise a late-iteration regression would silently overwrite a good earlier draft.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one company-research request.**
+1. **`User → OUTER`** — outer loop guard.
+2. **`OUTER → INJECT`** — append critique history (empty on iter 1) to actor context.
+3. **`INJECT → REACT (inner loop)`** — actor LLM (opus) runs ReAct sub-loop with tools, produces draft.
+4. **`REACT → CRITIC`** — Critic LLM (haiku) scores the draft and emits weaknesses.
+5. **`CRITIC → OUT (score ≥ 8)`** — accept, return.
+6. **`CRITIC → HIST → OUTER (score < 8)`** — append critique to history, re-enter outer loop.
+7. **`OUTER (iter = MAX_OUTER) → BEST`** — out of budget; return best report seen across all iterations.
 
 ---
 
@@ -303,6 +373,24 @@ flowchart TD
 
 > **Analogy (Infra):** A Spark fan-out job. The orchestrator defines the partitioning strategy. Three workers execute their partitions concurrently. The dead-letter queue holds failed partitions — the job proceeds with available data and notes the gap. The synthesizer is the final reduce step.
 
+#### Pattern D — walkthrough
+
+Orchestrator-Worker fans out N parallel workers (each a small LLM agent), collects their findings, and synthesizes into a single output. Workers do not talk to each other; they only talk to the orchestrator and the synthesizer.
+
+`★ Insight ─────────────────────────────────────`
+- **Wall-time wins are the entire reason this exists.** Three sequential workers ≈ 3 × single-worker time. Three parallel workers ≈ 1 × single-worker time. On the company-research task this drops latency from ~30 s to ~10 s.
+- **DLQ is a first-class node, not an exception path.** Workers that fail or return empty go to a Dead-Letter-Queue node which logs the failure and writes a "missing data" note that the synthesizer reads. The system proceeds with whatever workers succeeded.
+- **`COLLECT ≥ 2 workers ok` is the soft-quorum gate.** Below that threshold, the system aborts rather than synthesize on insufficient data. Pattern D fails loudly when most workers fail; Pattern A would silently produce a thin report.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one company-research request.**
+1. **`User → ORCH`** — orchestrator LLM (opus) decomposes the query into 3 subtasks.
+2. **`ORCH → W1, W2, W3` (async dispatch)** — three Haiku worker agents start in parallel.
+3. **`W1, W2 → COLLECT`** — successful workers return findings JSON.
+4. **`W3 → DLQ → COLLECT`** — failed worker logs + writes "missing data" note.
+5. **`COLLECT (≥ 2 ok) → SYNTH`** — synthesizer LLM (sonnet) merges findings into final CompanyReport.
+6. **`COLLECT (< 2 ok) → FAIL`** — abort with "insufficient data".
+
 ---
 
 ### Pattern E — Writer–Reviewer Adversarial (Fix-Until-Pass Gate)
@@ -336,6 +424,25 @@ flowchart TD
 > 1. **Two roles, two system prompts** — not one agent critiquing itself.
 > 2. **Binary verdict + deterministic pre-gate** — not a soft score that invites score-gaming.
 > 3. **Independent reviewer context** — the reviewer never sees prior drafts or prior critiques, so it cannot anchor on the frame the writer has been iterating inside.
+
+#### Pattern E — walkthrough
+
+Writer-Reviewer is the only pattern in this set that uses *two distinct LLM agents with different system prompts and different context histories*. The Writer drafts; the Reviewer judges with no memory of prior rounds. A deterministic gate sits in front of the Reviewer to filter cheap-to-detect failures.
+
+`★ Insight ─────────────────────────────────────`
+- **Three structural choices that make this NOT Reflexion.** First: two roles, two system prompts — not one agent critiquing itself. Second: a deterministic pre-gate (`citations ≥ 3, 300–500 words, all URLs non-empty`) that is binary, not a soft score the writer can game. Third: independent reviewer context — the reviewer never sees prior drafts or prior critiques.
+- **The deterministic gate is the cheap filter.** Most failed drafts get rejected by `pytest + ruff`-style checks and never reach the expensive Reviewer LLM. Saves cost AND prevents the Writer from learning "how to please the gate" — the gate is mechanical, not opinion.
+- **3-attempt budget is hard.** Reviewer rejection past attempt 3 fails loudly. Patterns C and B might keep iterating; Pattern E refuses.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one company-research request.**
+1. **`User → W (Writer)`** — Writer agent (sonnet) runs a ReAct sub-loop, produces a draft.
+2. **`W → DRAFT → GATE`** — deterministic gate checks citations count, word count, URL non-empty.
+3. **`GATE FAIL → FIXES → BUDGET`** — `required_fixes` appended to next attempt; if attempts < 3 loop back to Writer.
+4. **`GATE PASS → REV`** — Reviewer (opus) reads only the draft; no history of prior rounds.
+5. **`REV verdict PASS → OUT`** — accepted CompanyReport.
+6. **`REV verdict REJECT → FIXES → BUDGET`** — same retry path as gate failure.
+7. **`BUDGET no → FAIL`** — three rejected rounds; abort with "gate not met".
 
 ---
 
@@ -1906,17 +2013,29 @@ for pattern, rows in sorted(by_pattern.items()):
 
 ### 7.2 The pattern decision tree
 
-```
-Is the task decomposable into clearly independent subtasks?
-├─ YES → Can those subtasks run in parallel?
-│         ├─ YES → Orchestrator-Worker (fan-out/fan-in)
-│         └─ NO, ordered dependencies → Plan-and-Solve (DAG)
-└─ NO → Is the task highly exploratory / search-like?
-          ├─ YES → ReAct (linear interleaved reasoning)
-          └─ NO → Does quality need iterative refinement?
-                    ├─ YES, errors are structural/visible → Reflexion
-                    └─ YES, hallucinations are likely → ReAct + external validator
-                                                         (NOT naive Reflexion)
+```plantuml
+@startuml PatternDecisionTree
+start
+:User task arrives;
+if (Decomposable into\nclearly independent subtasks?) then (yes)
+  if (Subtasks run in parallel?) then (yes)
+    :**Orchestrator-Worker**\n(fan-out / fan-in);
+  else (no, ordered deps)
+    :**Plan-and-Solve**\n(DAG);
+  endif
+else (no)
+  if (Highly exploratory /\nsearch-like task?) then (yes)
+    :**ReAct**\n(linear interleaved reasoning);
+  else (no)
+    if (Quality needs iterative\nrefinement?) then (yes — errors\nstructural / visible)
+      :**Reflexion**;
+    else (yes — hallucinations\nlikely)
+      :**ReAct + external validator**\n(NOT naive Reflexion);
+    endif
+  endif
+endif
+stop
+@enduml
 ```
 
 > **What this means:** The tree encodes the key insight from your data. Orchestrator-Worker wins on wall time for parallelizable tasks. Plan-and-Solve wins on token efficiency for long-horizon ordered tasks. ReAct is the safest default for exploratory tasks. Reflexion improves quality only when errors are structurally visible — if you expect confident hallucinations, Reflexion can make things worse. Bring this tree to interviews. Draw it on the whiteboard. Quote a number from your results at each node.
@@ -2124,6 +2243,25 @@ sequenceDiagram
     Manager-->>User: complete
 ```
 
+#### Pattern F (Swarm) — diagram walkthrough
+
+The sequence diagram shows the **manager-as-router** dynamic: a `GroupChatManager` arbitrates which agent speaks next at every turn. Three role agents (Researcher, Writer, Critic) participate but none owns the conversation — control returns to the manager after each turn.
+
+`★ Insight ─────────────────────────────────────`
+- **Every turn is a manager LLM call.** The manager runs its own LLM round-trip after every agent message to decide next speaker. This is the latency tax: an N-turn swarm pays N+1 LLM calls just for routing, before any actual work.
+- **No global turn budget visible at the agent level.** Each agent only sees its own turn; only the manager tracks the conversation as a whole. Termination is the manager's responsibility — typically `max_turns` or detection of an `APPROVED` token.
+- **Agents can self-handoff.** In AutoGen, an agent can name another agent inside its message and the manager honors the routing. This makes the topology emergent rather than planned.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — sequence read top-to-bottom.**
+1. **`User → Manager`** — initial task arrives at the manager.
+2. **`Manager → Researcher`** — manager picks Researcher as first speaker by role relevance.
+3. **`Researcher → Manager`** — emits research notes, control returns.
+4. **`Manager → Writer → Manager`** — Writer drafts based on notes.
+5. **`Manager → Critic → Manager`** — Critic reviews the draft.
+6. **`Manager → Writer → Manager`** — manager routes back to Writer for revision based on critique.
+7. **`Manager → User`** — task complete.
+
 ### Code Skeleton — CrewAI 3-Agent
 
 ```python
@@ -2188,6 +2326,25 @@ stateDiagram-v2
     quality_check --> llm_node : quality == "revise"
     quality_check --> [*] : quality == "done"
 ```
+
+#### Pattern G (State-Machine) — diagram walkthrough
+
+The state diagram is the LangGraph-style architecture in canonical form: nodes are pure functions reading/writing typed state, edges are conditional transitions evaluated against that state. There is no manager LLM, no transcript, no emergent ordering — just a graph compiled at design time.
+
+`★ Insight ─────────────────────────────────────`
+- **State is shared, transcript is not.** Each node reads/writes the typed `ResearchState` dict. There is no shared message history; the graph is the coordination primitive, not the conversation.
+- **Conditional edges are pure Python functions.** `route_after_quality(state) → "write" | END` is a deterministic routing function — no LLM call to decide where to go next. This is the latency win vs Swarm.
+- **`[*]` is the only START and END.** Re-entry from `quality_check` to `llm_node` is a back-edge, not a new entry. This makes replay deterministic: re-applying the state transitions reproduces the run exactly.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — graph traversal.**
+1. **`[*] → router`** — entry node decides if a search is needed based on initial state.
+2. **`router → search_tool` (`needs_search == true`)** — execute tool, write results to state.
+3. **`router → llm_node` (`needs_search == false`)** — skip tool, go straight to draft generation.
+4. **`search_tool → llm_node`** — tool results land in state, draft node consumes them.
+5. **`llm_node → quality_check`** — draft produced, route to quality node.
+6. **`quality_check → llm_node` (`quality == "revise"`)** — revise loop; check `revision_count` ceiling inside the function.
+7. **`quality_check → [*]` (`quality == "done"`)** — terminate.
 
 ### Code Skeleton — LangGraph 4-Node
 
@@ -2278,6 +2435,33 @@ app = graph.compile()
 | F — Swarm | Role-heavy, emergent critique | Low | High | High | Pipelines; latency-critical |
 | G — State-Machine | Enumerable branches; compliance; HITL | High | Low | Low | Exploratory tasks where graph topology is unknown |
 
+## Bad-Case Journal
+
+**Entry 1 — Forked worker silently breaks prompt cache.**
+*Symptom:* Orchestrator spawns N parallel workers; after first 2–3 workers complete, wall time per worker triples and cost balloons 2–3× expected. No error in logs; workers report success.
+*Root cause:* Child agents modify `maxOutputTokens` to give workers more budget for their scoped task — seems innocent. But the cache key includes inference config, so each worker's modified parameter invalidates the prompt cache. Subsequent worker LLM calls pay full prefix scan cost instead of cached hit. With 10 parallel workers, 10 independent cache misses compound to catastrophic cost.
+*Fix:* Pass cache-critical parameters (system prompt, user context, tool schema, model config) unchanged from parent to child. If a worker truly needs different `maxOutputTokens`, use a separate API call with explicit cache_control override, not a silent parameter mutation. Auditor: add a lint rule that flags `fork()` calls where child agent re-specifies `maxOutputTokens`, `temperature`, or other inference config without an explicit `# cache-aware` comment.
+
+**Entry 2 — Reflexion loop amplifies confident hallucination.**
+*Symptom:* Pattern C (Reflexion) agent produces a well-cited, well-structured company report on a non-existent startup. Critic LLM reviews, agrees the citation formatting is solid, suggests minor hedging tweaks. Agent revises with better-sounding language. Report circulates internally before someone fact-checks — all citations are fabricated.
+*Root cause:* Critic model (Sonnet, same family as actor Opus) evaluates plausibility by LLM likelihood, not external ground truth. When actor confidently hallucinates (e.g., "Founded 2018 by ex-Google engineers"), the critic has no independent signal to contradict — only surface-level checks like "is the date format valid" and "does the company name appear in the text?". Actor's confident frame anchors critic's expectations; revision loop reinforces the frame instead of breaking it.
+*Fix:* (a) Use a critic model from a different family or tier (e.g., Haiku critic on Opus actor, not Opus on Opus). (b) Add a deterministic pre-gate: if actor's output contains unverifiable claims (company founding, financial figures, historical dates), gate to external fact-checker API *before* critic evaluates quality. (c) For high-stakes outputs, prefer Pattern E (Writer-Reviewer Adversarial) over Pattern C — separate context, deterministic pre-check, binary verdict from reviewer who hasn't seen prior iterations.
+
+**Entry 3 — Worker self-certifies, orchestrator rubber-stamps.**
+*Symptom:* Orchestrator (Pattern D) dispatches research worker on "who is CTO of Anthropic?". Worker returns `{"name": "Dario Amodei"}` (incorrect — Dario is CEO). Worker's success boolean is `true`. Orchestrator synthesizes final report stating Dario is CTO. No error; nothing broke.
+*Root cause:* Pattern D diagram shows workers returning results; orchestrator collects them. No explicit verification stage. Worker's `success=true` is self-reported confidence, not independent verification. Orchestrator has no adversarial path — synthesizer just forwards worker output.
+*Fix:* Make verification a separate agent. Orchestrator dispatches research worker, *then* independently dispatches verification worker with instructions "you have seen no prior context; you are skeptical; independently verify these claims: [worker output]. Return `verified=true` or `verified=false` with evidence." Only synthesizer reads verified results. If verification fails, orchestrator sends both worker output and verification feedback to a replanner agent — worker does not self-correct, a third agent revises the plan.
+
+**Entry 4 — Parallel workers have nondeterministic race condition on shared state.**
+*Symptom:* Orchestrator forks 5 parallel workers on same task, passing a shared context dict with accumulated findings. Worker 3 updates `context["sources"]` (appending a found paper); Worker 1 is simultaneously iterating over `context["sources"]` to check for duplicates. Iteration fails silently (dict size changed during iteration) or reads partial data. Final report has duplicate citations and gaps. Bug does not reproduce — depends on OS scheduling.
+*Root cause:* Shared mutable state between parallel agents. No isolation. Worker 3's write races with Worker 1's read. Context is passed by reference, not copied.
+*Fix:* Clone read state at fork time; each worker gets an immutable snapshot. Workers write to their own local `results_dict`, not shared context. After all workers complete, orchestrator merges results with explicit deduplication (keyed by URL/DOI). Pattern 4 concept: "state isolation by default; sharing is an explicit opt-in." Enforce in code: `child_context = copy.deepcopy(parent_context)` before `fork()`.
+
+**Entry 5 — Synthesis bottleneck: orchestrator rubber-stamps without reading.**
+*Symptom:* 4 workers produce quality reports; orchestrator calls synthesizer with all 4 outputs concatenated into a mega-context. Synthesizer emits final report in 2 seconds without reading any worker output carefully — just sampling first 50 tokens of each and filler text. Report is incoherent.
+*Root cause:* Orchestrator is responsible for synthesis per Concept 5, but implementation treats it as a pass-through. Synthesizer has no incentive to be thorough — context is too large, model knows it, defaults to high-level summary instead of actually integrating the findings.
+*Fix:* Synthesizer must be the bottleneck, not the workers. Reduce context size: (a) ask each worker to emit a 100-token summary, not full reasoning; (b) orchestrator reads summaries, identifies contradictions, and sends structured synthesis request: "Workers A and B disagree on founding date. Worker A says 2015, cites TechCrunch. Worker B says 2018, cites LinkedIn. Resolve." (c) Use a strong model (Opus) for synthesis, not a cost-optimized one (Haiku). Synthesis is where the quality lives.
+
 ## Interview Soundbites
 
 **State-machine vs swarm:** "Swarm pattern is appealing because agents look after each other, but that collaboration costs: every turn is an LLM call, transcript grows until context saturates, and you cannot easily unit-test emergent turn-ordering. State-machine removes all three. When I can enumerate the branches — research, write, quality-check, conditionally revise — I define them as typed edges in LangGraph; routing becomes pure Python. I can test it, replay from checkpoint, interrupt for human review at any node. State-machine by default for production; swarm only when task genuinely requires open-ended back-and-forth I cannot pre-specify."
@@ -2332,6 +2516,25 @@ flowchart LR
 ```
 
 No central orchestrator. Each agent decides when to read its mailbox and what to send to other mailboxes. Coordination is a property of the message graph, not a controlling process.
+
+#### Pattern H (Async Mailbox) — diagram walkthrough
+
+The flowchart shows the actor-model coordination: each agent has its own mailbox, agents read/write asynchronously, no central orchestrator. Coordination is a property of the message graph, not a controlling process.
+
+`★ Insight ─────────────────────────────────────`
+- **No turn counter, no global ordering.** Each agent runs on its own cadence. Some agents may process dozens of messages while others process one. This is the architectural difference from Swarm/State-Machine — synchronous coordination is gone.
+- **Mailboxes are durable.** A mailbox is typically a Redis list or Kafka topic — agent crashes do not lose messages, agents can reconnect and resume. State-Machine state is in-process; mailbox state survives.
+- **Agents need not be LLMs.** Agent C in this diagram could be a deterministic data fetcher, a SQL executor, or a webhook responder. The mailbox protocol is the coordination contract; the agent implementation is opaque.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — message flow.**
+1. **`A1 (Research) → writes task → M2 (Mailbox B)`** — Research agent posts a writing task.
+2. **`A2 (Writer) → reads → M2`** — Writer polls its mailbox, picks up the task.
+3. **`A2 → writes draft → M3 (Mailbox C)`** — Writer publishes draft to Reviewer's mailbox.
+4. **`A3 (Reviewer) → reads → M3`** — Reviewer picks up draft, runs review.
+5. **`A3 → writes feedback → M2`** — Reviewer sends feedback back to Writer's mailbox.
+6. **`A2 → writes done → M1 (Mailbox A)`** — Writer signals completion to Researcher.
+7. **`A1 → reads → M1`** — Research agent learns task is complete.
 
 ### Code Skeleton — Redis-backed Mailbox
 

@@ -1,7 +1,10 @@
 ---
 title: "Week 3.5 — Cross-Session Memory"
 created: 2026-04-24
+updated: 2026-05-03
 tags: [agent, curriculum, week-3-5, memory, mem0, qdrant, runbook]
+audience: "Cloud infrastructure engineer (3 yrs), building stateful agent systems"
+stack: "MacBook M5 Pro, mem0 (local via pip), Qdrant on Docker, SQLite, Python 3.11+"
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03-5-memory"
 estimated_time: "5 hours over 1–2 days"
@@ -13,6 +16,14 @@ prerequisites: "Week 3 lab complete (RAG eval harness working) + Qdrant running 
 > Goal: build an agent that remembers a user's preferences across three or more separate conversations, using `mem0` (open-source memory layer) + Qdrant for vector-addressable facts + SQLite for structured user state. Exit with a working demo, a recall benchmark, and a crisp answer to the interview question "how do you give an agent long-term memory?"
 
 This is a **half-week insert** between Week 3 and Week 4. It adds ~5 hours to Phase 1 and closes a real portfolio gap: before this lab, every agent you've built is session-local. Cross-session memory is the product feature behind ChatGPT's "memories," Claude Projects' context, and most 2026 consumer-agent products. It's also the thing interviewers will probe once you've explained RAG cleanly — "RAG gives your agent knowledge; what gives it a relationship?"
+
+---
+
+## Why This Week Matters
+
+Every agent you've built up to now forgets. Close the browser tab, or start a new session, and the model has no idea who you are or what you've told it before. RAG solved *knowledge* amnesia (agents can now retrieve documents); this week solves *relationship* amnesia — agents remember facts about their users across separate conversations.
+
+This is production critical. ChatGPT's "memories" feature, Claude Projects' context persistence, and every 2026 consumer AI product stores facts extracted from conversations. The interview signal is distinct: candidates who can articulate the four memory types (working, episodic, semantic, procedural), explain the extract→store→retrieve→inject lifecycle, and describe the dual-store topology (vector for episodes, relational for semantic facts) demonstrate they understand agent state management as a system design decision, not a feature checkbox.
 
 ---
 
@@ -117,6 +128,28 @@ flowchart TB
 
 **Why two stores:** semantic facts need exact-match queries (`SELECT value FROM user_facts WHERE key='location'`) AND a uniqueness constraint for the archive-on-contradiction rule — those are RDBMS strengths. Episodic memories are free-form and retrieved by similarity — that's a vector-store strength. Forcing both into one store makes one of the two query patterns painful.
 
+#### Diagram 1 Walkthrough — Dual-Store Topology
+
+The dual-store topology separates memory into two tiers: SQLite for durable facts (location, preferences, role) and Qdrant for episodic events (conversations, observations, task completions). This split is foundational because semantic queries demand ACID isolation and contradiction resolution, while episodic retrieval demands vector similarity. A single unified store forces you to sacrifice one query pattern — prod at both and neither performs. The diagram shows the agent's REPL reading from both stores at turn-start, then writing to both after the model responds, with contradiction detection in the semantic write path to maintain single-source truth.
+
+`★ Insight ─────────────────────────────────────`
+- **Two-tier split avoids false choice**: SQLite (exact match + uniqueness + audit trail) + Qdrant (free-form + similarity) solves different problems with appropriate tools, not a compromise that half-works for both
+- **Archive-on-conflict, not update-in-place**: New semantic facts don't overwrite old ones; old rows get `archived=1` so audit trail and revert paths remain available
+- **Read-before-call, write-after-reply**: Model sees memories in system prompt (read path), then memory extraction runs async post-reply (write path) so user never waits on extraction latency
+`─────────────────────────────────────────────────`
+
+**Data flow (numbered nodes):**
+1. **chat.py REPL** — user session entry point; owns read/respond/write cycle
+2. **extract_memories** — haiku-class LLM call; distills conversation into `{semantic: [], episodic: []}` 
+3. **write_semantic_fact** — SQLite insert/update with contradiction detection; returns "new" / "updated" / "unchanged"
+4. **write_episodic** — Qdrant upsert; embeds text, stores with payload (user_id, session_id, timestamp)
+5. **recall** — reads both stores; fetches live facts from SQLite, top-k episodes from Qdrant by vector similarity
+6. **Stores**: SQLite (key/value + archived flag) and Qdrant (1024-dim, COSINE distance)
+
+**Why this matters in interviews**: Explain that you separated concerns by storage technology, not by trying to build a one-size-fits-all memory system. Show you understand why `SELECT WHERE key=?` and vector-similarity search are different enough that forcing them into one backend is a footgun.
+
+---
+
 ### Diagram 2 — Single-Turn Lifecycle (read → respond → write)
 
 ```mermaid
@@ -165,6 +198,33 @@ sequenceDiagram
 ```
 
 Two beats that separate this from Reflexion-style self-critique: **(a)** the read path runs **before** the model call — the model sees memories in its system prompt as context, not as a post-hoc correction; **(b)** the write path runs **after** the reply is shown to the user, so memory extraction never adds latency to the visible response. In production you'd move step 12 onward onto a background queue (Celery, RQ, or a simple `asyncio.create_task`) so the user never waits on memory writes.
+
+#### Diagram 2 Walkthrough — Single-Turn Lifecycle (read → respond → write)
+
+The sequence diagram choreographs a single agent turn: the agent reads existing memories at request-start (steps 1–6), feeds them into the system prompt, calls the LLM (steps 7–9), and then asynchronously extracts and stores new memories after showing the user the reply (steps 10–13). The critical insight is the *order*: read before model call, write after user sees the response. This avoids Reflexion's latency penalty (where the model waits for critique) and preserves the archive-on-contradiction invariant (contradiction detection runs in the write path, not in the read path). The diagram shows autonumbered steps so you can trace what happens at each stage — who calls whom, when does Qdrant get involved, which step involves the LLM.
+
+`★ Insight ─────────────────────────────────────`
+- **Eager read, lazy write**: Model gets memory context upfront (read path = synchronous, visible), writes happen after reply (write path = async, invisible to user latency)
+- **Two LLM calls, different models**: Recall is lightweight (no LLM); extraction uses haiku (cheap) after the main model call; archive-on-contradiction uses LLM-based diff detection
+- **Contradiction detection is write-time, not read-time**: Old semantic facts are archived only when a *new* fact contradicts them, not preemptively; this lets the model see prior context and decide if the new fact should actually replace it
+`─────────────────────────────────────────────────`
+
+**Sequence steps:**
+1. **User sends message** → chat.py receives it
+2. **chat.py calls recall(user_id, user_message)** → fetch live facts + episodic top-k
+3. **Recall queries SQLite** → SELECT live facts (archived=0)
+4. **Recall queries Qdrant** → vector search for similar episodes
+5. **Recall returns both** → {semantic_facts, relevant_episodes}
+6. **chat.py injects memory block** → prepend to system prompt
+7. **chat.py calls LLM** → chat.completions(system + history + user_msg)
+8. **LLM responds** → assistant reply ready
+9. **chat.py displays reply** → user sees response (no memory latency!)
+10. **chat.py calls extract_memories** → haiku-model: distill turn into {semantic, episodic}
+11. **For each semantic fact** → write_semantic_fact() handles archive-on-conflict
+12. **For each episodic summary** → write_episodic() embeds and upserts to Qdrant
+13. **Both stores updated** → SQLite + Qdrant consistency maintained
+
+**Interview framing**: "Memory read is synchronous and happens before the model call so the context is fresh. Memory write is asynchronous and happens after the user sees the response so extraction latency never blocks the user. The write path also handles contradiction detection — if a new fact contradicts an old one, we archive the old one instead of overwriting it."
 
 ---
 
@@ -391,6 +451,82 @@ def format_memory_block(memory: dict) -> str:
             lines.append(f"- {e}")
     return "\n".join(lines)
 ```
+
+#### Code Walkthrough — src/memory.py
+
+`src/memory.py` is the memory backend contract — all extraction, write, and read logic lives here. It exports four public functions: `extract_memories()` (distill conversation), `write_semantic_fact()` (SQLite archive-on-conflict), `write_episodic()` (Qdrant upsert), and `recall()` (fetch both stores). The module bootstraps Qdrant on import (idempotent create-collection) and wraps the oMLX client so every call uses the same model config. The key design: extraction is cheap (haiku model, JSON mode), semantic writes are deterministic (SQL logic), episodic writes are idempotent (Qdrant upsert with UUID), and reads merge both stores before returning to the caller.
+
+`★ Insight ─────────────────────────────────────`
+- **JSON mode extraction**: LLM extraction is not summarization—it's structured output via `response_format={"type": "json_object"}` with a strict schema, so the model cannot deviate into prose
+- **Archive-on-conflict, not UPDATE**: When a new semantic fact contradicts an existing one, the old row gets `archived=1` (not deleted), preserving audit trail and allowing rollback if the new fact is wrong
+- **UUID per episodic, not per session**: Qdrant upsert uses UUID per memory, not per session; this allows the same episode (e.g., "user mentioned they love cycling") to appear in multiple sessions' episode stores without collision
+- **Similarity threshold on retrieval**: Qdrant queries set `threshold > 0.35` to reject low-confidence matches; raw cosine similarity is too noisy without this gate
+`─────────────────────────────────────────────────`
+
+**Block 1 — Module init + Qdrant bootstrap (lines 249–263).**
+
+The module imports clients (OpenAI for oMLX, Qdrant for vector store), loads environment, and initializes a Qdrant collection. The key is **idempotent**: `qdrant.collection_exists()` check before create means re-importing this module does not error out — critical for testing and interactive environments. The collection is 1024-dim (bge-m3 embedding size) with COSINE distance. Note that you configure all of this once here; every later function call re-uses the same client instances.
+
+**Block 2 — extract_memories() (lines 287–300).**
+
+Extraction is the LLM call that turns a user message + assistant response into `{semantic: [], episodic: []}`. The prompt is hardcoded (lines 267–279) and examples-based — it shows the model what a semantic fact looks like (structured key/value) and what an episodic memory looks like (one-sentence summary). The `response_format={"type": "json_object"}` is critical: it forces the LLM to output valid JSON without prose wrapper. Temperature = 0.0 (deterministic). Max_tokens = 400 (enough for ~5 facts + ~5 episodes). Failure case: if the response is not valid JSON, catch and return empty lists (graceful degradation).
+
+Why this matters: extraction is the compression step — you could skip it and store raw turns, but then retrieval returns verbose transcripts instead of crisp facts. The LLM is forced to distill.
+
+**Block 3 — write_semantic_fact() (lines 305–330).**
+
+This is the archive-on-conflict logic. For a given (user_id, key), check if a live row exists. If none, insert. If it exists and value is unchanged, return "unchanged" (no-op). If it exists and value differs, archive the old row (UPDATE archived=1) and insert a new row. This preserves audit trail: you can query archived facts to see what the user previously stated and when it changed.
+
+Why archive instead of update: Audit trail + revert safety. If the new fact is wrong, you can revert to the old one. If you UPDATE in place, you lose history.
+
+The UNIQUE constraint `(user_id, key, archived)` allows multiple rows per key as long as only one has `archived=0`. This enforces single-source truth for live facts.
+
+**Block 4 — write_episodic() (lines 333–341).**
+
+Episodic writes are idempotent: embed the memory text using bge-m3, generate a UUID, and upsert into Qdrant with payload (user_id, session_id, text). Upsert = insert if not exists, update if exists (by ID). The payload metadata allows filtering by user during retrieval.
+
+Why upsert: if the same text appears multiple times, it gets the same embedding and overwrites the same Qdrant point (same UUID). This is fine — episodes are additive and duplicates don't hurt.
+
+**Block 5 — remember_turn() (lines 344–352).**
+
+Orchestrator that calls extract_memories, then writes both semantic and episodic facts. Returns a summary of what was written (status per fact, count of episodes). This is called from the REPL after the LLM response is shown to the user.
+
+**Block 6 — recall() (lines 407–428).**
+
+Read path: fetch all live semantic facts (archived=0) and top-k episodic memories by similarity. Episodic hits are filtered by `score > 0.35` to reject low-confidence noise. Returns merged dict with both. The query embedding is computed by calling embed() on the incoming query string.
+
+Why the 0.35 threshold: cosine similarity on 1024-dim embeddings can be high by chance; 0.35 is an empirical threshold that rejects noise. Tune this per your corpus — too low and you get irrelevant episodes, too high and you miss relevant ones.
+
+**Block 7 — format_memory_block() (lines 431–441).**
+
+Formats the recalled memory dict into a prompt-injectable string. The model sees this block prepended to its system prompt:
+```
+Known facts about this user:
+- location: Taipei
+- diet: vegan
+
+Relevant past interactions:
+- user mentioned they are preparing for an agent-engineering interview
+- user asked about setting up LangGraph for a customer-support agent
+```
+
+This is the injection point where memory becomes context.
+
+**Common modifications:**
+- **Change embedding model**: Edit line 283 (`embed()`) to use a different model (e.g., "nomic-embed-text-v1.5" instead of bge-m3). Update COLLECTION vector size accordingly.
+- **Tune episodic threshold**: Line 423 `if h.score > 0.35` — lower for recall, raise for precision.
+- **Archive retention**: Add a TTL by querying `SELECT * FROM user_facts WHERE archived=1 AND updated_at < CURRENT_TIMESTAMP - 30 days` and deleting old archives periodically.
+- **Confidence scoring**: Add a confidence column to semantic facts and use it to rank retrieved facts; higher confidence facts get injected first.
+
+**Expected runtime (M5 Pro):**
+- extract_memories (haiku, JSON mode): ~150–200 ms per turn
+- write_semantic_fact (SQLite): ~2–5 ms per fact
+- write_episodic (Qdrant embed + upsert): ~20–30 ms per episode
+- recall (SQLite + Qdrant query): ~10–20 ms
+- Total memory write latency (post-reply): ~200–300 ms for a turn with 5 facts + 5 episodes
+- Total memory read latency (pre-model): ~10–20 ms (unnoticed by user)
+
+---
 
 ### 2.2 The chat REPL that uses it
 
@@ -637,6 +773,35 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 - Extension: add **procedural memory** via system-prompt augmentation — after 20 turns, an LLM reads episodic history and emits "operating guidance for this user" sentences that get appended to the system prompt. This is how ChatGPT-style "custom instructions" are learned rather than manually written.
 - Interview prep: this lab is the strongest evidence you have for the "how does your agent remember things?" follow-up. Bring the three-session demo transcript in your portfolio.
 
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Retrieval returns contradiction: "lives in Taipei" and "just moved to Tokyo" both rank high.**
+*Symptom:* User updates location across sessions. `recall()` returns both semantic facts, or both episodic memories. Model gets conflicting context and either refuses to answer or hallucinates a merge.
+*Root cause:* Semantic facts not deduplicated on key. Two live rows exist for the same user+key because contradiction detection failed (extraction said different things; `value` field mismatch passed UNIQUE constraint). Episodic memories from different sessions both match the query embedding.
+*Fix:* Semantic facts must enforce `UNIQUE(user_id, key, archived)` at schema level. On contradiction, query live facts by key and archive old before write. For episodic retrieval, set a relevance threshold (similarity > 0.7) so old irrelevant memories don't surface.
+
+**Entry 2 — Extraction returns structurally invalid JSON; pipeline crashes silently.**
+*Symptom:* `extract_memories()` calls `json.loads()`, which throws `JSONDecodeError` on some turns. Try-except silently returns empty dicts; facts aren't written; user has no idea memory didn't persist. Later queries fail silently.
+*Root cause:* Model sometimes returns markdown-wrapped JSON (```json ... ```) or raw text comments before JSON. Extraction prompt doesn't enforce strict JSON mode (or model doesn't support it).
+*Fix:* Force JSON mode in API call: `response_format={"type": "json_object"}` in OpenAI SDK. Add regex extraction as fallback: `re.search(r'\{.*\}', resp, re.DOTALL)` before `json.loads()`. Log extraction failures loudly; don't swallow errors.
+
+**Entry 3 — Seed-entity matching fails; graph traversal finds zero edges.**
+*Symptom:* `recall()` successfully retrieves episodic memories ("user mentioned cycling"). But semantic facts retrieval returns empty because the embedding of "cycling" doesn't match the stored fact's embedding (e.g., fact stored as "hobby=cycling" during extraction, but query embedded just the word "cycling").
+*Root cause:* Extraction and retrieval use the same embedding model, but extraction embeds the full semantic fact string while retrieval embeds the isolated query term. Vocabulary mismatch.
+*Fix:* On write, embed both the full fact string and the key+value separately; store both embeddings. On retrieval, search both. Alternatively, normalise by always embedding in context: extract time writes `f"{key}={value}"` and retrieval embeds incoming query as `f"user fact: {query}"`.
+
+**Entry 4 — Memory writes cause N+1 queries on user table lookups.**
+*Symptom:* `write_semantic_fact()` does a SELECT to check for live facts, then UPDATE/INSERT. In a multi-turn session, this repeated SELECT per turn causes 50 queries to SQLite. Latency compounds; agent response stalls.
+*Root cause:* No indexing; no connection pooling. Each write is a separate sqlite3.connect(), which is slow. SELECT-then-write pattern is atomic at app level but not DB level.
+*Fix:* Add `CREATE INDEX idx_user_facts_live ON user_facts(user_id, archived)` (already in schema). Use connection pool or keep one persistent connection per session. Or, use `INSERT OR REPLACE` with a trigger to handle contradictions atomically on the DB side.
+
+**Entry 5 — Memory injected into prompt exceeds context window.**
+*Symptom:* After 20 turns, `recall()` returns 30+ semantic facts and 50+ episodic summaries. System prompt + retrieved facts + conversation now exceeds 4K tokens on a 4K model, context exhausted, model fails.
+*Root cause:* No cap on `recall()` results. Every fact ever stored is eligible for retrieval and injection. Memory growth is unbounded.
+*Fix:* Add `LIMIT k` to retrieval queries (e.g., `LIMIT 20` for facts). Implement TTL (facts older than 30 days get archived). Implement confidence-weighted eviction: each fact has a `confidence` score; lowest scores are archived when store hits cap. Summarise old facts: after N days, run an LLM over episodic history to emit "permanent takeaways" (semantic facts) and archive the raw episodes.
 
 ---
 

@@ -7,9 +7,16 @@ time_estimate: "12–15 hours"
 prerequisites: "Weeks 1–11 complete. lab-07, lab-08, lab-09 repos exist locally. Phoenix running. At least one RESULTS.md per lab."
 week: 12
 phase: 4
+updated: 2026-05-03
+audience: "Cloud infrastructure engineer (3 yrs), ready to make their agent work visible and apply for roles"
+stack: "MacBook M5 Pro; GitHub; cloud VCS (private repo shadowing); Miro for architecture diagrams; screen recording software"
 ---
 
 # Week 12 — Capstone & Mocks: Ship Week
+
+## Why This Week Matters
+
+Eleven weeks of private learning just happened — that is serious depth. But recruiters cannot read your mind, and hiring managers cannot evaluate a folder on your laptop. The only metric that matters this week is not what you learned but what you shipped. A polished GitHub repo with a README that tells a story in sixty seconds, three supporting lab repos cross-linked, real numbers in a published write-up, and ten tailored applications beats twenty private notebooks every single time. The distinction is visibility: technical depth + public presence = interview conversations. Technical depth alone = silence. This week forces you to flip your mindset from "private learning" to "portfolio as narrative." Every artifact — README, RESULTS.md, diagram, screencast, write-up — is part of a single coherent story that answers three questions immediately: what did you build, why does it matter, how do you know it works. The hiring manager has thirty seconds. The README is your first interview. The screencast removes ambiguity about what "works" actually looks like. The published write-up proves you ran the benchmark, not just read about it. The cross-linked repos show depth. This week is not about building anything new technically; it is about making what you already built legible, defensible, and discoverable.
 
 ---
 
@@ -151,9 +158,107 @@ Scoring: retrieval depth ✓✓✓, agent patterns ✓, infra story ✗, differe
 
 #### Capstone A — Architecture Diagram
 
-![Capstone A — Legal RAG Architecture](assets/diagrams/week-12/capstone-a-legal-rag.png)
+```plantuml
+@startuml
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam ArrowColor #444
+skinparam ArrowFontColor #444
+skinparam ArrowFontSize 11
+skinparam DefaultFontName Helvetica
+skinparam shadowing false
 
-> *Diagram source: [`diagrams/week-12/gen_capstone_a_legal_rag.py`](https://github.com/shaneliuyx/agent-prep/blob/main/diagrams/week-12/gen_capstone_a_legal_rag.py) — regenerable Python script.*
+skinparam rectangle {
+    BackgroundColor White
+    BorderColor #777
+    FontColor #222
+}
+
+skinparam database {
+    BackgroundColor #F3E5F5
+    BorderColor #7B1FA2
+    FontColor #4A148C
+}
+
+rectangle "Multi-Tenant Input" as Input #E1F5FE {
+    rectangle "Tenant A\nLaw Firm ABC" as TenantA #BBDEFB
+    rectangle "Tenant B\nLaw Firm XYZ" as TenantB #BBDEFB
+}
+
+rectangle "Access Control" as AccessControl #FFF3E0 {
+    rectangle "Extract Tenant ID\nfrom request" as ExtractID #FFE0B2
+    rectangle "Tenant ACL Gate\nverify corpus access" as ACLGate #FFE0B2
+}
+
+rectangle "Query Processing" as QueryProc #F5F5F5 {
+    rectangle "Out-of-Scope\nClassifier" as OOSClassifier #EEEEEE
+    rectangle "Query Router" as QueryRouter #EEEEEE
+}
+
+rectangle "Retrieval Pipeline" as RetrievalPipe #F3E5F5 {
+    rectangle "Dense Retrieval\nBGE-M3 over Qdrant" as DenseRetrieval #E1BEE7
+    rectangle "Reranker\nCross-encoder" as Reranker #E1BEE7
+    rectangle "Context Assembly" as ContextAssembly #E1BEE7
+}
+
+rectangle "Model Layer" as ModelLayer #E8F5E9 {
+    rectangle "Claude 3.5 Sonnet\nor local Qwen" as Model #C8E6C9
+    rectangle "Citation Enforcer\nstructured output" as CitationEnforcer #C8E6C9
+}
+
+rectangle "Safety and Compliance" as Safety #FFEBEE {
+    rectangle "Refusal Handler\nblocked or out-of-scope" as RefusalHandler #FFCDD2
+    rectangle "Audit Logger\nSQLite append-only" as AuditLogger #FFCDD2
+}
+
+rectangle "Observability and Eval" as Obs #EDE7F6 {
+    rectangle "Phoenix Traces\nper query" as Phoenix #D1C4E9
+    rectangle "Eval Dashboard\nRAGAS metrics" as EvalDash #D1C4E9
+}
+
+database "Qdrant\nPer-Tenant Collections" as Qdrant
+database "Audit Log\nAppend-Only Record" as AuditLogDB
+
+TenantA --> ExtractID
+TenantB --> ExtractID
+ExtractID --> ACLGate
+
+ACLGate --> OOSClassifier : approved
+ACLGate --> RefusalHandler : denied
+
+OOSClassifier --> QueryRouter : in-scope
+OOSClassifier --> RefusalHandler : out-of-scope
+
+QueryRouter --> DenseRetrieval
+DenseRetrieval <--> Qdrant
+DenseRetrieval --> Reranker
+Reranker --> ContextAssembly
+ContextAssembly --> Model
+Model --> CitationEnforcer
+
+CitationEnforcer --> AuditLogger
+RefusalHandler --> AuditLogger
+AuditLogger --> AuditLogDB
+AuditLogger --> Phoenix
+Phoenix --> EvalDash
+
+@enduml
+```
+
+**Architecture callouts:**
+- **Tenant ACL Gate** (orange): enforces per-tenant access — no cross-tenant leakage. One Qdrant collection per tenant.
+- **Out-of-Scope Classifier** (orange): blocks refusal topics (billing disputes, confidential matter escalation) before retrieval to save latency.
+- **Citation Enforcer** (green): structured output constraint forces every answer to reference source documents. No floating hallucinations.
+- **Audit Log** (red): immutable append-only record of query → tenant → retrieved docs → answer. Table schema: `(timestamp, tenant_id, query, doc_ids, answer, citations, latency_ms)`. Use for compliance, debugging, and eval.
+
+**Distinguishers from baseline RAG:**
+- Per-tenant vector collections (Qdrant namespace or separate store)
+- ACL gate before retrieval (not post-hoc)
+- Deterministic out-of-scope classifier (LLM free, rules-based)
+- Structured output with citations (Pydantic schema)
+- Append-only audit log (immutable, queryable for eval)
+
+**Interview angle:** "The ACL gate runs before retrieval to prevent a single query from leaking across tenant boundaries. The audit log is not an afterthought — it's the artifact that proves compliance and calibrates the RAGAS eval. A hiring manager sees the diagram and immediately understands you designed for multi-tenancy constraints, not just added them later."
 
 > **Polish tip:** The ACL gate and audit log are what separates Capstone A from a generic RAG chatbot. If your diagram does not show both, your README is not telling the right story.
 

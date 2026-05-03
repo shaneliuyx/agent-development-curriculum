@@ -1,11 +1,14 @@
 ---
 title: "Week 3 — RAG Evaluation"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-3, rag, eval, ragas, phoenix, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03-rag-eval"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 1 + Week 2 labs complete"
+audience: "Cloud infrastructure engineer (3 yrs), building measurable RAG systems"
+stack: "MacBook M5 Pro, RAGAS on oMLX (Sonnet), Qdrant on Docker, Python 3.11+, Phoenix for tracing"
 ---
 
 # Week 3 — RAG Evaluation
@@ -20,6 +23,12 @@ prerequisites: "Week 1 + Week 2 labs complete"
 - [ ] Full Phoenix tracing wired (every retrieval → rerank → compress → generate has a span)
 - [ ] `ARCHITECTURE.md` (ADR) explaining final pipeline choices
 - [ ] `RESULTS.md` with A/B tables + screenshots of Phoenix traces
+
+---
+
+## Why This Week Matters
+
+Weeks 1–2 built a working pipeline. This week forces you to measure it — and prove you can improve it reproducibly. In production, "it seems to work" has a short shelf life: you'll face queries it fails on, stakeholders asking "is this better than the old way?" and your own uncertainty about whether a change actually helped. Without a grounded dev set and repeatable metrics, you're flying blind. This week teaches you the observable floor for each component (retriever recall, reranker precision, generator faithfulness) so you can cold-answer "which part is the bottleneck?" in interviews. You'll also learn why RAGAS metrics measure what they do (and what they don't), how to A/B test retrieval variants without redesigning your whole pipeline, and how to calibrate production guardrails from offline benchmarks. The outcome is the ability to confidently claim: "I measured this, these are the failure modes, here's my fix."
 
 ---
 
@@ -949,9 +958,15 @@ Parallelizing LLM-backed checks (faithfulness, relevance) recovers ~30% of the l
 
 ### Bad-Case Journal
 
-**Faithfulness gate blocks correct answer due to paraphrase.** User asks "What is the cancellation window?" Context says "48 hours". Model answers "two-day window". Judge fails to resolve "two-day" as equivalent to "48 hours"; scores claim as unsupported. Gate fires; user sees refusal for factually correct response. Mitigation: include few-shot examples of numeric equivalence in judge prompt, or two-pass approach where first pass rewrites answer in context vocabulary before scoring.
+**Entry 1 — Faithfulness gate rejects paraphrase of correct answer.**
+*Symptom:* User asks "What is the cancellation window?" Retrieved context says "48 hours". Model answers "two-day window" (semantically equivalent, factually correct). Faithfulness judge scores the claim as unsupported. Gate fires; user sees refusal for factually correct response.
+*Root cause:* LLM-judge faithfulness metric decomposes answers into atomic claims and checks entailment. Judge sees "two days" and "48 hours" as distinct claims; no explicit equivalence relation or few-shot example teaches numeric/temporal conversion. Entailment check fails on paraphrases requiring domain knowledge or unit reasoning.
+*Fix:* Add few-shot examples of numeric equivalence to the judge prompt: `{claim: "two days", context: "48 hours", entailed: true}`. Alternatively, two-pass approach where first pass rewrites the answer in exact context vocabulary ("two-day window" → "48-hour window" using retrieved phrase) before faithfulness scoring.
 
-**Toxicity classifier false-positives on medical Q&A.** Clinical decision-support context with medication overdose thresholds. Llama Guard (trained on consumer safety) flags as self-harm content. Mitigation: domain-specific classifier fine-tuned on clinical data, or pre-classification context tag ("clinical professional mode") that shifts decision boundary.
+**Entry 2 — Toxicity classifier false-positives on clinical Q&A.**
+*Symptom:* Clinical decision-support system retrieves context with medication overdose thresholds ("lethal dose is X mg"). User asks legitimate dosing question. Llama Guard toxicity classifier flags context as self-harm content. Guardrail blocks response before retrieval/generation runs.
+*Root cause:* Llama Guard trained on consumer safety (preventing self-harm promotion). Medical language (overdose, lethal dose, thresholds) triggers identical patterns as self-harm instructions, but in clinical context is legitimate reference material. Domain-agnostic classifier cannot distinguish and has no mechanism to condition on document provenance or domain tags.
+*Fix:* Three options: (1) Use domain-specific toxicity classifier fine-tuned on clinical data. (2) Add pre-classification context tag ("clinical professional mode") that shifts decision boundary. (3) Reorder pipeline: run toxicity check *after* retrieval so guardrail can condition on retrieved document metadata. Route clinical corpora through separate guardrail pipeline tuned for medical language.
 
 ### Interview Soundbite
 

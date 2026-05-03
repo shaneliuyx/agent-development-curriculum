@@ -1,11 +1,14 @@
 ---
 title: "Week 9 — Faithfulness Checker"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-9, hallucination, faithfulness, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-09-faithfulness-checker"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 3 RAG Evaluation complete; dev set at data/dev_set.jsonl"
+audience: "Cloud infrastructure engineer (3 yrs), building hallucination detection and truthfulness verification for production RAG systems"
+stack: "MacBook M5 Pro; oMLX for inference; NLI models (RoBERTa-base); SelfCheckGPT; Python 3.11+"
 ---
 
 # Week 9 — Faithfulness Checker

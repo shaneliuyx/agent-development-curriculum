@@ -1,11 +1,14 @@
 ---
 title: "Week 3.7 — Agentic RAG (LangGraph-Canonical Architecture)"
 created: 2026-04-27
+updated: 2026-05-03
 tags: [agent, curriculum, week-3.7, rag, agentic-rag, langgraph, runbook, expansion-week]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03.7-agentic-rag"
 estimated_time: "6–8 hours over 2–3 sessions (expansion week — lighter than main weeks)"
 prerequisites: "Weeks 1–3 complete (single-pass RAG baseline + RAGAS eval harness must exist); Week 5 ReAct loop helpful but not required"
+audience: "Cloud infrastructure engineer (3 yrs), building production RAG systems that handle ambiguous queries"
+stack: "MacBook M5 Pro, 48 GB unified memory; oMLX or vLLM for inference; LangGraph + Qdrant + BGE-M3"
 ---
 
 # Week 3.7 — Agentic RAG (LangGraph-Canonical Architecture)
@@ -19,6 +22,12 @@ prerequisites: "Weeks 1–3 complete (single-pass RAG baseline + RAGAS eval harn
 - [ ] One CRAG (Corrective RAG) variant implemented with confidence-threshold + web-fallback
 - [ ] `RESULTS.md` with comparison matrix + decision tree ("when does Agentic RAG help vs hurt?")
 - [ ] You can name the 7 architectures from the Singh et al. survey + the 4 canonical papers (CRAG / Adaptive-RAG / GeAR / Agent-G) cold
+
+---
+
+## Why This Week Matters
+
+Week 3 teaches single-pass RAG — the linear pipeline (dense retrieve → rerank → compress → synthesize) that dominates most production tutorials. But single-pass has a hard limitation: when retrieval fails on ambiguous queries, the whole system fails. There is no recovery path. This expansion week teaches the production-default successor: Agentic RAG, a 5-node graph where the agent itself judges retrieval relevance, rewrites queries when needed, and loops until confident or budgeted. The canonical shape is now standard across LangChain 1.0, LlamaIndex, and every production RAG system published in 2025–2026. In interviews, the distinction matters: candidates who know "RAG" at the 2024 single-pass level answer differently from candidates who can articulate why Agentic RAG costs 2–4× latency but earns graceful degradation on hard queries. This week is lighter than main weeks (6–8 hours vs 12–15) because most infrastructure reuses your Week 1–3 artifacts. What is new is the graph topology, the grading node, and the empirical comparison showing *when* the cost is worth it. You measure the lift on ambiguous queries specifically and walk out able to defend the architecture choice in production decisions, not just tutorials.
 
 ---
 
@@ -551,7 +560,7 @@ Open [[Week 4 - ReAct From Scratch]] when this lab's `RESULTS.md` is committed. 
 
 ## Cross-References
 
-- **Builds on:** W2 Rerank (retrieve node reuses BGE-M3 + reranker stack), W3 RAG Eval (RAGAS reused for comparison matrix), W3 single-pass baseline.
+- **Builds on:** W1 Vector Retrieval (Qdrant collection + BGE-M3 embeddings are the retrieval substrate), W2 Rerank (retrieve node reuses reranker stack), W3 RAG Eval (RAGAS reused for comparison matrix), W3 single-pass baseline.
 - **Distinguish from:** Static RAG (single linear pass, no grading, no loop); GraphRAG (graph traversal is retrieval strategy not agent decision); hybrid retrieval (deterministic dense+sparse fusion, no agent judgment); Self-RAG (internalizes grading via reflection tokens vs explicit grading node).
 - **Connects to:** W5 Pattern Zoo (5-node graph = ReAct specialized to retrieval); W7 Tool Harness (retriever wrapped via `create_retriever_tool` is tool-calling pattern; grading conditional edge is tool-result routing).
 - **Foreshadows:** W11 System Design (5-node graph maps to Argo / Step Functions / Airflow BranchPythonOperator; CRAG fallback = circuit breaker pattern); W12 Capstone (default retrieval substrate for mixed-complexity queries).

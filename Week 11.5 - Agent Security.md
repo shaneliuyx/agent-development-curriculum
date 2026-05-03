@@ -23,6 +23,40 @@ A production agent is not a chatbot. It has tools. It writes files, sends emails
 
 ## Theory Primer — Threat Model for Agents
 
+#### Threat Model Architecture Walkthrough
+
+An agent threat model has four distinct trust zones: system prompt (highest trust, immutable), user input (untrusted, injection vector), tool output (re-ingested, high implicit trust), and RAG retrieval (highest implicit trust, often treated as authoritative). The attack surface spans five paths: direct prompt injection (user message), indirect injection (RAG corpus), tool poisoning (tool description), exfiltration via tool arguments (data leak), and sandbox escape (shell execution). Classical web security assumes a binary trust boundary (auth vs unauth). Agents require a **four-tier trust model** because re-ingestion of tool outputs creates attack surfaces that don't exist in web apps. A single poisoned RAG document can execute with system-prompt authority even though it was written by an attacker and lives in your retrieval corpus.
+
+`★ Insight ─────────────────────────────────────`
+- **Four trust tiers, not two**: System prompt (immutable), User input (untrusted), Tool output (re-ingested, implicit trust), RAG retrieval (highest implicit trust — "this is authoritative background knowledge")
+- **Tool output is trustedmore than user input**: The LLM was trained to treat tool returns as credible information; this asymmetry is the root cause of indirect injection attacks
+- **Attacks target the tool dispatch layer, not the prompt layer**: Standard LLM safety (RLHF, refusal training) suppresses harmful outputs; it does not prevent the agent from using a legitimate tool for harmful purposes (e.g., sendEmail with attacker address)
+- **RAG retrieval is an attack vector, not just a feature**: A document in your retrieval corpus has higher implicit authority than a user message, so poisoned documents execute with higher impact
+`─────────────────────────────────────────────────`
+
+**Trust tier diagram (mental model):**
+```
+IMMUTABLE SYSTEM PROMPT (set at deploy time)
+           ↓
+    AGENT TOOL LOOP
+    ↙         ↘
+USER INPUT      TOOL OUTPUT
+(untrusted)   (high implicit trust)
+              ↓
+          RAG RETRIEVAL
+        (highest implicit trust)
+```
+
+Each zone requires independent enforcement:
+- System prompt: no runtime modification, no config-DB assembly
+- User input: sanitization + rate limiting + direct injection detection
+- Tool output: content validation before re-ingestion, source metadata
+- RAG retrieval: corpus integrity checks, adversarial doc detection, confidence gates
+
+**Why classical web security fails here**: Web apps have one main boundary (user input = untrusted). Agents have four. Tool output is treated as credible by the LLM; RAG retrieval is treated as *authoritative*. Poisoning the RAG corpus is often more impactful than poisoning user input because the model's training taught it to defer to tool outputs and retrieved documents.
+
+---
+
 ### 1. Trust Boundaries
 
 Classical web security draws a single trust boundary: authenticated user versus unauthenticated user. Agents have at least four distinct trust tiers, and failing to enforce them independently causes most real incidents.
@@ -430,7 +464,7 @@ mkdir agent_security_lab && cd agent_security_lab
 
 ## Cross-References
 
-**Builds on: W7 — Tool Harness.** The tool dispatch layer built in W7 is the insertion point for all three defenses.
+**Builds on: W7 — Tool Harness** and **W7.5 — Computer Use and Browser Agents.** The tool dispatch layer built in W7 is the insertion point for all three defenses. W7.5's orchestrator loop (screenshot → LLM → tool dispatch) and browser sandbox patterns are direct application of these security principles to vision-based agents.
 
 **Sets up: W12 — Capstone.** The W12 capstone agent must include a security review section: threat model diagram identifying all four trust tiers, evidence that every tool has a Pydantic schema with tested validation, and a red-team table showing at least three attacks blocked.
 

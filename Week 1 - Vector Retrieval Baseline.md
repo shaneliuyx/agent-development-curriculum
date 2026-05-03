@@ -1,14 +1,23 @@
 ---
 title: "Week 1 — Vector Retrieval Baseline"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-1, rag, embeddings, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-01-vector-baseline"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 0 smoke test passed"
+audience: "Cloud infrastructure engineer (3 yrs), building local-first RAG systems"
+stack: "MacBook M5 Pro, sentence-transformers (MLX via MPS), Qdrant on Docker, Python 3.11+"
 ---
 
 # Week 1 — Vector Retrieval Baseline
+
+## Why This Week Matters
+
+Vector retrieval is the bottleneck in production RAG. A system is only as good as its top-k recall — if the gold document is not in the top-10 retrievals, no downstream reranker or generation stage can recover it. This week teaches you to measure and optimize that ceiling empirically on real data, not on public benchmarks. You'll run three embedding models (BGE-M3, Nomic v2, optionally a third) and two index configurations (HNSW dense vs fast) on a 10K-document corpus and produce a recall/MRR/nDCG table that justifies your model choice with numbers. In interviews, this is the differentiator: most candidates know dense retrieval exists; you can cold-answer "how do you choose an embedding model for a new corpus?" with measured tradeoffs, latency numbers, and concrete failure modes you've debugged. You'll also lock in one production-critical discipline: the model config as an atomic unit, so swapping embedding models doesn't require edits in four files.
+
+---
 
 > Goal: own the full embed → index → retrieve → measure loop. Cold-answer "how do you choose an embedding model" with numbers from **your own** table.
 
@@ -859,9 +868,55 @@ I already ship pipelines with this shape at work; the only new piece is the vect
 
 ### 6.2 Answer these 3 questions aloud (record yourself)
 
-1. "Walk me through how you'd pick an embedding model for a new corpus."
-2. "What's the difference between HNSW and IVF, and when would you pick each?"
-3. "Your recall@10 is 0.6 and everyone says it should be 0.8+. What do you check?"
+#### Q1. "Walk me through how you'd pick an embedding model for a new corpus." (target: 90 sec)
+
+**Answer reference — points to hit:**
+- **Profile the corpus first.** Domain (general vs medical / legal / code), language coverage, document length distribution, asymmetric vs symmetric retrieval (query ≪ doc?). These pin the model family.
+- **Start with MTEB leaderboard, then domain-specific evals.** General-purpose: BGE-M3, E5-large-v2, Nomic-embed. Code: CodeBERT / UniXcoder / OpenAI text-embedding-3 with code prefix. Medical: BioBERT-derived. Don't trust leaderboard rank alone; run a 10K-query slice on YOUR data.
+- **Asymmetric prefixes are non-optional for some models.** Nomic and E5 require `search_query:` / `search_document:` prefixes — using them wrong silently halves recall. BGE-M3 doesn't need them but pre-normalizes.
+- **Dimensions matter for cost.** 1024-dim BGE-M3 vs 384-dim MiniLM = 2.6× storage + 2.6× similarity FLOPs. On a 100M-doc index that's the difference between $30K and $80K storage. Smaller-with-rerank often beats larger-without on cost-adjusted recall.
+- **Local vs API.** Local (MLX / sentence-transformers) for batch ingest, API for on-the-fly query embedding when latency budget < 50ms. Cost crossover ~5M queries/month.
+- **Validate with measured recall@K on YOUR queries, not benchmark recall.** Public benchmarks plateau at the top; your domain has long-tail queries the benchmark doesn't cover.
+
+**Supporting evidence:** §2 Theory Primer (asymmetric vs symmetric retrieval), §4 Phase 1 measurements, [[#Bad-Case Journal]] Entry on missing prefixes.
+
+#### Q2. "What's the difference between HNSW and IVF, and when would you pick each?" (target: 90 sec)
+
+**Answer reference — points to hit:**
+- **HNSW** (Hierarchical Navigable Small World) — multi-layer graph, log(N) search, 30-50ms p99 typical at 10M scale, **memory-resident** (~RAM = vectors × dim × 4 bytes + 30% graph overhead). Higher recall at fixed latency.
+- **IVF** (Inverted File Index) — partitions vector space into K cells via k-means, search probes top-`nprobe` cells. Smaller memory footprint (you don't store every vector relationship), supports OPQ / PQ compression natively. Lower recall ceiling at fixed latency unless you crank nprobe.
+- **Pick HNSW when:** RAM is cheap, latency is tight, recall is critical, dataset is mostly static. Default for sub-50M-vector indexes.
+- **Pick IVF (often IVF-PQ) when:** RAM is the bottleneck, dataset is 100M+, you can tolerate 2-5pp recall hit for 10× memory savings. Faiss IVF-PQ is the canonical open-source pattern.
+- **Hybrid:** HNSW on hot tier (10M latest), IVF-PQ on cold tier (100M historical). Re-rank top-K from both.
+- **Production knob:** for HNSW, `M` (graph degree, default 16) and `efConstruction` (build-time) trade build time for query speed; `efSearch` is the runtime quality knob. For IVF, `nlist` (cells, ~√N) and `nprobe` (search depth, default 8-32).
+
+**Supporting evidence:** §2 Theory Primer (HNSW papers, Malkov 2018), Qdrant docs cited in §8 References, [[#Phase 2 — Indexing]] measurements on M5 Pro.
+
+#### Q3. "Your recall@10 is 0.6 and everyone says it should be 0.8+. What do you check?" (target: 2 min)
+
+**Answer reference — points to hit (in this debug order):**
+
+*1. Validate the eval itself first (~30 sec):*
+- Are you measuring on the right query set? Public benchmark queries may be saturated; your domain queries may not match the model's training distribution.
+- Is the gold-relevance set actually right? `qrels` files have errors. Spot-check 20 random failures by hand.
+
+*2. Indexing-side bugs (~30 sec):*
+- **Missing prefixes** for asymmetric models (Nomic, E5). Most common silent killer. Symptom: recall drops 30-50pp vs published.
+- **Wrong distance metric.** `Distance.COSINE` vs `Distance.DOT` — equivalent only when vectors are pre-normalized. If your model doesn't pre-normalize and you use `DOT`, you measure norm dominance instead of cosine.
+- **Fp16 quantization NaN risk** on MPS (BGE-M3 sparse head). Check for `nan` in `point.vector`.
+- **Off-by-one in chunk window** — if chunks overlap incorrectly, gold passages may not be retrievable.
+
+*3. Retrieval-side knobs (~30 sec):*
+- `efSearch` too low for HNSW. Bump from default 16 to 64-128 — often gets 5-10pp.
+- `nprobe` too low for IVF. Same fix.
+- Top-K filter cutting good results. If your reranker re-orders top-50, retrieve top-50 not top-10.
+
+*4. Model fit (~30 sec):*
+- Domain mismatch. General-purpose model on legal corpus → consider domain-tuned. Or: stack a hybrid (BM25 + dense) with RRF — lexical match anchors rare terms.
+- Document length explosion past max_tokens. Long-doc queries truncate; recall drops on those queries specifically. Stratify your eval by query/doc length.
+- Asymmetric query/doc length when model expects symmetric (or vice versa). Symptoms: recall is 0.9 on long queries, 0.3 on short ones.
+
+**Supporting evidence:** [[#Bad-Case Journal]] (prefix bugs, NaN cases), [[#Troubleshooting]] table, §4 Phase measurements showing default vs tuned recall.
 
 ---
 
@@ -876,6 +931,45 @@ I already ship pipelines with this shape at work; the only new piece is the vect
 | `Qdrant: collection already exists` | Previous run crashed mid-insert | `qd.delete_collection(name)` is in the script; just re-run `02_collections.py` |
 | OOM during embedding | Batch too big | Drop `BATCH = 64` → `BATCH = 16` |
 | Embedding takes 3× longer than expected | MPS fallback to CPU | Check `m.device` — should print `mps:0` |
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Nomic v2 recall collapses to ~0.02 (random baseline).**
+*Symptom:* Nomic Embed v2 ingest and eval both appear to run clean with no errors; eval script shows recall@10 = 0.021 (random chance on a retrieval set), but BGE-M3 on the same data achieves 0.782. No warnings or failures in the output.
+*Root cause:* Stale `~/.cache/huggingface/modules/transformers_modules/nomic_hyphen_ai/` cache holds an old commit hash that pre-dates Nomic v2 MoE support being added to the modeling code. When `trust_remote_code=True` triggers transformers to fetch custom modeling code, the cache returns the stale file. The model loads with broken layer mappings: MoE expert weights reported as `UNEXPECTED`, dense MLP layers as `MISSING`, and both get discarded or randomly initialized. Every forward pass on the randomly-initialized layers produces different outputs — embedding drift makes vectors incomparable.
+*Fix:* Nuke the stale cache directory and re-ingest:
+```bash
+rm -rf ~/.cache/huggingface/modules/transformers_modules/nomic_hyphen_ai/
+python src/03_ingest_nomic.py    # re-embeds 10K docs; ~10-15 min on M-series
+python src/04_eval.py            # Nomic recall should now land at ~0.95+
+```
+Quick diagnostic before committing to a 10-min ingest: encode the same string twice and check if outputs are bit-identical (max abs diff < 1e-5). If they differ, the model has random-init layers and the cache is stale.
+
+**Entry 2 — Nomic v2 recall drops ~30 points; missing `search_query:` prefix.**
+*Symptom:* Nomic Embed v2 eval script runs without errors but produces recall@10 = 0.52 instead of expected 0.95+. No error messages.
+*Root cause:* Nomic v2's training baked asymmetric prefixes into the embedding space: documents are encoded with `"search_document: "` prefix, queries with `"search_query: "`. The model was trained on data with these prefixes; without them, the query and document embeddings live in different parts of the space. Using the doc prefix on queries (or no prefix at all) produces meaningless similarity scores.
+*Fix:* Prepend the correct prefix in the eval script's query-embedding step. In `04_eval.py`, line 570: `texts = [prefix + queries[qid] for qid in qids]` where `prefix = "search_query: "` for Nomic configs. Verify the prefix in the ingest script matches: `src/03_ingest_nomic.py` line 416 uses `f"search_document: {d['text']}"`.
+
+**Entry 3 — Nomic v2 loads but with `UNEXPECTED` and `MISSING` weight warnings.**
+*Symptom:* `SentenceTransformer(model_path, trust_remote_code=True)` succeeds; no exception is raised. Downstream, model produces embeddings but with nonsensical recall. Console output includes `Some weights are not expected:` or `Some weights are missing:` warnings.
+*Root cause:* `trust_remote_code=True` is mandatory for Nomic v2 because its MoE architecture is not in the stock transformers model registry. Forgetting it falls back to loading the base model without custom modeling code, and the layer mappings fail. The `trust_remote_code` flag must be set **everywhere** the model loads — both the ingest scripts AND the eval script. An ingest-vs-eval mismatch causes the same model to load with different layer mappings on each side, putting query and document embeddings in incomparable spaces.
+*Fix:* Set `trust_remote_code=True` on every `SentenceTransformer()` instantiation for Nomic models. Use the `model_config.py` spec to enforce this across all scripts: `m = SentenceTransformer(model.path, device="mps", trust_remote_code=model.trust_remote_code)`.
+
+**Entry 4 — Qdrant scroll copies empty vectors; recall@10 = 0.00 in fast-index ablation.**
+*Symptom:* Phase 3.3 script (copying vectors from `bge_m3_hnsw` to `bge_m3_hnsw_fast`) completes without error. Both collections report the same point count in Phase 4. But eval on `bge_m3_hnsw_fast` returns recall@10 = 0.00 across all queries — no results match any gold docs.
+*Root cause:* Qdrant's `scroll()` call defaults to `with_vectors=False` to save bandwidth when you only need payloads. If you forget the flag, `scroll()` returns points with `vector=None`, and upserting `None` vectors creates points with no vector data. HNSW search then has no vectors to compare and returns nothing. The failure is silent: `points_count` on the destination collection is non-zero (points exist), but they are empty shells.
+*Fix:* Always set `with_vectors=True` in `scroll()` calls when copying vectors:
+```python
+points, offset = qd.scroll(
+    collection_name=SRC,
+    limit=BATCH,
+    with_vectors=True,   # CRITICAL — default is False
+    with_payload=True,
+    offset=offset,
+)
+```
 
 ---
 

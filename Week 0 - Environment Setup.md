@@ -1,15 +1,67 @@
 ---
 title: "Week 0 — Environment Setup"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-0, setup, mlx, local-first]
-companion_to: "Agent Development 3-Month Curriculum.md"
-estimated_time: "90–120 minutes (end-to-end, fresh start)"
+audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
+stack: macOS M5 Pro, oMLX, vMLX, Qdrant, Phoenix, Docker/OrbStack
 ---
 
 # Week 0 — Environment Setup
 
 > Step-by-step setup so every lab in the 3-month curriculum is copy-paste ready.
 > Machine baseline: macOS 26.4.1 on Apple Silicon (arm64). If you're on a different machine, adjust paths.
+
+---
+
+## Why This Week Matters
+
+Environment setup is not IT-department busywork. It is the foundation of reproducibility: the difference between "I built an agent that works" and "I built an agent that someone else can run six months later without debugging." A misconfigured environment (wrong Python version, stale model weights, network isolation broken, missing API keys) cascades into weeks of debugging. Production systems live in containers and managed infrastructure *because* local-machine entropy must be eliminated. This week mirrors that discipline: every step is versioned, every tool is pinned, every artifact is disk-local (models, code, configs). You will build an agent in W1–W12 using this environment; if the environment is fragile, every lab result becomes suspect. Interviewers ask about environment design because deployment readiness requires it. You'll need to articulate: why inference runs locally (cost, latency, data residency), how model weights are cached, why Docker or containers matter, and what happens when a dependency goes stale. This week teaches you to think like infrastructure.
+
+---
+
+## Theory Primer — Local-First Agent Infrastructure
+
+The curriculum runs on **local-first architecture**: inference, embedding, reranking, and persistence all execute on your machine (or in local Docker containers). This is not the default. Cloud APIs (Claude API, OpenAI API, Google Vertex) are the standard for production agents. Why local-first here?
+
+**Cost ceiling.** Anthropic's Claude API costs ~$0.005 per 1K input tokens (Haiku), ~$3 per 1M input tokens (Sonnet). Over 12 weeks of labs with iterative development, cloud costs would exceed $200–500. The same workload via local MLX models (Qwen, Gemma) on your M-series Mac costs $0 in runtime (only electricity, ~$10–20 total). Reasonable cap for a self-directed learner is <$50 total.
+
+**Model versioning.** Cloud APIs versioned you: when OpenAI ships Claude 4.2, your old code may break or behave differently. Local models on disk are version-locked. `gemma-4-26B-A4B-it-heretic-4bit` weights, once downloaded, don't change. Reproducibility is guaranteed. This is critical for labs: if a lab's results drift between runs, you cannot debug whether your code is wrong or the model shifted. Local models eliminate that variable.
+
+**Inference backends.** Two tools serve local models:
+- **oMLX**: Inference server for large models (Qwen 35B, Gemma 31B). Runs on M3/M5 Pro/Max. Latency 50–150ms per token (vs. 10–20ms for cloud APIs). Cost: electricity.
+- **vMLX**: Smaller/faster models. Benchmarking in W7/W8 compares oMLX (Opus-tier) vs vMLX (Haiku-tier) vs cloud APIs.
+
+**Stateful services (Docker).** Qdrant (vector database) and Phoenix (tracing + observability) run in Docker. Docker ensures consistent environment across machines: same Qdrant version, same Phoenix schema. Without containerization, "works on my machine" becomes your nightmare. Phase 3 uses OrbStack (lightweight Docker daemon on macOS).
+
+**Dependency isolation (venv).** Python's `uv` creates a project-specific virtual environment. Each lab gets its own venv; no global package pollution. `uv` is ~100x faster than pip. Weights are cached globally in `~/.cache/huggingface/`, so a second lab does not re-download 5GB of Qwen weights.
+
+---
+
+## Mechanism / Architecture Diagram
+
+```mermaid
+graph TB
+    A["macOS Host<br/>(M3/M5 Pro)"] --> B["oMLX Server<br/>:8000<br/>(Qwen 35B,<br/>Gemma 26B)"]
+    A --> C["vMLX Server<br/>:8002<br/>(Gemma 31B<br/>uncensored)"]
+    A --> D["Python Venv<br/>(lab-01, lab-02, ...<br/>uv project isolation)"]
+    D --> E["Lab Code<br/>(RAG, ReAct,<br/>Tool Harness, etc.)"]
+    E -->|API calls| B
+    E -->|API calls| C
+    E -->|HTTP| F["Docker: Qdrant<br/>:6333<br/>(Vector DB)"]
+    E -->|HTTP| G["Docker: Phoenix<br/>:6006<br/>(Tracing)"]
+    F --> H["Disk: ~/.qdrant/<br/>(embeddings index)"]
+    B --> I["Disk: ~/.omlx/models/<br/>(Qwen, Gemma weights)"]
+    C --> J["Disk: ~/.cache/<br/>huggingface/<br/>(embedding models,<br/>weights)"]
+    D --> K["Disk: ~/projects/<br/>agent-prep/<br/>lab-*/"]
+    
+    style A fill:#e1f5ff
+    style B fill:#fff3e0
+    style C fill:#fff3e0
+    style D fill:#f3e5f5
+    style F fill:#e8f5e9
+    style G fill:#e8f5e9
+```
 
 ---
 
@@ -690,6 +742,114 @@ Use it anywhere:
 from run_local import chat
 print(chat("opus", [{"role": "user", "content": "Plan a 3-step recipe."}], max_tokens=200))
 ```
+
+---
+
+## Configuration Walkthroughs
+
+### Walkthrough 1 — Shell Wrapper Pattern (~8.2)
+
+The shell wrappers in `~/.zshrc` (added in Phase 1) let you call local models from any terminal:
+
+```bash
+omlx-python  # launches Python with OMLX_BASE_URL pre-set
+vmlx-python  # launches Python with VMLX_BASE_URL pre-set
+```
+
+**Why this pattern:** Each lab runs in its own venv (isolation), but still needs to know where oMLX/vMLX are listening. Environment variables (not hardcoded URLs) let you swap inference backends. If you move oMLX to port 9000, one `.zshrc` edit fixes all 12 labs.
+
+**Block 1 — Shell wrapper definition:**
+```bash
+alias omlx-python='OMLX_BASE_URL=http://127.0.0.1:8000/v1 /Users/yuxinliu/.openharness-venv/bin/python'
+alias vmlx-python='VMLX_BASE_URL=http://127.0.0.1:8003/v1 /Users/yuxinliu/.openharness-venv/bin/python'
+```
+
+The wrapper sets two things: (1) the URL environment variable, (2) the absolute path to the Python interpreter in the venv. Avoid `which python` here — it is shell-version dependent and can pick the system Python instead of your venv.
+
+**Common modifications:** If oMLX is on a different port (say 9000), change `8000` to `9000`. If vMLX is on 8002 instead of 8003, update accordingly. These settings live in `~/.zshrc` because they are machine-specific and global.
+
+### Walkthrough 2 — uv Project Isolation Pattern (~4)
+
+Each lab creates a venv via `uv`:
+
+```bash
+cd ~/code/agent-prep/lab-01-vector-retrieval
+uv venv
+uv sync --requirement requirements.txt
+```
+
+**Why this pattern:** `uv` is 100x faster than `pip`. It also enforces version locks — `requirements.txt` pins exact versions (e.g., `anthropic==0.24.2`). If W1 worked with Anthropic SDK 0.24.2, W6 (six weeks later) still runs with 0.24.2, not a broken 0.30.0 from PyPI. No silent upgrade surprises.
+
+**Block 1 — Venv initialization:**
+The first call `uv venv` creates `.venv/` locally. The second call `uv sync` installs packages. `uv` caches wheels in `~/.cache/uv/`, so the second lab's install is instant (wheels already downloaded).
+
+**Common modifications:** If `requirements.txt` is in a different location, adjust the path. If you add a new package mid-lab, run `uv pip install package-name` to add it to the .venv without recreating the entire venv.
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Stale Model Weights Cause Silent Failures (W0).**
+
+*Symptom:* After downloading Qwen weights to `~/.omlx/models/`, a network blip interrupts the download. The file is 5GB but only 2.3GB was written. Next time you run a lab, oMLX loads the truncated weights. Inference hangs for 30 seconds, then returns junk: `"zzzzzzzzzzzzzzz"` or `None`. Lab produces wrong results. Weeks of debugging before you discover corrupted weights.
+
+*Root cause:* oMLX does not validate checksums on startup. It loads whatever file is at the expected path, even if the file is incomplete. The truncation is silent — no error, just garbage output.
+
+*Fix:* (1) Delete corrupt files: `rm ~/.omlx/models/Qwen*`. (2) Re-download via oMLX UI or `ollama pull model-name`. (3) Verify checksum after download: `shasum -a 256 ~/.omlx/models/qwen-model.safetensors` against the official published hash. (4) Add a startup script that verifies file sizes: if Qwen weighs 35GB and your file is 25GB, alert and stop.
+
+*The diagnostic muscle:* When inference returns garbage or hangs, the first probe is not your code — it's the model weights. Check file sizes: `ls -lh ~/.omlx/models/`. If a weight file is smaller than expected (lookup official size from huggingface.co), delete and re-download.
+
+**Tags:** #weights #caching #silent-failure #disk-integrity #w0 #ops-pattern
+
+**Lab artifact:** `lab-00-setup/scripts/verify_weights.py` — checks all downloaded weights against official sizes
+
+---
+
+**Entry 2 — Wrong Python Version Picked by uv (W0).**
+
+*Symptom:* Lab uses a package (e.g., pydantic v2) that requires Python 3.11+. Your system Python is 3.14.3, and uv is told to use 3.11. But uv finds a globally-installed 3.10 first (from an old Conda install) and uses that instead. Import fails: `pydantic.v1` does not exist in Pydantic v2. Weeks of debugging, "pydantic must be broken."
+
+*Root cause:* `uv` searches the PATH for Python interpreters. If multiple versions are installed, the search order is: first in PATH, system default, then uv-installed Python. If an old Conda or pyenv installation is in PATH, uv picks it instead of your intended 3.11.
+
+*Fix:* (1) Check which Python uv is using: `uv python list`. (2) Explicitly specify Python: create a `.python-version` file in the project root with `3.11` on a single line. uv respects this. (3) Or pin explicitly in uv.toml: `python = "3.11"`. (4) Verify in the venv: `source .venv/bin/activate && python --version` should print `3.11.*`.
+
+*The diagnostic muscle:* When an import fails because a package version is wrong, check `python --version` immediately. If you're in the lab's venv and it says 3.10, the venv is misconfigured. Delete `.venv/` and re-run `uv venv`.
+
+**Tags:** #venv #version-management #python-discovery #w0 #ops-pattern
+
+**Lab artifact:** `.python-version` file in all labs, pinning 3.11
+
+---
+
+**Entry 3 — Qdrant Port Collision Blocks Phase 3 (W0).**
+
+*Symptom:* Phase 3 tries to start Qdrant in Docker on port 6333. Command fails: `Error response from daemon: driver failed programming external connectivity on endpoint qdrant: Error starting userland proxy: listen tcp4 0.0.0.0:6333: bind: address already in use`. Another Docker container (from a previous lab run, not properly stopped) is using port 6333. You spend 30 minutes killing random containers.
+
+*Root cause:* `docker-compose up` in Phase 3 does not kill the old container if the Compose project was not cleaned up. Running Phase 3 twice without `docker-compose down` leaves a zombie container. The second run fails.
+
+*Fix:* (1) Always clean up: after a lab, run `docker-compose down` in the Qdrant folder. (2) Or force a new container: `docker-compose up --force-recreate`. (3) Before Phase 3, check what's running: `docker ps` — if qdrant is listed and you didn't start it this session, kill it: `docker stop qdrant && docker rm qdrant`.
+
+*The diagnostic muscle:* When Docker fails with "address already in use," the port is bound by a zombie container, not a rogue process. Never use `lsof` — use `docker ps` to list all containers and check if one is the culprit.
+
+**Tags:** #docker #port-collision #cleanup #w0 #ops-pattern
+
+**Lab artifact:** `lab-00-setup/scripts/cleanup.sh` — runs `docker-compose down` for all services
+
+---
+
+**Entry 4 — Missing Cloud API Keys Block W7/W8 Labs (W0).**
+
+*Symptom:* Phase 6 asks you to add API keys for OpenAI, Anthropic Cloud, Google Vertex. You skip it (thinking it's optional). Week 7 (Computer Use, W7.5) uses Claude API. Lab crashes: `AuthenticationError: API key not found in ANTHROPIC_API_KEY`. You lose a day because the error appears deep in inference code, not at startup.
+
+*Root cause:* Phase 6 is marked "only for Weeks 7 & 8" and is optional. But optional does not mean "skip if you want." It means "skip if you plan to never use the cloud APIs." If you do W7.5 (Computer Use), you need the API key.
+
+*Fix:* (1) Before starting W1, finish Phase 6 (cloud API setup). (2) Add startup validation: create a script that checks all required API keys are present. Code: `import os; assert os.getenv("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY missing"`. Run this at the start of every lab. (3) Document in each lab's README: "You need ANTHROPIC_API_KEY set before running this lab."
+
+*The diagnostic muscle:* When a lab crashes with "API key not found," the fix is not code — it's environment setup. Check: `echo $ANTHROPIC_API_KEY` in the terminal. If empty, the key was never set. Source your `.zshrc` or `.bash_profile` again: `source ~/.zshrc`.
+
+**Tags:** #api-keys #environment-variables #w0 #w7-w8-dependency #ops-pattern
+
+**Lab artifact:** `lab-00-setup/scripts/validate_keys.sh` — checks all required API keys before lab startup
 
 ---
 

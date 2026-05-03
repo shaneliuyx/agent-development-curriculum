@@ -29,6 +29,16 @@ This is a **half-week insert** between Week 2 and Week 3. It adds ~6 hours to yo
 
 ---
 
+## Why This Week Matters
+
+Vector RAG breaks on multi-hop questions in a measurable, reproducible way. Ask a vector index "Who was the founder of the company that built the first transistor?" and it returns chunks about Bell Labs, AT&T, the transistor — but the answer (William Shockley, John Bardeen, Walter Brattain) is in a *different* document that connects through "the team that built the transistor at Bell Labs." Cosine similarity does not traverse relations; chunks do not link.
+
+GraphRAG (Microsoft, 2024) attacks this by extracting entities and relations into a knowledge graph at ingest time, then traversing the graph at query time to gather context that vector search alone misses. This week you will build the entity-extraction pipeline, the Neo4j graph, the query-time traversal, and a head-to-head eval against your Week 2 vector RAG on a 32-question categorized set (factoid / two_hop / relational / multi_hop / out_of_domain) with both substring + LLM-judge scoring.
+
+The interview signal is precise: candidates who can articulate when GraphRAG wins (multi-hop, relational, audit-trail-required queries) and when it loses (factoid, paraphrase, single-document) demonstrate they understand retrieval architecture as a system-design decision rather than a default tool choice. The hybrid pattern — vector for recall, graph for reasoning — is the production answer most production RAG systems converge on.
+
+---
+
 ## Theory Primer — Four Concepts You Must Be Able to Explain
 
 ### Concept 1 — Why Vector RAG Fails on Multi-Hop Queries
@@ -119,6 +129,349 @@ flowchart TD
 Cost asymmetry to notice: every request pays one haiku call + one Cypher query + one sonnet call ≈ 4–6 seconds end-to-end, independent of corpus size (Neo4j traversal is sub-millisecond). Vector RAG has the opposite profile: retrieval time scales with index size but there's no per-query LLM cost until the final answer step.
 
 ---
+
+
+#### v12.4m Architecture Updates
+### Architecture Overview
+
+```plantuml
+@startuml ArchitectureOverview
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+package "Build Path (offline, ~4h for 400 articles)" #LightBlue {
+  [Wikipedia\n(400 articles)] as wiki
+  [Sliding-window\nextraction\n(3000c, 500c overlap)] as window
+  [LLM extractor\n(Gemma-4-26B)] as extract
+  [QID resolver\n(Wikidata cache)] as qid
+  [Neo4j MERGE\n(QID-keyed)] as merge
+  [GDS degree\nwriteProperty] as degree
+  [Fulltext index\nname + aliases] as ft
+
+  wiki --> window
+  window --> extract
+  extract --> qid
+  qid --> merge
+  merge --> degree
+  degree --> ft
+}
+
+package "Query Path (online, 8-25s/query)" #LightYellow {
+  [User query] as q
+  [extract_seed_entities] as seed
+  [_decompose_multihop?] as decomp
+  [fetch_subgraph\n(topology filter +\nsubstring expansion)] as fetch
+  [_find_bridge_edges?\n(2 seeds + relational kw)] as bridge
+  [_ppr_retrieve?\n(if no decomp)] as ppr
+  [_execute_decomposition\n(chain or intersection)] as exec
+  [Subgraph render\n+ QID inline tags\n+ multi-source dedupe] as render
+  [Answer LLM\nFACTS / ANSWER\n(THINKING for COMPOUND)] as ans
+  [Final answer] as final
+
+  q --> seed
+  seed --> decomp
+  decomp -down-> fetch : if null plan
+  decomp -down-> exec : if plan
+  fetch --> bridge
+  fetch --> ppr
+  bridge -down-> render
+  ppr -down-> render
+  exec -down-> render
+  render --> ans
+  ans --> final
+}
+
+ft -[hidden]down-> q
+@enduml
+```
+
+#### Architecture Overview — walkthrough
+
+This diagram is the canonical map of the v12.4m system. The two packages — **Build Path** (offline, ~4 hours for 400 articles) and **Query Path** (online, 8–25 s per query) — share nothing at request time except the populated Neo4j graph and its fulltext index. Read top-to-bottom: the build path produces a graph; the query path consumes it.
+
+`★ Insight ─────────────────────────────────────`
+- **Asymmetric cost is the whole design.** Extraction is the only LLM-heavy step in the build path and the dominant offline cost (~$0 local, ~4 h wall time on Apple Silicon). Query path makes one LLM call (the answer step) plus zero–two graph queries. This is what makes GraphRAG affordable at small corpus sizes despite ingestion looking expensive.
+- **Wikidata QID is the join key, not the surface name.** Every node merges by QID, not by lexical form. "Apple", "Apple Inc.", and "苹果公司" all collapse onto Q312 if the resolver finds them. This is the single design choice that prevents the corpus from accumulating duplicate ghost-nodes per article.
+- **Topology metadata is precomputed.** Node degree is materialized via GDS at build time and stored as a node property; the query-time topology gate reads it as a cheap property lookup, not a graph traversal. That is why `extract_seed_entities` runs in tens of milliseconds despite scoring against a heavy fulltext index.
+`─────────────────────────────────────────────────`
+
+**Build path — step by step.**
+1. **Wikipedia (400 articles)** — fixed corpus of well-curated long-form English articles, deliberately small enough to fit a $0 local budget.
+2. **Sliding-window extraction (3000 chars, 500 char overlap)** — articles are chunked with a 500-char overlap so a triple straddling a chunk boundary is seen at least once intact. Without overlap, ~3% of triples drop at boundaries.
+3. **LLM extractor (Gemma-4-26B local)** — pulls (subject, predicate, object) triples per chunk via a structured prompt. Local model selected so 4 hours of inference costs $0; quality is acceptable for Wikipedia-style prose.
+4. **QID resolver (Wikidata cache)** — for each surface form ("Steve Jobs", "Tim Cook"), look up the canonical Wikidata QID (Q19837, Q1331). Cached locally so repeated names are O(1). Surface forms without a QID still flow through but are flagged.
+5. **Neo4j MERGE (QID-keyed)** — write triples to Neo4j using `MERGE` (idempotent upsert) keyed on QID where present, else on normalized name. `MERGE` not `CREATE` is critical: re-running the build does not duplicate nodes.
+6. **GDS degree writeProperty** — Neo4j Graph Data Science library computes each node's edge count and writes it back as a `degree` property. This is the input to the query-time topology gate.
+7. **Fulltext index (name + aliases)** — final step builds a Lucene-backed Neo4j fulltext index over `name` and `aliases` fields. This is what `extract_seed_entities` queries against during retrieval.
+
+**Query path — step by step.**
+
+1. **User query** enters as plain text.
+2. **`extract_seed_entities`** runs a Lucene query against the fulltext index, applies the topology gate (see *Topology Gate* diagram below), and returns top-K anchor candidates.
+3. **`_decompose_multihop?`** asks an LLM classifier whether the query is multi-hop. Three outcomes:
+   - `null` — skip decomposition; fall through to plain `fetch_subgraph`.
+   - chain plan — `step1 → step2`.
+   - intersection plan — `step1a + step1b` run in parallel and intersected.
+4. **If decomposition fired** — `_execute_decomposition` runs the planned 1-hop or 2-hop traversals against Neo4j and yields a list of *bridge edges*.
+5. **If decomposition did not fire** — `fetch_subgraph(seeds)` runs a topology-filtered, substring-expanded neighborhood around the seeds. Two optional augmenters may also run:
+   - `_find_bridge_edges` — fires only when the query has 2 seeds AND contains a relational keyword like "relationship between".
+   - `_ppr_retrieve` — Personalized PageRank seeded on the anchor set, capped at top-60 nodes.
+6. **Subgraph render** — fans in all retrieved edges and produces the prose passed to the answer LLM. Three transformations happen here:
+   - Multi-source dedupe across decomp + bridge + ppr + subgraph (the same edge can be emitted by more than one retriever).
+   - Inline QID tag injection (renders an entity as `<entity> [Q42]`).
+   - Plain-prose formatting for the answer prompt (no JSON, no Cypher).
+7. **Answer LLM** — receives the rendered evidence under a fixed `SYSTEM_PROMPT` and returns three structured output blocks:
+   - `FACTS` — verbatim evidence cited from the rendered prose.
+   - `ANSWER` — the user-facing reply.
+   - `THINKING` — intermediate reasoning. Emitted only for queries the decomposition classifier flagged as compound; suppressed otherwise to keep latency down.
+8. **Final answer** — parsed out of the `ANSWER` block and returned to the user.
+
+#### Glossary — Architecture Overview jargon
+
+| Term                | Meaning                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| QID                 | Wikidata canonical ID (e.g. `Q312` for Apple Inc.). Enables aliasing across surface forms. |
+| GDS                 | Neo4j Graph Data Science — graph algorithms (degree, PPR, etc.) executed inside Neo4j.     |
+| MERGE               | Neo4j Cypher upsert: create-if-missing, match-if-exists. Idempotent; safe to re-run.       |
+| Fulltext index      | Lucene index inside Neo4j; enables BM25 retrieval over name/alias fields.                  |
+| Topology filter     | Degree-gated rejection of low-connectivity ("singleton noise") anchors.                    |
+| Substring expansion | "Steve Jobs" matches "Jobs"; expands seed match radius beyond exact tokens.                |
+| PPR                 | Personalized PageRank — random-walk scoring biased toward seed nodes.                      |
+| Bridge edges        | Edges directly connecting two specified seed entities (relational queries).                |
+
+### Query Flow Sequence
+
+```plantuml
+@startuml QueryFlow
+participant User
+participant answer as a
+participant extract_seed as s
+participant decompose as d
+participant fetch_subgraph as f
+participant bridge as br
+participant ppr as p
+participant render as r
+participant LLM as l
+
+User -> a: query
+a -> s: extract_seed_entities(query)
+s --> a: seeds[]
+
+a -> d: _decompose_multihop(query)
+alt plan returned
+    a -> d: _execute_decomposition(plan)
+    d --> a: decomp_edges[]
+end
+
+a -> f: fetch_subgraph(seeds)
+f --> a: subgraph[], matches{}
+
+alt 2 seeds + "relationship" keyword
+    a -> br: _find_bridge_edges(s1, s2)
+    br --> a: bridge_edges[]
+end
+
+alt no decomposition fired
+    a -> p: _ppr_retrieve(seeds)
+    p --> a: ppr_edges[]
+end
+
+a -> r: render(bridge + ppr + subgraph)\nwith QID tags + dedupe
+r --> a: prompt_text
+
+a -> l: SYSTEM_PROMPT + prompt_text
+l --> a: ANSWER block
+a --> User: answer
+@enduml
+```
+
+#### Query Flow Sequence — walkthrough
+
+The Architecture Overview shows the topology; this sequence diagram shows the **call ordering** during a single query. Read top-to-bottom as a timeline. Three optional `alt` blocks model the conditional paths through `answer()`.
+
+`★ Insight ─────────────────────────────────────`
+- **`answer()` is the conductor, not the executor.** It owns no business logic except sequencing and result fusion. Every named function (extract_seed, decompose, fetch_subgraph, bridge, ppr) is independently testable against fixtures — the answer-LLM call is the only step that talks to a model at runtime.
+- **Three branch conditions, evaluated independently.** Decomposition, bridge, and PPR are not mutually exclusive. A query can fire all three or none. `render` fans them in via dedupe.
+- **Why `render` is last and central.** All retrieval functions return raw edge lists; `render` is where surface-form drift, QID tagging, and multi-source dedupe happen. Putting fusion in one place (not per retriever) keeps each retriever simple and replaceable.
+`─────────────────────────────────────────────────`
+
+**Process flow.**
+1. `User → answer(query)` — single entry point.
+2. `answer → extract_seed_entities(query)` — returns a list of anchor seeds (likely entity names found in the fulltext index, gated by topology).
+3. `answer → _decompose_multihop(query)` — always called once. If a plan is returned, `answer → _execute_decomposition(plan)` runs and returns `decomp_edges[]`. If null, this branch is skipped.
+4. `answer → fetch_subgraph(seeds)` — always runs; pulls a topology-filtered neighborhood and the matched-node metadata.
+5. **First conditional `alt`** — only if the query has 2 seeds AND contains a relational keyword (e.g. "relationship", "connection"), `answer → _find_bridge_edges(s1, s2)` runs. Returns `bridge_edges[]` or empty.
+6. **Second conditional `alt`** — only if no decomposition fired (i.e. the query was not multi-hop), `answer → _ppr_retrieve(seeds)` runs Personalized PageRank biased toward the seed set, returns top-K nodes' incident edges as `ppr_edges[]`.
+7. `answer → render(bridge + ppr + subgraph)` with QID tags and multi-source dedupe — produces the final prompt prose.
+8. `answer → LLM(SYSTEM_PROMPT + prompt_text)` — returns a structured response with `FACTS` / `ANSWER` / (optional) `THINKING` blocks.
+9. `answer → User: answer` — parsed final answer.
+
+**Why the diagram matters for debugging.** When a query produces a wrong answer, the first triage step is to log which `alt` branches fired. If decomposition fired but `decomp_edges` was empty, the LLM classifier hallucinated a plan against a corpus that could not satisfy it (Bad-Case Journal entry: "decomposed-into-void"). If neither bridge nor PPR fired and `subgraph` was thin, the topology gate over-rejected and seeds were starved (Bad-Case Journal entry: "topology starvation"). The sequence diagram is the call-stack reference for those triage steps.
+
+### Topology Gate Decision Logic
+
+```plantuml
+@startuml TopologyGate
+start
+:BM25 fulltext match\n(Lucene phrase or OR);
+:Compute composite score\nbm25 + qid_bonus +\nexact_bonus + log(deg)*coeff;
+if (composite >= threshold?) then (yes)
+    if (qid IS NOT NULL\nOR degree >= 2?) then (yes)
+        :Include as anchor candidate;
+        :Apply topology gate;
+    else (no)
+        :REJECT (singleton noise:\n'CEO of Apple', sentence\nfragments, monetary amounts);
+    endif
+else (no)
+    :REJECT (below threshold);
+endif
+:Sort by composite DESC;
+:LIMIT top-K;
+stop
+@enduml
+```
+
+#### Topology Gate Decision Logic — walkthrough
+
+This is the most consequential filter in the system. It decides which entities mentioned in the query become anchors in the graph traversal. Bad anchors (sentence fragments, monetary amounts, generic phrases) cascade into bad subgraphs and bad answers; over-strict gates starve the retrieval. The two-stage gate (composite-score threshold + QID/degree gate) is the v12.4m result of 23 design iterations against this exact failure surface.
+
+`★ Insight ─────────────────────────────────────`
+- **Composite score is a weighted sum, not a learned function.** It reads `bm25 + qid_bonus + exact_bonus + log(deg) * coeff`. Each term has a tunable coefficient calibrated against the bad-case journal — see `src/calibrate_scorer.py`. Linearity is deliberate: keeps the gate explainable to a future debugger reading entries that got rejected.
+- **`log(deg)` not raw `deg`.** Raw degree lets one mega-hub like "United States" dominate every query; log dampens that to a flat-ish bonus past degree ~30. Prefer well-connected anchors slightly, not exclusively.
+- **The QID-OR-degree secondary gate is the singleton-noise filter.** A node with no QID and degree < 2 is almost always either a surface-form fragment, a monetary amount ($1B), or a generic phrase ("CEO of Apple") that the LLM extractor mistakenly emitted as an entity. Letting them anchor produces zero-context subgraphs.
+`─────────────────────────────────────────────────`
+
+**Walkthrough of each decision node.**
+
+1. **BM25 fulltext match (Lucene phrase or OR).** First pass: query the Neo4j fulltext index. *Lucene phrase* is the strict version — `"Steve Jobs"` matches only contiguous "Steve Jobs". *Lucene OR* relaxes — `Steve OR Jobs` matches either token. The pipeline runs phrase first; if zero hits, falls back to OR.
+2. **Compute composite score.** Score = `bm25 + qid_bonus + exact_bonus + log(deg) * coeff`. Each component:
+   - `bm25` — standard Okapi BM25 score from Lucene; rewards rare-token + frequency match.
+   - `qid_bonus` — fixed bonus (≈ +0.5) if the matched node has a Wikidata QID. Encodes "well-known entity" prior.
+   - `exact_bonus` — fixed bonus (≈ +0.3) if the query token matches the node's name exactly (case-folded). Distinguishes "Apple" → Apple Inc. from "Apple" → fruit when both are in the graph.
+   - `log(deg) * coeff` — degree damping; well-connected nodes get a small bump but no more than ~+0.4 even at very high degree.
+3. **Composite ≥ threshold?** Hard cutoff. Below threshold: REJECT (not even considered for the secondary gate). Threshold is calibrated by `src/calibrate_scorer.py` against the bad-case journal so that ≥ 95% of known-good seeds pass and ≥ 90% of known-bad seeds fail.
+4. **QID IS NOT NULL OR degree ≥ 2?** Secondary gate. Above-threshold scores still get filtered if they failed *both*: have no Wikidata QID AND have degree 0 or 1 in the graph. Examples that fail this gate:
+   - "CEO of Apple" — sentence fragment, no QID, ends up degree 1 because one bad extraction wrote it.
+   - "$1 billion" — monetary amount, no QID, no edges.
+   - "the company" — pronoun reference that the extractor mistakenly captured.
+5. **Sort by composite DESC, LIMIT top-K.** Whatever survives both gates is sorted by composite score descending; top-K (typically K=5) returned as anchors.
+
+**Why this gate exists.** Pre-v12, any matched fulltext result became an anchor. Result: ~30% of queries had at least one anchor that was a sentence fragment, dragging retrieval into noisy regions of the graph. Adding the gate cut bad-anchor rate to ~3% on the 32-question eval set.
+
+### Decomposition Classifier Decision Tree
+
+```plantuml
+@startuml DecompositionDecisions
+start
+:User query;
+:LLM classifier (_decompose_multihop);
+if (Multi-hop bridge or chain?) then (yes)
+    if (Both anchors specific named entities?) then (yes)
+        :Intersection plan\nstep1a + step1b;
+    else (no, ≥1 category)
+        :Chain plan\nstep1 → step2;
+        if (Compound question with\nqualifying clause?\n"later acquired", "previously\nco-founded", etc.) then (yes)
+            :Set expand_terminal: true\n→ step3 1-hop expansion;
+        else (no)
+            :Set expand_terminal: false;
+        endif
+    endif
+    :_execute_decomposition;
+    :Yield bridge edges\n(prepended to subgraph);
+else (no)
+    :Return null plan;
+    :Use standard fetch_subgraph;
+endif
+stop
+@enduml
+```
+
+#### Decomposition Classifier Decision Tree — walkthrough
+
+This LLM classifier turns an English question into a structured retrieval plan. It sits in front of `fetch_subgraph` and decides whether the query needs a single graph hop, a chain of hops, or two parallel hops intersected. Without decomposition, multi-hop queries reduce to "match every entity, dump the union of all neighborhoods, hope" — which collapses to noise above 2 hops.
+
+`★ Insight ─────────────────────────────────────`
+- **Classification is binary, then categorical.** Binary: is this multi-hop? Categorical (only if yes): chain, intersection, or compound. Each branch produces a *different* execution plan with different bridge-edge semantics — so misclassification at this step is its own class of bad-case ("misrouted plan").
+- **The "both anchors specific?" gate is the chain-vs-intersection split.** Intersection assumes both endpoints are well-grounded named entities (QIDs both resolvable). Chain assumes one anchor is specific and the other is a category (e.g. "the founder of"), so step1 must traverse from the specific anchor to candidates.
+- **`expand_terminal: true` is a hand-found fix for compound queries.** Without it, queries like "Where did the founder of Tesla, who later acquired Twitter, study?" stop at "founder of Tesla" because step2 ignores the qualifying clause. With it, step3 fans out 1-hop from the terminal node and the LLM picks the qualifying-clause-matching neighbor.
+`─────────────────────────────────────────────────`
+
+**Walkthrough.**
+
+1. **User query** enters the classifier.
+2. **LLM classifier (`_decompose_multihop`)** runs a few-shot prompt that asks the model to return either `null` (single-hop) or a JSON plan with `type` ∈ {chain, intersection}, anchors, and edge filters.
+3. **Multi-hop bridge or chain?** First decision. If the model says no, return `null` — caller falls back to standard `fetch_subgraph(seeds)`. If yes, proceed.
+4. **Both anchors specific named entities?** Second decision.
+   - **Yes** — both endpoints have resolvable QIDs. Build an **Intersection plan** with two parallel 1-hop steps (`step1a` from anchor A, `step1b` from anchor B). At execution time, the intersection of returned node sets answers "what links A and B?".
+   - **No (≥ 1 anchor is a category)** — one anchor is a noun phrase like "the founder of Apple". Build a **Chain plan**: step1 traverses from the specific anchor through the named relation to candidate intermediate nodes; step2 filters those candidates by the category constraint.
+5. **(Chain only) Compound question with qualifying clause?** Third decision.
+   - **Yes** ("later acquired", "previously co-founded", "who is also known for") — set `expand_terminal: true`. At execution, after step2 produces a candidate set, step3 fans out one more hop to capture the qualifying-clause neighbor.
+   - **No** — `expand_terminal: false`; step2 is the last hop.
+6. **`_execute_decomposition`** runs the plan against Neo4j and yields **bridge edges** — the edges that traverse the planned path. These are *prepended* to the rendered prose ahead of the standard subgraph, so the answer LLM sees the multi-hop chain first and treats it as the spine of evidence.
+7. **Null plan branch** — caller skips decomposition and falls back to plain `fetch_subgraph`. This is the right behavior for fact-lookup queries ("When was Apple founded?") that are single-hop and do not benefit from planning.
+
+**Failure modes this tree was designed against** (full entries in §6 Bad-Case Journal):
+- *Decomposed-into-void* — classifier hallucinated a plan for a query the corpus cannot satisfy. Mitigation: validate plan against fulltext-resolvable anchors before executing.
+- *Wrong-plan-type* — chose intersection where chain was needed. Mitigation: prompt requires the model to first decide whether each anchor is specific vs categorical, then derive plan type from that.
+- *Compound-clause-dropped* — chose chain without `expand_terminal`, missed the qualifying clause. Mitigation: explicit third decision node added at v11.
+
+### Surface-Form-Drift Detection Flowchart
+
+```plantuml
+@startuml SurfaceFormDrift
+start
+:Two entities in subgraph\nshare a substring token;
+if (Both have QIDs?) then (yes)
+    if (QIDs differ?) then (yes)
+        if (Share ≥1 neighbor\nin edge context?) then (yes)
+            :MERGE candidate;
+            :Render with combined QID tags\n"<Entity> [Q1, also Q2]";
+            :LLM treats edges from both\nas evidence for one entity;
+        else (no)
+            :Different real-world entities;
+            :Render with separate QID tags;
+            :LLM disambiguates via\nedge context;
+        endif
+    else (no — same QID)
+        :Same entity, different surface forms;
+        :Single canonical reference;
+    endif
+else (no — at least one no QID)
+    :Topology gate filters\nlow-degree no-QID nodes;
+endif
+stop
+@enduml
+```
+
+#### Surface-Form-Drift Detection — walkthrough
+
+The graph almost always contains multiple nodes that name the same real-world entity in different ways: "Apple", "Apple Inc.", "苹果公司". The LLM extractor sees them as different surface forms; without intervention, they end up as separate nodes with no edges between them. This flowchart is the mechanism that, *at render time*, decides whether two same-substring nodes should be merged in the prose given to the answer LLM, kept separate, or dropped.
+
+`★ Insight ─────────────────────────────────────`
+- **Disambiguation is a render-time concern, not a build-time concern.** The graph stores both nodes; merging at build time would lose information when QIDs disagree. Render-time merge means the same graph supports different aggregation policies per query.
+- **QID is a 3-state, not a boolean.** Three branches: same QID, different QIDs, missing QID. Each gets a different render strategy. Most surface-form drift sits in the "different QIDs but share neighbors" cell — that is where the merge-candidate logic lives.
+- **`<Entity> [Q1, also Q2]` is a surface-form trick.** When merging two nodes, the renderer emits combined QID tags inline so the answer LLM sees them as one entity but can still disambiguate downstream if asked. The combined-tag syntax was tuned against the bad-case journal — earlier versions just dropped one QID, which the LLM occasionally noticed and called out.
+`─────────────────────────────────────────────────`
+
+**Walkthrough.**
+
+1. **Two entities in subgraph share a substring token.** Trigger condition. Examples: "Steve Jobs" and "Jobs"; "Apple" and "Apple Inc."; "OpenAI" and "OpenAI, Inc.". Detected at render time by tokenizing each subgraph node's name and looking for shared content tokens (stopwords excluded).
+
+2. **Both have QIDs?** First decision.
+    - **Yes** — proceed to QID comparison.
+    - **No (at least one missing QID)** — fall through to the topology-gate branch (last node). Reason: if a node lacks a QID it has already passed (or failed) the topology gate at retrieval time; rendering treats it conservatively.
+
+3. **(Both QIDs) QIDs differ?** Second decision.
+    - **No (same QID)** — same canonical entity, two different surface forms. Render under a single canonical reference (the longer / more-specific surface form). No merge tag needed.
+    - **Yes (QIDs differ)** — proceed to neighbor-context check.
+
+4. **(Differing QIDs) Share ≥ 1 neighbor in edge context?** Third decision.
+    - **Yes** — strong signal both surface forms participate in the same local subgraph topology. Treat as **MERGE candidate**: render with combined inline QID tags (`<Entity> [Q1, also Q2]`). The answer LLM treats edges from both as evidence for one entity. Catches surface-form drift where Wikidata has separate QIDs for slightly-different conceptual versions of the same thing (organization vs parent company).
+    - **No** — different real-world entities that happen to share a substring. Render with separate QID tags so the answer LLM disambiguates them via edge context. Example: "Apple" the fruit vs "Apple Inc." — share substring "Apple", but no shared neighbors, render separately.
+
+5. **(One or both missing QID) Fall through to topology-gate filter.** Low-degree no-QID nodes were already filtered at retrieval time; whatever survived lands here as a presumed-real entity but with no Wikidata anchor. Render as-is, no merge attempt.
+
+**Why this matters for the answer LLM.** Without surface-form-drift handling, the LLM sees "Apple" and "Apple Inc." as two separate entities and double-counts evidence. With it, the LLM sees one entity tagged with both QIDs, and downstream factuality checks (citation, multi-source corroboration) align correctly. On the 32-question eval set, this handling lifted multi-source dedupe accuracy from ~73% to ~91% (measured 2026-04-30).
 
 ## Production Design — Iterative Lessons (v1 → v23)
 
@@ -301,20 +654,19 @@ REQUEST_SLEEP          = 0.6   # ~100 req/min — under MediaWiki's 200/min anon
 
 **High-level architecture.**
 
-```
-  HuggingFace Hub
-       │
-       │  datasets.load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]")
-       ↓
-  Raw HF Dataset (id, url, title, text, ...)
-       │
-       │  project: keep id, title, text[:4000] only
-       ↓
-  List of 200 dicts
-       │
-       │  json.dumps(..., indent=2)
-       ↓
-  data/corpus.json   ←── consumed by build_graph.py and query_graph.py
+```plantuml
+@startuml
+start
+:HuggingFace Hub;
+:datasets.load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]");
+:Raw HF Dataset (id, url, title, text, ...);
+:project: keep id, title, text[:4000] only;
+:List of 200 dicts;
+:json.dumps(..., indent=2);
+:data/corpus.json
+(consumed by build_graph.py and query_graph.py);
+stop
+@enduml
 ```
 
 **Block 1 — Dataset load and split selection.**
@@ -757,38 +1109,17 @@ Expect ~40 minutes for 400 articles on M5 Pro + Gemma-4-26B with `MAX_WORKERS=6`
 
 **High-level architecture.**
 
-```
-  data/corpus.json  (400 articles)
-         │
-         │  _extract_one() — one worker per article
-         ↓
-  ┌──────────────────────────────────────────────┐
-  │   sentence_window_chunks()                   │
-  │   WINDOW_CHARS=3000, OVERLAP=500             │
-  │   → ~7 windows/article (400-char overlap)    │
-  │             │                                │
-  │   extract_triples(window)                    │
-  │   Gemma-4-26B, T=0.1, max_tokens=1500        │
-  │   → JSON {"triples": [{s, rel, o}, ...]}     │
-  │             │                                │
-  │   resolver.resolve_batch(unique_names)       │
-  │   QIDResolver → Wikidata wbsearchentities    │
-  │   → {name → qid_or_None}                    │
-  └──────────────────────────────────────────────┘
-         │
-         │  write_triples_to_neo4j(qid_map)
-         ↓
-  ┌─────────────────────────────────────────────────────┐
-  │                     Neo4j                           │
-  │  apoc.merge.node(['Entity'], {qid: "Q211098"})      │
-  │  ← canonical node for "Reid Hoffman" AND            │
-  │    "Reid Garrett Hoffman" → same node               │
-  │  (a)-[:CO_FOUNDED]->(b)                             │
-  │   rel.source_article, .source_title, .raw_relation  │
-  └─────────────────────────────────────────────────────┘
-         │
-         ↓
-  graph ready for query_graph.py traversal
+```plantuml
+@startuml
+:data/corpus.json\n(400 articles);
+:_extract_one()\none worker per article;
+:sentence_window_chunks()\nWINDOW_CHARS=3000, OVERLAP=500\n~7 windows/article (400-char overlap);
+:extract_triples(window)\nGemma-4-26B, T=0.1, max_tokens=1500\nJSON {"triples": [{s, rel, o}, ...]};
+:resolver.resolve_batch(unique_names)\nQIDResolver → Wikidata wbsearchentities\n{name → qid_or_None};
+:write_triples_to_neo4j(qid_map);
+:Neo4j\napoc.merge.node(['Entity'], {qid: "Q211098"})\nCanonical: Reid Hoffman & Reid Garrett Hoffman → same node\n(a)-[:CO_FOUNDED]->(b)\nrel.source_article, .source_title, .raw_relation;
+:graph ready for query_graph.py traversal;
+@enduml
 ```
 
 **Block 1 — Module-level constants.**
@@ -835,6 +1166,34 @@ The "Include BOTH corporate/affiliation AND biographical/life events" rule corre
 The `10-15 triples per window` target (up from v9's `5-20 per article`) is calibrated to the per-window scope. A 3000-char window of a Wikipedia biography section typically contains 10-20 extractable facts. The v9 range `5-20` applied to an entire article was too permissive at the bottom (5 triples from a 10-window article = extraction failure) and too strict at the top (capped at 20 total when the article had 70+). Per-window targets aggregate to ~70-100 triples per long article, a 3-5× density improvement.
 
 The final note "MERGE will dedupe" is for the LLM's benefit, not the programmer's. Without it, models occasionally self-censor repeated facts across windows ("I already said this") — but the prompt-context doesn't carry window history, so this self-censorship is based on the model's prior training patterns, not actual duplicate knowledge. Telling the model dedup is handled downstream encourages it to extract any fact it sees, whether or not it guesses the fact was in an earlier window.
+
+#### Function Reference
+
+#### Function 14: `extract_triples(text: str) -> list[dict]`
+
+**Purpose:** Extract entities + relations from a text segment via LLM as JSON.
+
+**Called by:** `_extract_one()` (line 279)
+
+**Returns:** List of triple dicts `{"subject", "relation", "object"}`, empty on failure.
+
+**Universal mechanism:** LLM-based open-vocabulary extraction with sliding-window chunking support. System prompt explicitly enumerates relation categories (corporate / biographical / education / employment) to prevent bias toward affiliation/ownership predicates. Includes "don't invent facts" constraint. Falls back to empty list on JSON parse failure (logs error, caller continues).
+
+---
+
+#### Function 15: `write_triples_to_neo4j(session, article, triples, qid_map, ...)`
+
+**Purpose:** MERGE entities + relations into Neo4j graph, keyed on Wikidata QID where available, fallback to name.
+
+**Called by:** `main()` (line 324)
+
+**Returns:** Dict of stats (`{"nodes_created", "edges_created", ...}`)
+
+**Universal mechanism:** MERGE on `(qid, name)` pair when QID available, else name only. Wikidata QID linking at extraction time (not post-hoc) prevents duplicate-entity problem (Leak #4). Each extracted entity name is resolved via `wbsearchentities` API in parallel batches. Disk-backed cache so rebuilds don't re-query Wikidata (API quota limits).
+
+Alias accumulation: if same QID seen with multiple surface forms, they accumulate in `node.aliases: list[str]`. The fulltext index covers both `name` and `aliases`, so "Jeff Bezos" matches the canonical "Jeffrey Preston Bezos" node.
+
+---
 
 | Parameter | Value | Effect of changing |
 |---|---|---|
@@ -998,18 +1357,33 @@ The `entity_names` fulltext index covers `[n.name, n.aliases]` — both properti
 
 **High-level flow:**
 
-```
-Discover (Cypher)              ┌─→ Judge once per predicate
-  passive predicates           │   (gemma-4-26B JSON-mode)
-  WHERE type(r) ENDS WITH '_BY'│        ↓
-       OR STARTS WITH 'WAS_'   │   {flip: true|false,
-       AND r.normalized_from   │    active_relation: str|null,
-            IS NULL            │    rationale: str}
-  → list[{rel_type, count,     │        ↓
-          sample_s, sample_raw,│   if flip: bulk-rewrite via
-          sample_o}]           │     apoc.create.relationship
-                               └─→     fallback: per-edge Python loop
-                                       audit: normalized_from = old_type
+```plantuml
+@startuml
+start
+:Discover (Cypher)
+passive predicates
+WHERE type(r) ENDS WITH '_BY'
+OR type(r) STARTS WITH 'WAS_'
+AND r.normalized_from IS NULL
+→ list[{rel_type, count,
+sample_s, sample_raw, sample_o}];
+
+:Judge once per predicate
+(gemma-4-26B JSON-mode)
+→ {flip: true|false,
+active_relation: str|null,
+rationale: str};
+
+if (flip?) then (yes)
+  :bulk-rewrite via
+  apoc.create.relationship
+  fallback: per-edge Python loop
+  audit: normalized_from = old_type;
+else (no)
+  :keep predicate;
+endif
+stop
+@enduml
 ```
 
 **Block 1 — Discover passive predicates.**
@@ -1109,18 +1483,31 @@ The Cypher dynamically creates a new relationship of the active type via `apoc.c
 
 **High-level flow:**
 
-```
-Discover (Cypher)               ┌─→ Judge once per predicate
-  all forward predicates        │   (gemma-4-26B JSON-mode)
-  WHERE r.inferred_reverse_of   │        ↓
-        IS NULL                 │   {add_inverse: bool,
-  AND count >= min_count        │    inverse_relation: str|null,
-  → list[{rel_type, count,      │    rationale: str}
-          sample_s, sample_raw, │        ↓
-          sample_o}]            │   INVERSIBLE: bulk-create via
-                                │     apoc.create.relationship(b, $new_type,
-                                │       {inferred_reverse_of: $forward_rel}, a)
-                                └─→ SYMMETRIC / STATE-OF-BEING: skip
+```plantuml
+@startuml
+start
+:Discover (Cypher)
+all forward predicates
+WHERE r.inferred_reverse_of IS NULL
+AND count >= min_count
+→ list[{rel_type, count,
+sample_s, sample_raw, sample_o}];
+
+:Judge once per predicate
+(gemma-4-26B JSON-mode)
+→ {add_inverse: bool,
+inverse_relation: str|null,
+rationale: str};
+
+if (INVERSIBLE?) then (yes)
+  :bulk-create via
+  apoc.create.relationship(b, $new_type,
+  {inferred_reverse_of: $forward_rel}, a);
+else (SYMMETRIC / STATE-OF-BEING)
+  :skip;
+endif
+stop
+@enduml
 ```
 
 **Block 1 — Discover forward predicates with idempotency guard.**
@@ -1227,39 +1614,38 @@ The second `WHERE r.inferred_reverse_of IS NULL` inside `add_reverse_edges` mean
 
 **High-level architecture (the resolver shape):**
 
-```
-unique entity-names (from extraction)
-        │
-        ▼
-  ┌─────────────────────────────────┐
-  │ QIDResolver(cache_path)         │
-  │                                 │
-  │  ┌──────────────────────────┐   │
-  │  │ disk cache (JSON dict)   │   │ ← persisted across runs
-  │  │  {"Bill Gates": "Q5284", │   │
-  │  │   "Microsoft":  "Q2283", │   │
-  │  │   "fictional":  null}    │   │
-  │  └─────────┬────────────────┘   │
-  │            │                    │
-  │  cache hit?│ no                 │
-  │            ▼                    │
-  │  ┌──────────────────────────┐   │
-  │  │ resolve_batch(names)     │   │
-  │  │  ThreadPoolExecutor(16)  │   │
-  │  │  ┌──────────────────┐    │   │
-  │  │  │ wbsearchentities │ ×N │   │ ← parallel HTTPS to Wikidata
-  │  │  │ ?search=<name>   │    │   │
-  │  │  │ &type=item       │    │   │
-  │  │  │ &limit=1         │    │   │
-  │  │  └──────────────────┘    │   │
-  │  └─────────┬────────────────┘   │
-  │            │                    │
-  │  cache.update({name: qid})      │
-  │            │                    │
-  └────────────┼────────────────────┘
-               ▼
-        {name → qid_or_None}
-        (caller MERGEs by qid when present, by name when None)
+```plantuml
+@startuml
+start
+:unique entity-names
+(from extraction);
+
+partition QIDResolver(cache_path) {
+  :disk cache (JSON dict)
+  persisted across runs
+  {"Bill Gates": "Q5284",
+   "Microsoft":  "Q2283",
+   "fictional":  null};
+
+  if (cache hit?) then (yes)
+    :return cached qid;
+  else (no)
+    :resolve_batch(names)
+    ThreadPoolExecutor(16)
+    parallel HTTPS to Wikidata:
+      wbsearchentities
+      ?search=<name>
+      &type=item
+      &limit=1;
+    :cache.update({name: qid});
+  endif
+}
+
+:{name → qid_or_None}
+(caller MERGEs by qid when present,
+by name when None);
+stop
+@enduml
 ```
 
 **Block 1 — Module header + imports.**
@@ -1415,6 +1801,43 @@ Atomic-write pattern: write to `.tmp` then `os.replace` to the canonical path. C
 | Single ad-hoc `resolve("Bill Gates")` | ~600-700 ms uncached; ~50 ns cached |
 | `resolve_batch(50_names)` cold | ~3.3 s (49 calls, 16-way parallel) |
 
+### Code walkthrough — `src/calibrate_scorer.py`
+
+`calibrate_scorer.py` is a calibration utility that tunes the composite scoring formula in `query_graph.py` by testing the current graph against a set of known probe queries. After each rebuild of the graph, the relative importance of QID presence, exact-name matches, and node degree shifts as the graph structure changes. This script measures those shifts empirically and outputs the adjusted weight constants that `query_graph.py` should use.
+
+**Purpose:** Score a set of (seed, lucene_query, expected_canonical_name) tuples against the composite formula. Returns recall across the probe set.
+
+**Universal mechanism:** For each probe, run the fulltext query against the current graph, measure how many probes returned the expected entity in LIMIT-5 results. Probe pass iff the composite score (after topology gate) includes the expected entity. Batch-score with different weight combinations to find the (QID_BONUS, EXACT_BONUS, DEGREE_COEFF) triple that maximizes recall.
+
+**Run after graph rebuild:**
+```bash
+python src/calibrate_scorer.py --quick
+```
+
+Outputs calibrated constants to stdout; edit query_graph.py QID_BONUS, EXACT_BONUS, DEGREE_COEFF with new values.
+
+---
+
+### Code walkthrough — `src/decomp_probes.py`
+
+`decomp_probes.py` is a mechanism-level test harness for the decomposition pipeline (the LLM-based query classifier and the entity resolution steps). Unlike outcome-based eval which measures end-to-end answer quality, decomp_probes measures the intermediate function behavior: "Did the classifier correctly identify this as a bridge question?" and "Did anchor resolution return the expected intermediates?" This allows debugging the decomposition mechanism independently of the generator LLM and graph traversal.
+
+**Purpose:** Test `_decompose_multihop()` (LLM classifier) and `_step_one_intermediates()` (anchor resolution) at the mechanism layer, BEFORE outcome eval.
+
+**Probe format:** `(query, expected_plan_kind, expected_step1_intermediates_subset)`
+
+- expected_plan_kind: "chain" (plan present) | "intersection" | "none"
+- expected_step1_intermediates_subset: ≥1 of these names must appear in step1 output
+
+**Run:** 
+```bash
+python src/decomp_probes.py --quick  # 5 queries, fast
+```
+
+Pass criterion: `probe_pass_rate >= 0.85` (panel B1' gate).
+
+---
+
 ### 2.2 Sanity-check the graph
 
 In Neo4j Browser (`http://localhost:7474`):
@@ -1550,27 +1973,24 @@ if __name__ == "__main__":
 
 **High-level architecture.**
 
-```
-  user query (natural language)
-         │
-         │  extract_seed_entities()
-         │  MODEL_SONNET (Gemma-4-26B, non-reasoning)
-         ↓
-  ["Apple Inc.", "Steve Jobs"]   ← seed entities (1-5)
-         │
-         │  fetch_subgraph()
-         │  for each seed: fuzzy-match → 2-hop Cypher traversal
-         ↓
-  ┌──────────────────────────────────────────┐
-  │  subgraph: list of {s, rel, o, src}      │
-  │  e.g. "Apple Inc. --[CO_FOUNDED_BY]-->   │
-  │        Steve Jobs  (source: Apple Inc.)  │
-  └──────────────────────────────────────────┘
-         │
-         │  answer()
-         │  MODEL_SONNET with graph facts as context
-         ↓
-  {"answer": "...", "seeds": [...], "edges_used": N}
+```plantuml
+@startuml
+start
+:user query (natural language);
+:extract_seed_entities()
+MODEL_SONNET (Gemma-4-26B, non-reasoning);
+:["Apple Inc.", "Steve Jobs"]
+seed entities (1-5);
+:fetch_subgraph()
+for each seed: fuzzy-match → 2-hop Cypher traversal;
+:subgraph: list of {s, rel, o, src}
+e.g. "Apple Inc. --[CO_FOUNDED_BY]--> Steve Jobs"
+(source: Apple Inc.);
+:answer()
+MODEL_SONNET with graph facts as context;
+:{"answer": "...", "seeds": [...], "edges_used": N};
+stop
+@enduml
 ```
 
 **Block 1 — Reasoning model problem and the regex fallback.**
@@ -1615,6 +2035,197 @@ def extract_seed_entities(query: str) -> list[str]:
     except json.JSONDecodeError:
         return _regex_seed_fallback(query)
 ```
+
+#### Function Reference
+
+#### Function 1: `extract_seed_entities(query: str) -> list[str]`
+
+**Purpose:** Extract 1-5 named entity strings from a user query using an LLM, with regex fallback for determinism.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** List of entity name strings, guaranteed non-empty (falls back to regex if LLM fails).
+
+**Universal mechanism:** Non-reasoning model + structured output + fallback extraction. The design encodes "reasoning models are unreliable for extraction tasks" (Bad-Case Entry 6). Uses `MODEL_SONNET` (Gemma-4-26B, non-reasoning) with `max_tokens=2000` and `temperature=0.0` for determinism. Falls back to `_regex_seed_fallback()` on `content=None` (signature of a reasoning-model budget exhaustion) or JSON parse failure.
+
+**Key insight:** The fallback regex `_PROPER_NOUN = re.compile(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b")` captures capitalized noun phrases ("Steve Jobs", "Apple", "NeXT") without requiring LLM correctness. ~20% of real queries hit this fallback when the LLM reasoning path is long.
+
+---
+
+#### Function 2: `_lucene_tokens(seed: str) -> list[str]`
+
+**Purpose:** Tokenize a seed string into Lucene-safe tokens (lowercased, 3+ chars, no reserved chars).
+
+**Called by:** `_lucene_phrase_query()`, `_lucene_or_query()`
+
+**Returns:** List of cleaned token strings, empty if seed has no tokens ≥3 chars.
+
+**Universal mechanism:** Single source of truth for query builder tokenization. Three steps:
+1. Remove Lucene reserved chars (`+`, `-`, `!`, `()`, `{}`, `^`, `"`, `~`, `*`, `?`, `:`, `\/`)
+2. Lowercase (Neo4j fulltext index lowercases at index time)
+3. Filter to ≥3 chars (matches StandardAnalyzer stopword behavior)
+
+**Why this matters:** Prevents `+`, `:`, `~` from being interpreted as Lucene operators. Seed "CEO of Apple" → tokens `["ceo", "apple"]` (no "of" — too short, is a stopword). Both builders call this, guaranteeing consistent behavior.
+
+---
+
+#### Function 3: `_lucene_phrase_query(seed: str) -> str`
+
+**Purpose:** Build a Lucene required-AND query: all tokens must be present, no adjacency required.
+
+**Called by:** `fetch_subgraph()` (line 250), `_find_bridge_edges()`, `_step_one_intermediates()`
+
+**Returns:** String like `"+mark +zuckerberg"` or single token `"mark"`, or original seed if tokenization fails.
+
+**Universal mechanism:** Phrase-first strategy for precision. Rather than quoted phrase `"mark zuckerberg"` (requires adjacency, fails on middle names), use `+token` syntax (requires presence, accepts permutation). Traded adjacency precision for middle-name tolerance.
+
+**Example:** Seed "Mark Zuckerberg" → `"+mark +zuckerberg"`. Matches "Mark David Zuckerberg", not "Mark Pincus".
+
+---
+
+#### Function 4: `_lucene_or_query(seed: str) -> str`
+
+**Purpose:** Build a Lucene OR query using only proper-noun tokens (capital first letter).
+
+**Called by:** `fetch_subgraph()` (line 250 fallback), `_find_bridge_edges()`, `_step_one_intermediates()`
+
+**Returns:** String like `"mark OR zuckerberg"`, filters to capitalized words only.
+
+**Universal mechanism:** Fallback for phrase misses, with semantic filtering. Avoids generic words ("Stanford alumni" → "stanford", not "stanford OR alumni"). Proper-noun filter drops descriptors that would pollute OR expansion.
+
+**Example:** "Jensen Huang" → `"jensen OR huang"`. "Stanford alumni" → `"stanford"` (filters "alumni").
+
+---
+
+#### Function 5: `_resolve_seed_node_names(session, lucene: str, seed: str, limit=5, threshold=2.0) -> list[str]`
+
+**Purpose:** Return up to 5 entity names from Neo4j fulltext index, ranked by composite BM25+QID+exact+degree score.
+
+**Called by:** `fetch_subgraph()` (line 250), `_find_bridge_edges()`, `_step_one_intermediates()`, `_execute_decomposition()`
+
+**Returns:** List of entity name strings, empty if no node clears `threshold=2.0`.
+
+**Universal mechanism:** Composite scoring with topology gate. Formula:
+```
+composite = bm25 + qid_bonus(2.5) + exact_bonus(0.8) + log(degree+1)*DEGREE_COEFF(0.3)
+WHERE composite >= threshold AND (has_qid OR degree >= 2)
+```
+
+The topology gate (second WHERE clause) rejects singleton noise like "CEO of Apple" (no QID, degree=1). Measured at calibration time on 5-probe set to ensure coverage on multi-token seeds.
+
+**Key insight:** The composite combines four independent signals. QID signals "this is a Wikidata entity" (canonical). Exact signals "seed matches this entity's name or alias list exactly". Degree signals "this is a hub" (degree ≥ 2 is a redundancy gate for noise like "CEO of", sentence fragments, monetary amounts). BM25 is Lucene's relevance ranking.
+
+---
+
+#### Function 6: `fetch_subgraph(seeds: list[str], max_hops=5) -> (list[dict], dict[str, dict])`
+
+**Purpose:** Main retrieval entry point. Resolve seeds to graph nodes via fulltext index, walk n-hop neighborhood, return edges + diagnostics.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** Tuple of (subgraph_edges, matches_per_seed). Each edge is `{"s", "rel", "o", "src"}`. Diagnostics include phrase/or match counts and strategy used.
+
+**Universal mechanism:** Phrase-first two-stage resolution. Multi-word seed → phrase query (high precision), fallback to OR query (broader recall) if phrase yields 0 matches POST-FILTER (after topology gate). Single-word seeds skip OR fallback (OR == phrase).
+
+Two-pass traversal: 1-hop edges first (canonical direct neighbors), then 2..N-hop fill (bridges). 1-hop edges appear in LLM context even on dense neighborhoods where multi-hop expansion would crowd them out.
+
+Substring-token expansion: If seed is multi-token proper noun ("Marc Andreessen"), also fetch the bare last token ("Andreessen") as a rare variant node that may have edges the canonical node doesn't.
+
+---
+
+#### Function 7: `_decompose_multihop(query: str) -> dict | None`
+
+**Purpose:** LLM-based query classifier. Detects multi-hop bridge/intersection questions, returns a decomposition plan or None.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** Plan dict with structure `{"step1": {...}, "step2": {...}}` or `{"type": "intersection", "step1a": {...}, "step1b": {...}}`, or None.
+
+**Universal mechanism:** LLM classifier with fallback to None. System prompt uses 9 worked examples (PayPal founders → companies, Stanford alumni → companies, Apple ↔ NeXT, etc.). Temperature=0.0 for determinism. Falls back to None on any LLM error or invalid JSON — the caller continues with default fetch_subgraph().
+
+**Key insight:** The classifier decides **question shape**, not entity resolution. Same query "companies founded by Stanford alumni" could decompose as "step1: Stanford → alumni, step2: alumni → companies" OR as plain fetch_subgraph (1-hop + 2-5-hop fill). The decomposer says "use targeted Cypher" when it detects the bridge pattern; the router in `answer()` says "use decomposition edges first, then PPR, then subgraph".
+
+---
+
+#### Function 8: `_execute_decomposition(plan: dict, max_intermediate=30) -> list[dict]`
+
+**Purpose:** Execute a 2-step decomposition plan (bridge or intersection) against Neo4j. Returns edges suitable for LLM context.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** List of edge dicts, same shape as fetch_subgraph output.
+
+**Universal mechanism:** Two plan types: bridge (anchor → intermediates → targets) and intersection (both anchors independently → intermediates, intersect by name). Step-3 optional expansion if `plan["step2"].get("expand_terminal")=true` (for questions like "companies founded by Harvard dropouts that were later acquired" where step-2 filter is "founded" but the qualifier needs "acquired" edges beyond step-2).
+
+Edge ordering: step-2 first (direct answer), step-3 second (terminal context), step-1 last (supporting). LLMs attend most reliably to context start ("lost in the middle" effect), so the primary answer edges appear early.
+
+---
+
+#### Function 9: `_step_one_intermediates(session, anchor: str, edge_filter: str, limit: int) -> list[str]`
+
+**Purpose:** Resolve an anchor entity → its neighbors filtered by edge relation regex.
+
+**Called by:** `_execute_decomposition()` (line 481)
+
+**Returns:** List of entity names (intermediates), up to `limit`.
+
+**Universal mechanism:** Wrapper that combines seed resolution + traversal. Resolves anchor via `_resolve_seed_node_names()`, then runs Cypher with regex filter on r.raw_relation (case-insensitive substring). E.g., anchor="Stanford", filter="attend|graduate|stud|alum|enroll", returns ~100 Stanford alumni names.
+
+---
+
+#### Function 10: `_ensure_gds_projection() -> bool`
+
+**Purpose:** Create or refresh an undirected Neo4j GDS projection for Personalized PageRank.
+
+**Called by:** `_ppr_retrieve()` (line 687)
+
+**Returns:** True on success, False on failure (logs warning, PPR skipped gracefully).
+
+**Universal mechanism:** Refresh-once flag (`_gds_projection_refreshed`). On first call per process, drops any pre-existing projection (prevents inheriting stale node IDs from a prior graph build). Subsequent calls reuse the in-memory projection. Wildcard relationship projection (`type='*'`) so ALL edge types propagate — no edge-type specification needed. This is the key difference from decomposition: decomposition filters by relation type, PPR uses all edges.
+
+---
+
+#### Function 11: `_ppr_retrieve(seeds: list[str], top_k=60) -> list[dict]`
+
+**Purpose:** Personalized PageRank retrieval from seed entity names. Last-resort retriever when decomposition + subgraph produced nothing.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** List of edge dicts (edges incident to top-K PPR-ranked nodes).
+
+**Universal mechanism:** Two-step: resolve seed names → exact graph nodes via fulltext index. Pass to GDS PPR with `maxIterations=20, dampingFactor=0.85`. Return edges where both endpoints are in top-K. Ordered last in the edge concatenation (Bridge | PPR | Initial) because PPR's 200+ edges can push targeted bridge edges past the 300-edge context cap.
+
+**Why conditional firing:** Unconditional PPR caused multi_hop regression (v13: Q20 0.60→0.20, Q23 1.00→0.33). When decomposition already found targeted edges, PPR's global high-PageRank neighbors add noise, not signal. New rule: fire PPR only if neither decomposition nor bridge produced edges.
+
+---
+
+#### Function 12: `_find_bridge_edges(e1: str, e2: str) -> list[dict]`
+
+**Purpose:** Find shared neighbors of two entities (relational bridge). Works for "who worked at both X and Y" / "founders of both X and Y" patterns.
+
+**Called by:** `answer()` (line 805)
+
+**Returns:** List of edge dicts (edges incident to shared intermediates).
+
+**Universal mechanism:** Fetch each entity's 1-hop edge set (≤150 edges each), intersect neighbor names in Python, return all edges touching shared intermediates. No hardcoded relation types — works for founders, investors, board members, alumni, anything.
+
+**Firing rule:** Conditional: `len(seeds)==2 AND no decomp_plan AND relational keyword in query` (keyword list: "relationship", "connection", "connected", "related", "between", "link").
+
+---
+
+#### Function 13: `answer(query: str) -> dict`
+
+**Purpose:** Top-level orchestrator. Chain: extract seeds → fetch subgraph → optional decomposition → optional bridge → optional PPR → per-edge dedup → QID inline tagging → format for LLM → synthesize answer.
+
+**Called by:** `__main__` (line 805)
+
+**Returns:** Dict with keys: "answer" (str), "seeds" (list), "matches_per_seed" (dict), "edges_used" (int).
+
+**Universal mechanism:** Multi-stage router (decomposition → bridge → PPR → initial) with per-edge dedup and multi-source aggregation. Per-edge dedup preserves direction (Apple-acquired-NeXT ≠ NeXT-acquired-Apple) and attributes sources per unique edge (critical for citation).
+
+Precondition surfaces: warns if seed matches 0 entities (corpus mismatch) or falls back to OR-only (weak match).
+
+---
 
 `temperature=0.0` is correct here: entity extraction is a deterministic classification task. There is no benefit to sampling; you want the same query to produce the same seeds on every run so that query results are reproducible. `max_tokens=2000` is set uniformly across all three LLM call sites (seed extraction, decomposition planning, answer generation) for consistency and to avoid silent truncation — in practice seed extraction uses far fewer tokens, but a shared ceiling eliminates an entire class of `finish_reason="length"` failures.
 
@@ -2147,6 +2758,165 @@ You should see populated `seeds`, `edges_used > 0`, and an answer grounded in th
 
 ---
 
+
+#### v12.4m Mechanism Reference
+### Mechanism Functions (with signatures and behavior)
+
+#### Phase A: Core Read Mechanisms
+
+**`extract_seed_entities(query: str) → List[str]`**
+- LLM-based seed extraction with regex fallback.
+- Prompt: "Extract exactly the named entities to search for in the knowledge graph. Return list."
+- Returns list of entity phrases to anchor traversal.
+- Example: "Who founded Apple?" → ["Apple"]
+- Example: "Stanford alumni founded companies?" → ["Stanford University", "company", "founder"]
+
+**`_lucene_phrase_query(seed: str) → str`**
+- Constructs Neo4j fulltext phrase query with required tokens.
+- Syntax: `entity_name:("{seed}" OR "{variations}")`
+- Matches exact multi-token sequences before falling back to OR.
+- Example: `_lucene_phrase_query("Larry Page")` → `entity_name:"Larry Page" OR entity_name:"Page"`
+
+**`_lucene_or_query(seed: str) → str`**
+- OR fallback when phrase prunes too many results.
+- Filters singleton-frequency tokens (category noise).
+- Excludes: "CEO", "founder", "company", "person", "organization" (stop words for generic roles).
+- Example: `_lucene_or_query("Stanford University founders")` → tokens: ["Stanford", "University", "founders"] minus stop words, returns OR clause.
+
+**`_resolve_seed_node_names(session, lucene, seed: str, limit: int, threshold: float) → List[Node]`**
+- Composite scorer: BM25 + QID bonus + exact match bonus + log(degree)*coeff.
+- **Topology gate:** Returns only nodes with `qid IS NOT NULL OR degree >= 2`.
+- Rejects singleton noise: sentence fragments, monetary amounts, generic role names.
+- Sorts by composite score DESC; limits to top-K.
+
+**`_RERANK_CYPHER` (line 55)**
+- Cypher scoring subquery. Ranks candidates by composite score.
+- Gate: `WHERE (n.qid IS NOT NULL OR apoc.node.degree(n) >= 2)`
+- Returns: `(node, composite_score, normalized_score)` triples.
+
+**`fetch_subgraph(seeds: List[str], max_hops: int = 2) → (Graph, Dict)`**
+- Two-stage resolution:
+  1. Phrase query → hits
+  2. If empty, OR query fallback
+- Substring-token expansion: if "Larry Page" seed found, also surface bare "Page" node if it has edges.
+- BFS from all seed nodes up to max_hops radius.
+- Returns: subgraph dict `{node: [...], edges: [...], metadata: {...}}`.
+
+#### Phase B: Decomposition & Advanced Retrieval
+
+**`_decompose_multihop(query: str) → Optional[DecompositionPlan]`**
+- LLM query planner. Returns plan or null.
+- Plan schema: `{type: "chain" | "intersection", step1a: str, step1b: str, expand_terminal: bool}`
+- Classifier distinguishes:
+  - Multi-hop bridge/chain → decompose
+  - Single-hop → return null (use fetch_subgraph)
+- Example: "Stanford alumni founded companies acquired by Google?" → `{type: "chain", step1a: "Stanford University", step1b: null, expand_terminal: true}`
+
+**`_execute_decomposition(plan: DecompositionPlan) → List[Edge]`**
+- Chain: step1 → enumerate step2 → optional step3 (if expand_terminal=true)
+- Intersection: step1a + step1b in parallel → bridge edges between them
+- Respects LLM-decided `expand_terminal` flag; probes show this outperforms always-on step3.
+
+**`_step_one_intermediates(session, anchor: str, edge_filter: str, limit: int) → List[Node]`**
+- Enumerate all entities connected to anchor (e.g., all Stanford alumni, all founders).
+- Post-filter on edge metadata if decomp plan specifies relation type.
+
+**`_ensure_gds_projection() → None`**
+- GDS in-memory projection lifecycle.
+- Drops stale `entity-ppr-graph` on first call per process.
+- Reproject from current Neo4j data to prevent stale-node-ID errors after graph rebuilds.
+
+**`_ppr_retrieve(seeds: List[str], top_k: int = 10) → List[Node]`**
+- Personalized PageRank from seed entities.
+- Initialize seed set; 20 iterations; return top-K by proximity.
+- Fallback for decomp-null or single-hop queries.
+
+**`_find_bridge_edges(e1: str, e2: str) → List[Edge]`**
+- 1-hop intersection: entities connected to both e1 and e2.
+- Triggered for "relationship" keyword in query.
+- Example: "Apple ↔ Pixar?" → find all entities with edges to both.
+
+**`answer(query: str) → str`**
+- Top-level orchestrator.
+- Flow:
+  1. Extract seeds
+  2. Decompose (or null)
+  3. Fetch subgraph (always)
+  4. Apply bridge/PPR/decomp edges
+  5. Render with QID inline tags + deduplication
+  6. LLM answer (FACTS + ANSWER for FACTOID/RELATIONAL; ANSWER-only for LIST)
+  7. COMPOUND queries: add THINKING block
+- Returns final answer string.
+
+### Testing & Validation (Decomposition Probes)
+
+**decomp_probes.py (14 probes, 0.929 pass rate)**
+
+Tests each mechanism independently before eval-scoring:
+
+1. `test_phrase_query_exact_match` — exact multi-token seed matching
+2. `test_phrase_query_empty_fallback_to_or` — phrase → OR fallback
+3. `test_topology_gate_rejects_singletons` — degree filter rejects noise
+4. `test_qid_bonus_promotion` — explicit QID scored higher
+5. `test_composite_score_ranking` — all bonuses sum correctly
+6. `test_two_stage_resolution_success` — phrase + OR both return results
+7. `test_seed_extraction_lvm_vs_regex` — LLM fallback to regex
+8. `test_decompose_chain_vs_intersection` — LLM classifier branches correctly
+9. `test_chain_step1_to_step2_edge_walk` — step1→step2 enumeration
+10. `test_intersection_step1a_step1b_parallel` — parallel steps for intersection
+11. `test_expand_terminal_lvm_decision` — LLM-decided step3 expansion
+12. `test_substring_token_expansion` — multi-word seed substring matching
+13. `test_bridge_edges_1hop_intersection` — 1-hop entity intersection
+14. `test_ppr_fallback_ranking` — PPR seed initialization + ranking
+
+Running probes before eval scoring isolates mechanism failures. If a probe fails, the corresponding mechanism is broken; if probes pass but eval score regresses, the issue is downstream (prompt, rendering, or eval ground truth).
+
+### Prompt Structure (SYSTEM_PROMPT constants)
+
+**Two-Pass Output (FACTS + ANSWER):**
+
+For FACTOID and RELATIONAL question types:
+```
+Output format:
+FACTS: [list of specific facts from the knowledge graph that support the answer]
+ANSWER: [direct answer to the question, 1-2 sentences max]
+```
+
+For LIST questions:
+```
+Output format:
+ANSWER: [bulleted list of items from the knowledge graph]
+```
+
+**COMPOUND Question Type with THINKING:**
+
+For multi-clause or conditional questions:
+```
+You are answering a COMPOUND question with multiple sub-clauses.
+Think through each clause step-by-step:
+THINKING: [internal reasoning for each sub-clause, entity resolution, edge walking]
+ANSWER: [final answer combining all sub-clauses]
+```
+
+**QID Inline Tagging Rule:**
+
+When rendering entities:
+- Single QID: `Steve Jobs [Q19520]`
+- Multiple QIDs (same entity, different surfaces): `Steve Jobs [Q19520, also Q8937]`
+- Different entities, same name: `Page [Q4934 — Larry] and [Q13563379 — company surname]`
+
+**Intersection Eligibility Rule:**
+
+"Only resolve anchors as specific named entities, NOT categories. Examples:
+- ✓ 'Stanford University', 'Google', 'Nvidia', 'Steve Jobs'
+- ✗ 'company', 'founder', 'space company', 'person'"
+
+Audit examples vs rules: adding this rule but keeping example `["space", "payments"]` confuses the LLM.
+
+**Surface-Form-Drift Exception:**
+
+"When two entities share a substring token (e.g., 'Page' in 'Larry Page' and 'Page Inc.'), check if they share a neighbor in the graph. If yes, treat as one entity with merged QIDs. If no, render as separate entities."
+
 ## Phase 4 — Head-to-Head vs Week 2 Vector RAG (~1.5 hours)
 
 ### 4.0 Vector index setup — `src/ingest_to_vector.py` + `src/ingest_to_vector_hybrid.py`
@@ -2366,25 +3136,43 @@ The original walkthrough (above) describes substring-only scoring (Block 3). v10
 
 **High-level architecture (v10d):**
 
+```plantuml
+@startuml
+start
+:per query;
+fork
+  :graph_answer(q)
+  → {answer, edges_used};
+  fork
+    :score_substring(answer, expected)
+    → g_substr;
+  fork again
+    :score_llm_judge(q, answer, expected)
+    → g_judge + per-entity matches;
+  end fork
+fork again
+  :search_with_rerank(q, k=5)
+  → {answer, chunks};
+  fork
+    :score_substring(answer, expected)
+    → v_substr;
+  fork again
+    :score_llm_judge(q, answer, expected)
+    → v_judge + per-entity matches;
+  end fork
+end fork
+stop
+@enduml
 ```
-  per query
-    │
-    ├── graph_answer(q) ──→ {answer, edges_used}
-    │                            │
-    │                            ├── score_substring(answer, expected) ──→ g_substr
-    │                            └── score_llm_judge(q, answer, expected) ──→ g_judge + per-entity matches
-    │
-    └── search_with_rerank(q, k=5) ──→ {answer, chunks}
-                                  │
-                                  ├── score_substring(answer, expected) ──→ v_substr
-                                  └── score_llm_judge(q, answer, expected) ──→ v_judge + per-entity matches
 
-  per-question record:
-    {q, type, expected,
-     graphrag:  {recall: g_substr, recall_judge: g_judge, judge_detail: {entity → bool}, latency, edges},
-     vectorrag: {recall: v_substr, recall_judge: v_judge, judge_detail: ..., latency},
-     winner:        substring-based (backward compat),
-     winner_judge:  judge-based (honest)}
+**Per-question record:**
+
+```
+{q, type, expected,
+ graphrag:  {recall: g_substr, recall_judge: g_judge, judge_detail: {entity → bool}, latency, edges},
+ vectorrag: {recall: v_substr, recall_judge: v_judge, judge_detail: ..., latency},
+ winner:        substring-based (backward compat),
+ winner_judge:  judge-based (honest)}
 ```
 
 **Block 1 — Substring scorer (preserved from v9.5).**
@@ -2591,9 +3379,73 @@ GraphRAG ingestion cost is analogous to a materialised view vs an index. Materia
 5. Q: Rough cost asymmetry for GraphRAG ingestion vs vector-RAG ingestion? — A: 10–50×.
 
 ### 3 Spoken Interview Questions (record yourself answering each out loud)
-1. "When does GraphRAG beat vector RAG, and when does it lose?" (target: 90 sec)
-2. "Walk me through your entity-extraction prompt. How would you evaluate extraction quality?" (target: 3 min)
-3. "You have a 100K-document corpus and $50K ingestion budget. Design the retrieval stack." (target: 5 min — the answer is almost certainly hybrid with query routing; justify every choice with numbers)
+
+#### Q1. "When does GraphRAG beat vector RAG, and when does it lose?" (target: 90 sec)
+
+**Answer reference — points to hit (in this order):**
+- **Win condition:** multi-hop reasoning across explicit typed relationships. My v12.4m eval on a 400-article tech-founder corpus: GraphRAG multi_hop = 0.88, vector multi_hop = 0.03 — a +0.85 delta because the question requires composing edges (`founder → founded → company`) that no single document states verbatim.
+- **Win condition #2:** relational queries asking how X and Y connect. GraphRAG = 1.00, vector = 0.12 on the same eval. Bridge inference (Apple ↔ Pixar via Steve Jobs) is structural and only the graph traversal surfaces it.
+- **Lose condition:** single-hop factoid lookups where one document already states the answer. Vector RAG with rerank wins on latency (~1s vs 8-25s for graph) and matches on accuracy. Both hit 1.00 on factoid in my eval.
+- **Lose condition #2:** ingest cost. GraphRAG = 10-50× more expensive (LLM extraction over every chunk + QID resolution + Neo4j writes vs single embedding pass). On a $50K budget, you'd want to push only the multi-hop slice through the graph.
+- **Production answer:** hybrid with classifier routing. Single-hop → vector. Multi-hop / relational → graph. Ambiguous → both + cross-encoder rerank.
+- **Honest scope:** my numbers are tech-founder Wikipedia. Domain-shift validation is required before claiming the same gap on legal/medical/scientific corpora.
+
+**Supporting evidence in this chapter:** §1 motivation, §2 theory primer, [[#v12.4m Architecture Updates]] PlantUML diagram, [[#Phase 4 — Eval Harness]] comparison.json metrics, [[#Bad-Case Journal Entry 5]] (router pattern), [[#Empirical findings]] subsections.
+
+#### Q2. "Walk me through your entity-extraction prompt. How would you evaluate extraction quality?" (target: 3 min)
+
+**Answer reference — points to hit:**
+
+*Prompt design (1-1.5 min):*
+- **Sliding-window over articles** at 3000 chars / 500 overlap. Single-pass over 50K-char article would let LLM forget mid-document; 500-char overlap catches cross-window facts.
+- **Active-voice rule:** "Apple was acquired by NeXT" → emit `(NeXT, acquired, Apple)`. Passive constructions silently invert subject/object — would corrupt downstream traversal.
+- **8 universal relation categories** (action/causation, affiliation, derivation, transition, production, education, location, temporal) — universal across corpora, not biz-domain-specific. The LLM picks the verb phrase per triple.
+- **Entity validation rules:** proper-noun-only (capital-first letter), no role descriptors as entities ("CEO of Apple" rejected), no comma-lists as a single subject, drop leading articles.
+- **QID resolution post-pass:** every entity name → `wbsearchentities` → canonical Wikidata QID. MERGE on QID, not on string. Same person under different surface forms ("Bill Gates" / "William Henry Gates III") collapses to one node.
+
+*Evaluation (1.5 min):*
+- **Mechanical:** triples per article (avg 98 in my v12.2 build), QID resolution rate (50.1% — rest are corpus-specific entities not in Wikidata), null-QID rate as a noise proxy, extraction wall-time per article.
+- **Question-level eval (the load-bearing metric):** end-to-end QA over a curated question set with substring + LLM-judge scoring. v12.4m hits 0.96 overall, 32/0/0 W/L/T vs vector. Stratified by question type (factoid, two-hop, relational, multi-hop, out-of-domain) so regressions are localized.
+- **Mechanism probes (decomp_probes.py):** 14 known-input → known-output assertions on `_decompose_multihop` classifier and step1 intermediate resolution. 0.929 pass rate — gates production deploys.
+- **Bad-case journal:** every regression gets a 3-field entry (symptom / root cause / fix). Forces post-mortem discipline; later iterations cite specific entries.
+
+**Supporting evidence:** [[#Code walkthrough — `src/build_graph.py`]] (extract_triples, EXTRACT_SYSTEM), [[#Code walkthrough — `src/query_graph.py`]] (fetch_subgraph, decomposition), [[#Code walkthrough — `src/decomp_probes.py`]] (mechanism probes), [[#v12.4m Mechanism Reference]] (universal mechanisms catalog), [[#Bad-Case Journal]].
+
+#### Q3. "100K-document corpus, $50K ingestion budget. Design the retrieval stack." (target: 5 min)
+
+**Answer reference — points to hit:**
+
+*1. Profile the corpus and the queries first (~30 sec):*
+- "Documents" is too vague — what's the document size, domain, and update cadence? Static + small (<10KB avg) + multi-domain knowledge → graph is feasible. Streaming + long-form + single-domain → reconsider.
+- Sample the query distribution: what fraction is factoid vs relational vs multi-hop? Determines retrieval-strategy mix.
+
+*2. Cost decomposition for $50K (~1 min):*
+- LLM extraction is the dominant ingest cost. At ~$0.003/triple on Gemma-26B local (or ~$0.01 cloud), 100K docs × 100 triples = 10M triples × $0.003 = **$30K just for extraction**.
+- QID resolution: ~$200 (Wikidata API is free, but parallel batch of 13K-50K unique names = ~10 hours wall time).
+- Neo4j cluster: $200-500/month managed (AuraDB) for a 5M-node, 50M-edge graph. 12 months → $3-6K.
+- Vector index (FAISS or Qdrant): ~$2K total compute + storage on RAM-resident HNSW.
+- Reserve $10-15K for re-extractions and eval iterations — Phase B/C iteration costs in my lab were ~30% of total spend.
+
+*3. Stack design — hybrid with explicit routing (~2 min):*
+- **Tier 1 — fast vector RAG** (BGE-M3 + cross-encoder rerank, single-hop, ~1s latency). Handles ~70% of queries. Built first because it's a fallback for everything else.
+- **Tier 2 — GraphRAG** (Neo4j + topology-gate retrieval + decomposition + bridge + PPR, ~8-25s latency). Handles relational + multi-hop chains.
+- **Router** = LLM-classifier (small, fast) labeling each query as vector / graph / both. From my Phase A work: hardcoded keyword routing breaks; LLM-decided is universal.
+- **Both-path queries** rerank graph + vector results jointly via cross-encoder.
+- **Eval loop:** per-question-type W/L/T tracking. Promotion gate: graph beats vector on at least one metric per category before deploy.
+
+*4. Per-component justification (~1 min):*
+- Why local LLM (Gemma-26B MLX) over GPT-4 for extraction: extraction is volume-dominated, not quality-dominated; locally-deployed throws hardware at it. Quality-eval shows Gemma-26B + good prompts = 50.1% QID match, sufficient.
+- Why Neo4j over a pure SPARQL store: GDS (Personalized PageRank, degree centrality) ships in-engine — saves a second compute layer.
+- Why universal mechanisms over hardcoded patterns: rebuild cost is the gate. My v12.3-v12.4m delivered +0.15 recall via read-path changes only, no rebuild. Hardcoded fixes per failure mode would require rebuild per fix.
+
+*5. Failure-mode planning (~30 sec):*
+- Eval-laxness vs system-correctness: audit ground-truth before debugging system. My v12.4 eval correction (4 historically-wrong entries) was +0.03 overall with zero code changes.
+- Graph fragmentation (same QID under multiple surface forms): canonical-ID merge at extraction; surface-form-drift exception in answer prompt.
+- Temporal/rename drift (Loudcloud → Opsware): Wikidata `former_name` enrichment pass, not solvable at read path.
+
+**Supporting evidence:** [[#Cost asymmetry]], [[#Bad-Case Journal Entry 5]] (routing pattern), [[#v12.4m Architecture Updates]], [[#13 Universal Mechanisms]] catalog, [[#Empirical findings]] (latency tables, W/L/T progression).
+
+---
 
 ---
 
@@ -2965,6 +3817,39 @@ The path from "GraphRAG missed Apple/NeXT and Mark Zuckerberg" to v10's sliding-
 
 ## Troubleshooting
 
+### v12.4m Failure Modes & Debugging
+### Common Failure Modes & Debugging
+
+**Failure 1: Phrase Query Returns Empty, No OR Fallback**
+- Symptom: seed "Larry Page" → no results
+- Debug: Check if `_resolve_seed_node_names` is called twice (phrase first, then OR)
+- Fix: Ensure two-stage resolution in `fetch_subgraph` line 250
+
+**Failure 2: GDS "sourceNodes Do Not Exist" Error**
+- Symptom: After graph rebuild, PPR fails with WARN
+- Debug: Check if `_ensure_gds_projection()` drops old graph
+- Fix: Call on first process invocation; drop+reproject each process
+
+**Failure 3: Bridge Edges Not Found in Relational Queries**
+- Symptom: "Apple ↔ Pixar?" returns subgraph but no bridge
+- Debug: Check if `_find_bridge_edges` is called for "relationship" keyword
+- Fix: Keyword detection in query type classifier; ensure bridge called before render
+
+**Failure 4: THINKING Block Truncates LIST Answers**
+- Symptom: 30-item alumni list gets truncated mid-sentence
+- Debug: Check if THINKING is bounded to COMPOUND only
+- Fix: Remove THINKING from LIST prompt; let LLM internally reason
+
+**Failure 5: QID Fragmentation (Same Entity, Different QIDs)**
+- Symptom: Q29 missing some entities; extraction resolved "Page" to two different QIDs
+- Debug: Grep subgraph render for [Q1, also Q2] tags
+- Fix: Surface-form-drift merge exception in prompt; render combined QID tags
+
+**Failure 6: Eval Ground Truth Wrong**
+- Symptom: System produces correct answer; eval scores 0.00
+- Debug: Grep `data/corpus.json` for expected entities; check if extraction would surface them
+- Fix: Audit ground truth before debugging retrieval; replace corpus-absent entities with confirmed-present chains
+
 | Symptom                                                     | Likely cause                                                 | Fix                                                                                  |
 | ----------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
 | `ServiceUnavailable` on Neo4j connect                       | Docker container not ready                                   | `docker logs neo4j-graphrag` — wait for "Started." line                              |
@@ -2981,16 +3866,6 @@ The path from "GraphRAG missed Apple/NeXT and Mark Zuckerberg" to v10's sliding-
 - If you want to go deeper: run Microsoft's `graphrag` library on the same corpus and compare its Leiden-community summaries against your 2-hop traversal. The Microsoft library adds global-query support (community-summary-based) which your lab doesn't cover — that's the third GraphRAG mode worth knowing.
 - Interview prep: this week is the strongest material you have for the "design a RAG system for a legal discovery product" type of system-design question. Multi-hop is the default regime in those products.
 
-
----
-
-## Why This Week Matters
-
-Vector RAG breaks on multi-hop questions in a measurable, reproducible way. Ask a vector index "Who was the founder of the company that built the first transistor?" and it returns chunks about Bell Labs, AT&T, the transistor — but the answer (William Shockley, John Bardeen, Walter Brattain) is in a *different* document that connects through "the team that built the transistor at Bell Labs." Cosine similarity does not traverse relations; chunks do not link.
-
-GraphRAG (Microsoft, 2024) attacks this by extracting entities and relations into a knowledge graph at ingest time, then traversing the graph at query time to gather context that vector search alone misses. This week you will build the entity-extraction pipeline, the Neo4j graph, the query-time traversal, and a head-to-head eval against your Week 2 vector RAG on a 32-question categorized set (factoid / two_hop / relational / multi_hop / out_of_domain) with both substring + LLM-judge scoring.
-
-The interview signal is precise: candidates who can articulate when GraphRAG wins (multi-hop, relational, audit-trail-required queries) and when it loses (factoid, paraphrase, single-document) demonstrate they understand retrieval architecture as a system-design decision rather than a default tool choice. The hybrid pattern — vector for recall, graph for reasoning — is the production answer most production RAG systems converge on.
 
 ---
 
@@ -3391,3 +4266,5 @@ The `notes` list captures the probe + every decision derived from it ("device=mp
 - **Connects to: W3.7 Agentic RAG.** Agentic RAG dispatches retrieval as a tool call; the router pattern from this week's bad-case Entry 5 is the same pattern an agent uses to decide when to call the GraphRAG tool versus the vector tool. W3.7 generalizes the routing decision.
 - **Distinguish from: W3 RAG Evaluation.** W3 evaluates retrieval quality with metrics (recall, MRR, nDCG) over a corpus. This week evaluates retrieval *strategy* (graph vs vector) over a question set. W3's metrics apply within either strategy; this week's comparison is between strategies.
 - **Foreshadows: W11 System Design.** Production GraphRAG systems require ingest pipeline (entity extraction, graph build, embedding refresh) + serving stack (Neo4j cluster + vector store + router) + observability (which retriever fired, what entities were resolved, was the answer cited). W11 covers how to architect this end-to-end.
+
+---
