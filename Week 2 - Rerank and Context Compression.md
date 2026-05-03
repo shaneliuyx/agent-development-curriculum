@@ -1,14 +1,23 @@
 ---
 title: "Week 2 — Rerank & Context Compression"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-2, rag, rerank, compression, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-02-rerank-compress"
 estimated_time: "15–18 hours over 6–8 days"
 prerequisites: "Week 1 RESULTS.md committed, bge_m3_hnsw collection still populated, FlagEmbedding library available (installed in Phase 1.1)"
+audience: "Cloud infrastructure engineer (3 yrs), building RAG systems and learning to optimize the retrieval → generation pipeline"
+stack: "MacBook M5 Pro, 48 GB unified memory; oMLX for inference; BGE-M3 and BGE-reranker; Gemma 26B for compression"
 ---
 
 # Week 2 — Rerank & Context Compression
+
+## Why This Week Matters
+
+Retrieval quality has a hard ceiling set in Week 1 — if the gold document isn't in the top-10, no stage downstream can recover it. This week teaches you the next-layer defenses: reranking (using a cross-encoder to re-score top-50 candidates with joint query-document attention) and context compression (summarizing retrieved chunks before feeding them to generation). In production, these layers buy back quality points within your latency budget. You'll measure reranking's lift empirically on two very different benchmarks: MS MARCO (saturated, where retrieval already captures most of the signal) and BEIR-FiQA (harder, where reranking matters). You'll implement context compression with a smaller model (Gemma 26B) and quantify the token-count savings vs. answer-quality delta. In interviews, this is where you demonstrate fluency in the tradeoff stack: hybrid retrieval (cheap), reranking (expensive), compression (memory-bound). You'll be able to explain why hybrid + reranker sometimes beats hybrid alone, and when context compression is or isn't worth the latency cost.
+
+---
 
 > Goal: measure the **lift from reranking** and the **cost/quality tradeoff of context compression** on your own corpus. Defend a specific chunking + reranking strategy with numbers.
 
@@ -3689,10 +3698,108 @@ Reranker = feature-engineering layer. Compression = lossy-serialization codec ch
 
 ### 6.2 Three out-loud questions
 
-1. "Your RAG answer is right but unsupported by any retrieved chunk. Walk me through the debug."
-2. "When does reranking hurt rather than help?"
-3. "How do you A/B test a new reranker in production?"
-4. "Walk me through when you'd reach for hybrid retrieval vs adding a cross-encoder reranker. What does each cost, what does each buy?"
+#### Q1. "Your RAG answer is right but unsupported by any retrieved chunk. Walk me through the debug." (target: 90 sec)
+
+**Answer reference — points to hit (in this debug order):**
+
+*1. Isolate the layer first (~20 sec):*
+- "RAG" can mean two stacks: **(a) pure RAG** = retrieve + rerank + compress, output IS ranked chunks; **(b) RAG + synthesis** = (a) followed by an LLM that turns chunks into prose.
+- In **pure RAG, this failure mode is impossible** — chunks ARE the answer; "unsupported by any retrieved chunk" is tautologically false.
+- The "right but unsupported" failure ONLY exists in stack (b), and it's a **synthesis-LLM problem**, not a retrieval problem. The synthesis LLM leaked parametric knowledge into the final prose. Fixing it does not require touching retrieval.
+
+*2. Synthesis-side root causes (~50 sec):*
+- **Prompt non-compliance.** "Use ONLY the passages below" gets ~85-95% compliance; well-known facts leak through. Check by running the same query with `temperature=0` and a smaller LLM — if leak rate drops, parametric pull is confirmed.
+- **Blended answer.** Retrieved chunks are partially relevant; LLM fills the gap from priors. Example: retrieved "Apple founded 1976 by Jobs/Wozniak" → answer "Apple founded 1976 in Cupertino by Jobs/Wozniak". "Cupertino" came from training data. Fix: refusal-required prompt (*"If not stated in passages, reply 'not in source'"*).
+- **Hallucinated citation.** When forced to cite, LLM fabricates a citation pointing at a real chunk that doesn't actually contain the claim. Fix: programmatic citation verification — parse cite → NLI or substring-match against the chunk → reject if no entailment.
+
+*3. Retrieval-side cross-check (~20 sec):*
+- Confirm the issue is NOT retrieval-side by inspecting the actual chunks passed to the synthesis model. Are they relevant to the query? If yes → confirmed synthesis-layer leak. If chunks are off-topic → retrieval bug, fix that first (recall@K too low, reranker dropping gold, K too small).
+- If retrieval looks healthy but the answer still drifts: groundedness is not the same as retrieval recall. Measure it separately — see follow-up below.
+
+*3. Quantitative anchor (~15 sec):*
+- Have a measurement ready (replace `X` and `Y` with your own numbers): "On my W2 lab slice, the ungrounded rate was `X`% before adding the citation requirement, `Y`% after. The failures that remained shifted from synthesis-side to retrieval-side, which is the easier failure to debug."
+
+**Pre-interview action:** run a 100-query slice with and without the `(source: <doc_id>)` citation requirement; count answers where the cited source doesn't actually contain the claim. Record `X` and `Y` from your run.
+
+**Likely follow-up — "OK how do you fix it?" (have these mitigations ready):**
+
+Even with strict grounding prompts ("Use ONLY the context below"), the failure persists. Five reasons + stacked mitigations:
+
+| Failure mode | Why it happens | Mitigation | Residual leak rate |
+|---|---|---|---|
+| Prompt non-compliance | LLM still leaks well-known facts ("Apple → Cupertino") even when prompted not to | `temperature=0` + smaller model (less parametric knowledge to leak) | ~10% |
+| Blended answers | Retrieved chunk is partially relevant; LLM fills gap from priors | Refusal-required prompt: *"If not stated in the passages, reply 'not in source'"* | ~3-5% |
+| Multi-hop chain leak | LLM reasons across retrieval; some hops from chunks, some from priors | Citation requirement per claim: every sentence ends with `(source: <chunk_id>)` | ~2% |
+| Hallucinated citation | LLM fabricates a citation pointing at a real chunk that doesn't actually contain the claim | **Programmatic citation verification** — parse cite → NLI or substring-match against chunk → reject if no entailment | <0.5% |
+| Weak constraint semantics | "Use ONLY" interpreted as "prefer", not "must" | Constrained decoding (regex / JSON schema enforcing citation format) | structural |
+
+The interview-grade insight: groundedness is a **measurable property** (groundedness rate = fraction of claims supported by cited chunks), not a binary "I added the prompt instruction." Production systems use NLI models (e.g., RoBERTa-MNLI) or benchmarks like Vectara's HHEM to compute it. 95% sounds great until 1 in 20 answers fabricates a fact with a real-looking citation.
+
+**Supporting evidence:** §3 architecture (synthesis prompt design), [[#Bad-Case Journal]] entries on groundlessness, [[#Phase 4 — Eval Harness]] FiQA measurements.
+
+#### Q2. "When does reranking hurt rather than help?" (target: 90 sec)
+
+**Answer reference — points to hit:**
+
+*1. Diminishing-return regimes (~30 sec):*
+- **Saturated benchmarks.** When the underlying retriever already hits recall ≥0.95, the reranker can only re-order — net lift is noise, p<0.05 testing usually fails. Benchmark BEFORE deploying.
+- **Out-of-distribution queries.** Cross-encoder is trained on (query, passage) pairs from the model's training distribution. New domain → reranker confidence is miscalibrated, can demote correct passages.
+
+*2. Cost-sensitive regimes (~30 sec):*
+- **Latency-sensitive paths.** Rerank adds 80-140ms p99 on M5 Pro for top-50 with bge-reranker-v2-m3. Live-typing autocomplete or sub-100ms-budget paths can't absorb this.
+- **High-volume + low-margin pipelines.** Rerank cost (compute or API $) per query × the volume of retrieval-only paths. If marginal-lift × downstream-value < cost, kill it.
+
+*3. Quantitative anchor (~30 sec):*
+- "On my W2 lab: saturated MS MARCO 10K (dense recall@10 ≥0.99) — neither hybrid nor rerank moved the needle (hybrid lift ~0.005, noise). On harder BEIR-FiQA — rerank lift was ~5-10pp recall@10 (or ~10 nDCG@10), clearly worth the latency. The decision is corpus-by-corpus, never religion."
+- **Counter-pattern:** when retrieval is multi-source (BM25 + dense + KG), reranker is usually worth it because it harmonizes score scales across heterogeneous retrievers — RRF averages ranks but loses fine-grained ordering.
+
+**Supporting evidence:** [[#1 Hybrid Retrieval Lift]] (saturated MS MARCO, rerank invisible), [[#2 BEIR-FiQA-2018]] (rerank +5-10pp recall on hard benchmark), [[#3 Reranker Lift]] measured numbers.
+
+#### Q3. "How do you A/B test a new reranker in production?" (target: 2 min)
+
+**Answer reference — points to hit:**
+
+*1. Offline first (~30 sec):*
+- Replay logs: take last 30 days of queries + their gold-relevance labels (manually curated or from click-stream as proxy). Score recall@K, MRR, nDCG@10 for old vs new reranker. If new < old offline, you don't ship — A/B test in prod is for ambiguous offline results.
+
+*2. Online setup (~45 sec):*
+- **Bucketed traffic split.** 5-10% of queries route to new reranker; rest to control. Bucketing by user_id (sticky) — same user always hits same arm to avoid within-session variance. Random bucketing is wrong because user sessions span multiple queries.
+- **Latency guardrail.** New reranker p99 > control + 15ms? Auto-rollback. Don't ship a quality lift you can't afford.
+- **Quality metrics.** Click-through rate on top-3 (proxy for relevance), session abandonment (proxy for "didn't find what I needed"), explicit feedback if available. NEVER measure quality from the reranker's own scores — they're not calibrated to user value.
+  > **CTR primer:** Click-Through Rate = fraction of queries where user clicks on (or interacts with) a returned result. **CTR@1** = clicks on rank-1 / total queries → "did we put the right answer first?"; **CTR@K** = clicks on any of top-K / total queries → "did the relevant thing show up at all?". Cheap to log (one bit per query), implicit signal of relevance, sensitive to ranking changes. Known confounders: position bias (top results get clicks regardless), survivorship bias, click ≠ satisfaction. Supplement with session-level metrics (reformulation rate, abandonment, return-visit) to catch "clicked but wrong answer."
+
+*3. Stop conditions (~30 sec):*
+- **Power calculation up front.** How many queries to detect a **1pp CTR lift** (1 percentage point — e.g., baseline 30% → new arm 31%) at p<0.05? Usually 50K-200K queries depending on baseline CTR (lower baseline needs more queries; higher baseline needs fewer). Don't peek before that volume — early stopping inflates false positives.
+- **Decision gate:** new wins on CTR ≥1pp AND latency p99 within budget AND no segment-level regression (stratify by query length, language, domain) → ship. Any fail → kick back to offline analysis.
+	
+*4. Operational note (~15 sec):*
+- Keep the rollback button hot for 1 week post-100% rollout. Distribution shift hits at week 2 most often (after promotional events, content updates, or seasonal query shifts).
+
+**Supporting evidence:** §4 Phase 4 eval methodology, [[#3 Reranker Lift]] offline measurement template, [[Engineering Decision Patterns#A/B test planning]] (cross-cutting reference).
+
+#### Q4. "Walk me through when you'd reach for hybrid retrieval vs adding a cross-encoder reranker. What does each cost, what does each buy?" (target: 2 min)
+
+**Answer reference — points to hit:**
+
+*1. They solve different problems (~30 sec):*
+- **Hybrid retrieval (BM25 + dense + RRF)** improves the **recall** of the top-K candidate pool. It catches queries the dense model misses — rare terms, proper nouns, exact-match identifiers, code, numbers.
+- **Cross-encoder rerank** improves the **precision** of the top-K ordering. It demotes near-misses that dense retrieval scored high but aren't actually relevant.
+- They compose: hybrid → wider net → rerank → tighter ordering. Not either/or.
+
+*2. Cost asymmetry (~45 sec):*
+- **Hybrid cost:** BM25 index = 1.5× document storage, ~20ms p99 retrieval. RRF fusion = ~1ms post-process. Cheap to add.
+- **Reranker cost:** cross-encoder inference per query = 80-140ms p99 for top-50. Either dedicated GPU/MPS instance OR API call (e.g., Cohere rerank ~$1/1K calls). 10× the latency cost of hybrid.
+
+*3. When to reach for which (~45 sec):*
+- **Reach for hybrid when:** queries have proper nouns / rare terms / domain-specific identifiers; recall@K is low; corpus has long-tail vocabulary the embedding model didn't train on. Cheap fix; near-zero downside.
+- **Reach for reranker when:** recall is already strong (BM25 + dense gets gold into top-50) but precision@1 / precision@5 is weak. Top-K is contaminated with semantic-but-not-correct chunks.
+- **Both when:** retrieval is multi-source AND precision matters. Production RAG over heterogeneous content.
+- **Neither when:** benchmark is saturated (single retriever already at recall@10 ≥0.99). Adding either is dead weight.
+
+*4. Concrete from my W2 lab:*
+- "On MS MARCO 10K (saturated, dense recall@10 ≥0.99), neither hybrid nor rerank moved the needle — hybrid lift was ~0.005 (noise). On BEIR-FiQA (hard, dense nDCG@10 = 0.408), hybrid added ~+6pp recall and ~+5pp nDCG, capturing roughly 70-80% of what reranker-on-dense alone would give — at ~5% the latency. Adding rerank on top of hybrid still wins on absolute quality (Phase 2 measured another ~10 nDCG points on top), so for highest-quality you want both. The decision boils down to: is the marginal lift from rerank-on-hybrid worth its 80-140ms p95? Corpus-by-corpus answer."
+
+**Supporting evidence:** [[#1 Hybrid Retrieval Lift]], [[#3 Reranker Lift]], [[#4.4 Actual chunking sweep results]], [[#Phase 7 — Production Library Refactor]] for the production-grade cost trade-offs.
 
 ---
 

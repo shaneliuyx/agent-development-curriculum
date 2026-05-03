@@ -1,7 +1,10 @@
 ---
 title: "Week 4 — The ReAct Loop, Built From Scratch"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-4, react, agents, runbook]
+audience: "Cloud infrastructure engineer (3 yrs), building agentic systems from first principles"
+stack: "MacBook M5 Pro, local oMLX (Sonnet/Haiku), Python 3.11+, no frameworks"
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-04-react-from-scratch"
 estimated_time: "12–15 hours over 5–7 days"
@@ -20,6 +23,16 @@ prerequisites: "Week 3 RESULTS.md committed"
 - [ ] `tests/test_bad_cases.py` contains at least 15 named test scenarios; each has a docstring explaining the failure mode and the patch that fixed it
 - [ ] `RESULTS.md` is committed with the 15-row failure-mode table filled in with real observed behavior
 - [ ] You can answer, out loud, without notes: "Walk me through how a ReAct loop handles a tool error." (≥ 60 seconds, no stumbling)
+
+---
+
+## Why This Week Matters
+
+Most agent tutorials teach you *concepts* (what is a tool, what is a reward signal) or *frameworks* (LangChain, LangGraph). This week teaches you the *shape* of the code — the 150 lines of Python that define how a language model thinks, acts, observes, and reflects. You will not use a framework. You will implement the loop directly.
+
+Why this matters: frameworks hide the loop. Once you whiteboard the loop from scratch, you understand what every library is doing underneath. You can debug agent failures at first principles. You can design agents that frameworks don't support. And you can answer the most honest interview question an engineer can ask: "Does your agent actually *think*, or does it just follow a script?"
+
+ReAct (Reasoning + Acting) is the standard loop: model reasons ("I need tool X"), acts (calls tool), observes output, and loops. This week, every loop failure — malformed JSON, tool timeout, infinite recursion, hallucinated tool arguments — becomes a test case you patch. By the end, you'll have a 15-failure repertoire and a production-shaped understanding of why agents fail.
 
 ---
 
@@ -228,6 +241,43 @@ flowchart TD
 
 > **Analogy (Infra):** Read the loop left-to-right as a streaming pipeline. The Scratchpad is the append-only Kafka topic. `context_for_llm()` is the consumer that reads from offset 0 every time (full replay). `run_tool()` is the sink connector. `log_event()` is the audit log writer — a separate consumer on the same topic, never blocking the main flow.
 
+#### System Architecture — walkthrough
+
+This diagram is the agent's full anatomy on a single page. Three subgraphs (LOOP, TOOLS, OBS) capture the three roles of the implementation: the reasoning conductor, the side-effect surface, and the audit sidecar. Every box names a function or guard in `src/react.py`, `src/tools.py`, or `src/obs.py`. The walkthrough below traces a single user request through the diagram and pairs every decision diamond with the bad-case scenario it defends against.
+
+`★ Insight ─────────────────────────────────────`
+- **The two terminal nodes are the only loop exits.** Green `Return final answer` and red `Return DLQ message` ("AGENT STOPPED"). Every other path in the diagram is a back-edge to `ASSEMBLE`. If your loop has any third exit (e.g. raising on tool error), you have introduced a class of bug that this design prevents — tool errors should flow into the scratchpad as messages, not bubble up as exceptions.
+- **OBS is a sidecar, not a participant.** `log_event()` is a one-way arrow from LOOP to OBS. The loop never reads from SQLite, never blocks on disk I/O, never branches on log success. This is the difference between observability and instrumented business logic — confusing the two creates outages where the audit pipeline takes the agent down.
+- **Two budgets, two purposes.** Per-tool `max_calls` (in TOOLS) defends against a tool stuck in a tight loop ("call web_search 50 times"). Outer `MAX_ITER` defends against the LLM stuck reasoning without converging. Both must exist; either alone is insufficient.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one user message through the loop.**
+
+1. **`User message → ASSEMBLE`** — the only entry point. `context_for_llm()` builds the prompt fresh on every iteration: system prompt + JSON tool schemas + user message + full scratchpad replay (no truncation at this step — truncation happens later via `CTX_GUARD`).
+2. **`ASSEMBLE → LLM`** — `call_llm()` makes a single OpenAI-compatible chat completion call against the local oMLX server (Qwen3.6-35B-A3B-nvfp4). Returns `(content, tool_calls, usage)`.
+3. **`LLM → PARSE`** — first decision diamond: did the model emit `tool_calls`? If no, the response is the final answer; jump to `Return final answer` (green terminal).
+4. **`PARSE → BUDGET`** (yes branch) — second decision diamond: budget guard. Two checks:
+   - Has this tool's `max_calls` been hit?
+   - Are the arguments identical to a previous successful call (circular-args detector)?
+   If either trips, the loop synthesizes an error string for the scratchpad and skips dispatch (circuit breaker behavior). Defends against bad-case Scenario 1 ("infinite tool ping-pong") and Scenario 7 ("repeated identical call").
+5. **`BUDGET → DISPATCH`** (OK branch) — `run_tool()` resolves the tool name, calls the function, catches *all* exceptions (broad except is intentional — the LLM must see the error), and truncates results > 4000 chars to keep scratchpad bounded.
+6. **`DISPATCH → T1..T4`** — fans out to one of four registered tools: `web_search` (DDGS), `python_repl` (subprocess + timeout), `read_file`, `write_file` (both path-contained).
+7. **`T1..T4 → TOOL_RESULT`** — append the tool result (or error string) to the scratchpad as an append-only event. Errors go through the same path as successes — that is how the model self-corrects on the next iteration.
+8. **`TOOL_RESULT → CTX_GUARD`** — third decision diamond: did appending push us past `CONTEXT_TOKEN_LIMIT`? If yes, drop the oldest tool result (FIFO eviction). Tiered eviction defends against bad-case Scenario 10 ("context overflow without graceful degradation").
+9. **`CTX_GUARD → ITER_GUARD`** — fourth decision diamond: have we hit `MAX_ITER`? If yes, return the DLQ terminal ("AGENT STOPPED"). If no, loop back to `ASSEMBLE`.
+10. **OBS sidecar** — runs in parallel with every iteration. `log_event()` writes one row to SQLite per loop turn: `run_id`, `iter`, `tool_name`, `prompt_tokens`, `tool_latency_ms`, `tool_error`. Never modifies loop state.
+
+#### Glossary — System Architecture jargon
+
+| Term | Meaning |
+|---|---|
+| Scratchpad | Append-only event log of `(assistant_msg, tool_msg)` pairs. Replayed in full on every iteration. |
+| Circuit breaker | Pre-dispatch check that short-circuits a doomed tool call by writing a synthesized error to scratchpad. |
+| Tiered eviction | FIFO drop of oldest tool result when scratchpad exceeds token budget. |
+| DLQ | Dead-letter queue — terminal "stop and surface failure" exit when MAX_ITER hit. |
+| Tool registration | Tools register into a global `_TOOLS: dict[str, Callable]` at import time of `src/tools.py`. |
+| Sidecar | OBS module — observability that runs alongside the loop with no back-pressure on it. |
+
 ---
 
 ## Phase 1 — Lab Scaffold and Environment Variables
@@ -351,6 +401,49 @@ Three load-bearing properties made explicit by the diagram:
 1. **The guard is the first check inside the loop**, not at the end — that's what prevents off-by-one budget blowouts (a tool call succeeds on iteration `MAX_ITER - 1`, which would otherwise execute a full `MAX_ITER`-th iteration of `call_llm` before checking).
 2. **Errors flow into the scratchpad on the same path as successes** — see Concept 5 of the Theory Primer. The model reads tool errors as context and can self-correct on the next iteration. There is no `except / return` branch that aborts the loop on tool failure.
 3. **Logging lives after `call_llm` and before `decide`** — every iteration writes exactly one observation row to SQLite, giving you one-row-per-iteration tracing in Week 4's SQLite-based Phoenix-lite observability.
+
+#### Code-flow diagram — walkthrough
+
+The System Architecture diagram (above) shows the *anatomy* of the agent — modules, tools, sidecar. This Code-flow diagram shows the *line-by-line state transitions inside `run_agent()`*. Read it as a flowchart of the function body. Every box maps to a few lines of Python in `src/react.py` Phase 2.2 implementation.
+
+`★ Insight ─────────────────────────────────────`
+- **Guard-first ordering is a 1-line bug-class eliminator.** Putting the iteration guard at the *top* of the loop body (not the bottom) means iteration `MAX_ITER` is never started, only the budget for it is consumed by checking. Bottom-of-loop guards are off-by-one prone — the canonical Python idiom (`for i in range(MAX_ITER):`) hides the issue, but a hand-rolled `while True` body must be guard-first.
+- **Errors-as-messages is the design that makes the model debug itself.** The `TOOL_ERR` diamond does not branch to a return path — both yes and no flow into `APPEND`. The model sees `"tool_error: <stack trace>"` as a tool message and on the next iteration usually re-formulates the call correctly. This is the single most important pattern in the loop; removing it would force the model to give up on any failed tool call.
+- **`log_observation` runs *after* `call_llm` and *before* `decide`.** This placement guarantees one SQLite row per iteration with the LLM response embedded. If logging ran inside the success branch only, error iterations would be invisible in observability.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — `run_agent(user_msg)` from entry to return.**
+
+1. **`run_agent(user_msg) → INIT`** — initialize state: empty `scratchpad`, `iter = 0`. Both are local to this run; no global state.
+2. **`INIT → GUARD`** — first decision: `iter < MAX_ITER?` Guard at the *top* of the loop body, not the bottom (see ★ Insight #1).
+3. **`GUARD (no) → FAIL`** — exhausted budget. Return `(content=last_assistant_content, success=False, failure_reason="exceeded MAX_ITER")`. Caller sees the partial answer plus the explicit failure reason.
+4. **`GUARD (yes) → ASSEMBLE`** — `context_for_llm()` builds the message list: `[system, *tool_schemas, user, *scratchpad]`. Full replay every iteration; no incremental state.
+5. **`ASSEMBLE → CALL`** — `call_llm(context)` returns `(content, tool_calls, usage)`. One LLM round-trip per iteration.
+6. **`CALL → LOG`** — `log_observation()` writes one SQLite row capturing this iteration's metadata. Always runs (regardless of branch below).
+7. **`LOG → DECIDE`** — second decision: `tool_calls non-empty?` Branches the loop.
+8. **`DECIDE (no) → DONE`** — model emitted plain text with no tool calls. Return `(content, success=True)`.
+9. **`DECIDE (yes) → PARSE`** — parse the `tool_calls` JSON list out of the model response.
+10. **`PARSE → DISPATCH`** — `dispatch(call)` resolves `TOOL_MAP[name](**args)`. Returns either the tool result or raises an exception.
+11. **`DISPATCH → TOOL_ERR`** — third decision: did the tool raise?
+    - **Yes** → `ERR_MSG`: wrap the exception as `"tool_error: <repr>"` in a TOOL message.
+    - **No** → `OK_MSG`: wrap the result string in a TOOL message.
+12. **`ERR_MSG / OK_MSG → APPEND`** — append two messages to the scratchpad in order: the assistant message (the model's `tool_calls` request) AND the tool message (the result or error). Two appends per iteration.
+13. **`APPEND → INC → GUARD`** — `iter += 1`, loop back to the top guard.
+
+**Three failure modes this control-flow shape prevents** (full entries in §6 Bad-Case Journal):
+- *Off-by-one MAX_ITER blowout* — guard-at-bottom would let iteration `MAX_ITER` execute one full LLM call before stopping. Guard-at-top prevents the call entirely.
+- *Silent tool-error swallowing* — without errors-as-messages, the loop would either crash or fall through to `DONE` with an empty answer. Both are worse than letting the model see the error and retry.
+- *Missing rows on error iterations* — placing `LOG` before `DECIDE` ensures every iteration produces one row, including those that ended in `tool_error`.
+
+#### Glossary — Code-flow jargon
+
+| Term | Meaning |
+|---|---|
+| `scratchpad` | List of message dicts (`{"role": "assistant"|"tool", "content": …}`) replayed every iteration. |
+| `MAX_ITER` | Outer loop budget; default 8. Tunable via `REACT_MAX_ITER` env var. |
+| TOOL_MAP | Module-global `dict[str, Callable]` populated by `register_tool()` at import time. |
+| `success=True/False` | Two-tuple return shape: `(content_str, success_bool)` distinguishes converged answers from budget-exhausted partial answers. |
+| `usage` | OpenAI-compatible token-usage record (prompt_tokens, completion_tokens). Logged per iteration. |
 
 ### 2.2 Full implementation
 
@@ -2424,8 +2517,39 @@ The Infra bridge for Week 5: multi-agent = distributed compute. The orchestrator
 
 ---
 
-— end —
+## Bad-Case Journal
 
+**Entry 1 — Malformed JSON response from model; `json.loads()` fails silently.**
+*Symptom:* Model returns ```json ... ``` wrapped JSON or embeds explanation before JSON. `json.loads()` throws `JSONDecodeError`. Try-except catches it and defaults to `{"thoughts": "", "action": "..."}`. Agent produces wrong output silently.
+*Root cause:* Model doesn't consistently respect "Return JSON only" in prompt. API doesn't enforce `response_format={"type": "json_object"}` or model ignores it.
+*Fix:* Use `response_format={"type": "json_object"}` in OpenAI SDK. Add regex extraction: `re.search(r'\{.*\}', resp, re.DOTALL)` before `json.loads()`. Log JSON parse failures loudly with full response context.
+
+**Entry 2 — Tool function hangs; agent loop blocks forever.**
+*Symptom:* Agent calls `python_repl` to compute something. Tool process hangs (network call, infinite loop in user code). Main loop waits forever. No timeout.
+*Root cause:* No timeout on tool calls. Tool execution is synchronous. One blocking tool blocks entire agent.
+*Fix:* Wrap tool calls with `timeout` (e.g., `subprocess.run(..., timeout=30)`). Catch `TimeoutError`, return error message to model: "Tool timed out after 30 seconds. Simplify the query." Async tool execution with `concurrent.futures` if performance critical.
+
+**Entry 3 — Tool returns error; agent hallucinates it succeeded.**
+*Symptom:* `python_repl` executes user code, returns `stderr: "SyntaxError: invalid syntax"`. Agent reads error, produces reasoning step that ignores the error and moves forward as if code ran.
+*Root cause:* Agent prompt doesn't emphasize "if tool returns error, the error is the ground truth. Do not continue."  Prompt mixing success + error in the same JSON output field confuses attention.
+*Fix:* Separate error and success: `{"action_type": "tool", "tool": "...", "success": true/false, "result_or_error": "..."}`. In prompt, emphasize: "If success=false, the error is the ground truth. Do not assume the tool succeeded."
+
+**Entry 4 — Infinite loop: agent calls same tool with same args repeatedly.**
+*Symptom:* Agent enters loop calling `web_search("python list comprehension")` 10 times in a row, producing identical results each iteration. Loop never converges.
+*Root cause:* No check for repeated (tool, args) pairs. No early exit when agent repeats. Prompt doesn't discourage repetition.
+*Fix:* Track last N (tool, args) pairs. If current pair matches recent history, interrupt: "You just called this tool with the same arguments. The result won't change. Either refine your query or conclude." Limit total loop steps (e.g., max 20 iterations).
+
+**Entry 5 — Tool returns large result; exceeds context window.**
+*Symptom:* `read_file("large_csv.txt")` returns 10MB of text. Full result appended to scratchpad. Scratchpad now 15K tokens. Next model call fails due to context overflow.
+*Root cause:* Tool returns unbounded result. No truncation. No summarization.
+*Fix:* Truncate results: if tool response > 2K tokens, truncate with "...[X more tokens]." Implement summari
+
+zation for large results: `summarize_text(result)` for read_file if file is large. Add `max_result_tokens` config per tool.
+
+**Entry 6 — Agent gets stuck in error-retry loop: same error, repeated fix attempts.**
+*Symptom:* Agent calls tool, gets error, produces new reasoning, calls tool with different args but same logical error repeats. Loops through 5 retries, each failing with same root cause.
+*Root cause:* Model doesn't analyze the error cause, just tries variations. Prompt doesn't ask "why did this fail?" before retrying.
+*Fix:* After 2 consecutive errors, force reflection: "Two consecutive errors. Analyze the root cause. Do not retry without explaining why your previous attempt failed." Include error patterns in scratchpad for learning across retries.
 
 ---
 

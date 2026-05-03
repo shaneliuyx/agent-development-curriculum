@@ -1,16 +1,29 @@
 ---
 title: "Week 7 — Tool Harness"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-7, tools, function-calling, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-07-tool-harness"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 4 ReAct loop working and committed; Phoenix running on :6006; oMLX on :8000 with Qwen3.6-35B-A3B-nvfp4 loaded"
+audience: "Cloud infrastructure engineer (3 yrs), building reliable tool-calling systems with production-grade error handling and observability"
+stack: "MacBook M5 Pro; oMLX with Qwen3.6-35B-A3B-nvfp4; Phoenix trace UI; local Anthropic API compatibility; Python 3.11+"
 ---
 
 # Week 7 — Tool Harness
 
 > **Goal:** Build a production-grade tool-calling harness, stress-test it across 20 adversarial scenarios, compare local vs cloud reliability, and be able to answer — cold, without notes — "What are the five things you do to make tool-calling reliable in production?"
+
+---
+
+## Why This Week Matters
+
+Weeks 4–6 taught you loops, patterns, and architecture. You know what a tool *is*. But "agent can call tools" and "agent calls tools reliably in production with 99.9% correctness across argument types, error cases, and edge cases" are a chasm apart. This week is about crossing it. A single tool-calling failure cascades: agent calls `delete_user(id="abc")`, you send it to production, the tool typo is in the code, deletes the wrong user, data loss. Tool-calling reliability is not a nice-to-have — it is the gate between "working lab" and "deployed system."
+
+The interview signal is concrete. A candidate who says "I've built agents" is common. A candidate who says "I built a tool harness that handles malformed JSON responses from the model, validates argument types before dispatch, implements retry logic with exponential backoff for transient failures, logs every call to Phoenix, and scores 8.8/10 on a 20-scenario adversarial test suite" sounds like they have shipped something real. This week you do exactly that.
+
+By the end, you will own a harness that: (a) accepts a tool schema in MCP or OpenAI format and normalizes both; (b) validates every model-generated tool call before dispatch (correct tool name, correct argument types, no missing required fields); (c) gracefully handles five categories of errors (malformed JSON, hallucinated tool names, wrong argument types, network timeouts, tool execution failures); (d) traces every call to Phoenix; (e) scores your implementation against a curated test suite of 20 adversarial scenarios; (f) compares reliability across oMLX (Qwen), Anthropic Claude, and OpenAI GPT-4 on the same harness. You will be able to answer "What are the five things you do?" with measured data.
 
 ---
 
@@ -192,79 +205,67 @@ The cost-benefit is workload-specific. For a research agent doing 8 sequential w
 
 Read this diagram as a sequence, top to bottom. The harness sits between the LLM and your tools exactly as an RPC client sits between application code and a remote service. The cross-cutting concerns (retry, timeout, budget, idempotency, tracing) are sidecars — they intercept every dispatch without the tool implementation knowing they exist.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ToolHarness.run(query)                          │
-│                         ═══════════════════════                         │
-│                      "the RPC client boundary"                          │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-                    ┌───────────▼───────────┐
-                    │   LLM (Qwen3.6 /      │  ← chat.completions.create
-                    │   claude-haiku-4-5)   │    with tools= array
-                    └───────────┬───────────┘
-                                │
-                    ┌───────────▼───────────┐
-                    │  Response has         │
-                    │  tool_calls?          │
-                    └───────┬───────┬───────┘
-                           YES      NO
-                            │        └──────────────► return final text
-                            │
-          ┌─────────────────▼──────────────────┐
-          │   _dispatch_parallel()             │
-          │   asyncio.gather(*tasks)           │  ← ALL calls in one
-          │   [ call_A | call_B | call_C ]     │    response run in parallel
-          └──────┬──────────┬──────────┬───────┘
-                 │          │          │
-    ╔════════════▼══════════▼══════════▼════════════╗
-    ║          _dispatch_tool_call()                 ║  ← per-tool entry point
-    ║                                                ║
-    ║  ┌──────────────────────────────────────────┐  ║
-    ║  │  SIDECAR 1: Budget Limiter               │  ║
-    ║  │  calls[tool] >= max_calls_per_run?       │  ║
-    ║  │  YES → return budget-exceeded error str  │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ║                     │                          ║
-    ║  ┌──────────────────▼───────────────────────┐  ║
-    ║  │  SIDECAR 2: Idempotency Cache            │  ║
-    ║  │  SHA-256(tool_name + sorted_args) in     │  ║
-    ║  │  _IDEM_STORE?  YES → return cached       │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ║                     │                          ║
-    ║  ┌──────────────────▼───────────────────────┐  ║
-    ║  │  SIDECAR 3: Retry + Backoff              │  ║
-    ║  │  _call_with_retry(tool, args, max=3)     │  ║
-    ║  │  delay: 1s → 2s → 4s → … → 30s cap      │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ║                     │                          ║
-    ║  ┌──────────────────▼───────────────────────┐  ║
-    ║  │  SIDECAR 4: Timeout                      │  ║
-    ║  │  asyncio.wait_for(callable, timeout_sec) │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ║                     │                          ║
-    ║  ┌──────────────────▼───────────────────────┐  ║
-    ║  │  "Remote Service" — tool.callable(**args)│  ║
-    ║  │  (search API / DB / payment endpoint)    │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ║                     │                          ║
-    ║  ┌──────────────────▼───────────────────────┐  ║
-    ║  │  SIDECAR 5: Phoenix Tracer               │  ║
-    ║  │  span attrs: tool.name, latency_ms,      │  ║
-    ║  │  retries, error, cache_hit               │  ║
-    ║  └──────────────────┬───────────────────────┘  ║
-    ╚════════════════════╪═══════════════════════════╝
-                         │
-              result_json OR error_json
-                         │
-          ┌──────────────▼──────────────────────────┐
-          │  Append to message history               │
-          │  {"role": "tool", "content": result}     │  ← error-as-prompt
-          │  ← model READS this on the next iter     │    pattern lives here
-          └──────────────┬──────────────────────────┘
-                         │
-                  back to LLM ↑  (loop until no tool_calls
-                                  or max_iterations reached)
+```plantuml
+@startuml ToolHarness_RequestFlow
+skinparam roundCorner 10
+title ToolHarness.run(query) — RPC client boundary
+
+start
+
+:LLM call
+(chat.completions.create
+ with tools= array)
+[Qwen3.6 / claude-haiku-4-5];
+
+if (Response has tool_calls?) then (no)
+  :Return final text;
+  stop
+endif
+
+:_dispatch_parallel()
+asyncio.gather(*tasks)
+[ALL calls in one response run in parallel];
+
+partition "_dispatch_tool_call() — per-tool entry point" {
+  :SIDECAR 1: Budget Limiter
+  calls[tool] >= max_calls_per_run?
+  YES → return 'budget_exceeded';
+
+  :SIDECAR 2: Idempotency Cache
+  SHA-256(tool_name + sorted_args) in _IDEM_STORE?
+  YES → return cached;
+
+  :SIDECAR 3: Retry + Backoff
+  _call_with_retry(tool, args, max=3)
+  delay: 1s → 2s → 4s → … → 30s cap;
+
+  :SIDECAR 4: Timeout
+  asyncio.wait_for(callable, timeout_sec);
+
+  :"Remote Service"
+  tool.callable(**args)
+  (search API / DB / payment endpoint);
+
+  :SIDECAR 5: Phoenix Tracer
+  span attrs: tool.name, latency_ms,
+  retries, error, cache_hit;
+}
+
+:result_json OR error_json;
+
+:Append to message history
+("role": "tool", "content": result)
+← error-as-prompt pattern lives here
+← model READS this on next iter;
+
+if (LLM emits more tool_calls\nAND iter < MAX_ITER?) then (yes)
+  :loop back to LLM call;
+  detach
+else (no)
+  :return final answer to caller;
+  stop
+endif
+@enduml
 ```
 
 > **Analogy (Infra):** Read the sidecar stack (Budget → Idempotency → Retry → Timeout) as the middleware chain you'd wire into a Spark `foreachPartition` that calls an external API. Each layer is a guard: Budget = rate limit guard, Idempotency = dedup guard, Retry = transient-failure guard, Timeout = stall guard. The only agent-specific layer is the very last one — error-as-prompt — which feeds failures back into the LLM's context window instead of to a DLQ.
@@ -332,6 +333,29 @@ classDiagram
 
 Key read: `_execute_with_guards()` is the **only** path from `run()` to your actual tool functions. Any cross-cutting concern — new rate limiter, new audit log, new sandboxing layer — should be added as a sidecar inside this method, never inline in the tool. This is the same rule that keeps an RPC client usable across a hundred downstream services: middleware in one place, business logic in another.
 
+#### Class Architecture — walkthrough
+
+The class diagram is the static structure of the harness: who owns what, who calls what, who is external. Read it as the answer to "if I want to add a new tool, where does it plug in?" — and the answer is: implement the `Tool` interface, register on `ToolHarness`, and the existing middleware chain handles you for free.
+
+`★ Insight ─────────────────────────────────────`
+- **`ToolHarness` owns three runtime collections.** `messages` (the LLM conversation), `call_counts` (per-tool budget tracking), `idempotency_cache` (request deduplication). All three are instance state, not module-global — which means one harness per agent run, not one global harness shared across runs. This is why budget and idempotency reset on every `run()` call.
+- **`Tool` is the public extension point.** `WebSearchTool`, `ReadFileTool`, `PythonReplTool`, `HttpGetTool` all inherit from `Tool` and override the `name`, `schema`, and `fn` attributes. New tools plug in here without touching `ToolHarness` at all.
+- **External boundaries are typed as `<<external>>`.** `LLMEndpoint` and `PhoenixCollector` are stereotyped as external — they have their own SLAs, can fail independently, and the harness must be defensive against them. The dotted dependency arrows (`..>`) mark where the harness reaches across a process boundary.
+`─────────────────────────────────────────────────`
+
+**Walkthrough of the static structure.**
+
+1. **`ToolHarness` (1) — `Tool` (*)** composition relation. One harness registers many tools. The `name_to_tool` map is the registry; `register(tool)` populates it.
+2. **`Tool` ← `WebSearchTool / ReadFileTool / PythonReplTool / HttpGetTool`** inheritance. Concrete tool classes each define their own `name`, `description`, `schema`, and `fn`. None override `Tool` methods — the schema/callable contract is enough.
+3. **`ToolHarness ..> LLMEndpoint`** — dependency arrow into an external service. `_call_llm()` is the only method that reaches across this boundary. Mocking it out gives you fully offline tests.
+4. **`ToolHarness ..> PhoenixCollector`** — dependency arrow into the observability sidecar. `_trace(event)` is the only method that emits to it. Phoenix down ≠ harness down.
+5. **`run() loop` (note attached to `ToolHarness`)** — pseudocode of the main loop body. Three internal methods compose the flow: `_call_llm()` → `_dispatch()` → `_execute_with_guards()`. The guard order is **budget → idempotency → retry → timeout**, fixed across all tools.
+
+**Why it is shaped this way.**
+- One class for the harness, not one per concern. The temptation is to split into BudgetMiddleware, RetryMiddleware, etc. — resist it. Five sidecars composed inside one method is easier to read and debug than five middleware classes wired through a chain-of-responsibility pattern. Add the abstraction only when you have ≥ 8 sidecars.
+- `Tool` as a flat interface, not a hierarchy. There is no `LocalTool` vs `RemoteTool` split; that distinction is captured in the `fn` attribute (sync vs async vs subprocess) without baking it into the type system. Keeps the registration code uniform.
+- External services as `<<external>>` and dotted dependencies signal "be defensive here" to the reader without forcing a specific defensive pattern.
+
 ### Diagram 1c — Error-Recovery Decision Flow (per tool call)
 
 ```mermaid
@@ -383,39 +407,61 @@ Two non-obvious properties this diagram makes explicit:
 1. **Every failure path exits through the same `OUT` node** — a tool message back to the LLM, never a raised exception to the outer loop. This is Concept 4 (error-as-prompt) rendered as control flow: errors are data, not control signals. If you find yourself adding a `raise` in any recovery branch, you have reintroduced the exception-path failure mode the harness exists to prevent.
 2. **Budget and idempotency checks run *before* schema validation**, because validation is cheap but argued-for-but-ungrounded-in-math. Budget is a hard business rule; violating it is more expensive than a malformed argument. Senior harness design bakes cheap-first, hard-rule-first ordering into the middleware chain.
 
+#### Error-Recovery — walkthrough
+
+This flowchart is the most consequential single diagram in the chapter. It encodes the "errors are data, not control signals" principle (Concept 4 of the Theory Primer) as explicit control flow. Every leaf returns a tool message back to the LLM via the same `OUT` node — there is no path that raises out of the harness.
+
+`★ Insight ─────────────────────────────────────`
+- **All error branches converge on `OUT`.** Six distinct error returns (`ERR_BUDGET`, `ERR_NAME`, `ERR_SCHEMA`, `ERR_TRANSIENT`, `ERR_TERMINAL`, `ERR_TIMEOUT`) plus the success return all land on the same node. This is the diagrammatic invariant of error-as-prompt — diverge in cause, converge in shape.
+- **Cheap-first gate ordering.** Budget → name → schema → idempotency → execute. The first three are O(1) dict lookups; the next is a hash lookup; only after all four do we run actual tool code. Short-circuits 90%+ of bad calls before paying for `tool.fn()`.
+- **Retry is a self-loop on `EXECUTE`, not a wrapper around it.** The diagram makes this explicit — retry doesn't rerun the gates, only the `EXECUTE` node. This means budget is decremented exactly once per `tool_call`, not once per retry. Subtle but interview-worthy.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one tool_call from LLM through the gates.**
+
+1. **`CALL → BUDGET_CHECK`** — has this tool used up its per-run quota? If yes, return `'budget_exceeded: tool X'` and exit. Hard business rule first.
+2. **`BUDGET_CHECK (yes) → NAME_CHECK`** — is the requested tool name in the registry? Common failure: LLM hallucinates a tool name (`"web_searc"`). Return `'unknown_tool: X, available: [list]'` so the LLM can self-correct on the next iteration.
+3. **`NAME_CHECK (yes) → SCHEMA`** — do the args validate against the tool's pydantic schema? If no, return `'invalid_args: <pydantic error>'` — the structured pydantic error message is what lets the LLM fix the call rather than guess.
+4. **`SCHEMA (yes) → IDEMP`** — is the SHA-256 of `(name + sorted_args)` in the cache? If yes, return cached result. Cache hits skip every cost downstream including budget increment (the run already paid for it on the first call).
+5. **`IDEMP (no) → EXECUTE`** — actually run `tool.fn()` with timeout.
+6. **`EXECUTE → RESULT`** — four outcomes:
+   - **ok** → `STORE` (cache, increment budget) → `OUT`.
+   - **transient exception** (network flap, rate limit, 5xx) → `RETRY` self-loop, with exponential backoff, up to 3 attempts. If exhausted → `'tool_error: retries exhausted'`.
+   - **terminal exception** (auth failure, 4xx, malformed response) → `'tool_error: <class>: <message>'`. No retry — these will not improve.
+   - **timeout** → `'tool_timeout: <t>s'`. Treated as terminal; retrying a timeout is rarely useful and burns budget.
+7. **All branches → `OUT`** — tool message back to the LLM. Loop continues from `_call_llm()`.
+
+**Why "tool_error: retries exhausted" matters as a string.** The LLM reads this on the next iteration. With this exact phrasing, the model usually responds by trying a different tool, retrying with different args, or asking the user. With a vague phrasing like `"error"`, the model often loops on the same broken call. The string is the API; design it for the model's reading.
+
 ---
 
 ### Diagram 2 — 20-Scenario Bad-Case Coverage Matrix
 
 Use this as a portfolio artifact. Each cell is a scenario. The x-axis groups by failure category; the y-axis is scenario number.
 
-```
-Failure Category →  │ Transient  │ Schema /   │ Model      │ Loop       │ Contract   │
-                    │ Network    │ Type Error │ Selection  │ Safety     │ Violations │
-────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
-S01 rate-limited    │     ✦      │            │            │            │            │
-S02 similar names   │            │            │     ✦      │            │            │
-S03 wrong arg type  │            │     ✦      │            │            │            │
-S04 ambiguous desc  │            │            │     ✦      │            │            │
-S05 incons. schema  │            │     ✦      │            │            │            │
-S06 50 KB payload   │            │            │            │            │     ✦      │
-S07 halluc. use     │            │            │     ✦      │            │            │
-S08 net. flapping   │     ✦      │            │            │            │            │
-S09 deprecation     │            │            │            │            │     ✦      │
-S10 cascade fail    │     ✦      │            │            │     ✦      │            │
-S11 timeout stream  │     ✦      │            │            │            │            │
-S12 cond. schema    │            │     ✦      │     ✦      │            │            │
-S13 idempotency     │            │            │            │            │     ✦      │
-S14 mislead success │            │            │     ✦      │            │     ✦      │
-S15 cross-contam    │            │            │            │            │     ✦      │
-S16 recursion       │            │            │            │     ✦      │            │
-S17 long-poll       │     ✦      │            │            │            │            │
-S18 path vs content │            │            │     ✦      │            │     ✦      │
-S19 schema version  │            │     ✦      │            │            │     ✦      │
-S20 JSON-enc error  │            │            │     ✦      │            │     ✦      │
-────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
-Category total      │     5      │     4      │     7      │     3      │     7      │
-```
+| Scenario | Transient / Network | Schema / Type Error | Model Selection | Loop Safety | Contract Violations |
+|---|:-:|:-:|:-:|:-:|:-:|
+| S01 rate-limited | ✦ | | | | |
+| S02 similar names | | | ✦ | | |
+| S03 wrong arg type | | ✦ | | | |
+| S04 ambiguous desc | | | ✦ | | |
+| S05 incons. schema | | ✦ | | | |
+| S06 50 KB payload | | | | | ✦ |
+| S07 halluc. use | | | ✦ | | |
+| S08 net. flapping | ✦ | | | | |
+| S09 deprecation | | | | | ✦ |
+| S10 cascade fail | ✦ | | | ✦ | |
+| S11 timeout stream | ✦ | | | | |
+| S12 cond. schema | | ✦ | ✦ | | |
+| S13 idempotency | | | | | ✦ |
+| S14 mislead success | | | ✦ | | ✦ |
+| S15 cross-contam | | | | | ✦ |
+| S16 recursion | | | | ✦ | |
+| S17 long-poll | ✦ | | | | |
+| S18 path vs content | | | ✦ | | ✦ |
+| S19 schema version | | ✦ | | | ✦ |
+| S20 JSON-enc error | | | ✦ | | ✦ |
+| **Category total** | **5** | **4** | **7** | **3** | **7** |
 
 > **What this means:** The matrix shows you have coverage across all five failure categories. Model-selection failures (7 scenarios) are the most common — which is why description quality is the single highest-leverage improvement you can make to a tool-calling system. Transient/network failures (5 scenarios) are the second most common in production but the easiest to handle mechanically with retry/backoff. Contract violations (7 scenarios) require human fixes: schema updates, output validators, or tool rewrites.
 
@@ -2104,10 +2150,16 @@ For each ❌ in the matrix, write 2-3 sentences:
 
 The harness is an RPC client. Retry/backoff, timeout, budget cap, idempotency keys, and error-as-prompt are the five production reliability patterns — identical to what I'd wire into a Spark job calling an external API, a Terraform module calling an API hook, or an Argo task calling a third-party service. The difference is that in the agent setting, errors don't crash the job — they become prompt content, and the model decides how to recover. That self-correction loop is the key thing that makes agent tool-calling different from standard RPC.
 
-## Bad-case journal entry
+## Bad-Case Journal
 
-(add to the running ~1,500-word journal in the main curriculum repo)
-```
+**Entry 1 — Tool call succeeds but returns wrong data type; model hallucinates next step.**
+*Symptom:* Agent calls `fetch_user_metadata(user_id="123")`. Tool returns a string `"active"` (status). Schema promises `{status: string, created_at: timestamp}`. Agent doesn't validate; appends the string to context. Model later calls `calculate_account_age(created_at="active")` — type mismatch. Error. Agent recovers, but two calls and extra context burned.
+*Root cause:* Harness dispatched the tool call without validating schema. Tool implementation diverged from schema. No output validation gate.
+*Fix:* Add output_schema field to Tool dataclass. After tool execution, before returning to model, run `jsonschema.validate(result, output_schema)`. Reject mismatched outputs; return structured error to model: "Tool returned unexpected data type. Expected {status, created_at}. Got string. Try again or use a different tool."
+
+**Tags:** #tool-calling #type-validation #contract-violations #tool-harness #w7
+
+**Captured in curriculum at:** [[Week 7 - Tool Harness#Bad-Case Journal]]
 
 ---
 

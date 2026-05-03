@@ -95,6 +95,46 @@ Mid-utterance language switches cause WER spikes. Set agent system prompt to exp
 
 ---
 
+## Voice Agent Architecture Walkthrough
+
+Voice agents live in a design tension: cascaded pipelines are inspectable and flexible but slow; end-to-end models are fast but opaque. This walkthrough covers the cascaded architecture (used in the lab) and explains the specific design choices that make it production-ready despite its latency cost.
+
+**★ Insight ─────────────────────────────────────**
+- **Cascaded architecture trades latency for inspectability:** Each stage (STT → LLM → TTS) is independent, so you can log transcripts, audit LLM outputs, redact PII, and swap backends without retraining. End-to-end models compress latency by collapsing three network round-trips into one, but sacrifice visibility and vendor flexibility.
+- **VAD is the latency lever, not LLM:** Most practitioners optimize the LLM first, but actual latency is bottlenecked by VAD end-of-utterance detection (400–600ms silence) and STT processing time (350ms local GPU). The LLM first-token latency is the third contributor.
+- **Two separate VAD thresholds solve barge-in without false positives:** End-of-utterance detection must be conservative (avoid cutting mid-sentence). Barge-in detection must be aggressive (interrupt quickly). Conflating them into a single threshold produces either broken interruption (lagged by 800ms) or broken end-of-utterance (cuts mid-sentence). The lab below demonstrates this pattern.
+
+`─────────────────────────────────────────────────`
+
+**Cascaded Pipeline — Stage by stage:**
+
+- **VAD (Voice Activity Detection)** — Silero VAD is the standard: 1MB model, runs on CPU in real-time, outputs speech probability per 30ms frame. Critical implementation detail: maintain a separate high threshold (0.5) for starting speech capture and a low threshold (0.3) for triggering STT at the end of an utterance. This prevents early triggering on breath sounds but ensures rapid response when the user finishes.
+
+- **STT (Speech-to-Text)** — Whisper large-v3 is the production standard for accuracy (2.7% WER on LibriSpeech clean), but larger models require GPU acceleration. The lab uses `faster-whisper` (Hugging Face inference library) to get ~2× faster inference. Always set `condition_on_previous_text=False` to prevent the model from hallucinating context; always check `no_speech_prob` and `avg_logprob` to filter Whisper's tendency to output YouTube-style metadata on silence.
+
+- **LLM** — Standard Claude or GPT-4 with streaming enabled. Voice agents typically tolerate lower max_tokens (~300) because users lose patience with long-form responses. System prompt should emphasize conciseness. Voice context size is smaller than text agents because acoustic features (tone, pauses) are lost — the agent cannot rely on natural speech patterns to disambiguate, so be explicit.
+
+- **TTS (Text-to-Speech)** — ElevenLabs Turbo v2.5 (~120ms TTFA) or Cartesia Sonic (~90ms TTFA) are the latency leaders. Open-source alternatives like Coqui (slow, ~2–3s generation) exist but are deployment-heavy. In production, latency beats quality — a good voice that arrives in 500ms beats a perfect voice that arrives in 5s.
+
+- **Barge-In Monitoring** — The main loop spawns TTS in a background thread while simultaneously monitoring the input stream. The VAD threshold for barge-in (0.7 in the lab) is deliberately aggressive (much higher than the 0.5 start threshold). When speech above 0.7 is detected, set the `cancel_event`, which signals the TTS thread to stop writing audio and exit. This gives the agent ~150–200ms to respond to interruptions.
+
+**Key Modifications:**
+
+| Scenario | Change | Rationale |
+|----------|--------|-----------|
+| **Low-latency priority (consumer app)** | Replace Cascaded with OpenAI Realtime or Gemini Live | Save ~550ms at cost of vendor lock-in and reduced visibility |
+| **HIPAA/PCI required** | Use local Whisper (base.en) + local Coqui TTS | Avoid sending audio to third-party APIs; BAA requirements become trivial |
+| **High-accuracy transcripts needed** | Use Whisper large-v3 (slower, better WER) | ~700ms STT latency vs 350ms, but near-human accuracy |
+| **Non-English primary language** | Use Whisper large (multilingual) with `condition_on_previous_text=False` | Large-v3 English-only; multilingual version trades latency for language coverage |
+
+**Expected Metrics (cascaded on RTX 3080):**
+- VAD + STT: ~350ms p50, ~700ms p95
+- LLM first token: ~150ms p50, ~300ms p95 (Sonnet streaming)
+- TTS TTFA: ~120ms p50, ~280ms p95
+- Total E2E: ~620ms p50, ~1280ms p95 (no network overhead, pure local GPU)
+
+---
+
 ## Lab — Build a Cascaded Voice Agent (~3 hours)
 
 **Setup:**
@@ -219,6 +259,109 @@ def voice_agent():
 
 CPU-only with Whisper base.en:
 - p50: ~1400ms, p95: ~2500ms
+
+---
+
+## Code Walkthroughs — Steps 1–5
+
+This section walks through the lab implementation block-by-block, explaining design choices that make each component production-shaped: real-time constraints, edge case handling, and measurable latency.
+
+---
+
+### Step 1 — VAD-based Audio Capture
+
+`record_utterance()` blocks until the user finishes speaking, determined by 400ms of detected silence. The function returns raw audio bytes that are then passed to Whisper.
+
+**Why 30ms frames matter:**
+
+Audio is buffered in 30ms frames because Silero VAD operates at 30ms resolution — that's its design window. Larger chunks (100ms) reduce granularity; smaller chunks (10ms) require higher CPU overhead. 30ms is the equilibrium.
+
+**Speech probability threshold = 0.5:**
+
+Silero outputs speech probability [0, 1] per frame. A threshold of 0.5 means "probably voice" — catches real speech while filtering hard breathing, keyboard clicks, and rustling. In production, you may tune this per-user if noise floor varies (car, office, home); typical range is 0.4–0.6.
+
+**Silence threshold = 400ms = 13 frames:**
+
+400ms is the minimum human pause to consider an utterance complete without risking false positives from mid-sentence breaths. If you reduce this to 200ms, you cut sentences mid-thought ("The capital of France is" → [stop]). If you increase to 800ms, users wait 800ms after finishing before the agent reacts. 400ms is the Goldilocks zone.
+
+**Why `exception_on_overflow=False`:**
+
+Real-time audio capture from the system can temporarily overflow the buffer if the process gets descheduled. Throwing an exception crashes the agent; silently dropping frames (the default with `exception_on_overflow=False`) is transparent to the user — they may repeat if the STT result is wrong, but the system stays alive.
+
+---
+
+### Step 2 — STT with Hallucination Filter
+
+Whisper sometimes outputs plausible-sounding text on silence: "Thank you for watching" and "Please subscribe" are notorious because they're over-represented in YouTube data. This step implements two filters:
+
+1. `no_speech_prob > 0.6` — Whisper itself reports confidence that the audio contains speech. If this is < 0.4, the model doubts its own output.
+2. `avg_logprob < -1.0` — The average log-probability across all tokens in the transcript. Hallucinations are produced with lower confidence (more negative logprobs) because the model is guessing rather than transcribing.
+
+**Why two filters instead of one:**
+
+`no_speech_prob` catches the "silence → YouTube text" case. `avg_logprob` catches ambiguous audio where Whisper generated plausible but low-confidence text. Together, they form a safety net without overfitting to specific failure modes.
+
+**`condition_on_previous_text=False`:**
+
+By default, Whisper uses prior context to guide decoding — if you just said "the capital of France," it uses that as a prefix for the next utterance. This prevents the model from repeating you, but it also causes it to hallucinate context continuations ("is Paris, which is...") when you actually said something unrelated. Setting this to False makes each utterance independent — safer for conversation agents.
+
+---
+
+### Step 3 — LLM Streaming with Claude
+
+Standard Claude streaming via the Anthropic SDK. The system prompt is intentionally terse: "Voice assistant. Concise — 2-3 sentences max. No markdown." Long-form responses frustrate voice users because they cannot skim; audio is sequential. Markdown is invisible in voice — strip it.
+
+**Why `max_tokens=300` for voice:**
+
+Text agents often use 2000–4000 tokens to accommodate essays and long reasoning. Voice users lose patience after ~15 seconds of agent speaking — that's roughly 200–300 tokens at 30 words/minute. Capping at 300 ensures responses are brief enough to hold attention.
+
+**History as the context carrier:**
+
+The `history` list is passed intact to each call, so the agent has full conversation context. In production, cap history at recent K turns (e.g., last 10 messages) to avoid context explosion and token cost blowup on long conversations.
+
+**Streaming for latency:**
+
+The loop accumulates `text` as it arrives, which allows downstream stages (TTS in Step 4) to begin processing immediately — no need to wait for the full response. This is critical for perceived latency: if you wait for the entire LLM response before starting TTS, users perceive a full LLM latency + TTS latency sequence. Streaming allows parallelization.
+
+---
+
+### Step 4 — TTS with Cancellation Support
+
+ElevenLabs TTS runs in a separate thread, receiving a `cancel_event` that signals it to stop and exit.
+
+**Why threading is necessary:**
+
+The main loop must continue monitoring the input stream (for barge-in detection) while TTS plays audio. A synchronous call to `speak()` would block the loop and delay interruption detection by the entire TTS duration.
+
+**Cancellation pattern:**
+
+The TTS thread checks `cancel_event.is_set()` in its inner loop and breaks when true. This is more responsive than thread termination (which is not safe for I/O operations like audio streaming) and allows the TTS buffer to flush gracefully.
+
+**ElevenLabs voice ID = 21m00Tcm4TlvDq8ikWAM:**
+
+This is a generic female voice. In production, allow voice selection per-user or per-session. Some users have strong preferences for voice characteristics; voice mismatch reduces engagement.
+
+**Hardcoded sample rate = 22050:**
+
+ElevenLabs returns 22.05kHz audio; PyAudio must open the output stream at matching sample rate or the audio will pitch-shift. Verify this matches your TTS provider's output spec.
+
+---
+
+### Step 5 — Main Loop with Barge-In Monitoring
+
+The heart of the agent: capture → transcribe → respond → TTS while monitoring for interruptions.
+
+**Barge-in VAD threshold = 0.7 (vs 0.5 for capture):**
+
+The capture threshold (0.5) starts buffering when speech is probably present. The barge-in threshold (0.7) is much higher — "definitely human speech" — to avoid false interruptions from background noise or the agent's own audio bleeding into the input. This asymmetry is crucial; see Bad-Case Journal Entry 3.
+
+**TTS in a background thread + join():**
+
+`tts.start()` spawns TTS asynchronously. The while loop monitors the thread until it finishes or cancellation is triggered. `tts.join()` waits for the TTS thread to fully exit (including audio buffer flush) before the next iteration. This prevents race conditions where the next user utterance is captured while TTS is still playing.
+
+**Why `exception_on_overflow=False` again:**
+
+During TTS playback, the input stream still needs to accept frames for barge-in detection. If the capture buffer overflows, silently dropping frames is better than crashing.
 
 ---
 

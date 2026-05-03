@@ -99,6 +99,44 @@ flowchart TD
 
 ---
 
+## Reflexion Loop Mechanism Walkthrough
+
+The Reflexion Loop diagram encodes a multi-episode architecture that extends W4's single-episode ReAct. This walkthrough covers the three core innovations: how the verifier gates the loop, why the reflection module must produce actionable statements (not platitudes), and how episodic memory avoids unbounded growth through bounded buffers and recency eviction.
+
+**★ Insight ─────────────────────────────────────**
+- **Multi-episode learning without external training:** Reflexion learns across multiple attempts at the *same task* by capturing error diagnoses and injecting them as context, not by fine-tuning or backprop. This is critical for deployment: you can ship Reflexion on day 1 without waiting for a training pipeline.
+- **Verifier as the control signal, not the agent:** The agent's self-critique is only as good as the verifier. If the verifier cannot reliably distinguish correct from incorrect answers, episodic memory will compound wrong diagnoses. Deterministic verifiers (unit tests, schema validation) vastly outperform model-based judges.
+- **Trade-off: latency and token cost for reliability:** Each reflection and retry cycle costs tokens and wall-clock time. Reflexion is only worth applying when baseline performance is well below ceiling (e.g., recall@1 < 60%) and the task is recoverable within K trials (typically K=3).
+`─────────────────────────────────────────────────`
+
+**Node-by-node walkthrough:**
+
+- **ReAct Episode** — The inner loop from W4. Identical in structure; stateless across episodes. All memory of prior attempts lives in the episodic memory buffer, not in the agent's internal state. This separation is key: the agent does not "remember" failures implicitly; it only sees them through the explicit lesson block prepended to its system prompt.
+
+- **Verifier** — The gate. The verifier receives the question, the gold answer, and the agent's predicted answer, and emits a binary or scalar signal. In the lab below, we use a local Mistral model; in production, prefer deterministic checks (exact-match, F1-overlap, test suite) because they are calibrated by definition and carry no hallucination risk.
+
+- **Reflection Module** — The diagnostic LLM. Given the full episode trajectory (Thought/Action/Observation steps), it produces a natural-language post-mortem. Critical constraint: the reflection must be actionable. "The agent should check the timezone field before arithmetic" is valid. "The agent should be more careful" is not — it provides no hook for the next attempt.
+
+- **Write reflection to episodic memory** — A simple append to a circular buffer. Use `deque(maxlen=N)` to prevent unbounded growth. Recency eviction (most recent N lessons) is typically sufficient for tasks with stable structure.
+
+- **k attempts exhausted** — The hard ceiling. Without this guard, a broken verifier or an unsolvable task can cause runaway looping. Wall-clock timeouts are a second-order backstop.
+
+**Key modifications for different scenarios:**
+
+| Scenario | Modification | Rationale |
+|----------|--------------|-----------|
+| **Production, high-stakes task** | Use deterministic verifier + human spot-check (5% sample) | Model-based judges hallucinate; spot-checking catches systematic bias |
+| **Open-ended generation (code, essays)** | Replace Reflexion with Self-Refine (Madaan et al.) | No ground-truth verifier; critique + refine within one episode instead |
+| **High-latency tolerance** | Increase K to 5 or 7 | Diminishing returns after 3, but sometimes 4–5 trials yield meaningful gain on very hard tasks |
+| **High-latency sensitivity** | Apply Self-Consistency (Wang et al.) instead | Parallel sampling + majority vote; no reflection pass; no episodic memory |
+
+**Expected runtime per task (on a 50-example hard-HotpotQA set, M5 Pro):**
+
+- ReAct baseline (1 attempt): ~8 min
+- Reflexion-3: ~24 min (3× cost, proportional to 3 episodes + 2 reflection calls)
+
+---
+
 ## Lab — Reflexion on a ReAct Failure Set (~3 hours)
 
 ### Goal
@@ -339,6 +377,125 @@ print(r['solved'], r['trials'])
 # Full batch evaluation (expect ~15 min on 50 examples with local verifier)
 python evaluate.py --max-trials 3 --output results.json
 ```
+
+---
+
+## Code Walkthroughs — Steps 1–6
+
+This section walks through the lab implementation block-by-block, explaining the design choices that make each component production-shaped rather than tutorial-simple.
+
+---
+
+### Step 1 — Load the W4 Failure Set
+
+The lab assumes you have run W4's ReAct agent and saved its failures to `failed_react.jsonl` — a standard, serializable representation. If not, the code provides a fallback: load hard-HotpotQA examples from the `datasets` library.
+
+**Why this shape matters:** 
+
+Failure sets are the fuel for metacognition research. By working only on tasks where the baseline agent already failed, you isolate the Reflexion contribution (recovery via reflection) from the trivial contribution (succeeding on easy tasks). The fallback dataset load ensures reproducibility: anyone can run this lab without first completing W4, though the measured gains will differ (your failure set may be easier or harder).
+
+The `failure_set` list should contain dicts with keys `question`, `gold_answer`, and optionally `trajectory` (the full episode steps). The trajectory is used later in the Reflection Module (Step 3) to diagnose what went wrong.
+
+**Common pitfalls:**
+
+- Loading the full HotpotQA dataset instead of filtering to hard examples means you're not testing Reflexion on its intended use case (recovery from hard mistakes). Reflexion shines on the `level == "hard"` subset.
+- Storing failed examples without their full trajectories forces you to re-run failed examples just to get the trajectory for reflection. Always include trajectory in the saved failure set from W4.
+
+---
+
+### Step 2 — Verifier
+
+The verifier is a small model (Mistral-7B) that judges whether the agent's answer matches the gold answer. The prompt is deliberately minimal: "Reply with exactly one word: CORRECT or INCORRECT."
+
+**Why exactly one word matters:**
+
+Model-based judges tend to hedge and explain when they should be definitive. "The answer is mostly correct, though the agent said 1969 instead of the more precise 1969-03-15" is unhelpful noise. By enforcing a one-word response and using `temperature=0`, we make the verifier's decision deterministic and force it to make a binary choice.
+
+**Calibration is critical:**
+
+In production, measure verifier precision and recall against a held-out set of 50 examples where you know the right answer. If precision is below 85%, the verifier is too lenient (it calls wrong answers correct) and will corrupt downstream Reflexion reflections. If recall is below 90%, the verifier is too strict (it rejects correct paraphrases) and will trigger spurious reflection passes.
+
+**A common mistake:** Using a larger model (GPT-4) as the verifier to improve accuracy, at 3–5× the cost per episode. For HotpotQA, a 7B-parameter local model is sufficient if calibrated correctly. Spend compute on the base agent, not the judge.
+
+---
+
+### Step 3 — Reflection Module
+
+The reflection prompt asks the LLM to diagnose the agent's failure in 2–3 sentences, framing each statement as an actionable imperative: "In the next attempt, the agent should..."
+
+**Why this framing is crucial:**
+
+Reflections that say "the agent was wrong" or "be more careful" provide no gradient for the next attempt. Reflections that specify a concrete next action — "check the timezone field," "call authenticate() before get_price()," "recognize that 'further north' refers to latitude, not longitude" — give the next episode a concrete lesson to apply.
+
+**Temperature=0.3 instead of 0:**
+
+The base agent uses `temperature=0` for reproducibility, but the reflection module benefits from slight stochasticity. Completely deterministic reflection can produce repetitive diagnoses ("the agent should search more carefully") that mislead the agent. A small temperature allows the reflection module to explore different framings while staying focused.
+
+**Trajectory formatting:**
+
+The trajectory is serialized as `[{step_type}] step_content` (e.g., `[Thought] The question asks for the capital of France. [Action] Search(France) [Observation] The capital of France is Paris.`). This preserves the temporal structure of the ReAct loop while remaining readable to the reflection LLM.
+
+---
+
+### Step 4 — Episodic Memory
+
+A simple circular buffer implemented as `deque(maxlen=max_entries)`. When the buffer is full, appending a new reflection evicts the oldest one (FIFO).
+
+**Why `maxlen=5` is the right default:**
+
+Unbounded episodic memory causes latency and cost blowup (covered in Bad-Case Journal, Entry 2). Keeping the 5 most recent lessons preserves task-specific learning without overwhelming the system prompt. Experiments show that gains flatten after 3–5 lessons; older lessons are usually either stale or superseded by newer lessons.
+
+**Why `appendleft` (most recent first):**
+
+When the memory is serialized into the system prompt, the agent reads from top to bottom. Placing the most recent lesson first ensures it is weighted more heavily in the agent's reasoning. If an old lesson contradicts a recent lesson, the recent one is encountered first and takes precedence.
+
+**Production variant:** Instead of simple recency eviction, embed each reflection and store in a vector index (e.g., Qdrant). On each new task, retrieve the top-K most *similar* reflections. This keeps prompt size constant while preserving the most relevant prior experience. The trade-off: added complexity (embedding model, vector DB) for better reuse across task classes.
+
+---
+
+### Step 5 — Reflexion Outer Loop
+
+The core orchestrator. For each trial, it:
+1. Generates the memory block (lessons from prior trials, or empty on trial 1)
+2. Runs a ReAct episode with the augmented context
+3. Calls the verifier to check the answer
+4. If failed and not on the last trial, calls the reflection module and writes the lesson to memory
+
+**Why the loop terminates on success, not on trial count:**
+
+If the agent succeeds on trial 1, there's no point running trials 2 and 3. The loop breaks immediately, saving token cost. This is why the expected metric is `recall@3` (did it succeed within 3 attempts?) not `cost@3 attempts` (how much did 3 attempts cost?).
+
+**Return structure:**
+
+The function returns a dict with keys:
+- `solved`: boolean, whether any trial succeeded
+- `trials`: list of per-trial results (answer, pass/fail, trajectory length)
+- `final_answer`: the answer from the last trial (may be wrong)
+
+This structure allows downstream analysis: you can inspect which trial succeeded, how long the trajectories got, and whether the agent is looping (trajectory length increasing without convergence).
+
+---
+
+### Step 6 — Evaluation
+
+Batch evaluation of all examples, computing `recall@k` for k=1,2,3.
+
+**Metric definition:**
+
+`recall@k` = fraction of examples where the agent succeeded within the first k trials. So `recall@1` is equivalent to baseline ReAct (single attempt), and `recall@3` measures the improvement from Reflexion.
+
+**Why mean_trials matters:**
+
+If `recall@3 == 0.40` (40% of examples solved), but `mean_trials == 2.95` (each solved example used nearly all 3 attempts), that's a red flag: the agent is barely scraping by. If `recall@3 == 0.40` with `mean_trials == 1.5`, the agent is converging faster and the reflections are high-quality.
+
+**Token cost accounting:**
+
+A full evaluation run on 50 examples at 3 trials each requires:
+- 50 base ReAct episodes (baseline)
+- ~40 reflection calls (assuming 20% success on trial 1, 80% on trial 2, etc.)
+- 50 verifier calls (always happens after each episode)
+
+With gpt-4o-mini at ~0.15/1M input tokens and Mistral-7B (local) at ~free, expect ~$0.50–1.00 for a full run. Scaling to 200 examples is ~$2–4 and takes ~1 hour.
 
 ---
 

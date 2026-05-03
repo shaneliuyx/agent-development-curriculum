@@ -1,11 +1,14 @@
 ---
 title: "Week 6 — Claude Code Source Dive"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-6, claude-code, architecture, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-06-claude-code-map"
 estimated_time: "12–15 hours over 5–7 days (reading-heavy; light on code)"
 prerequisites: "Weeks 1–5 complete"
+audience: "Cloud infrastructure engineer (3 yrs), understanding harness engineering and production agent architecture from a shipped system"
+stack: "MacBook M5 Pro; reading-heavy lab (no significant compute); Obsidian/markdown for notes and architecture diagrams"
 ---
 
 # Week 6 — Claude Code Source Dive
@@ -20,6 +23,16 @@ prerequisites: "Weeks 1–5 complete"
 - [ ] `RESULTS.md` committed with personal notes, struggled spots, and a sentence on each subsystem in your own words
 - [ ] Can whiteboard the agent loop + 3 subsystems in 5 minutes from memory (timed — use a real timer)
 - [ ] 5 Anki cards created; 3 spoken answers recorded (see §Lock-in)
+
+---
+
+## Why This Week Matters
+
+Weeks 1–5 built your conceptual toolkit: vectors, retrieval, reranking, memory, loops, patterns. You understand the pieces. But production agents are not modular demos. Claude Code is a shipped product serving thousands of users with billions of tokens, real-time latency budgets, and concurrent request handling that would fail instantly if any subsystem was wrong. This week forces you to read the architecture of a real system and ask: where is the complexity? Where are the failure modes? What details did the researchers gloss over that the engineers had to solve?
+
+The interview signal is precise. A candidate who says "I know what ReAct is" sounds like they read a paper. A candidate who says "I reverse-engineered Claude Code's caching layer and it uses a three-tier prompt cache with hash-keyed invalidation; here's why that matters for multi-agent forking" sounds like they *understand* what production engineering means. This week is that difference.
+
+By the end, you will own three artifacts: a one-page architecture cheat sheet you can whiteboard in 5 minutes from memory, a "3 design ideas I'd steal" document with concrete reasoning about why those ideas matter for *your* systems, and the mental model of how eight subsystems (request routing, context windowing, tool dispatch, cache invalidation, token budgeting, error handling, observability, state isolation) fit together into a coherent shipping vehicle. You will understand why Harness Engineering 101 emphasizes "infrastructure, not intelligence" — because Claude Code proves it.
 
 ---
 
@@ -1531,6 +1544,63 @@ The patterns generalize beyond coding agents. A farm agent's harness is its sens
 
 When you finish W6, you should be able to take any Claude Code mechanism (subagent isolation, on-demand skill loading, context compression) and re-implement it in a non-coding domain. That portability is the proof you've understood harness engineering, not just memorized Claude Code's specific architecture.
 
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Confused harness responsibility with model capability.**
+*Symptom:* Engineer implements agent that calls a tool, gets an error, and expects the model to decide to retry. Retries happen inconsistently. Tool succeeds sometimes on retry, sometimes not. Engineer blames the model for "not being smart enough to retry."
+*Root cause:* Harness does not implement retry logic. Model outputs `tool_call`, harness executes tool, but harness never checks whether error is transient and retryable. Model sees error in scratchpad but has no authority to control retry behavior — that is a harness responsibility, not a model decision.
+*Fix:* Implement retry logic in the harness, not as a model prompt instruction. Define which errors are transient (network timeout, rate limit, temporary 503). Harness catches those, sleeps, and retries automatically before returning error to model. Model never sees transient errors. This is the harness/intelligence split: model decides what to do; harness handles the mechanical details of doing it safely.
+
+**Tags:** #harness-vs-intelligence #error-handling #retry-logic #architecture
+
+**Captured in curriculum at:** [[Week 6 - Claude Code Source Dive#Bad-Case Journal]]
+
+---
+
+**Entry 2 — Permission gates designed as an afterthought instead of structurally.**
+*Symptom:* Agent system ships with basic auth (user can call agent). After 2 weeks, an untrusted user calls the agent with a tool that deletes files. Agent executes the delete. Data loss.
+*Root cause:* Permission gates were added to UI ("show button only if user is admin") instead of being enforced at harness layer. Model was never prevented from calling tools it should not have access to — UI just hid the button. Harness accepted any tool call.
+*Fix:* Permission gates must be in the harness, not the UI. Before executing any tool, check ACL: does this user have permission to call this tool in this context? Reject at harness layer before tool execution, not at UI layer. Model never sees tools it cannot access — they should not even be in the tool schema it receives.
+
+**Tags:** #security #permissions #harness-responsibility #access-control
+
+**Captured in curriculum at:** [[Week 6 - Claude Code Source Dive#Bad-Case Journal]]
+
+---
+
+**Entry 3 — Context window exhaustion because input pipeline did not compress.**
+*Symptom:* Agent processes documents. User provides a 200KB PDF. Agent reads entire text into context. Model call fails: context window exceeded (200K tokens > 200K available).
+*Root cause:* Input pipeline (harness) did not compress the document before passing to model. Assumed user input would be small. No truncation, no summarization, no chunking.
+*Fix:* Harness must implement input compression *before* calling model. If user input exceeds 50% of available context, compress: summarize long documents, truncate with "...[X tokens omitted]", chunk into separate requests. Model should never receive input larger than it can handle. Compression is harness responsibility, not model responsibility.
+
+**Tags:** #context-window #input-compression #harness-design #scalability
+
+**Captured in curriculum at:** [[Week 6 - Claude Code Source Dive#Bad-Case Journal]]
+
+---
+
+**Entry 4 — Tool dispatch routing failed because tool schema was out of sync with implementation.**
+*Symptom:* Tool schema says `read_file(path: str) → str`. Implementation is `read_file_handler(request: ReadFileRequest) → ReadFileResponse`. Model calls `read_file("/etc/passwd")`. Dispatcher looks for function `read_file`, can't find it, returns error. User sees failure.
+*Root cause:* Tool schema (what model sees) and implementation (what harness executes) drifted. Schema was not generated from implementation; they were edited separately and fell out of sync.
+*Fix:* Tool schema must be the single source of truth. Generate implementation stubs from schema, or generate schema from implementation via introspection. Never maintain them separately. Add a linter that checks every tool in schema has a matching handler in implementation before deploy.
+
+**Tags:** #tool-dispatch #schema-sync #harness-contracts #consistency
+
+**Captured in curriculum at:** [[Week 6 - Claude Code Source Dive#Bad-Case Journal]]
+
+---
+
+**Entry 5 — Cache invalidation logic failed because state mutation was not tracked.**
+*Symptom:* Agent loads a prompt with cached prefix. Later, a tool modifies state that should invalidate the cache (e.g., a permission is revoked). But harness does not track that state change. Next model call reuses old cache — model still has permissions it should not have.
+*Root cause:* Caching strategy (harness responsibility) did not define cache invalidation keys. What state changes invalidate the cache? Harness never specified. State mutation happened without triggering cache invalidation.
+*Fix:* Before implementing caching, define cache invalidation explicitly: (a) what is the cache key? (b) what state mutations invalidate it? (c) which subsystem must broadcast "state changed" events? (d) how does the cache listener receive those events? Claude Code uses hash-based invalidation: when user permissions change, the session's cached prefix is invalidated. Harness tracks dependency: cache key includes permission hash. State change broadcasts event; cache listener watches for it.
+
+**Tags:** #caching #cache-invalidation #state-tracking #consistency
+
+**Captured in curriculum at:** [[Week 6 - Claude Code Source Dive#Bad-Case Journal]]
 
 ---
 

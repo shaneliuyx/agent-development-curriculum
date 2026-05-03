@@ -1,14 +1,21 @@
 ---
 title: "Week 10 — Framework Shootout"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-10, frameworks, langchain, langgraph, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-10-framework-shootout"
 estimated_time: "12–15 hours over 5–7 days"
 prerequisites: "Week 5 ReAct loop complete and committed; Week 9 faithfulness checker complete"
+audience: "Cloud infrastructure engineer (3 yrs), building production agent systems and learning to evaluate framework choices"
+stack: "MacBook M5 Pro, 48 GB unified memory; oMLX or vLLM for inference; LangChain 1.0 + LangGraph"
 ---
 
 # Week 10 — Framework Shootout
+
+## Why This Week Matters
+
+Weeks 5–9 taught you ReAct loops, pattern libraries, tool harnesses, schema validation, and hallucination detection — all using raw SDK calls to Claude. This week asks the operational question: when you hire a framework, what are you actually paying for? The 2026 agent landscape has four first-class tools (LangChain LCEL + LangGraph, LlamaIndex with agent loop support, OpenAI Agents SDK, raw SDK), each with different complexity budgets and observability properties. In interviews, the distinction matters: candidates who treat LangChain as a monolith ("use LangChain for agents") read as 2023-era, while candidates who can articulate the LCEL ↔ LangGraph tradeoff and name the specific failure modes of each ("LangGraph buys you checkpointing and human-in-the-loop pauses at the cost of upfront state-machine scaffolding") signal production experience. This week is a guided tour through the four frameworks' actual 2026 shapes — what they earn you, what they cost, what problem each solves. You'll implement the same multi-step agent task four ways and measure latency, observability depth, and implementation complexity. Walk out able to say "for *this* use case, we'd choose [framework] because [specific tradeoff]" instead of defaulting to whichever one has the most GitHub stars.
 
 ---
 

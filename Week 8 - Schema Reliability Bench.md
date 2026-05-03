@@ -1,11 +1,14 @@
 ---
 title: "Week 8 — Schema Reliability Bench (The Signature Week)"
 created: 2026-04-23
+updated: 2026-05-03
 tags: [agent, curriculum, week-8, schema, signature, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-08-schema-bench"
 estimated_time: "15–18 hours over 6–8 days (heavier than other weeks by design)"
 prerequisites: "Week 0 complete; Week 4 loop working; Week 7 tool harness with Phoenix traces. You must have read Appendix B of the curriculum end-to-end at least once before starting Phase 1."
+audience: "Cloud infrastructure engineer (3 yrs), building high-reliability structured output systems with measured trade-offs across five defensive layers"
+stack: "MacBook M5 Pro; oMLX + Qwen3.6-35B-A3B-nvfp4; Phoenix for trace visualization; Instructor + Pydantic; Python 3.11+"
 ---
 
 # Week 8 — Schema Reliability Bench (The Signature Week)

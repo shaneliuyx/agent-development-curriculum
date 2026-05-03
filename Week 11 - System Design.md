@@ -2,11 +2,20 @@
 tags: [agent, curriculum, week-11, system-design, interview, runbook]
 title: "Week 11 — System Design Rehearsal"
 created: 2026-04-23
+updated: 2026-05-03
 week: 11
 type: runbook
+audience: "Cloud infrastructure engineer (3 yrs), honing system design communication for senior-level interviews"
+stack: "MacBook M5 Pro; Obsidian for notes; Miro/Excalidraw for diagram capture; screen recording software"
 ---
 
 # Week 11 — System Design Rehearsal
+
+## Why This Week Matters
+
+Weeks 0–10 trained you on agent loops, retrieval quality, pattern selection, tool integration, schema design, and framework tradeoffs — all topics you can defend technically. This week flips the signal: interviews have *two* evaluation axes, and most engineers optimize for only one. A coding interview measures *what you built*; a system design interview measures *how you think*. The rubrics are orthogonal. You can ship production-grade code and still score 3/5 on design because you led with prompts instead of data flow, or you named one failure mode instead of three, or you skipped the "when *not* to use an LLM" question. This week is not about learning new technical depth — you are done learning new material. It is about recording yourself on whiteboard walkthroughs, playing them back, and internalizing where *you specifically* lose points (not where the rubric says you should, but where *you actually do*). The 6-point rubric exists to make that visible: data flow before prompts, eval strategy up front, three failure modes with mitigations, cost discussion, cold-start + drift, and the counterintuitive senior signal of naming when you *would not* use an LLM. Senior hires are candidates who anticipate the strongest counterargument to their own proposal. This week trains you to be that candidate.
+
+---
 
 > This week has almost no code. That is intentional. The signal an interviewer reads from a whiteboard round is different from what they read from a coding round — and most candidates prepare for one while showing up under-rehearsed for the other. Week 11 repairs that gap.
 
@@ -332,6 +341,26 @@ flowchart LR
 
 What is missing: ACL enforcement, confidence threshold, refusal path, citation binding at retrieval time, output validator, audit log, and the entire eval/observability layer. This is the diagram that scores 12/30 on the rubric. The first diagram scores 26–28/30 if you can explain each box.
 
+#### Reference architecture — walkthrough (Legal RAG)
+
+The strong-answer architecture turns "vector RAG over legal documents" into a production system by adding the layers a vector-only diagram skips. Walk through the strong diagram by data flow; pair every layer with the failure mode it defends against.
+
+`★ Insight ─────────────────────────────────────`
+- **ACL must enforce at retrieval, never at generation.** Filtering documents *before* they enter the context window is the only defensible model. A "system prompt asks the model to respect ACLs" answer is a fail.
+- **Citation binding at retrieval time.** Every chunk gets a unique source ID *before* it reaches the LLM. The output validator checks that every cited ID actually appears in the retrieved context — making citation a structural property of the pipeline, not a prompting wish.
+- **Audit log is the legal-domain tell.** Every query, retrieved chunk set, and generated answer logged with user ID + timestamp. This single layer is what separates "an interesting RAG demo" from "a system you can deploy at a law firm".
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one query.**
+1. **`User query → ACL filter`** — pull the user's role; restrict candidate doc set before retrieval.
+2. **`Vector retrieval (top-K) → Confidence threshold`** — if top-1 cosine similarity < threshold, return "no relevant documents found" (refusal path; prevents hallucination on retrieval whiff).
+3. **`Citation binding`** — wrap each retrieved chunk with a unique source ID; pass to the generator.
+4. **`Generation → Output validator`** — validator confirms every factual claim has an inline citation and every cited ID exists in the retrieved set.
+5. **`Audit log + eval`** — record query, retrieved IDs, generated answer with user_id + ts; sample claims for faithfulness/citation-accuracy spot-checks.
+6. **`Response → user`** — only after passing validator + ACL.
+
+**Defense-in-interview lines.** "ACL enforcement at retrieval, not generation." "Refusal path on retrieval whiff." "Citation binding before LLM, not after." "Audit log as a compliance requirement."
+
 ### 6-Rubric Scoring Sheet (fill in after replay)
 
 | Rubric point | Score (1–5) | What I said | Fix next time |
@@ -432,6 +461,27 @@ flowchart LR
 ```
 
 Missing: classifier confidence threshold, escalation logic, SLA state store, specialist tool sets, output validator, feedback loop from human edits, eval metrics. Scores roughly 8/30.
+
+#### Reference architecture — walkthrough (Multi-Agent Triage)
+
+The diagram is a **Hierarchical Multi-Agent** topology: one classifier in front, three typed specialists in the middle, an output validator at the end. Each layer is a defense — escalation routing isn't only confidence-based, output isn't sent without validation, every human edit becomes training signal.
+
+`★ Insight ─────────────────────────────────────`
+- **Specialists are typed, not interchangeable.** Billing has payment-API tools, Tech has error-log search, Account has user-profile API. The hierarchy is the security boundary, not just routing — wrong specialist getting wrong tools is the failure mode this prevents.
+- **Escalation triggers are multi-dimensional.** Confidence < threshold OR enterprise tier OR angry sentiment OR repeat offender. Single-trigger escalation under-routes; multi-trigger reflects how human triage actually works.
+- **MCP as integration protocol.** Naming Model Context Protocol explicitly is the 2026 senior-signal move — uniform tool schema/permissions instead of bespoke API code per tool.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one ticket.**
+1. **`Email/Chat/In-app → Ticket normalizer → State store (Postgres + SLA clock)`** — multi-channel ingestion to unified schema.
+2. **`Classifier agent → CONF gate`** — small model emits intent + confidence. Below threshold, or escalate intent, or enterprise tier, or angry sentiment → `Human queue`.
+3. **`CONF pass → Router → Billing | Tech | Account`** — three typed specialists with disjoint tool grants.
+4. **`Specialists → Output validator (tone · PII scrub · policy)`** — pre-send checks before draft leaves the system.
+5. **`Draft → Human review?`** — soft-quorum decision; if reviewed and edited, capture into `Edit log`.
+6. **`Edit log → Edit-distance metric`** — high edit distance flags low-quality prompts/specialists.
+7. **`SLA monitor → Escalation trigger`** — re-examines in-flight tickets, escalates near breach.
+
+**Defense-in-interview lines.** "Hierarchical Multi-Agent — typed specialists, not interchangeable workers." "Escalation is multi-dimensional, not just confidence." "Edit distance as a feedback metric." "MCP for tool integration."
 
 ### 6-Rubric Scoring Sheet
 
@@ -540,6 +590,26 @@ flowchart LR
 
 Missing: permission model, sandbox isolation, reversibility distinction, context compaction, session log, cost circuit-breaker, test-as-eval ground truth, multi-subtask planning. Scores around 6/30.
 
+#### Reference architecture — walkthrough (Coding Agent)
+
+The diagram encodes the four production-quality choices that distinguish a coding agent from a "LLM that writes code": permission allowlist, sandboxed execution, context compaction, and a session log with cost circuit-breaker.
+
+`★ Insight ─────────────────────────────────────`
+- **Permission model is allowlist, not denylist.** Reversible actions auto-execute; irreversible actions (push, publish, migrate) require explicit confirmation. Denylist permission models always have gaps — Claude Code uses allowlist for exactly this reason.
+- **Tests are the eval.** `pytest / make test` is ground truth — a passing test suite is the success signal, not LLM judgement of code quality. This is the single most important property to articulate aloud.
+- **Context compaction at 70% threshold.** Long coding sessions exceed any context window; compaction summarizes completed subtasks and discards intermediate reasoning while keeping open files + last test output. Without this, the agent is a prototype.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one developer task.**
+1. **`Onboarding (README · tests · architecture) → Task planner`** — read repo first, then enumerate files + dependency order + subtasks.
+2. **`Plan → Permission check`** — three branches: unknown action → ask, reversible → execute, irreversible (push/publish/migrate) → confirm.
+3. **`Sandboxed execution`** — file_read/write contained to `./src`, shell_execute in container, test_runner is the eval.
+4. **`Tests pass?`** — yes → subtask complete; no → form error hypothesis → targeted fix → re-execute (single retry path, not full re-read).
+5. **`Context check (70%)`** — when threshold hit, compact: summarize done subtasks, retain open files + last test output, discard intermediate reasoning.
+6. **`Session log → Cost meter → Circuit-breaker`** — every tool call logged; cost meter trips at threshold and pauses to ask user.
+
+**Defense-in-interview lines.** "Allowlist over denylist." "Tests are the eval." "Compact at 70%, retain open files + last test output." "Cost circuit-breaker on agent runtime."
+
 ### 6-Rubric Scoring Sheet
 
 | Rubric point | Score (1–5) | What I said | Fix next time |
@@ -634,6 +704,26 @@ flowchart LR
 ```
 
 Missing: front-end intent classifier with hard refusal path, citation binding at retrieval time (not generation time), output validator enforcing citation presence, deterministic factual-accuracy eval, data freshness timestamps, audit log. Scores around 9/30.
+
+#### Reference architecture — walkthrough (Financial Research)
+
+The diagram answers "how do you build a research agent that won't hallucinate or speculate?" with three structural choices: front-end intent classifier with hard refusal, citation binding at retrieval time, deterministic factual eval against primary sources.
+
+`★ Insight ─────────────────────────────────────`
+- **Refusal is a separate layer, not a system-prompt instruction.** Speculative-intent classification fires *before* the agent runs. Defense-in-depth that cannot be jailbroken from inside the agent loop.
+- **Citation binding at retrieval time, validation at output time.** Every chunk wrapped with `[SOURCE:id·timestamp]` *before* the LLM sees it; output validator regex-checks that every claim has an inline `[SOURCE:id]`. Pipeline design, not prompt engineering.
+- **Deterministic eval is the unlock.** Numbers in SEC filings have ground truth — sample 50 claims, check primary sources directly. LLM-as-judge is the wrong tool when you have ground truth.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one analyst query.**
+1. **`Analyst query → Intent classifier`** — speculative / investment-advice intent → hard refusal exit.
+2. **`Factual / comparative / transcript → ReAct planner (8–12 tool calls budgeted)`**.
+3. **`Tools (web · edgar · transcript · spreadsheet) → Citation binder`** — every retrieved chunk wrapped with source ID + timestamp before entering context.
+4. **`Context → Generation`** — model emits answer with inline `[SOURCE:id]` tokens and structured JSON for any comparison tables.
+5. **`Output validator`** — regex citation-presence check + speculative-language check + freshness-timestamp check. Fail → flag/regen; pass → response.
+6. **`Audit log → Deterministic factual eval + Citation presence regex`** — primary-source spot-check, not LLM-as-judge.
+
+**Defense-in-interview lines.** "Refusal as a separate classifier, not a system-prompt instruction." "Citation binding at retrieval time, validated at output." "Deterministic eval against primary source." "Freshness timestamp on every response."
 
 ### 6-Rubric Scoring Sheet
 
@@ -753,6 +843,29 @@ flowchart LR
 ```
 
 Missing: PromQL for precise metric queries (the whole point), trace walking to find the slow span, Kubernetes rollout history correlation, Terraform plan risk classification, runbook retrieval, deterministic eval. This answer treats the observability stack as a text corpus rather than a structured, queryable system. Shows no knowledge of how SRE tooling actually works. Scores around 5/30.
+
+#### Reference architecture — walkthrough (SRE Agent)
+
+The differentiator exercise. The diagram encodes the single most important design choice for an infra-aware agent: **deterministic tools, LLM only for synthesis**. Every tool box is labeled "no LLM" — only the synthesis box uses the model. This is what separates an SRE agent from a chatbot reading log dumps.
+
+`★ Insight ─────────────────────────────────────`
+- **Tool layer is deterministic by design.** Kubernetes API, PromQL, trace walking, Terraform plan parsing — all return structured data via real APIs, no LLM in the loop. The model generates PromQL expressions and synthesizes findings; everything in between is mechanical. This is the single most defensible design choice in this exercise.
+- **Hypothesis-first reasoning, not search.** When p99 spikes, the agent first checks `kubectl rollout history` for recent deploys (90% of latency spikes), then falls through to `walk_distributed_trace` only if no deploy correlates. Structured fallthrough beats freeform metric dumping.
+- **Safe-by-default — all tools are read-only.** Rollback / scale / `terraform apply` are surfaced as proposed actions in the response, never executed. Engineer confirms. This is what makes the agent demoable in front of an interviewer without disclaimers.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one incident query.**
+1. **`SRE query → LLM (interpret + plan tool sequence)`** — model picks the hypothesis-first path: deploy correlation? trace walk? metric query? runbook?
+2. **`kubectl_tools / promql_query / walk_distributed_trace / parse_terraform_plan / fetch_pagerduty_incident`** — deterministic tools execute (in parallel where possible) and return structured data.
+3. **`semantic_runbook_search (BGE-M3 + Qdrant)`** — institutional knowledge layer; returns top-3 relevant runbook excerpts.
+4. **`All evidence → LLM synthesis`** — model produces narrative: root cause + evidence chain + proposed action.
+5. **`Proposed action`** — rollback / scale recommendation surfaced to engineer; never auto-executed.
+6. **`Deterministic eval`** — verify the agent's claims against live tool output. "p99 was 1.8s" → rerun PromQL query.
+7. **`Phoenix traces`** — span per tool call + token + latency.
+
+**Defense-in-interview lines.** "Tool layer deterministic, LLM only for synthesis." "Hypothesis-first reasoning, not freeform metric dumping." "Safe-by-default — read-only tools, write actions proposed not executed." "Deterministic eval — claims are verifiable against the same APIs."
+
+**The infra-aware vocabulary lines.** "Prefill (compute-bound, parallelizable) vs decode (memory-bandwidth-bound) — different GPU optimization profiles." "vLLM/TGI prefix caching cuts TTFT by 50–80% because system prompt + runbooks are identical across requests." "Model routing — small model for health checks, large model for incident synthesis = 60–80% cost reduction."
 
 ### 6-Rubric Scoring Sheet
 
@@ -1210,6 +1323,27 @@ flowchart TD
     OS -->|block| OR[Output Replacement]
 ```
 
+#### Where Guardrails Live in the Stack — walkthrough
+
+Three insertion points, three latency profiles, three coverage profiles. The diagram makes "defense in depth" concrete: each layer catches what the prior layer missed, but each adds latency and complexity. Pick layers based on what you need to prevent.
+
+`★ Insight ─────────────────────────────────────`
+- **Pre-tool is the highest-leverage layer for agents.** It is the *only* layer that can prevent a side effect from already happening. Input scanner can block a malicious prompt; output scanner can hide leaked PII; only pre-tool can stop the harmful API call before it executes.
+- **Each layer has a different runtime model.** Input scanner = classifier or regex (5–80 ms); pre-tool = lookup against allowlist + role check (< 5 ms); output scanner = classifier or LLM judge (40–300 ms). Latency budget for "real-time" agents has to account for all three.
+- **Layers are not optional — they are complementary.** A homegrown regex input scanner catches blunt-force injection cheaply; Llama Guard catches novel attack patterns through model reasoning; output scanner is your last line. Skipping any one creates a gap an adversary will find.
+`─────────────────────────────────────────────────`
+
+**Walkthrough — one user request.**
+1. **`User → Input scanner (pre-prompt)`** — block before LLM sees it. Catches: prompt injection, jailbreak patterns, PII in input, topic-scope violations. Block path: `Input rejection`.
+2. **`Pass → Agent planner / LLM`** — agent reasons, picks tool calls.
+3. **`Planner → Tool-call validator (pre-tool)`** — for each tool call: validate name, args, scope against the user's role. Block path: `Denied`. **This is the only layer that can prevent the side effect.**
+4. **`Approve → Tool execution`** — actual API call.
+5. **`Tool → Planner (loop)`** — back to planner with tool result. Loop continues until planner emits final answer.
+6. **`Planner → Output scanner (post-output)`** — toxicity, PII leakage, off-policy content. Block path: `Output replacement` (e.g. "I cannot provide that response").
+7. **`Pass → User response`** — only after surviving all three layers.
+
+**Defense-in-interview lines.** "Three insertion points — input, pre-tool, output." "Pre-tool is highest-leverage — only layer that prevents side effects." "Defense in depth: each layer catches what the prior layer missed." "CAI as floor, external guardrails as ceiling."
+
 **Pre-prompt (input scanning):** runs before LLM sees user message. Checks for prompt injection, jailbreak patterns, PII in input, topic-scope violations. Fastest layer — classifier-based, no LLM call. Catches blunt-force injection.
 
 **Pre-tool (tool-call validation):** intercepts each tool call before execution. Validates tool, arguments, scope are permitted for current user role. **Highest-leverage layer for agents** — only layer that can prevent a harmful action from already happening. Adds latency per tool call, not per request.
@@ -1361,13 +1495,16 @@ def agent_with_guardrails(message, role, react_agent, tox_classifier):
 
 #### Shape 1 — vLLM Single-Node
 
-```
-┌───────────── Single GPU Node ─────────────┐
-│  FastAPI ──▶ vLLM Engine                  │
-│  /generate    PagedAttention KV cache     │
-│               Continuous batching         │
-│               Tensor parallelism (TP=N)   │
-└────────────────────────────────────────────┘
+```plantuml
+@startuml vLLM_SingleNode
+title Shape 1 — vLLM Single-Node
+
+rectangle "Single GPU Node" #DDEEFF {
+  component "FastAPI\n/generate" as API
+  component "vLLM Engine\nPagedAttention KV cache\nContinuous batching\nTensor parallelism (TP=N)" as VLLM
+  API --> VLLM
+}
+@enduml
 ```
 
 vLLM's PagedAttention allocates KV cache in fixed pages (analogous to OS paging), eliminates fragmentation. Continuous batching: new requests join in-flight batch at token boundary. Single H100 SXM running Llama-3-70B FP8 with `tensor_parallel_size=1` achieves ~2,800 tok/s mixed batch — ~11 RPS at 256 output tokens.
@@ -1406,9 +1543,34 @@ KServe defines K8s CRD `InferenceService` wrapping a model server (vLLM, Triton,
 
 #### Shape 4 — Hybrid (Local Embeddings + Cloud LLM)
 
-```
-Documents → nomic-embed-text (MLX/Ollama) → FAISS/LanceDB
-Query → Local embed → ANN search → Top-K chunks → [Context] → Cloud LLM (Claude/GPT-4o)
+```plantuml
+@startuml HybridLocalCloud
+title Shape 4 — Hybrid (Local Embeddings + Cloud LLM)
+
+rectangle "Local (MLX / Ollama)" #DDEEFF {
+  [Documents] as DOC
+  [nomic-embed-text] as EMB
+  [FAISS / LanceDB] as STORE
+  DOC --> EMB
+  EMB --> STORE
+}
+
+[Query] as Q
+[Local embed] as QEMB
+[ANN search] as ANN
+[Top-K chunks] as CHUNKS
+
+Q --> QEMB
+QEMB --> ANN
+STORE --> ANN
+ANN --> CHUNKS
+
+rectangle "Cloud" #FFDDDD {
+  [Cloud LLM\n(Claude / GPT-4o)] as CLOUD
+}
+
+CHUNKS --> CLOUD : "[Context]"
+@enduml
 ```
 
 Most pragmatic shape for teams without GPU infra: run compute-light data-heavy steps locally (chunking, embedding, ANN search), call cloud LLM only for final generation. Embedding 1M tokens on M2 takes 12-18 min, costs $0 marginal. Same job via OpenAI = $20 + API latency. Total cost for 10-question RAG session: under $0.05 with frontier models.

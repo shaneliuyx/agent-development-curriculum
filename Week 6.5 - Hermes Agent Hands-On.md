@@ -1,11 +1,14 @@
 ---
 title: "Week 6.5 — Hermes Agent Hands-On"
 created: 2026-04-26
+updated: 2026-05-03
 tags: [agent, curriculum, week-6.5, hermes, nous-research, extensibility, runbook, expansion-week]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-06.5-hermes-handson"
 estimated_time: "6–8 hours over 2–3 sessions (expansion week — lighter than main weeks)"
 prerequisites: "Week 6 (Claude Code Source Dive) complete; Pi repo skimmed; oMLX or vMLX serving a model"
+audience: "Cloud infrastructure engineer (3 yrs), building extensible agent systems with learned vs curated vs on-demand skill trade-offs"
+stack: "MacBook M5 Pro; oMLX or vMLX (local LLM serving); Hermes Agent (local install); Python 3.11+"
 ---
 
 # Week 6.5 — Hermes Agent Hands-On
@@ -75,6 +78,33 @@ flowchart TB
 ```
 
 **Reading the diagram:** the top half shows the three-position spectrum from Week 6's callouts. The bottom half zooms into Hermes specifically — the **two orange nodes** (Skill Creator + Skill Improver) are Hermes's defining contribution. Neither Claude Code nor Pi has anything analogous. The dashed "after complex task" trigger is the part you'll observe firing in Phase 3 of this lab.
+
+#### Architecture Walkthrough — The Three-Position Extensibility Spectrum
+
+The spectrum shows three agent architectures on a trade-off line: Claude Code (maximalist, 20+ curated surfaces), Pi (minimalist, 4 tools + scripted extensions), and Hermes (learned, autonomous skill creation). Claude Code wins on auditability and determinism — every plugin is reviewed before shipping. Pi wins on simplicity and cost — no framework overhead. Hermes wins on adaptability — the agent learns from experience and persists skills automatically. The lower half drills into Hermes's internals: the **Skill Creator** (orange) fires after complex tasks and generates new skills; the **Skill Improver** refines them on re-use. This is Voyager-style learning, brought to production.
+
+`★ Insight ─────────────────────────────────────`
+- **Three positions, not a spectrum of one dimension**: Claude Code is "curated maximalism" (humans decide all extensions); Pi is "on-demand minimalism" (scripts generate extensions live); Hermes is "learned optimization" (agent generates + improves extensions automatically)
+- **Skill Creator fires on task complexity, not on error**: The trigger is "I just did something non-trivial" (many tool calls, novel API, multi-step reasoning), not "I failed and need to correct myself" — this is proactive learning, not reactive patching
+- **Skill Store is append-only with versioning**: New skills don't overwrite old ones; older versions stay in the store; on re-use, the agent picks the best version or learns a new variant — this prevents catastrophic forgetting
+`─────────────────────────────────────────────────`
+
+**Spectrum positions:**
+1. **Claude Code** (top-left): Maximalist, 20+ extension surfaces (plugins, skills, hooks, MCP, subagents). Every extension is human-authored and reviewed before deploy. Trade-off: auditability and safety win; speed of iteration loses.
+2. **Pi** (middle): Minimalist, 4 tools + on-demand scripting. The agent constructs extensions at runtime for one-off tasks; may or may not persist. Trade-off: simplicity and cost win; adaptability loses.
+3. **Hermes Agent** (bottom-right): Learned, skill-creation loop. After complex tasks, the agent generates new skills and persists them to disk; on re-use, skills are refined. Trade-off: adaptability wins; auditability is harder because you don't manually review every generated skill.
+
+**Hermes internal architecture (bottom subgraph):**
+- **User input** → **Agent Loop** (any LLM provider — OpenAI, local, etc.)
+- **Agent Loop** ↔ **Persistent Memory** (curated by agent: "nudge me to remember this")
+- **Agent Loop** → **Skill Store** (append-only, indexed by embedding)
+- **Skill Creator** (dashed, triggered "after complex task") → writes new skills to Store
+- **Skill Improver** (dashed, triggered "on repeat use") → refines existing skills
+- **Skill Store** (dashed) → loads relevant skills back into Loop before LLM call
+
+**Why this taxonomy matters**: In interviews, you need to explain that agent extensibility is not a 1D knob (more extensions = better). It's a triangle with three distinct strategies, each with trade-offs. Claude Code's strength (auditability) is Hermes's weakness (generated code you didn't write). Hermes's strength (learned adaptability) is Claude Code's weakness (you have to manually curate everything). Pi occupies the middle: simple but not learning, flexible but not persistent.
+
+**Expected observation in Phase 3**: You'll trigger the Skill Creator by running a complex task (e.g., "scrape the first 3 pages of a news site and summarize by topic"). Hermes will emit a skill file to disk. You'll inspect it. Some skills will be good, some bad. That's the production risk: *how much will you trust agent-generated code?*
 
 ---
 
@@ -451,6 +481,19 @@ New agent project starting today
 
 (How does this connect back to your Cloud Infra background? Hint: skill versioning + retrieval is essentially Terraform module management; auditability is essentially policy-as-code; the orchestration/inference separation is essentially Kubernetes' pod/container split. Pick one and write 3 sentences.)
 ```
+
+---
+
+## Bad-Case Journal
+
+**Entry 1 — Learned skill conflicts with curated skill; version skew causes silent error.**
+*Symptom:* Hermes learns a skill `format_json_output.py` to format agent outputs. Separately, user codebase provides a curated skill of the same name but different implementation. Agent loads both. Sometimes model calls one, sometimes the other. Output format inconsistent. User sees different formats on successive runs of the same task.
+*Root cause:* Skill versioning system does not handle name conflicts between learned and curated skills. When two skills with same name exist, loader picks whichever it finds first (ordering undefined). No explicit priority or deprecation mechanism. Model was never taught that conflict existed.
+*Fix:* Implement namespace separation: learned skills go to `skills.learned.*`, curated to `skills.curated.*`. Or implement explicit versioning: each skill has a timestamp; loader always picks newest. When a conflict is detected, explicitly choose: prefer curated (human-audited) or learned (domain-specific)? Make the choice explicit in config, not implicit in file order.
+
+**Tags:** #skill-versioning #conflict-resolution #learned-agents #hermes #w6.5
+
+**Captured in curriculum at:** [[Week 6.5 - Hermes Agent Hands-On#Bad-Case Journal]]
 
 ---
 
