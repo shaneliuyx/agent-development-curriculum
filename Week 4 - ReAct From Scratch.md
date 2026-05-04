@@ -382,7 +382,21 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 |---|---|---|---|---|---|---|---|
 | haiku | `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` | `:8004` | 525–1208 | **1.00** | **1.00** | **1.00** | **1.00** |
 | sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | `:8003` | 301 (warm) / cold-timeout | 0.33–0.67 | 1.00 | 1.00 | 1.00 |
-| opus_lazy | `gemma-4-31B-uncensored-heretic-mlx-4bit` | `:8000` | ~1700 (cold) | **0.00** | 1.00 | 1.00 | 1.00 |
+| opus_lazy (selected) | `Gemma-4-31B-JANG_4M-CRACK` | `:8001` | 2135 (cold) | **1.00** | **1.00** | **1.00** | **1.00** |
+| opus_lazy (rejected) | `gemma-4-31B-uncensored-heretic-mlx-4bit` | `:8000` | ~1700 (cold) | **0.00** | 1.00 | 1.00 | 1.00 |
+
+**Two uncensored Gemma-4-31B variants compared at the same parameter scale and quant tier:**
+
+| Probe | JANG_4M-CRACK (selected) | heretic-mlx-4bit (rejected) |
+|---|---|---|
+| Tool calling (3 trials) | 3/3 perfect structured `tool_calls` | 0/3 — emitted plain text where tools required |
+| Reasoning | 1.00 | 1.00 |
+| JSON-only output | 1.00 | 1.00 |
+| Instruction following | 1.00 | 1.00 |
+| Context window | 4M tokens (4,000,000) | 32K (typical Gemma-4 default) |
+| Verdict | **Selected** for `finisher` and `hard_loop` roles | **Rejected** — tool=0.00 makes it strictly inferior at the same scale |
+
+JANG strictly dominates heretic on the only axis that matters for agent loops. Both fine-tunes are uncensored long-form variants of Gemma-4-31B-4bit, but heretic destroyed the function-call alignment during fine-tuning while JANG preserved it. JANG also carries a 4M context window — 30× larger than the typical 128K — making it the natural target for Week 8 long-context retrieval experiments.
 
 `★ Insight ─────────────────────────────────────`
 - **Smallest model is the most stable.** Distill 9B is the only model that scored 1.00 across every quality probe in five consecutive runs — through engine upgrades, fleet shuffling, and OOM cycles. The "Haiku" name in the tier ladder is a transport-layer label, not a quality ranking. On this fleet the lab's default `MODEL` is the smallest, the most reliable, and the one that survives operational chaos.
@@ -399,13 +413,14 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 | `classify` (cheap pre-loop / obs sidecar) | Distill 9B | `:8004` | Smallest, fastest reliable; reuses loop's hot KV cache |
 | `reason` (math / multi-step) | Gemma-26B | `:8003` | reason=1.00 + warm-state 301 ms median |
 | `compose` (post-tool answer drafting) | Gemma-26B | `:8003` | instr=1.00; no `tool_calls` emission needed |
-| `finisher` (post-loop polish, lazy) | gemma-31B-heretic | `:8000` | reason+instr 1.00; uncensored long-form. Spin up only after `agent_run()` returns. |
+| `finisher` (post-loop polish, lazy) | JANG_4M-CRACK | `:8001` | reason+instr+json+tool 1.00; uncensored long-form; 4M context. Spin up only after `agent_run()` returns. |
+| `hard_loop` (in-loop fallback when 9B reasoning is insufficient, lazy) | JANG_4M-CRACK | `:8001` | tool=1.00 at 31B scale — heretic could not serve this role (tool=0.00). |
 
 **Three new bad-case scenarios discovered via the probe harness (used in Phase 5):**
 
 - **Scenario 13 — cold-start latency exceeds tool budget.** Sonnet's first call after a memory-pressure event consistently times out at 200+ s. *Fix:* warm-up ping at agent boot; treat first-call latency as a separate per-tool budget axis.
 - **Scenario 14 — model post-OOM corruption.** Symptom: `{"x":33333333333333…` runaway digit decoding, instruction violations (8 words emitted for "EXACTLY 3"). Stale KV cache after a fleet-wide OOM cycle is the root cause, not model corruption on disk. *Fix:* `kill -HUP` the contaminated vMLX server on its port; re-run the probe to confirm scores recover.
-- **Scenario 15 — uncensored fine-tune drops `tool_calls`.** Symptom: `tool_choice="auto"` is sent, schema is valid, but the response has `content="..."` and `tool_calls=[]`. The model emitted plain text where structured calls were required. Root cause: function-call alignment is fragile and is often lost during uncensored / heretic fine-tunes. *Fix:* never route tool-bearing requests to that model; reserve it for the post-loop `finisher` role, which receives plain text.
+- **Scenario 15 — uncensored fine-tune drops `tool_calls`.** Symptom: `tool_choice="auto"` is sent, schema is valid, but the response has `content="..."` and `tool_calls=[]`. The model emitted plain text where structured calls were required. Root cause: function-call alignment is fragile and is often lost during uncensored / heretic fine-tunes — `gemma-4-31B-uncensored-heretic-mlx-4bit` scored tool=0.00 (0/3 perfect calls) in isolated probing, while `Gemma-4-31B-JANG_4M-CRACK` (same parameter scale, same 4-bit quant, different fine-tune) scored tool=1.00. *Fix:* probe every uncensored variant on tool calling specifically before adopting it; never assume tool capability survives a fine-tune. *Mitigation when only a non-tool-capable model is available:* relegate it to the `finisher` role (post-loop, plain text input/output) and never put it on the loop's `tool_arg` path. `src/models.py` selects JANG over heretic for exactly this reason.
 
 **Run the probe yourself:**
 
@@ -413,7 +428,8 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 cd ~/code/agent-prep/lab-04-react-from-scratch
 source ../.venv/bin/activate
 python scripts/probe_fleet.py                           # default = sonnet+haiku (Option C)
-python scripts/probe_fleet.py --only opus_lazy          # isolated probe of :8000
+python scripts/probe_fleet.py --only opus_jang          # isolated probe of JANG :8001
+python scripts/probe_fleet.py --only opus_lazy          # isolated probe of heretic :8000 (rejected variant)
 python scripts/probe_fleet.py --json > data/run_$(date +%s).json   # snapshot for replay
 ```
 
