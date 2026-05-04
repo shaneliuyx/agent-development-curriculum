@@ -1,10 +1,10 @@
 ---
 title: "Week 4 — The ReAct Loop, Built From Scratch"
 created: 2026-04-23
-updated: 2026-05-03
+updated: 2026-05-04
 tags: [agent, curriculum, week-4, react, agents, runbook]
 audience: "Cloud infrastructure engineer (3 yrs), building agentic systems from first principles"
-stack: "MacBook M5 Pro, local oMLX (Sonnet/Haiku), Python 3.11+, no frameworks"
+stack: "MacBook M5 Pro, local vMLX fleet (Qwen3.6-35B-A3B on :8002 / Gemma-4-26B-A4B on :8003 / Qwen3.5-9B-GLM5.1-Distill on :8004, no API key), Python 3.11+, no frameworks"
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-04-react-from-scratch"
 estimated_time: "12–15 hours over 5–7 days"
@@ -17,7 +17,7 @@ prerequisites: "Week 3 RESULTS.md committed"
 
 **Exit criteria.**
 
-- [ ] `src/react.py` runs end-to-end against your local oMLX endpoint with zero import errors
+- [ ] `src/react.py` runs end-to-end against your local vMLX endpoint (default `:8004`, `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` — smallest model in the fleet, optimized for fast lab iteration) with zero import errors
 - [ ] All 4 tools (`web_search`, `python_repl`, `read_file`, `write_file`) respond correctly to at least one live agent task
 - [ ] SQLite observability table is populated after every agent run; `SELECT * FROM agent_events` returns rows
 - [ ] `tests/test_bad_cases.py` contains at least 15 named test scenarios; each has a docstring explaining the failure mode and the patch that fixed it
@@ -176,7 +176,7 @@ flowchart TD
         direction TB
         ASSEMBLE["context_for_llm()<br/>Assemble: system + tools schema<br/>+ user msg + scratchpad"] --> LLM
 
-        LLM["call_llm()<br/>OMLX :8000<br/>Qwen3.6-35B-A3B-nvfp4"] --> PARSE
+        LLM["call_llm()<br/>vMLX :8004<br/>MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit"] --> PARSE
 
         PARSE{"tool_calls<br/>present?"}
 
@@ -254,7 +254,7 @@ This diagram is the agent's full anatomy on a single page. Three subgraphs (LOOP
 **Walkthrough — one user message through the loop.**
 
 1. **`User message → ASSEMBLE`** — the only entry point. `context_for_llm()` builds the prompt fresh on every iteration: system prompt + JSON tool schemas + user message + full scratchpad replay (no truncation at this step — truncation happens later via `CTX_GUARD`).
-2. **`ASSEMBLE → LLM`** — `call_llm()` makes a single OpenAI-compatible chat completion call against the local oMLX server (Qwen3.6-35B-A3B-nvfp4). Returns `(content, tool_calls, usage)`.
+2. **`ASSEMBLE → LLM`** — `call_llm()` makes a single OpenAI-compatible chat completion call against the local vMLX server (default: `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` on `:8004` — smallest model in the fleet, chosen for fast lab iteration; swap to `MODEL_OPUS` Qwen3.6-35B-A3B-nvfp4 on `:8002` for production-strength tool calling). Returns `(content, tool_calls, usage)`.
 3. **`LLM → PARSE`** — first decision diamond: did the model emit `tool_calls`? If no, the response is the final answer; jump to `Return final answer` (green terminal).
 4. **`PARSE → BUDGET`** (yes branch) — second decision diamond: budget guard. Two checks:
    - Has this tool's `max_calls` been hit?
@@ -318,12 +318,28 @@ uv pip install duckduckgo-search sqlite-utils pytest
 Your `.env` should contain the following. Confirm each line exists before moving to Phase 2.
 
 ```bash
-# .env — values from the oMLX settings panel
-OMLX_BASE_URL=http://127.0.0.1:8000/v1
-OMLX_API_KEY=Shane@7162
-MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4
-MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
-MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
+# .env — values from the vMLX settings panel.
+# vMLX serves each model on its own port; no API key is required, but the
+# OpenAI SDK still rejects an empty api_key at construction time, so we pass
+# a non-empty placeholder string ("not-needed") that vMLX ignores.
+VMLX_API_KEY=not-needed
+
+# Default endpoint = smallest model on the fleet (fast lab iteration).
+# agent_run() reads VMLX_BASE_URL + VMLX_MODEL — change both together.
+VMLX_BASE_URL=http://127.0.0.1:8004/v1
+VMLX_MODEL=MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit
+
+# Per-tier model fleet (Opus / Sonnet / Haiku — used in §5 tier-comparison
+# experiments and Week 5's pattern zoo). Each model has its own port; flip
+# both VMLX_BASE_URL and VMLX_MODEL together when switching tiers.
+MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4                       # port 8002 — strongest tool-caller (MoE)
+MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit           # port 8003 — mid tier
+MODEL_HAIKU=MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit      # port 8004 — smallest, fastest (default)
+
+# Per-tier base URLs (use when running tier-comparison experiments).
+VMLX_URL_OPUS=http://127.0.0.1:8002/v1
+VMLX_URL_SONNET=http://127.0.0.1:8003/v1
+VMLX_URL_HAIKU=http://127.0.0.1:8004/v1
 ```
 
 Quick sanity check — this should return the model name with no error:
@@ -333,9 +349,9 @@ set -a; source .env; set +a
 python -c "
 import os
 from openai import OpenAI
-c = OpenAI(base_url=os.getenv('OMLX_BASE_URL'), api_key=os.getenv('OMLX_API_KEY'))
+c = OpenAI(base_url=os.getenv('VMLX_BASE_URL'), api_key=os.getenv('VMLX_API_KEY', 'not-needed'))
 r = c.chat.completions.create(
-    model=os.getenv('MODEL_OPUS'),
+    model=os.getenv('VMLX_MODEL'),
     messages=[{'role':'user','content':'Reply with exactly: ready'}],
     max_tokens=10,
 )
@@ -343,9 +359,65 @@ print(r.choices[0].message.content)
 "
 ```
 
-> **Gotcha:** If oMLX is not running, this returns a `ConnectionRefusedError`. Open oMLX from the menu bar, wait for the green indicator, then re-run. Do not proceed to Phase 2 with a failing sanity check — every subsequent step depends on this connection.
+Verify the other two tiers are also reachable (each on its own port):
+
+```bash
+for url in "$VMLX_URL_OPUS" "$VMLX_URL_SONNET" "$VMLX_URL_HAIKU"; do
+  echo "Probing $url"
+  curl -fsS "${url}/models" >/dev/null && echo "  OK" || echo "  DOWN"
+done
+```
+
+> **Gotcha:** If vMLX is not running on the expected port, this returns a `ConnectionRefusedError`. Start the vMLX server for that model from the menu bar, wait for the green indicator, then re-run. Do not proceed to Phase 2 with a failing sanity check — every subsequent step depends on this connection. A common mistake: `VMLX_MODEL` env var still names `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` but `VMLX_BASE_URL` points at `:8003` (Gemma) — the request silently routes to whichever model that port is serving, producing confusing output. Always flip URL and MODEL together.
 
 > **Analogy (Infra):** This is identical to running `SELECT 1` against a new database connection before wiring it into a pipeline. The thirty seconds spent verifying connectivity saves hours of debugging later.
+
+### 1.4 Empirical findings — fleet probe (2026-05-04)
+
+The lab ships a probe harness at `scripts/probe_fleet.py` that scores every model in the fleet across five dimensions: ping latency, structured tool calling, JSON-only output, multi-step reasoning, and strict instruction-following. Run it once after starting vMLX and before writing any loop code; the scores anchor every per-role model assignment in `src/models.py` and every tier-comparison in §5 + Week 5.
+
+**Five-run aggregate on M5 Pro 48 GB, vMLX engine post-2026-05-04 upgrade:**
+
+| Tier | Model | Port | Ping (median ms) | Tool | JSON | Reason | Instr |
+|---|---|---|---|---|---|---|---|
+| haiku | `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` | `:8004` | 525–1208 | **1.00** | **1.00** | **1.00** | **1.00** |
+| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | `:8003` | 301 (warm) / cold-timeout | 0.33–0.67 | 1.00 | 1.00 | 1.00 |
+| opus_lazy | `gemma-4-31B-uncensored-heretic-mlx-4bit` | `:8000` | ~1700 (cold) | **0.00** | 1.00 | 1.00 | 1.00 |
+
+`★ Insight ─────────────────────────────────────`
+- **Smallest model is the most stable.** Distill 9B is the only model that scored 1.00 across every quality probe in five consecutive runs — through engine upgrades, fleet shuffling, and OOM cycles. The "Haiku" name in the tier ladder is a transport-layer label, not a quality ranking. On this fleet the lab's default `MODEL` is the smallest, the most reliable, and the one that survives operational chaos.
+- **Tool-calling is a learned format, not a function of size.** Gemma-26B (Sonnet) scores reason=1.00, instr=1.00, but tool=0.33–0.67. Gemma-31B-uncensored-heretic scores reason=instr=1.00 but tool=**0.00** — the uncensored fine-tune dropped the function-call grammar entirely. Tool calling capability is orthogonal to general capability and must be probed separately. Do not assume it from model size or benchmark scores.
+- **48 GB unified memory cannot hold all three hot.** Loading dense Gemma-31B on `:8000` alongside Gemma-26B and Distill-9B triggered cascading `APIConnectionError` across the fleet — total weight memory ≈ 38 GB, plus KV cache and activations exceeded the headroom. The architecturally correct fix is the same as in any memory-pressured infra system: lazy-load the heavy node and accept cold-start tax. This is the difference between "deploy three models" and "deploy three models you can actually use."
+`─────────────────────────────────────────────────`
+
+**Role-to-model mapping — driven by the table above (see `src/models.py::ROLE_MAP`):**
+
+| Role | Model | Port | Why |
+|---|---|---|---|
+| `loop` (default ReAct driver) | Distill 9B | `:8004` | Only model with 1.00 across every quality probe in 5 runs |
+| `tool_arg` (synthesize tool arguments) | Distill 9B | `:8004` | tool=1.00 vs Sonnet 0.67 vs Opus-lazy 0.00 |
+| `classify` (cheap pre-loop / obs sidecar) | Distill 9B | `:8004` | Smallest, fastest reliable; reuses loop's hot KV cache |
+| `reason` (math / multi-step) | Gemma-26B | `:8003` | reason=1.00 + warm-state 301 ms median |
+| `compose` (post-tool answer drafting) | Gemma-26B | `:8003` | instr=1.00; no `tool_calls` emission needed |
+| `finisher` (post-loop polish, lazy) | gemma-31B-heretic | `:8000` | reason+instr 1.00; uncensored long-form. Spin up only after `agent_run()` returns. |
+
+**Three new bad-case scenarios discovered via the probe harness (used in Phase 5):**
+
+- **Scenario 13 — cold-start latency exceeds tool budget.** Sonnet's first call after a memory-pressure event consistently times out at 200+ s. *Fix:* warm-up ping at agent boot; treat first-call latency as a separate per-tool budget axis.
+- **Scenario 14 — model post-OOM corruption.** Symptom: `{"x":33333333333333…` runaway digit decoding, instruction violations (8 words emitted for "EXACTLY 3"). Stale KV cache after a fleet-wide OOM cycle is the root cause, not model corruption on disk. *Fix:* `kill -HUP` the contaminated vMLX server on its port; re-run the probe to confirm scores recover.
+- **Scenario 15 — uncensored fine-tune drops `tool_calls`.** Symptom: `tool_choice="auto"` is sent, schema is valid, but the response has `content="..."` and `tool_calls=[]`. The model emitted plain text where structured calls were required. Root cause: function-call alignment is fragile and is often lost during uncensored / heretic fine-tunes. *Fix:* never route tool-bearing requests to that model; reserve it for the post-loop `finisher` role, which receives plain text.
+
+**Run the probe yourself:**
+
+```bash
+cd ~/code/agent-prep/lab-04-react-from-scratch
+source ../.venv/bin/activate
+python scripts/probe_fleet.py                           # default = sonnet+haiku (Option C)
+python scripts/probe_fleet.py --only opus_lazy          # isolated probe of :8000
+python scripts/probe_fleet.py --json > data/run_$(date +%s).json   # snapshot for replay
+```
+
+> **Re-run the probe after any vMLX engine upgrade.** A v?→v? bump in this lab changed Sonnet from "request timeout" to "301 ms median" with no model change. Engine version is a load-bearing variable in the role map; pin it in `RESULTS.md`.
 
 ---
 
@@ -482,15 +554,21 @@ from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 1. Client setup
-#    MODEL_OPUS defaults to Qwen3.6-35B-A3B-nvfp4 — the strongest tool-calling
-#    model in the local fleet. The fallback string lets the file run without a
-#    .env if needed (e.g., in CI against a stub server).
+#    VMLX_MODEL defaults to MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit — the
+#    smallest model on the local fleet (vMLX, port 8004), chosen as default
+#    for fast lab iteration (cheap tokens, snappy turn-around). For tier
+#    experiments swap both VMLX_BASE_URL and VMLX_MODEL: MODEL_OPUS
+#    Qwen3.6-35B-A3B-nvfp4 on :8002 is the strongest tool-caller in the fleet.
+#    The fallback strings let the file run without a .env if needed (e.g., in
+#    CI against a stub server).
+#    vMLX requires no auth, but the OpenAI SDK rejects an empty api_key at
+#    construction time, so we pass a non-empty placeholder ("not-needed").
 # ---------------------------------------------------------------------------
 _client = OpenAI(
-    base_url=os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1"),
-    api_key=os.getenv("OMLX_API_KEY", "Shane@7162"),
+    base_url=os.getenv("VMLX_BASE_URL", "http://127.0.0.1:8004/v1"),
+    api_key=os.getenv("VMLX_API_KEY", "not-needed"),
 )
-MODEL = os.getenv("MODEL_OPUS", "Qwen3.6-35B-A3B-nvfp4")
+MODEL = os.getenv("VMLX_MODEL", "MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit")
 
 # ---------------------------------------------------------------------------
 # 2. Loop constants
@@ -856,13 +934,15 @@ def agent_run(
 
 What it does: instantiates the `OpenAI` client once at module load and binds the model name from the environment.
 
-> **Why:** A module-level client is the Python equivalent of a connection pool — created once, reused for every `call_llm()` call in the process. Reading `MODEL` from the environment means you can swap `Qwen3.6-35B-A3B-nvfp4` for the haiku-tier model mid-experiment with a single `export` statement, no code edit required.
+> **Why:** A module-level client is the Python equivalent of a connection pool — created once, reused for every `call_llm()` call in the process. Reading `MODEL` from `VMLX_MODEL` means you can swap the default `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` for `MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4` mid-experiment with a single `export` statement (paired with `VMLX_BASE_URL=http://127.0.0.1:8002/v1`), no code edit required.
 
-> **Why:** The `or` fallback on `base_url` (defaulting to `http://127.0.0.1:8000/v1`) allows the file to import cleanly in test environments where `.env` is not loaded. Without it, a missing env var produces a confusing `None`-type URL error inside the OpenAI SDK.
+> **Why:** The `or` fallback on `base_url` (defaulting to `http://127.0.0.1:8004/v1`) allows the file to import cleanly in test environments where `.env` is not loaded. Without it, a missing env var produces a confusing `None`-type URL error inside the OpenAI SDK.
+
+> **Why a placeholder `api_key`:** vMLX does not validate auth, but the OpenAI SDK refuses to construct a client with an empty `api_key` (raises `OpenAIError` before any request goes out). The dummy string `"not-needed"` is a no-op that satisfies the SDK and is ignored by the local server.
 
 > **Analogy (Infra):** This is your SQLAlchemy engine — constructed once at startup, never recreated per request.
 
-Common modifications: to run the loop against vMLX for speculative-decoding benchmarks, override at call site: `os.environ["OMLX_BASE_URL"] = "http://127.0.0.1:8003/v1"` before importing.
+Common modifications: to promote from the default Haiku-tier `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` (`:8004`) up to the Opus-tier `Qwen3.6-35B-A3B-nvfp4` (`:8002`) without restarting the process, override both URL and MODEL together at call site, e.g. `os.environ["VMLX_BASE_URL"] = "http://127.0.0.1:8002/v1"; os.environ["VMLX_MODEL"] = "Qwen3.6-35B-A3B-nvfp4"` before importing `src.react`. Flipping URL alone routes requests to whatever model that port is serving and produces confusing output.
 
 ---
 
@@ -874,7 +954,7 @@ What it does: sets the two numeric guards that bound the loop's worst-case behav
 
 > **Why env-var tunable:** Hard-coding constants means changing them requires a code edit and a commit. Env-var tuning lets you run `REACT_MAX_ITER=3 pytest tests/test_bad_cases.py::TestScenario01` to reproduce a specific failure without touching source.
 
-> **Why `CONTEXT_TOKEN_LIMIT = 28000`:** Qwen3.6-35B-A3B supports a 32K context window. 28K leaves ~4K headroom for the system prompt and user message. Set this to 70% of the model's advertised window, not 100%.
+> **Why `CONTEXT_TOKEN_LIMIT = 28000`:** the default model `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` and the Opus-tier `Qwen3.6-35B-A3B-nvfp4` both support a 32K context window. 28K leaves ~4K headroom for the system prompt and user message. Set this to ~70% of the model's advertised window, not 100% — both vMLX and the model itself degrade quality near the upper bound. When you swap to a model with a different window (Gemma-4-26B-A4B-it-heretic-4bit is 128K), retune via `REACT_CTX_LIMIT`.
 
 Common modifications: `REACT_CTX_LIMIT=16000` for memory-constrained experiments; `REACT_MAX_ITER=20` for long research agent tasks.
 
@@ -2503,7 +2583,7 @@ Outline your answer:
 | `call_llm()` returns 400 with "context too long" | Scratchpad has grown past the model's context window before the eviction guard fires | Lower `REACT_CTX_LIMIT` env var to trigger eviction sooner; or increase `RESULT_TRUNCATION_CHARS` to truncate tool results more aggressively | Set `REACT_CTX_LIMIT` to 70% of the model's advertised context window, not 100%; reserve headroom for the system prompt and user message |
 | `agent_run()` hangs indefinitely | A tool is blocking (usually `python_repl` or `web_search`) | Set `timeout=` in `python_repl`; confirm `DDGS()` has a request timeout; add `signal.alarm()` as a last-resort watchdog around `run_tool()` | Always pass `timeout=` to any subprocess call; never trust external network calls to self-terminate |
 | `pytest tests/test_bad_cases.py` fails with `ImportError: src.react` | Python path not set correctly | Run `pytest` from the lab root directory (not from inside `tests/`); confirm `sys.path.insert(0, ...)` in the test file points to the correct parent | Use `pyproject.toml` with `[tool.pytest.ini_options] pythonpath = ["."]` to avoid manual path manipulation |
-| Model emits empty `content` and empty `tool_calls` on every iteration | Model is confused by the tool schema or system prompt; or the model is being asked to do something it refuses | Add `print(messages)` before `call_llm()` to inspect what the model is seeing; try a simpler task first; verify oMLX is serving the correct model (check the menu bar) | Log the raw `LLMResponse` to the SQLite table on every iteration so you can replay the conversation offline |
+| Model emits empty `content` and empty `tool_calls` on every iteration | Model is confused by the tool schema or system prompt; or the model is being asked to do something it refuses | Add `print(messages)` before `call_llm()` to inspect what the model is seeing; try a simpler task first; verify vMLX is serving the correct model on the port `VMLX_BASE_URL` points at (check the vMLX menu bar; mismatched port↔MODEL is a common silent-routing bug) | Log the raw `LLMResponse` to the SQLite table on every iteration so you can replay the conversation offline |
 
 ---
 
