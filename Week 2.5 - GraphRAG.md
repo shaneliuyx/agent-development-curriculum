@@ -477,31 +477,45 @@ The graph almost always contains multiple nodes that name the same real-world en
 
 The v1 pipeline this chapter starts from (slice the first 200 Wikipedia articles by `train[:200]` → extract triples → traverse) breaks in production-shape ways the moment a real query arrives. The current pipeline (v12.4m, ~400 articles via domain-bounded category walk + pageview-weighted A-ExpJ sampling + Wikidata QID linking at extraction time + universal-mechanism read-path) emerged from 14 iterations against the originally-failing queries "What is the relationship between Apple and NeXT?" and "Which companies are related to Mark Zuckerberg?". This section captures the design rationale, target metrics, and best practices distilled from that journey. Read it before Phase 1 — it tells you what each Phase is actually solving for, and why the Phase 1 walkthrough below TEACHES the broken `train[:200]` baseline before introducing the category-walk replacement in §1.3 (`fetch_corpus.py` walkthrough's "Why this corpus mechanism beats `train[:200]`" callout marks the transition).
 
-### Version Roadmap — Seven Phases of Iteration
+### Version Roadmap — Inheritance Tree
 
 ```mermaid
-flowchart TD
-    V1["**v1** — slice train[:200]<br/>baseline broken<br/>chemistry articles, no tech entities"]:::broken
+flowchart LR
+    V1["**v1** broken<br/>train[:200]<br/>chemistry corpus"]:::broken
+    V95["**v9.5**<br/>+ category walk<br/>+ pageview A-ExpJ<br/>+ truncation 50K<br/>ALL 0.55"]:::base
+    V11["**v11**<br/>+ 1-hop priority<br/>+ LLM-judge eval<br/>+ multi-hop decomp<br/>+ reverse-edge norm<br/>ALL 0.68"]:::base
+    V12["**v12**<br/>+ Wikidata QID<br/>at extraction<br/>closes Leak #4<br/>ALL 0.64"]:::base
+    V121["**v12.1**<br/>QID extraction<br/>layer stable<br/>**BRANCH POINT**"]:::branchpt
 
-    P1["**Phase 1 — Corpus rebuild (v8 → v9.5)**<br/>domain-bounded category walk<br/>pageview-weighted A-ExpJ sampling<br/>article truncation 4000 → 50000<br/>**ALL: 0.55**"]:::phase
-    P2["**Phase 2 — Read-path crisis & recovery (v10 → v11)**<br/>v10: hybrid VectorRAG, regression discovered<br/>v10c: 1-hop priority + directed edge format<br/>v10d: LLM-judge eval scoring<br/>v11: multi-hop decomposition + reverse-edge normalize<br/>**ALL: 0.25 → 0.68**"]:::phase
-    P3["**Phase 3 — Canonical-ID linking (v12)**<br/>Wikidata QID at extraction time<br/>'Reid Hoffman' + 'Reid Garrett Hoffman' → Q211098<br/>closes Leak #4 (surface-form fragmentation)<br/>**ALL: 0.64**"]:::phase
-    P4["**Phase 4 — PPR + bridge + context reorder (v13 → v16)**<br/>v13: GDS Personalized PageRank fallback<br/>v14b: query-type router (bridge / intersection / list)<br/>v16: edge_filter expansion + step-2-first ordering<br/>**ALL: 0.71**"]:::phase
-    P5["**Phase 5 — Model experiments (v17 → v21)**<br/>v17: Qwen3.6 — regressed on multi_hop<br/>v20: gpt-oss-20b reasoning — rejected (CoT exhausts max_tokens, 6.4× slower)<br/>v21: Gemma single-model — confirmed shipped baseline (4.6s)<br/>**ALL: 0.70**"]:::phase
-    P6["**Phase 6 — Eval-set repair (v22 → v23)**<br/>corpus-absent entity replacement (Q08, Q22 removed)<br/>seed-phrase rewriting (implicit → named entity)<br/>**zero code changes**<br/>**ALL: 0.80** ← system shipped"]:::shipped
+    %% Shipped lineage (top branch)
+    V13["**v13**<br/>+ GDS PPR<br/>+ bridge edges<br/>ALL 0.67"]:::base
+    V16["**v16**<br/>+ query router<br/>+ edge_filter exp<br/>+ step-2-first<br/>ALL 0.71"]:::base
+    V21["**v21**<br/>Gemma single-model<br/>(rejected Qwen3.6,<br/>gpt-oss-20b CoT)<br/>ALL 0.70"]:::base
+    V23["**v23**<br/>+ eval-set repair<br/>(zero code change)<br/>ALL 0.80<br/>**SHIPPED**"]:::shipped
 
-    P7["**Phase 7 — Universal read-path overhaul (v12.2 → v12.4m)**<br/>branched off v12.1 with all post-v12 lessons folded in<br/>v12.2: graph rebuild + degree centrality baseline<br/>v12.3 Phase A: 6 universal mechanisms (topology gate, two-stage seed,<br/>GDS lifecycle, QID inline tags, bridge-first, two-pass output)<br/>v12.4 Phase B: opt-in step3 expansion via LLM expand_terminal flag<br/>v12.4e: substring-token expansion + LIST CoT<br/>v12.4m: universal prompts (no hardcoded patterns) + canonical anchors<br/>**ALL: 0.96** ← production-shaped (32/0/0 vs Vector)"]:::final
+    %% Universal-mechanism overhaul lineage (bottom branch — fork at v12.1)
+    V122["**v12.2**<br/>graph rebuild<br/>+ degree centrality<br/>ALL 0.81"]:::overhaul
+    V123["**v12.3**<br/>Phase A:<br/>6 universal mech<br/>(topology, 2-stage<br/>seed, GDS lifecycle,<br/>QID tags, bridge-1st,<br/>2-pass output)<br/>ALL 0.88"]:::overhaul
+    V124["**v12.4**<br/>Phase B:<br/>+ opt-in step3<br/>via expand_terminal<br/>flag<br/>ALL 0.93"]:::overhaul
+    V124e["**v12.4e**<br/>+ substring-token<br/>expansion<br/>+ LIST CoT<br/>ALL 0.95"]:::overhaul
+    V124m["**v12.4m**<br/>+ universal prompts<br/>(no hardcoded patterns)<br/>+ canonical anchors<br/>**ALL 0.96**<br/>**32/0/0 vs Vector**"]:::final
 
-    V1 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6
-    P6 -.->|"branch:<br/>fold all v13–v23 lessons<br/>back into v12.x extraction"| P7
+    V1 --> V95 --> V11 --> V12 --> V121
+    V121 -->|inherits code| V13
+    V13 --> V16 --> V21 --> V23
+    V121 -->|inherits code<br/>+ rebuilds graph| V122
+    V122 --> V123 --> V124 --> V124e --> V124m
+    V23 -.->|inherits LESSONS<br/>not code<br/>universalizes patches| V124m
 
     classDef broken fill:#e94560,stroke:#fff,color:#fff
-    classDef phase fill:#1a1a2e,stroke:#4a9eff,color:#e0e0e0
+    classDef base fill:#1a1a2e,stroke:#4a9eff,color:#e0e0e0
+    classDef branchpt fill:#8b5cf6,stroke:#fff,color:#fff
+    classDef overhaul fill:#0f3460,stroke:#fbbf24,color:#fbbf24
     classDef shipped fill:#16a34a,stroke:#fff,color:#fff
     classDef final fill:#fbbf24,stroke:#000,color:#000
 ```
 
-> **How to read this diagram.** Each phase is gated by the metric below it (ALL = LLM-judge recall on the 32-Q eval). Phase 6 was the original "shipped" terminus at 0.80; Phase 7 is the post-ship overhaul that branched off v12.1 (the QID-linking commit) and re-applied every read-path lesson from v13–v23 inside a unified universal-mechanism framework. v12.4m is the current production state: 0.96 overall, 32/0/0 W/L/T against VectorRAG, 13 universal mechanisms, no hardcoded patterns. The dashed arrow from Phase 6 → Phase 7 is the conceptual fold-back: same lessons, cleaner architecture, measurable +0.16 lift.
+> **How to read this diagram.** The arrow direction is *inheritance*. Each child node inherits parent code + adds the delta in its label (lines starting with `+`). The **purple `v12.1` node is the branch point**: two children fork off it. The **green `v23` node** was the original shipped terminus (0.80). The **gold `v12.4m` node** is the current production state (0.96, 32/0/0). The yellow lineage (bottom) is a *parallel* re-derivation of v13–v23 inside a universal-mechanism framework — it does NOT inherit v23's code (separate branch), but the dashed arrow from v23 → v12.4m shows it *inherits the lessons*: every hardcoded patch in v13–v23 was re-expressed as a universal signal-driven mechanism (topology gate, two-stage seed, bridge-first, FACTS+ANSWER, expand_terminal). 13 universal mechanisms in v12.4m replace ~25 hardcoded behaviors that accumulated v10c–v22.
 
 ### Context — Why the v1 pipeline fails
 
