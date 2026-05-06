@@ -1080,7 +1080,110 @@ Two data structures do different jobs: `scores` accumulates the RRF sum per docu
 
 ### 4.2 Re-run RAGAS
 
-Same pattern as HyDE — write `results/ragas_multiquery.json`.
+Mirror of `03b_ragas_hyde.py` — same RAGAS legacy metric path, same RunConfig timeout/retries/workers, same autoconfig device probe for judge embeddings. Differences are scoped to the pipeline being scored.
+
+Save as `src/04b_ragas_multiquery.py`:
+
+```python
+"""Score the multi-query fusion pipeline with RAGAS, backed by local oMLX."""
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain.*")
+
+from datasets import Dataset
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from ragas import evaluate
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import LangchainLLMWrapper
+from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
+from ragas.run_config import RunConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Bootstrap shared/ for autoconfig probe.
+_REPO_ROOT = PROJECT_ROOT.parent
+sys.path.insert(0, str(_REPO_ROOT / "shared"))
+from rag_hybrid import autoconfig  # noqa: E402
+
+from src.script_wrap import load  # noqa: E402
+
+mq = load("04_multiquery.py")
+run_pipeline = mq.run_pipeline_mq
+
+
+def main() -> None:
+    # ... (require_env + load_jsonl helpers — identical to 03b_ragas_hyde.py)
+
+    dev_path     = PROJECT_ROOT / "data" / "dev_set.jsonl"
+    results_path = PROJECT_ROOT / "results" / "ragas_multiquery.json"
+    debug_path   = PROJECT_ROOT / "results" / "ragas_multiquery_debug.jsonl"
+
+    llm = ChatOpenAI(model=os.getenv("MODEL_SONNET"), base_url=os.getenv("OMLX_BASE_URL"),
+                     api_key=os.getenv("OMLX_API_KEY"), temperature=0.0)
+    ragas_llm = LangchainLLMWrapper(llm)
+
+    lc_emb = HuggingFaceEmbeddings(
+        model_name=os.path.expanduser("~/models/bge-m3"),
+        model_kwargs={"device": autoconfig.probe_system().device},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    ragas_emb = LangchainEmbeddingsWrapper(lc_emb)
+
+    dev = load_jsonl(dev_path)
+    rows, debug_rows = [], []
+    for i, q in enumerate(dev):
+        out = run_pipeline(q["question"])
+        rows.append({"question": q["question"], "answer": out["answer"],
+                     "contexts": out["contexts"], "ground_truth": q["short_answer"]})
+        debug_rows.append({
+            "source_doc_id": q.get("source_doc_id"),
+            "question": q["question"],
+            "short_answer": q["short_answer"],
+            "answer": out["answer"],
+            "context_ids": out.get("context_ids", []),
+            "rewrites": out.get("rewrites"),       # <-- only debug-shape difference vs HyDE
+            "contexts": out["contexts"],
+        })
+
+    metrics = [Faithfulness(llm=ragas_llm),
+               AnswerRelevancy(llm=ragas_llm, embeddings=ragas_emb),
+               ContextPrecision(llm=ragas_llm),
+               ContextRecall(llm=ragas_llm)]
+    scores = evaluate(Dataset.from_list(rows), metrics=metrics, llm=ragas_llm,
+                      embeddings=ragas_emb,
+                      run_config=RunConfig(timeout=300, max_retries=3, max_workers=2))
+
+    print("\n=== MULTI-QUERY ===")
+    print(scores)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(scores.to_pandas().to_dict(), indent=2, default=str))
+    debug_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in debug_rows))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`★ Insight ─────────────────────────────────────`
+- **Three RAGAS scripts, one template.** `02b` (baseline) / `03b` (HyDE) / `04b` (multi-query) all share: legacy RAGAS metric classes, `LangchainEmbeddingsWrapper`, autoconfig device probe, `RunConfig(timeout=300, max_retries=3, max_workers=2)`. The only per-pipeline differences are: which `script_wrap.load(...)` line runs, which `run_pipeline_*` function gets called, which `results/ragas_*.json` path the artifacts land in, and what extra debug field each captures (`hypothetical` for HyDE, `rewrites` for multi-query, none for baseline).
+- **Output paths must NOT collide.** v10 of the lab had a bug where `03_hyde.py` printed `=== HYDE ===` but still wrote to `ragas_baseline.json` — overwriting the baseline. Each variant's paths must be explicit. v2 lab fixes this by spelling out `results_path = PROJECT_ROOT / "results" / "ragas_multiquery.json"` per variant.
+- **`out.get("rewrites")` is defensive.** If `04_multiquery.py` ever rolls back the rewrites-in-output change, the eval script still runs (records `null` for rewrites). Same defensive pattern as `out.get("hypothetical")` in 03b.
+`─────────────────────────────────────────────────`
+
+Run it:
+
+```bash
+python src/04b_ragas_multiquery.py 2>&1 | tee /tmp/04b.log
+```
+
+**Regression-test contract.** Same as §2.6 — multi-query baseline metrics within ±0.02 of single-query baseline (Run 5: faithfulness=1.0000, answer_relevancy=0.7297, context_precision=0.9841, context_recall=1.0000) confirms multi-query is at least non-regressive. A meaningful lift on `context_recall` (already 1.0 — no headroom) or `context_precision` (could lift if rewrites surface diverse-vocabulary chunks the single-query missed) is the success signal. If `answer_relevancy` drops > 0.02, RRF fusion may be promoting irrelevant chunks via rare-token overlap — diagnose by reading `results/ragas_multiquery_debug.jsonl` rewrites field.
 
 ---
 
