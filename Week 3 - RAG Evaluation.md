@@ -1206,6 +1206,35 @@ python src/04b_ragas_multiquery.py 2>&1 | tee /tmp/04b.log
 
 **Regression-test contract.** Same as §2.6 — multi-query baseline metrics within ±0.02 of single-query baseline (Run 5: faithfulness=1.0000, answer_relevancy=0.7297, context_precision=0.9841, context_recall=1.0000) confirms multi-query is at least non-regressive. A meaningful lift on `context_recall` (already 1.0 — no headroom) or `context_precision` (could lift if rewrites surface diverse-vocabulary chunks the single-query missed) is the success signal. If `answer_relevancy` drops > 0.02, RRF fusion may be promoting irrelevant chunks via rare-token overlap — diagnose by reading `results/ragas_multiquery_debug.jsonl` rewrites field.
 
+### 4.2.1 Actual results — multi-query A/B on harder dev set (2026-05-06 runs)
+
+Ran `04b_ragas_multiquery.py` on the same 50-question harder dev set used for Run 5 (baseline) and Run 6 (HyDE).
+
+| Variant | Faithfulness | Answer relevancy | Context precision | Context recall | Decision |
+|---|---:|---:|---:|---:|---|
+| **Baseline prompt v2 (Run 5, post-migration)** | **1.0000** | **0.7297** | **0.9841** | 1.0000 | **Shipped** |
+| HyDE-short (Run 6, post-migration) | 0.9800 | 0.7081 | 0.9841 | 1.0000 | Reject — gap to baseline widened |
+| **Multi-query fusion (Run 7, post-migration)** | 1.0000 | 0.7230 | 0.9824 | 1.0000 | **Reject — non-regressive but no lift** |
+
+Deltas vs Run 5 baseline:
+
+| Metric | Δ | Within ±0.02 contract? | Interpretation |
+|---|---:|---|---|
+| faithfulness | **0.0000** | ✅ | Tied at ceiling — both 1.00 |
+| answer_relevancy | -0.0067 | ✅ | Well within LLM-judge noise (~0.03 on n=50) |
+| context_precision | -0.0017 | ✅ | Within noise |
+| context_recall | 0.0000 | ✅ | Tied at ceiling — both 1.00 |
+
+`★ Insight ─────────────────────────────────────`
+- **Same architectural lesson as HyDE: corpus saturation is the gating signal, not strategy.** When baseline `context_recall = 1.0`, every retrieval-strategy variant becomes pure cost. HyDE adds 1 LLM rewrite call per query (~100 ms, ~30 tokens) for zero lift; multi-query adds 4× embedding cost + 1 LLM rewrite call per query for zero lift. Both fail for the same reason — the retrieval gap they're designed to close doesn't exist on this dev set.
+- **Multi-query failed slightly less badly than HyDE.** Multi-query stayed tied with baseline on faithfulness (both 1.00), HyDE dropped 0.02 (0.98). On answer_relevancy multi-query is -0.0067 vs HyDE -0.0216. Plausible mechanism: multi-query's rewrites stay in natural-question form (cross-encoder's training distribution), so fp16 numerics behave more stably than on HyDE's drafted-answer form (out-of-distribution). Doesn't rescue multi-query — still no lift — but explains the asymmetric degradation.
+- **Three-way comparison complete: baseline wins.** On this corpus + dev set, the answer is "neither HyDE nor multi-query lifts above the v2 prompt baseline; ship single-query with the strict-format prompt." Generalizable lesson: ALWAYS measure baseline `context_recall` BEFORE adopting any retrieval-augmentation variant. If recall is saturated, the variant cannot win — the architectural gap it was designed to close doesn't exist.
+`─────────────────────────────────────────────────`
+
+**Decision: reject multi-query as default for this corpus / dev set.** Keep `04_multiquery.py` + `04b_ragas_multiquery.py` in the codebase as opt-in experiments for future query clusters where baseline `context_recall < 1.0` or vocabulary mismatch is visible — the SAME conditions under which HyDE would also be considered. Both strategies are recall-augmentation tools; both are no-ops when there's no recall gap.
+
+**Pre-migration multi-query (Run PreM-MQ) status: optional follow-up.** With post-migration multi-query (Run 7) tied with post-migration baseline (Run 5), the migration's effect on the multi-query strategy is moot — the strategy is non-shipped. Running `04b_ragas_multiquery_premigration.py` would still validate "did the migration introduce a regression on this rejected strategy?" but the answer doesn't change shipping decisions. Lower priority than running the (also-non-shipped) HyDE pre/post comparison was. Run if curiosity or completeness demands; skip if not.
+
 ---
 
 ## Phase 5 — Phoenix Tracing (~2 hours)
@@ -1421,10 +1450,14 @@ HyDE rejected as default: baseline `context_recall = 1.0000` left no recall gap 
 
 ## Multi-query fusion A/B
 
-| Variant | Faithfulness | Answer relevancy | Context precision | Context recall | p95 latency | Decision |
-|---|---:|---:|---:|---:|---:|---|
-| Baseline prompt v2 | 0.9900 | 0.7494 | 0.9824 | 1.0000 | TBD | Default |
-| + Multi-query fusion (3 rewrites + RRF) | TBD | TBD | TBD | TBD | TBD | TBD |
+| Variant | Faithfulness | Answer relevancy | Context precision | Context recall | Extra cost / query | Decision |
+|---|---:|---:|---:|---:|---|---|
+| Baseline prompt v2 (Run 5, post-migration) | **1.0000** | **0.7297** | 0.9841 | 1.0000 | — | **Default** |
+| + Multi-query fusion, 3 rewrites + RRF (Run 7, post-migration) | 1.0000 | 0.7230 | 0.9824 | 1.0000 | +1 LLM rewrite (~100 ms) + 4× embeddings + RRF | Reject as default |
+
+Multi-query is non-regressive vs baseline (all 4 metrics within ±0.02; max delta -0.0067 on answer_relevancy) but provides NO lift on this corpus + dev set. Reason: baseline `context_recall = 1.0000` already saturates retrieval — multi-query has no recall gap to close. Same architectural lesson as HyDE.
+
+**Three-way comparison complete: baseline wins.** Both retrieval-augmentation variants (HyDE + multi-query) are tied-with-or-worse-than baseline on every metric. Generalizable rule: when baseline `context_recall = 1.0`, all retrieval-augmentation variants are pure cost.
 
 ## Diagnostic reading
 
