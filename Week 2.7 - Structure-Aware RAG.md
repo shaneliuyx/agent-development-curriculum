@@ -194,64 +194,91 @@ MODEL_HAIKU=gemma-4-26B-A4B-it-heretic-4bit  # use same model for navigation; re
 
 ## Phase 2 — Tree Construction (~1.5 hours)
 
-### 2.1 PDF parse + heading detection
-
-Save as `src/build_tree.py` (skeleton — full implementation in lab repo):
+Save as `src/build_tree.py` — single runnable file with PDF parse + heading detection + LLM tree builder + per-node summary pass + main entry point. Read end-to-end below; the section breakdown after the code block walks through each function in order.
 
 ```python
 """Build a hierarchical Table-of-Contents tree from a long PDF.
 
-Two passes:
-1. PDF parse → extract text + page numbers + heading candidates
-   (heuristics: font-size, all-caps lines, numbered prefixes "1.", "1.1.")
-2. LLM tree builder → consolidate heading candidates into a clean tree,
-   filtering out spurious matches (page numbers, headers, table cells)
+Three passes:
+1. PDF parse + heading detection — heuristic over-recall on all-caps + numbered
+   prefixes; produces a noisy candidate list.
+2. LLM tree builder — one Gemma call consolidates the candidates into a clean
+   {title, node_id, nodes: [...]} JSON tree, filtering page numbers, running
+   headers, footer text. JSON-mode response_format enforces parse-safe output.
+3. LLM per-node summaries — recurse over the tree, summarize each node's page
+   range in 80-120 words. The navigation LLM at query time sees only summaries,
+   never raw content, so summary specificity is load-bearing.
+
+Output: data/tree.json. One JSON file is the entire index. No vector DB,
+no graph database — versionable, diff-able, inspectable with jq.
 """
-import json, os
+from __future__ import annotations
+
+import json
+import os
 from pathlib import Path
-from pypdf import PdfReader
-from openai import OpenAI
+
 from dotenv import load_dotenv
+from openai import OpenAI
+from pypdf import PdfReader
 
 load_dotenv()
-omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
+omlx = OpenAI(
+    base_url=os.getenv("OMLX_BASE_URL"),
+    api_key=os.getenv("OMLX_API_KEY"),
+)
 MODEL = os.getenv("MODEL_SONNET")
 
+# ---------------------------------------------------------------- PDF parsing
+
 def extract_pages(pdf_path: str) -> list[dict]:
-    """Return list of {page_num, text} for every page."""
+    """Return list of {page_num, text} for every page (1-indexed)."""
     reader = PdfReader(pdf_path)
-    return [{"page_num": i + 1, "text": p.extract_text() or ""}
-            for i, p in enumerate(reader.pages)]
+    return [
+        {"page_num": i + 1, "text": p.extract_text() or ""}
+        for i, p in enumerate(reader.pages)
+    ]
+
 
 def detect_heading_candidates(pages: list[dict]) -> list[dict]:
-    """Heuristic-first heading detection. Returns list of
-    {page_num, line_text, candidate_level} for lines that look like headings:
-    - All-caps lines (level 1)
-    - Numbered prefixes (1., 1.1., 1.1.1.) — level = depth of numbering
-    - Title-case lines under 60 chars (level 2-3)
+    """Heuristic-first heading detection — deliberately over-recall.
+
+    Returns {page_num, line_text, candidate_level} for lines that look like
+    headings:
+      - All-caps lines (level 1)
+      - Numbered prefixes 1., 1.1., 1.1.1. (level = depth of numbering)
+
+    Both heuristics produce false positives (page numbers like "PAGE 5",
+    list items like "1. Buy more milk"). The LLM in build_tree() filters
+    them out — optimizing this for precision burns engineering effort the
+    LLM can absorb cheaply.
     """
-    candidates = []
+    candidates: list[dict] = []
     for page in pages:
-        for line in page["text"].splitlines():
-            line = line.strip()
+        for raw in page["text"].splitlines():
+            line = raw.strip()
             if not line or len(line) > 80:
                 continue
-            # All-caps with mixed punctuation = section header
+            # All-caps short lines = likely section header
             if line.isupper() and len(line) > 4:
-                candidates.append({"page_num": page["page_num"],
-                                   "line_text": line, "candidate_level": 1})
-            # Numbered "1.", "1.1.", "1.1.1." prefix
+                candidates.append({
+                    "page_num": page["page_num"],
+                    "line_text": line,
+                    "candidate_level": 1,
+                })
+            # Numbered prefix "1.", "1.1.", "1.1.1." — depth = nesting level
             elif line[0].isdigit() and "." in line[:8]:
                 depth = line.split()[0].count(".")
-                candidates.append({"page_num": page["page_num"],
-                                   "line_text": line,
-                                   "candidate_level": min(depth + 1, 4)})
+                candidates.append({
+                    "page_num": page["page_num"],
+                    "line_text": line,
+                    "candidate_level": min(depth + 1, 4),
+                })
     return candidates
-```
 
-### 2.2 LLM tree builder
 
-```python
+# ---------------------------------------------------------- LLM tree builder
+
 TREE_BUILDER_SYSTEM = """You receive a list of heading-candidate lines from a long
 PDF document with their page numbers and detected hierarchy level. Your job is to
 produce a clean hierarchical JSON tree with this schema:
@@ -272,59 +299,147 @@ Rules:
 - Infer end_page from the start_page of the next sibling; the last node's
   end_page is the document's last page.
 - Generate clean human-readable titles. If a heading is "1.1. ITEM 1A. RISK FACTORS",
-  use "Item 1A — Risk Factors" as title.
+  use "Item 1A — Risk Factors" as title — keep the source-heading words verbatim,
+  apply case transformation only.
 - Do NOT include leaf-level subsection content; only the structural skeleton.
+- Assign node_id sequentially as 4-digit zero-padded strings ("0001", "0002", ...).
 
-Output strict JSON only, one tree object."""
+Output strict JSON only, one tree object. No markdown, no commentary."""
 
-def build_tree(headings: list[dict], doc_title: str) -> dict:
-    user_msg = f"Document title: {doc_title}\n\nHeadings:\n" + json.dumps(headings, indent=1)
+
+def build_tree(headings: list[dict], doc_title: str, last_page: int) -> dict:
+    """One LLM call consolidates heading candidates into a structural tree."""
+    user_msg = (
+        f"Document title: {doc_title}\n"
+        f"Last page in document: {last_page}\n\n"
+        f"Heading candidates ({len(headings)} total):\n"
+        + json.dumps(headings, indent=1)
+    )
     resp = omlx.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "system", "content": TREE_BUILDER_SYSTEM},
-                  {"role": "user", "content": user_msg}],
-        temperature=0.0, max_tokens=4000,
+        messages=[
+            {"role": "system", "content": TREE_BUILDER_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+        max_tokens=6000,
         response_format={"type": "json_object"},
     )
-    return json.loads(resp.choices[0].message.content)
-```
+    content = resp.choices[0].message.content or "{}"
+    return json.loads(content)
 
-### 2.3 Per-node summary pass
 
-```python
+# ---------------------------------------------------------- Per-node summaries
+
 SUMMARIZE_SYSTEM = """Summarize this document section in 80-120 words. Focus on
 WHAT the section discusses, not generic statements. The summary will be read by
 a navigation LLM deciding whether this section is relevant to a user query, so
-include enough specific content to enable that decision. Do not start with
-'This section discusses' — write the summary directly."""
+include enough specific content to enable that decision.
+
+Rules:
+- Mention three specific topics, products, risk types, or numeric facts named
+  in the section.
+- Do NOT start with "This section discusses" — write the summary directly.
+- If the section is generic boilerplate with no specific content, say so
+  explicitly: "Generic boilerplate; refer to specific subsections instead."
+"""
+
 
 def summarize_node(node: dict, pages: list[dict]) -> str:
-    """Pull the text spanning node['start_page']..node['end_page'] and summarize."""
-    text = "\n".join(p["text"] for p in pages
-                     if node["start_page"] <= p["page_num"] <= node["end_page"])
+    """Pull text spanning node['start_page']..node['end_page'] and summarize.
+
+    Head-truncate at 12000 chars — a 10-K's longest section fits, longer
+    sections get the head where the topic sentence usually lives.
+    """
+    start = node.get("start_page", 1)
+    end = node.get("end_page", start)
+    text = "\n".join(
+        p["text"] for p in pages if start <= p["page_num"] <= end
+    )
     if len(text) > 12000:
-        text = text[:12000]  # head-truncate; sections rarely need full content for summary
+        text = text[:12000]
+    if not text.strip():
+        return "Empty section (no extractable text)."
+
     resp = omlx.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "system", "content": SUMMARIZE_SYSTEM},
-                  {"role": "user", "content": text}],
-        temperature=0.0, max_tokens=300,
+        messages=[
+            {"role": "system", "content": SUMMARIZE_SYSTEM},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.0,
+        max_tokens=400,
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "").strip()
 
-def add_summaries_recursive(node: dict, pages: list[dict]):
+
+def add_summaries_recursive(node: dict, pages: list[dict]) -> None:
+    """In-place: write a `summary` field to every node that has a page range.
+    Recurse into children. Idempotent — re-running re-summarizes."""
     if "start_page" in node and "end_page" in node:
         node["summary"] = summarize_node(node, pages)
     for child in node.get("nodes", []):
         add_summaries_recursive(child, pages)
 
-def main():
-    pages = extract_pages("data/aapl-10k-2023.pdf")
+
+# ---------------------------------------------------------- Main entry
+
+def count_nodes(node: dict) -> int:
+    """Recursively count nodes in the tree (including the root)."""
+    return 1 + sum(count_nodes(c) for c in node.get("nodes", []))
+
+
+def tree_depth(node: dict) -> int:
+    """Maximum depth of the tree (root depth = 1)."""
+    children = node.get("nodes", [])
+    if not children:
+        return 1
+    return 1 + max(tree_depth(c) for c in children)
+
+
+def main() -> None:
+    pdf_path = "data/aapl-10k-2023.pdf"
+    out_path = Path("data/tree.json")
+
+    if not Path(pdf_path).exists():
+        raise FileNotFoundError(
+            f"Missing {pdf_path}. Run the curl from §1.2 first."
+        )
+
+    print(f"[1/3] Parsing {pdf_path} ...")
+    pages = extract_pages(pdf_path)
+    print(f"      {len(pages)} pages extracted.")
+
+    print("[2/3] Detecting heading candidates ...")
     headings = detect_heading_candidates(pages)
-    tree = build_tree(headings, "Apple Inc. 10-K Fiscal 2023")
+    print(f"      {len(headings)} heading candidates (over-recall expected).")
+
+    print("[3/3] Building tree (LLM call, ~10-25 s) ...")
+    tree = build_tree(headings, "Apple Inc. 10-K Fiscal 2023", last_page=len(pages))
+
+    print(f"      Tree skeleton: {count_nodes(tree)} nodes, depth={tree_depth(tree)}.")
+
+    print(f"[4/4] Generating per-node summaries ({count_nodes(tree)} LLM calls) ...")
     add_summaries_recursive(tree, pages)
-    Path("data/tree.json").write_text(json.dumps(tree, indent=2))
-    print(f"Wrote tree with {count_nodes(tree)} nodes.")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(tree, indent=2), encoding="utf-8")
+    print(f"\nWrote {out_path} — {count_nodes(tree)} nodes, depth {tree_depth(tree)}.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it once after §1.2 has downloaded the PDF:
+
+```bash
+python src/build_tree.py
+# [1/3] Parsing data/aapl-10k-2023.pdf ...
+# [2/3] Detecting heading candidates ...
+# [3/3] Building tree (LLM call, ~10-25 s) ...
+# [4/4] Generating per-node summaries (32 LLM calls) ...
+# Wrote data/tree.json — 32 nodes, depth 4.
 ```
 
 **Expected metrics on M5 Pro / Gemma-4-26B:**
@@ -433,13 +548,24 @@ def answer(query: str, tree_path: str = "data/tree.json",
         "traversal_path": traversal,
         "depth": len(traversal),
     }
+
+
+if __name__ == "__main__":
+    import sys
+    q = " ".join(sys.argv[1:]) or "What were the cybersecurity risks disclosed in fiscal 2023?"
+    out = answer(q)
+    print(json.dumps(out, indent=2, default=str))
 ```
 
 ### 3.2 Smoke test
 
 ```bash
+# Direct invocation
+python src/query_tree.py "What were the cybersecurity risks disclosed in fiscal 2023?"
+
+# Or via importable path
 python -c "from src.query_tree import answer; \
-import json; print(json.dumps(answer('What were the cybersecurity risks disclosed in fiscal 2023?'), indent=2))"
+import json; print(json.dumps(answer('What were the cybersecurity risks disclosed in fiscal 2023?'), indent=2, default=str))"
 ```
 
 You should see a populated `traversal_path` (e.g. root → Item 1A Risk Factors → Cybersecurity Risks), a non-empty `answer`, and a `depth` between 2 and 5. If `depth == 1`, the navigation LLM rejected every child at root — check that summaries in `tree.json` are populated and informative.
@@ -459,7 +585,7 @@ You should see a populated `traversal_path` (e.g. root → Item 1A Risk Factors 
 
 ### 4.1 Eval set construction
 
-Save as `data/eval.json` — 20 questions over the 10-K filing, stratified:
+Save as `data/eval.json` — 20 questions over the 10-K filing, stratified by question type. Each entry has `q` (question), `expected_entities` (list of strings the answer should mention; used for substring + LLM-judge scoring), and `type` (category for stratified reporting).
 
 | Category | N | Example |
 |---|---|---|
@@ -467,6 +593,57 @@ Save as `data/eval.json` — 20 questions over the 10-K filing, stratified:
 | Cross-section synthesis | 6 | "How does Apple's risk disclosure compare to its R&D spending discussion?" |
 | Citation-required | 4 | "Which section discusses supply chain concentration?" |
 | Out-of-document | 4 | "What is Apple's stock price today?" (refusal expected) |
+
+Starter set — 8 questions across 4 categories (expand to 20 after first run shows where the categories discriminate):
+
+```json
+[
+  {
+    "type": "section-specific factoid",
+    "q": "What was Apple's total net sales in fiscal 2023?",
+    "expected_entities": ["383", "billion", "net sales"]
+  },
+  {
+    "type": "section-specific factoid",
+    "q": "How many full-time equivalent employees did Apple have at the end of fiscal 2023?",
+    "expected_entities": ["161,000", "full-time"]
+  },
+  {
+    "type": "cross-section synthesis",
+    "q": "What cybersecurity risks did Apple disclose, and how does the company describe its mitigation approach?",
+    "expected_entities": ["cybersecurity", "risk", "incident", "mitigation"]
+  },
+  {
+    "type": "cross-section synthesis",
+    "q": "How does Apple's R&D investment relate to its disclosed product innovation strategy?",
+    "expected_entities": ["research and development", "innovation", "spending"]
+  },
+  {
+    "type": "citation-required",
+    "q": "Which section of the 10-K discusses supply chain concentration risks?",
+    "expected_entities": ["Item 1A", "Risk Factors", "supply chain"]
+  },
+  {
+    "type": "citation-required",
+    "q": "Where in the 10-K does Apple disclose information about cybersecurity governance?",
+    "expected_entities": ["Item 1C", "Cybersecurity"]
+  },
+  {
+    "type": "out-of-document",
+    "q": "What is Apple's stock price today?",
+    "expected_entities": ["insufficient", "do not", "cannot"]
+  },
+  {
+    "type": "out-of-document",
+    "q": "Who is the CEO of Microsoft?",
+    "expected_entities": ["insufficient", "do not", "cannot"]
+  }
+]
+```
+
+Curate up to 20 questions by walking the 10-K's table of contents and drafting 5 per category. Validate each by reading the source pages — if you can't answer it from the PDF, it doesn't belong on the eval.
+
+**On shared/rag_hybrid reuse — explicit boundary.** Tree-index retrieval has NO encoder, NO reranker, NO vector store by design. `shared/rag_hybrid` (encoder + reranker + Retriever + autoconfig) is therefore not applicable to `build_tree.py` or `query_tree.py` — those scripts are pure LLM + JSON tree manipulation. The shared-library reuse for this lab is *cross-lab imports* in `compare_three.py` (next section): pulls vector RAG from W2 and GraphRAG from W2.5 + their shared scoring helpers, so the three-way comparison runs on a single eval set with consistent metrics. If a future tree-index variant adds embedding-based leaf-level retrieval (the typical "hybrid tree" extension), `shared/rag_hybrid.DenseEncoder` would slot in at that layer.
 
 ### 4.2 Comparison runner
 
