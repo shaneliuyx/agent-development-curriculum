@@ -716,17 +716,17 @@ llm = ChatOpenAI(
 # RAGAS also needs embeddings. autoconfig.probe_system() picks device
 # (mps / cuda / cpu) — replaces the previous hardcoded `device="mps"` so the
 # script works on any host. Use langchain-huggingface (not the deprecated
-# langchain-community.embeddings path).
+# langchain-community.embeddings path). Probe is inlined into model_kwargs;
+# the temp var earned no second use.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
 from rag_hybrid import autoconfig
-_probe = autoconfig.probe_system()
 
 from langchain_huggingface import HuggingFaceEmbeddings
 emb = HuggingFaceEmbeddings(
     model_name=os.path.expanduser("~/models/bge-m3"),
-    model_kwargs={"device": _probe.device},
+    model_kwargs={"device": autoconfig.probe_system().device},
     encode_kwargs={"normalize_embeddings": True},
 )
 
@@ -1002,7 +1002,8 @@ unchanged — migration was at the encoder layer, not the fusion layer.
 Encode kwarg note: shared DenseEncoder.encode() takes `normalize=True`
 (default), NOT `normalize_embeddings=True` (the SentenceTransformer kwarg).
 """
-import os, json
+import json
+import os
 from collections import defaultdict
 from openai import OpenAI
 from src.script_wrap import load
@@ -1101,7 +1102,8 @@ to tell which variant produced them. With the wrapper, root spans group
 cleanly into 30 entries (10 queries × 3 variants) and child spans nest
 under each variant for waterfall inspection.
 """
-import os, json
+import json
+import os
 import phoenix as px
 from opentelemetry import trace as otel_trace
 from phoenix.otel import register
@@ -1124,9 +1126,13 @@ baseline = load("02_pipeline.py")
 hyde     = load("03_hyde.py")
 mq       = load("04_multiquery.py")
 
-dev = [json.loads(l) for l in open("data/dev_set.jsonl")][:10]  # first 10 for visual inspection
+# Explicit utf-8 + context manager + first 10 for visual inspection.
+with open("data/dev_set.jsonl", encoding="utf-8") as _f:
+    dev = [json.loads(l) for l in _f][:10]
 
-for q in dev:
+# enumerate gives O(1) index per loop iteration. dev.index(q) inside the
+# loop would have been O(n) per call — irrelevant at n=10 but unprincipled.
+for i, q in enumerate(dev):
     for label, fn in [
         ("baseline", baseline.run_pipeline),
         ("hyde", hyde.run_pipeline_hyde),
@@ -1137,7 +1143,7 @@ for q in dev:
         with _tracer.start_as_current_span(f"pipeline.{label}") as span:
             span.set_attribute("pipeline.variant", label)
             span.set_attribute("question", q["question"])
-            span.set_attribute("question_index", dev.index(q))
+            span.set_attribute("question_index", i)
             print(f"  [{label}] {q['question'][:60]}")
             _ = fn(q["question"])
 
