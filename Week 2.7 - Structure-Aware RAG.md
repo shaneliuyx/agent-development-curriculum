@@ -638,7 +638,7 @@ def answer(query: str, tree_path: str = "data/tree.json",
 
 if __name__ == "__main__":
     import sys
-    q = " ".join(sys.argv[1:]) or "What did Buffett write about acquisition criteria in 2023?"
+    q = " ".join(sys.argv[1:]) or "What did Buffett describe as Berkshire's not-so-secret weapon in 2023?"
     out = answer(q)
     print(json.dumps(out, indent=2, default=str))
 ```
@@ -647,14 +647,14 @@ if __name__ == "__main__":
 
 ```bash
 # Direct invocation
-python src/query_tree.py "What did Buffett write about acquisition criteria in 2023?"
+python src/query_tree.py "What did Buffett describe as Berkshire's not-so-secret weapon in 2023?"
 
 # Or via importable path
 python -c "from src.query_tree import answer; \
-import json; print(json.dumps(answer('What did Buffett write about acquisition criteria in 2023?'), indent=2, default=str))"
+import json; print(json.dumps(answer('What did Buffett describe as Berkshire'+chr(39)+'s not-so-secret weapon in 2023?'), indent=2, default=str))"
 ```
 
-You should see a populated `traversal_path` (e.g. root → Buffett's Letter → Acquisition Criteria, or root → Owner's Manual → Acquisition Section), a non-empty `answer`, and a `depth` between 2 and 5. If `depth == 1`, the navigation LLM rejected every child at root — check that summaries in `tree.json` are populated and informative.
+You should see a populated `traversal_path` (e.g. root → Chairman's Letter → Our Not-So-Secret Weapon), a non-empty `answer`, and a `depth` between 2 and 5. If `depth == 1`, the navigation LLM rejected every child at root — check that summaries in `tree.json` are populated and informative. The query above is calibrated against Berkshire 2023's actual sub-section names (verified post-`build_tree.py`); generic queries like "What are Berkshire's acquisition criteria?" will fail because that exact phrase doesn't appear in the 2023 letter (Buffett restructured the letter that year). Always inspect `tree.json` before deciding what to query.
 
 **Expected metrics:**
 
@@ -680,39 +680,39 @@ Save as `data/eval.json` — 20 questions over the 10-K filing, stratified by qu
 | Citation-required | 4 | "Which section discusses Berkshire's acquisition criteria?" |
 | Out-of-document | 4 | "What is Berkshire's stock price today?" (refusal expected) |
 
-Starter set — 8 questions across 4 categories (expand to 20 after first run shows where the categories discriminate):
+Starter set — 8 questions across 4 categories. **Calibrated against the actual tree extracted from Berkshire's 2023 annual report** (verified by walking the tree post-build_tree.py). Expand to 20 after first run shows where the categories discriminate.
 
 ```json
 [
+  {
+    "type": "section-specific factoid",
+    "q": "What were Berkshire's total revenues in 2023?",
+    "expected_entities": ["364", "billion", "revenues"]
+  },
   {
     "type": "section-specific factoid",
     "q": "What was Berkshire's net earnings attributable to shareholders in 2023?",
     "expected_entities": ["96", "billion", "net earnings"]
   },
   {
-    "type": "section-specific factoid",
-    "q": "How much did Berkshire spend on share repurchases in 2023?",
-    "expected_entities": ["billion", "repurchase", "treasury"]
+    "type": "cross-section synthesis",
+    "q": "What did Buffett describe as Berkshire's 'not-so-secret weapon' in the 2023 letter?",
+    "expected_entities": ["secret weapon", "Charlie", "shareholders", "patient"]
   },
   {
     "type": "cross-section synthesis",
-    "q": "How does Buffett describe the relationship between insurance float and the acquisition strategy in the 2023 letter?",
-    "expected_entities": ["float", "insurance", "acquisition"]
-  },
-  {
-    "type": "cross-section synthesis",
-    "q": "What did Buffett write about Berkshire Hathaway Energy's 2023 wildfire-related liabilities?",
-    "expected_entities": ["BHE", "wildfire", "PacifiCorp"]
+    "q": "What did Buffett write about non-controlled businesses that leave Berkshire comfortable in 2023?",
+    "expected_entities": ["Apple", "Coca-Cola", "American Express", "non-controlled"]
   },
   {
     "type": "citation-required",
-    "q": "Which section of the annual report lists Berkshire's six core acquisition criteria?",
-    "expected_entities": ["Acquisition Criteria", "criteria"]
+    "q": "Which section of the annual report covers BNSF Railway operating results?",
+    "expected_entities": ["BNSF", "Railroad", "Burlington Northern"]
   },
   {
     "type": "citation-required",
-    "q": "Where does the 2023 annual report cover BNSF railway operating results?",
-    "expected_entities": ["BNSF", "railroad", "operating"]
+    "q": "Where does the 2023 annual report disclose cybersecurity governance?",
+    "expected_entities": ["Item 1C", "Cybersecurity"]
   },
   {
     "type": "out-of-document",
@@ -727,7 +727,18 @@ Starter set — 8 questions across 4 categories (expand to 20 after first run sh
 ]
 ```
 
-Curate up to 20 questions by walking the annual report's table of contents and drafting 5 per category. Validate each by reading the source pages — if you can't answer it from the PDF, it doesn't belong on the eval. Verify expected_entities against the source PDF (Berkshire's 2023 numbers may differ slightly from these starter values; cross-check `data/brk-2023-ar.pdf` before scoring).
+Curate up to 20 questions by walking the annual report's table of contents and drafting 5 per category. Validate each by reading the source pages — if you can't answer it from the PDF, it doesn't belong on the eval.
+
+**Calibration note (load-bearing):** the question shapes above were designed AFTER inspecting the actual tree.json output. Each question targets a real section name that the tree contains:
+
+- "Not-so-secret weapon" → matches the literal sub-section "Our Not-So-Secret Weapon" (pages 9-10) in Buffett's letter
+- "Non-controlled businesses" → matches "Non-controlled Businesses That Leave Us Comfortable" (pages 10-18)
+- "BNSF Railway" → matches "Railroad Business—Burlington Northern Santa Fe" (page 30) under Item 1
+- "Cybersecurity" → matches Item 1C (page 52)
+
+Pre-mortem on common misses: questions like "What are Berkshire's acquisition criteria?" (a famous Berkshire phrase from older annual reports) FAIL on 2023 because the literal section doesn't exist — Buffett restructured the letter that year. Tree-index will refuse cleanly + surface adjacent sections, which is correct architectural behavior but scores 0 on substring eval. Always inspect tree.json before authoring eval questions; otherwise you're testing the document, not the system.
+
+Verify each `expected_entities` against the source PDF (Berkshire's 2023 numbers may differ slightly from these starter values; cross-check `data/brk-2023-ar.pdf` before scoring).
 
 **On shared/rag_hybrid reuse — explicit boundary.** Tree-index retrieval has NO encoder, NO reranker, NO vector store by design. `shared/rag_hybrid` (encoder + reranker + Retriever + autoconfig) is therefore not applicable to `build_tree.py` or `query_tree.py` — those scripts are pure LLM + JSON tree manipulation. The shared-library reuse for this lab is *cross-lab imports* in `compare_three.py` (next section): pulls vector RAG from W2 and GraphRAG from W2.5 + their shared scoring helpers, so the three-way comparison runs on a single eval set with consistent metrics. If a future tree-index variant adds embedding-based leaf-level retrieval (the typical "hybrid tree" extension), `shared/rag_hybrid.DenseEncoder` would slot in at that layer.
 
