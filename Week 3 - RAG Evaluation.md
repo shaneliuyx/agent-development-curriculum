@@ -1421,9 +1421,12 @@ Three traces vertically stacked. Variant difference visible at a glance: baselin
 
 ## Phase 6 — `ARCHITECTURE.md` (the ADR) (~90 min)
 
-Template — save as `ARCHITECTURE.md`. Shown below as raw markdown source (4-backtick `text` outer fence forces literal rendering — inner triple-backtick blocks display as characters, not as nested code, so what you see is what you copy):
+Template — copy everything between the two horizontal rules below into a new `ARCHITECTURE.md` file. Renders as native markdown (headings styled as headings, ASCII pipeline tree as code block, table as table) so the preview matches what your eventual ADR looks like.
 
-````text
+---
+
+**`ARCHITECTURE.md` — start of template**
+
 # RAG Pipeline — Architecture Decision Record
 
 **Date:** 2026-05-12
@@ -1476,15 +1479,19 @@ Decision: adopt __ / reject __. Reason: __.
 
 - Week 9 adds an automated faithfulness check post-generation.
 - Capstone A/B: extend to multi-tenant ACLs + audit logging.
-````
+
+**`ARCHITECTURE.md` — end of template**
 
 ---
 
 ## Phase 7 — `RESULTS.md` Template
 
-Template — save as `RESULTS.md`. Shown below as raw markdown source (4-backtick `text` outer fence forces literal rendering — inner triple-backtick blocks display as characters, not as nested code, so what you see is what you copy):
+Template — copy everything between the two horizontal rules below into a new `RESULTS.md` file. Renders as native markdown (headings styled, tables as tables, code blocks as code blocks) so the preview matches what your eventual results doc will look like.
 
-````text
+---
+
+**`RESULTS.md` — start of template**
+
 # Lab 03 — RAG Evaluation Results
 
 **Date:** 2026-05-06
@@ -1576,7 +1583,8 @@ RAGAS metrics are my OPA policy checks translated to an LLM pipeline. `context_r
 2. Tag each failure: answer-too-narrow / answer-too-broad / missing-condition / wrong-contrast-format / RAGAS-judge-noise.
 3. Run multi-query A/B on the same harder dev set before final architecture decisions.
 4. After multi-query, decide whether further synthesis-layer tuning is worth the LLM-judge variance floor (~0.03 on n=50).
-````
+
+**`RESULTS.md` — end of template**
 
 ---
 
