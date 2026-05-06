@@ -1421,9 +1421,9 @@ Three traces vertically stacked. Variant difference visible at a glance: baselin
 
 ## Phase 6 — `ARCHITECTURE.md` (the ADR) (~90 min)
 
-Template — save as `ARCHITECTURE.md`. Outer fence is 4 backticks so the inner triple-backtick code blocks (the ASCII pipeline tree) render correctly without prematurely closing the wrapper:
+Template — save as `ARCHITECTURE.md`. Shown below as raw markdown source (4-backtick `text` outer fence forces literal rendering — inner triple-backtick blocks display as characters, not as nested code, so what you see is what you copy):
 
-````markdown
+````text
 # RAG Pipeline — Architecture Decision Record
 
 **Date:** 2026-05-12
@@ -1482,9 +1482,9 @@ Decision: adopt __ / reject __. Reason: __.
 
 ## Phase 7 — `RESULTS.md` Template
 
-Outer fence is 4 backticks so the inner triple-backtick code block (the diagnostic-reading box) renders correctly without prematurely closing the wrapper:
+Template — save as `RESULTS.md`. Shown below as raw markdown source (4-backtick `text` outer fence forces literal rendering — inner triple-backtick blocks display as characters, not as nested code, so what you see is what you copy):
 
-````markdown
+````text
 # Lab 03 — RAG Evaluation Results
 
 **Date:** 2026-05-06
