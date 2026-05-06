@@ -221,14 +221,23 @@ ls -la pyproject.toml src/__init__.py
 
 ### 1.2 Pull a 10-K filing
 
+**Use the company's investor-relations PDF, NOT the SEC EDGAR `.htm` file.** SEC EDGAR is HTML-first (iXBRL filing format); their `.htm` files are not PDFs even if you save them with a `.pdf` extension. `pypdf` will crash with `PdfStreamError: Stream has ended unexpectedly` because the file's first bytes are `<!DOCTYPE` instead of `%PDF-`. Apple posts the actual PDF on their IR site:
+
 ```bash
-# Apple Inc. fiscal 2023 10-K — public SEC EDGAR document, ~150 pages.
 mkdir -p data
-curl -L -o data/aapl-10k-2023.pdf \
-  "https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/aapl-20230930.htm"
-# If the URL changes, search EDGAR for "Apple Inc. 10-K 2023".
-# Any large 10-K (Microsoft, Amazon, Meta, Tesla, Alphabet) works equivalently.
+curl -L --user-agent "Mozilla/5.0" -o data/aapl-10k-2023.pdf \
+  "https://s2.q4cdn.com/470004039/files/doc_financials/2023/q4/_10-K-2023-(As-Filed).pdf"
+file data/aapl-10k-2023.pdf          # verify: should print "PDF document, version X.Y"
 ```
+
+If `file` prints `HTML document` instead of `PDF document`, you downloaded an EDGAR HTML by mistake — re-curl the IR-site URL above (`--user-agent` flag is mandatory; IR CDNs block default curl UA).
+
+Other large 10-Ks that work equivalently (all hosted on the company's IR site as actual PDFs):
+- Microsoft: `https://microsoft.gcs-web.com/static-files/<id>.pdf` (find current via investor.microsoft.com → SEC Filings)
+- NVIDIA: `https://s201.q4cdn.com/141608511/files/doc_financials/2024/ar/NVIDIA-2024-Annual-Report.pdf`
+- Tesla: `https://www.sec.gov/Archives/edgar/data/1318605/000095017024005601/tsla-2023.pdf` (rare case where Tesla DID submit a PDF)
+
+5-second sanity test before running build_tree.py: `head -c 5 data/<name>.pdf` should print `%PDF-` (the binary PDF header). If it prints `<!DOC` or any HTML/XML opening, the file is wrong format.
 
 ### 1.3 Environment
 
