@@ -168,6 +168,8 @@ source .venv/bin/activate         # MANDATORY — uv venv creates the dir but do
 which python                      # verify: should print .../lab-02-7-pageindex/.venv/bin/python
                                   # if it prints ~/.openharness-venv or system python, your shell
                                   # PATH is shadowing the lab venv — re-source explicitly
+                                  
+uv pip install neo4j                                  
 ```
 
 Three scaffold files anchor the rest of the lab. Create them now so every Phase-2+ script imports cleanly.
@@ -740,66 +742,93 @@ Pre-mortem on common misses: questions like "What are Berkshire's acquisition cr
 
 Verify each `expected_entities` against the source PDF (Berkshire's 2023 numbers may differ slightly from these starter values; cross-check `data/brk-2023-ar.pdf` before scoring).
 
-**On shared/rag_hybrid reuse — explicit boundary.** Tree-index retrieval has NO encoder, NO reranker, NO vector store by design. `shared/rag_hybrid` (encoder + reranker + Retriever + autoconfig) is therefore not applicable to `build_tree.py` or `query_tree.py` — those scripts are pure LLM + JSON tree manipulation. The shared-library reuse for this lab is *cross-lab imports* in `compare_three.py` (next section): pulls vector RAG from W2 and GraphRAG from W2.5 + their shared scoring helpers, so the three-way comparison runs on a single eval set with consistent metrics. If a future tree-index variant adds embedding-based leaf-level retrieval (the typical "hybrid tree" extension), `shared/rag_hybrid.DenseEncoder` would slot in at that layer.
+**On shared/rag_hybrid reuse — explicit boundary.** Tree-index retrieval itself has NO encoder, NO reranker, NO vector store by design. `shared/rag_hybrid` is therefore not applicable to `build_tree.py` or `query_tree.py` — those scripts are pure LLM + JSON tree manipulation. **However, the three-way comparison harness in §4.2 below uses shared/rag_hybrid heavily for the vector backend** (`ingest_brk_to_vector.py` uses `Ingestor` + `chunk_corpus` + `char_window_chunks`; `compare_three.py` uses autoconfig'd `DenseEncoder` + `CrossEncoderReranker`). The boundary holds at the *tree-index* level; the *comparison harness* benefits from shared library reuse the same way W2.5 + lab-02b + lab-03 do.
 
-### 4.2 Comparison runner
+### 4.2 Comparison runner — same-corpus three-way
 
-Save as `src/compare_three.py`:
+The naive comparison "import vector_answer from W2, graph_answer from W2.5, tree_answer from W2.7" runs but compares THREE DIFFERENT CORPORA — W2 + W2.5 ingested tech-founder Wikipedia weeks ago; W2.7 just built the tree on Berkshire today. Same eval questions hitting different corpora = noise, not signal. To do a meaningful A/B, all three backends must query the SAME Berkshire corpus.
+
+Three new helper scripts achieve this. All commit to "Berkshire is the canonical corpus for W2.7", and isolate W2.7's data from W2's + W2.5's existing collections / graphs via namespacing (`brk_2023_dense` collection name + `BrkEntity` Neo4j label).
+
+#### `src/_brk_corpus.py` — Berkshire PDF → article-shape corpus
+
+Walks `data/tree.json` (built by `build_tree.py`), extracts the page text spanning each node's range, emits `data/brk_corpus.json` in lab-02-5's `corpus.json` shape (`[{id, title, text}, ...]`). Reusing the section boundaries means each "article" is a meaningful unit (Buffett's letter, Item 1A, BNSF segment, etc.), not arbitrary chunks. ~50 LOC.
+
+#### `src/ingest_brk_to_vector.py` — shared/rag_hybrid → Qdrant `brk_2023_dense`
+
+Reuses shared/rag_hybrid wholesale (Ingestor + chunk_corpus + char_window_chunks + autoconfig'd HybridEncoder). Mirrors lab-03's `ingest_to_vector.py` exactly except for spec/collection name. ~70 LOC.
 
 ```python
-"""Three-way comparison: vector RAG (W2) vs GraphRAG (W2.5) vs tree-index (W2.7)
-on a 20-question eval set drawn from one 10-K filing.
-
-Reuses substring + LLM-judge scoring from W2.5's compare.py.
-"""
-import json, sys, time
-from pathlib import Path
-
-sys.path.insert(0, "../lab-02-rerank-compress/src")
-sys.path.insert(0, "../lab-02-5-graphrag/src")
-
-from retrieve import search_with_rerank as vector_answer
-from query_graph import answer as graph_answer
-from query_tree import answer as tree_answer
-from compare import score_substring, score_llm_judge   # reuse W2.5's metrics
-
-def run(q: str, retriever, label: str):
-    t0 = time.time()
-    out = retriever(q)
-    elapsed = time.time() - t0
-    return {"label": label, "answer": out["answer"], "latency": round(elapsed, 2)}
-
-def main():
-    eval_set = json.loads(Path("data/eval.json").read_text())
-    results = []
-    for item in eval_set:
-        q, exp, q_type = item["q"], item["expected_entities"], item["type"]
-        v = run(q, lambda x: vector_answer(x, k=5), "vector")
-        g = run(q, graph_answer, "graph")
-        t = run(q, tree_answer, "tree")
-
-        for r in (v, g, t):
-            r["recall_substr"] = score_substring(r["answer"], exp)
-            r["recall_judge"], _ = score_llm_judge(q, r["answer"], exp)
-
-        results.append({"q": q, "type": q_type, "expected": exp,
-                        "vector": v, "graph": g, "tree": t})
-        print(f"  [{q_type}] V={v['recall_judge']:.2f} "
-              f"G={g['recall_judge']:.2f} T={t['recall_judge']:.2f} "
-              f":: {q[:60]}")
-
-    Path("results").mkdir(exist_ok=True)
-    Path("results/three_way.json").write_text(json.dumps(results, indent=2))
-
-    print("\n--- Aggregate (LLM-judge) ---")
-    for backend in ("vector", "graph", "tree"):
-        avg_jud = sum(r[backend]["recall_judge"] for r in results) / len(results)
-        avg_lat = sum(r[backend]["latency"] for r in results) / len(results)
-        print(f"  {backend:<8}  jud={avg_jud:.2f}  lat={avg_lat:.1f}s")
-
-if __name__ == "__main__":
-    main()
+SPEC = CollectionSpec(name="brk_2023_dense", model=BGE_M3)
+# load corpus → chunk → encode → upsert via Ingestor
 ```
+
+#### `src/build_brk_graph.py` + `src/query_brk_graph.py` — Berkshire-namespaced GraphRAG
+
+Copies of lab-02-5's `build_graph.py` + `query_graph.py` with `s/Entity/BrkEntity/g` + `s/entity_names/brk_entity_names/g` swap. Loads from `data/brk_corpus.json`. Coexists with W2.5's existing graph in the same Neo4j default database via label namespacing (Neo4j Community Edition supports only one user database — multi-database is Enterprise-only). ~700 LOC each, mostly inherited from W2.5.
+
+Trade-off: ~1400 LOC duplicated vs env-var-parameterizing W2.5. Picked copy because the blast radius is smaller — W2.5 lab stays fully untouched, W2.7's graph data lives in its own namespace.
+
+#### `src/compare_three.py` — runner
+
+Imports vector backend (autoconfig'd shared/rag_hybrid against `brk_2023_dense`), graph backend (`from query_brk_graph import answer`), tree backend (`from query_tree import answer`). Cross-lab import for scoring helpers from `lab-02-5/src/compare.py`. Per-category aggregation surfaces the architectural thesis (tree wins citation + refusal; vector wins factoid; graph degenerates on single-document star).
+
+```python
+# Canonical setup — full source in lab-02-7-pageindex/src/compare_three.py
+from rag_hybrid import (
+    BGE_M3, BGE_RERANKER_V2_M3, CrossEncoderReranker, DenseEncoder, autoconfig,
+)
+from compare import score_substring, score_llm_judge   # cross-lab from W2.5
+from query_brk_graph import answer as graph_answer
+from query_tree import answer as tree_answer
+
+_qd = QdrantClient(url="http://127.0.0.1:6333")
+_enc = DenseEncoder(autoconfig.encoder_config_for(BGE_M3))
+_rr = CrossEncoderReranker(autoconfig.recommend(BGE_M3, BGE_RERANKER_V2_M3).reranker)
+
+def vector_answer(q, k=5):
+    qv = _enc.encode([q])[0]
+    hits = _qd.query_points("brk_2023_dense", query=qv.tolist(), limit=30, with_payload=True).points
+    _rr._ensure_loaded()
+    pairs = [(q, h.payload["text"]) for h in hits]
+    scores = _rr._model.predict(pairs, batch_size=_rr.cfg.spec.batch_size)
+    top = [h for h, _ in sorted(zip(hits, scores), key=lambda x: -x[1])[:k]]
+    # ... LLM answer call against top-k ctx ...
+```
+
+### 4.2.5 Pre-req sequence — must run in this order
+
+`compare_three.py` only works AFTER all three backends have ingested the Berkshire corpus. Sequence:
+
+```bash
+cd ~/code/agent-prep/lab-02-7-pageindex
+source .venv/bin/activate
+uv pip install -e .                  # picks up qdrant-client + sentence-transformers + neo4j
+
+# 1. Build the tree (already done if you ran §2-§3)
+python src/build_tree.py             # ~2 min — writes data/tree.json
+
+# 2. Convert PDF + tree.json → article-shape corpus
+python src/_brk_corpus.py            # ~5 s — writes data/brk_corpus.json
+
+# 3. Vector ingest (new Qdrant collection)
+python src/ingest_brk_to_vector.py   # ~5 min — writes brk_2023_dense in Qdrant
+
+# 4. Graph ingest (new Neo4j BrkEntity nodes)
+python src/build_brk_graph.py        # ~30 min — entity extraction + Neo4j writes
+                                     # requires Neo4j running on bolt://localhost:7687
+
+# 5. Three-way comparison (8-question eval × 3 backends)
+python src/compare_three.py          # ~10 min — writes results/three_way.json
+```
+
+Total wall-time: ~50 min for first run. Re-runs of `compare_three.py` after the four ingest steps are ~10 min each (eval-only).
+
+`★ Insight ─────────────────────────────────────`
+- **Same-corpus is non-negotiable for meaningful A/B.** Comparing tree (Berkshire) vs vector (Wikipedia tech founders) vs graph (Wikipedia tech founders) returns noise. The pre-req sequence forces all three to ingest Berkshire before any eval runs. Heavy upfront cost (~45 min ingest), but it's the only way to get a real signal.
+- **Namespacing > separate database.** Neo4j Community Edition allows only the default database. Using `:BrkEntity` label + `brk_entity_names` index lets W2.5's `:Entity` graph + W2.7's `:BrkEntity` graph coexist without collision in the same Neo4j instance. Documented in `build_brk_graph.py` docstring; if you graduate to Neo4j Enterprise you can switch to `database="berkshire"` for cleaner isolation.
+- **Predicted result shape: graph LOSES on this corpus.** Berkshire annual report = ONE entity-dense document, not a multi-document graph. Entity extraction collapses into a star centered on Berkshire / Buffett / specific subsidiaries. Multi-hop traversal has no chains to walk because the document is *about one entity* with attribute-like sub-sections. This is the architectural failure mode W2.7 §1 Concept 1 predicts; the empirical run confirms it.
+`─────────────────────────────────────────────────`
 
 ### 4.3 Expected results shape (lab target)
 
