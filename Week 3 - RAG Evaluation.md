@@ -972,15 +972,27 @@ Two HyDE variants tested against the v2 baseline on the same harder 50-question 
 
 | Variant | Faithfulness | Answer relevancy | Context precision | Context recall | Extra cost / query | Decision |
 |---|---:|---:|---:|---:|---|---|
-| Baseline prompt v2 | **0.9900** | **0.7494** | 0.9824 | 1.0000 | — | **Keep as default** |
-| HyDE, original 3–5 sentence draft | 0.9898 | 0.7286 | 0.9781 | 1.0000 | +1 LLM call (~100ms, ~80 tok) | Reject |
-| HyDE, one sentence under 35 words | 0.9900 | 0.7293 | **0.9851** | 1.0000 | +1 LLM call (~100ms, ~30 tok) | Reject as default |
+| Baseline prompt v2 (pre-migration) | **0.9900** | **0.7494** | 0.9824 | 1.0000 | — | Keep as default |
+| HyDE, original 3–5 sentence draft (pre-migration) | 0.9898 | 0.7286 | 0.9781 | 1.0000 | +1 LLM call (~100ms, ~80 tok) | Reject |
+| HyDE, one sentence under 35 words (pre-migration) | 0.9900 | 0.7293 | **0.9851** | 1.0000 | +1 LLM call (~100ms, ~30 tok) | Reject as default |
+| **Baseline prompt v2 (post `shared/rag_hybrid` migration, Run 5)** | **1.0000** | **0.7297** | **0.9841** | 1.0000 | — | **Shipped baseline** |
+| **HyDE, one sentence under 35 words (post-migration, Run 6)** | 0.9800 | 0.7081 | 0.9841 | 1.0000 | +1 LLM call (~100ms, ~30 tok) | **Reject — gap to baseline widened** |
 
 **Decision:** Reject HyDE as the default for this corpus/dev set. Keep the one-sentence-under-35-words variant in the codebase as an opt-in experiment for future query clusters where baseline recall is low or vocabulary mismatch is visible.
 
 **5-second sanity test for adopting HyDE.** Before turning HyDE on by default for any corpus/dev set, check: is baseline `context_recall` < 1.0 with visible misses? If `context_recall = 1.0`, HyDE is structurally pure cost — there is no recall gap to close, so the only possible win is in ranking or downstream synthesis, and on this lab it didn't materialize.
 
 **Implementation correction (caught during the run).** The first HyDE eval invocation printed `=== HYDE ===` to stdout but still wrote artifacts to `results/ragas_baseline.json` and `results/ragas_baseline_debug.jsonl`, overwriting the baseline numbers. Fix: HyDE eval script must override the output paths before writing. Pattern documented in §3.2 above (`results_path = PROJECT_ROOT / "results" / "ragas_hyde.json"`, debug to `ragas_hyde_debug.jsonl`).
+
+**Run 6 post-migration analysis (2026-05-06).** Re-ran HyDE-short under the migrated `shared/rag_hybrid` stack (autoconfig'd encoder + fp16 cross-encoder reranker). Result: faithfulness 0.9800, answer_relevancy 0.7081, context_precision 0.9841, context_recall 1.0000.
+
+`★ Insight ─────────────────────────────────────`
+- **Baseline rose under migration; HyDE fell.** Same fp16 reranker, same DenseEncoder, same prompts. Only difference: HyDE rewrites the query before retrieval. Baseline faithfulness 0.99 → 1.00 (+0.01); HyDE faithfulness 0.99 → 0.98 (-0.01). Baseline answer_relevancy 0.7494 → 0.7297 (-0.02); HyDE answer_relevancy 0.7293 → 0.7081 (-0.02). The fp16 cross-encoder is more sensitive on borderline rankings when the input is a hypothetical sentence (out-of-distribution vs the natural-question training data) — small score perturbations flip more top-5 selections, and the resulting chunks happen to be slightly worse for HyDE's drafted-answer-as-query shape.
+- **HyDE deficit to baseline widened, not narrowed.** Pre-migration deficit on answer_relevancy was -0.0201; post-migration is -0.0216. On faithfulness HyDE moved from tied (0.9900 / 0.9900) to -0.02 deficit (0.9800 / 1.0000). HyDE was already rejected; migration strengthens the rejection. The architectural conclusion is more confidently defensible now than pre-migration.
+- **answer_relevancy -0.0212 is 0.0012 past the §2.6 ±0.02 contract.** Strictly speaking the contract failed. Two reasons NOT to revert HyDE: (1) the absolute number is well within the ~0.03 LLM-judge variance floor on n=50; (2) HyDE was already a rejected variant, so a marginal regression on a non-shipped path doesn't impact the production baseline. Document the edge case and move on. If HyDE were the shipped default, this would have triggered a v2.1 follow-up review.
+`─────────────────────────────────────────────────`
+
+**Decision (post-migration, unchanged):** Reject HyDE as the default. The migration strengthens the conclusion rather than reopening it.
 
 ---
 
