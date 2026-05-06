@@ -995,19 +995,27 @@ Save as `src/04_multiquery.py`:
 ```python
 """Pipeline variant: multi-query fusion with RRF.
 
-v2 (2026-05-06): inherits the migrated 02_pipeline.py — `_enc` is now a
-shared/rag_hybrid `DenseEncoder` (autoconfig'd device + batch tier), `qd`
-is the same QdrantClient. Multi-query rewrite logic + RRF formula
-unchanged — migration was at the encoder layer, not the fusion layer.
-
-Encode kwarg note: shared DenseEncoder.encode() takes `normalize=True`
-(default), NOT `normalize_embeddings=True` (the SentenceTransformer kwarg).
+v3 (2026-05-06): hand-rolled `rrf` function dropped — now uses
+shared/rag_hybrid.rrf_fuse (identical formula, k=60 default per Cormack
+et al. SIGIR 2009). Encoder/reranker/qdrant inherit from migrated
+02_pipeline.py.
 """
 import json
 import os
-from collections import defaultdict
+import sys
+from pathlib import Path
+
 from openai import OpenAI
-from src.script_wrap import load
+
+# Bootstrap shared/ onto sys.path BEFORE importing rag_hybrid (02_pipeline.py
+# adds the same path, but it loads later via script_wrap; rrf_fuse is needed
+# at module-top import time).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "shared"))
+
+from rag_hybrid import rrf_fuse  # noqa: E402
+
+from src.script_wrap import load  # noqa: E402
 
 # Universal loader from §2.2b — same pattern 03_hyde.py uses.
 pipeline = load("02_pipeline.py")
@@ -1030,29 +1038,27 @@ def rewrites(q):
         response_format={"type": "json_object"})
     return json.loads(r.choices[0].message.content).get("rewrites", [])[:3]
 
-def rrf(result_lists, k=60):
-    """Reciprocal Rank Fusion. result_lists = [[hit, ...], [hit, ...]]; hit has id+payload."""
-    scores = defaultdict(float)
-    lookup = {}
-    for hits in result_lists:
-        for rank, h in enumerate(hits):
-            scores[h.id] += 1.0 / (k + rank + 1)
-            lookup[h.id] = h
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
-    return [lookup[i] for i, _ in ranked]
-
 def run_pipeline_mq(q):
-    qs = [q] + rewrites(q)
+    rewrites_list = rewrites(q)
+    qs = [q] + rewrites_list
     lists = []
     for qq in qs:
         # rag_hybrid.DenseEncoder.encode kwarg is `normalize=True` (default),
         # not SentenceTransformer's `normalize_embeddings=True`.
         qv = _enc.encode([qq])[0]
         lists.append(qd.query_points("bge_m3_hnsw", query=qv.tolist(), limit=20, with_payload=True).points)
-    fused = rrf(lists)[:30]
+    # rrf_fuse: shared/rag_hybrid implementation, identical formula
+    # (1.0 / (k + rank + 1), k=60 default per Cormack et al. SIGIR 2009).
+    fused = rrf_fuse(lists)[:30]
     top = rerank(q, fused, k=5)
     ans, _ = answer_from(q, top)
-    return {"question": q, "answer": ans, "contexts": [h.payload["text"] for h in top]}
+    return {
+        "question": q,
+        "answer": ans,
+        "contexts": [h.payload["text"] for h in top],
+        "context_ids": [h.payload["doc_id"] for h in top],
+        "rewrites": rewrites_list,  # mirrors 03_hyde's `hypothetical` for debug audit
+    }
 ```
 
 ### Code walkthrough — `src/04_multiquery.py`
@@ -1060,21 +1066,24 @@ def run_pipeline_mq(q):
 **① Rewrite generation at `temperature=0.3`** (`rewrites(q)`)
 Same reasoning as HyDE: slight variation in phrasing is the goal. Each rewrite should hit different vocabulary so the three retrieval passes cover different parts of the index. At `temperature=0.0` all three rewrites would often be near-identical.
 
-**② `rrf(result_lists, k=60)` — Reciprocal Rank Fusion**
-RRF combines ranked lists without needing calibrated scores. Each document's fused score is `Σ 1/(k + rank)` across all lists it appears in.
+**② `rrf_fuse(lists)` — Reciprocal Rank Fusion via shared/rag_hybrid**
+Earlier iterations of this lab hand-rolled the RRF function (a 10-line `defaultdict + lookup` pattern). v3 dropped the local impl in favor of `from rag_hybrid import rrf_fuse` — identical formula (`Σ 1/(k + rank + 1)`, k=60 default per Cormack et al. SIGIR 2009), one less function to maintain, single source of truth shared with lab-02-5 GraphRAG and lab-02b production-libs.
 
-> **Why `k=60`?** This is the constant from the original RRF paper (Cormack, Clarke & Buettcher, SIGIR 2009). It dampens the rank-1 advantage: with k=60, rank 1 gets `1/61 ≈ 0.016` and rank 10 gets `1/70 ≈ 0.014` — a modest spread. Smaller k (e.g. 10) makes top ranks overwhelmingly dominant; larger k (e.g. 1000) makes all ranks nearly equal. 60 has been empirically robust across many retrieval benchmarks, which is why it became the de-facto default. You'd only tune it if you had a held-out dev set large enough to show a statistically significant improvement from a different value.
+> **Why `k=60`?** Cormack, Clarke & Buettcher (SIGIR 2009) evaluated multiple values empirically across TREC benchmarks; k=60 is robustly near-optimal across diverse query types. With k=60, rank 1 gets `1/61 ≈ 0.0164` and rank 10 gets `1/70 ≈ 0.0143` — a modest spread that avoids over-weighting the top rank without flattening rank distinctions entirely. Smaller k (e.g. 10) makes top ranks overwhelmingly dominant; larger k (e.g. 1000) makes all ranks nearly equal. The 60 default has held up across a decade of subsequent retrieval benchmarks, which is why it appears verbatim in LangChain's `EnsembleRetriever`, Qdrant's native FusionQuery, and shared/rag_hybrid's `RRF_DEFAULT_K`.
 
 **③ `limit=20` per rewrite in Qdrant search**
 Each of the 4 queries (original + 3 rewrites) retrieves 20 candidates, giving up to 80 unique docs before deduplication by RRF.
 
 > **Why `limit=20` and not 30 or 50?** At limit=20 per query you get up to 80 candidates feeding RRF — already well above the 30 you'd use for a single-query baseline. Bumping to 30 per query (120 candidates) adds ~40 ms of embedding + Qdrant time with marginal recall improvement, because RRF's re-ranking already surfaces the best documents from overlapping lists. 50 per query would also require the cross-encoder to score up to 200 chunks, which is ~4× slower with no meaningful precision gain.
 
-**④ `fused = rrf(lists)[:30]` — cap before rerank**
-Take the top-30 from the fused list before passing to the cross-encoder. This keeps the rerank step bounded at the same cost as the baseline's `n=30`.
+**④ `fused = rrf_fuse(lists)[:30]` — cap before rerank**
+Take the top-30 from the fused list before passing to the cross-encoder. This keeps the rerank step bounded at the same cost as the baseline's `n=30`. `rrf_fuse` returns docs sorted by aggregate RRF score, deduped by `.id`; first occurrence wins for the returned object so payloads from the earlier ranking survive.
 
-**⑤ `defaultdict(float)` + `lookup` dict**
-Two data structures do different jobs: `scores` accumulates the RRF sum per document ID; `lookup` maps IDs back to the full Qdrant hit objects (with payloads). The final list comprehension reassembles hits in fused-score order.
+`★ Insight ─────────────────────────────────────`
+- **Hand-rolled RRF was almost identical to shared rrf_fuse — but "almost" is the bug surface.** The lab's earlier hand-rolled `rrf` used `lookup[h.id] = h` (last-write-wins for the per-id object) while `rag_hybrid.rrf_fuse` uses `pt_by_id.setdefault(pid, pt)` (first-write-wins). On overlapping rank lists where the same doc appears in both, this changes which `payload` survives — usually irrelevant, but a subtle correctness drift to track. Shared lib is the correctness anchor; don't re-derive.
+- **One library, three labs.** `rrf_fuse` is now imported by lab-03 (this lab, multi-query), lab-02-5 (GraphRAG hybrid retrieval — used inside `Retriever`), and lab-02b (production-libs reference). Future RRF variants (DBSF, learned fusion) plug into `FusionStrategy` enum once and propagate to all three callers.
+- **Stable sort matters when scores tie.** `rrf_fuse` documents that ties resolve by insertion order. Hand-rolled version was non-deterministic on ties (sorted dict items in Python 3.7+ preserves insertion, but the score-sort wasn't guaranteed stable across implementations). For a curriculum lab where reproducibility matters, the documented contract wins.
+`─────────────────────────────────────────────────`
 
 **Common modifications:** Increase rewrites from 3 to 5 for higher recall at the cost of 2 extra embeddings + Qdrant calls; reduce to 2 rewrites if latency is the primary constraint.
 
