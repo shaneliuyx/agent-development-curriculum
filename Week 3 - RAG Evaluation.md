@@ -806,9 +806,10 @@ After the first baseline pass scored near-ceiling on a dev set that turned out t
 | 1 | Easier first curated set | Original concise prompt | 0.9800 | **0.8952** | 0.9726 | 1.0000 | Near-ceiling — dev set too easy to discriminate. |
 | 2 | Harder regenerated set | Original concise prompt | 0.9800 | 0.7336 | 0.9824 | 1.0000 | Harder questions exposed synthesis weakness. |
 | 3 | Harder regenerated set | v1.5 enhanced prompt, no length cap | 0.9400 | 0.6537 | 0.9824 | 1.0000 | Too verbose — extra sentences = extra unsupported claims. |
-| 4 | Harder regenerated set | **v2: enhanced + one sentence < 35 words** | **0.9900** | **0.7494** | 0.9824 | 1.0000 | **Best — adopt as baseline v2.** |
+| 4 | Harder regenerated set | **v2: enhanced + one sentence < 35 words** | **0.9900** | **0.7494** | 0.9824 | 1.0000 | **Best on hand-rolled retrieval — adopted as baseline v2.** |
+| **5** | Harder regenerated set | v2 + post `shared/rag_hybrid` migration (autoconfig'd encoder + fp16 reranker) | **1.0000** | **0.7297** | **0.9841** | 1.0000 | **Migration safe — all 4 metrics within ±0.02 of Run 4. Faithfulness improved +0.01; answer_relevancy -0.0197 within LLM-judge noise floor (~0.03 on n=50). v2 baseline preserved.** |
 
-Run 4 (v2) is the shipped state. The +0.01 faithfulness lift over Run 2 + the +0.0158 answer-relevancy lift come from the same change: bound the answer's surface form so verbose drift cannot accumulate. The retrieval / reranking layer is doing its job; further lift on this corpus + dev set has to come from synthesis-layer work (multi-query fusion in Phase 4, or a stronger judge / longer dev set to break the LLM-judge variance floor).
+Run 4 (v2) was the shipped state on hand-rolled retrieval (`SentenceTransformer + CrossEncoder`, hardcoded `device="mps"`). Run 5 (v2 post-migration) is the shipped state on `shared/rag_hybrid` (autoconfig probes device + memory tier; cross-encoder fp16-safe enabled). The +0.01 faithfulness lift over Run 2 + the +0.0158 answer-relevancy lift come from the prompt v2 change; Run 5's tiny deltas vs Run 4 confirm the migration was infrastructure-level (no behavior change beyond ~LLM-judge variance). The retrieval / reranking layer is doing its job; further lift on this corpus + dev set has to come from synthesis-layer work (multi-query fusion in Phase 4, or a stronger judge / longer dev set to break the LLM-judge variance floor).
 
 ### 2.5 Operational fixes — protobuf, numeric module, RAGAS API compat (2026-05-06)
 
