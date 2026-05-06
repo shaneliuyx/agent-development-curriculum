@@ -1421,9 +1421,9 @@ Three traces vertically stacked. Variant difference visible at a glance: baselin
 
 ## Phase 6 — `ARCHITECTURE.md` (the ADR) (~90 min)
 
-Template — save as `ARCHITECTURE.md`:
+Template — save as `ARCHITECTURE.md`. Outer fence is 4 backticks so the inner triple-backtick code blocks (the ASCII pipeline tree) render correctly without prematurely closing the wrapper:
 
-```markdown
+````markdown
 # RAG Pipeline — Architecture Decision Record
 
 **Date:** 2026-05-12
@@ -1476,13 +1476,15 @@ Decision: adopt __ / reject __. Reason: __.
 
 - Week 9 adds an automated faithfulness check post-generation.
 - Capstone A/B: extend to multi-tenant ACLs + audit logging.
-```
+````
 
 ---
 
 ## Phase 7 — `RESULTS.md` Template
 
-```markdown
+Outer fence is 4 backticks so the inner triple-backtick code block (the diagnostic-reading box) renders correctly without prematurely closing the wrapper:
+
+````markdown
 # Lab 03 — RAG Evaluation Results
 
 **Date:** 2026-05-06
@@ -1574,7 +1576,7 @@ RAGAS metrics are my OPA policy checks translated to an LLM pipeline. `context_r
 2. Tag each failure: answer-too-narrow / answer-too-broad / missing-condition / wrong-contrast-format / RAGAS-judge-noise.
 3. Run multi-query A/B on the same harder dev set before final architecture decisions.
 4. After multi-query, decide whether further synthesis-layer tuning is worth the LLM-judge variance floor (~0.03 on n=50).
-```
+````
 
 ---
 
