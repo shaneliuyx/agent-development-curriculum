@@ -163,11 +163,61 @@ Cost asymmetry: every query pays *tree_depth* navigation LLM calls + 1 answer LL
 ```bash
 mkdir -p ~/code/agent-prep/lab-02-7-pageindex/{src,data,results,logs}
 cd ~/code/agent-prep/lab-02-7-pageindex
-uv venv && source .venv/bin/activate
-uv pip install pypdf openai python-dotenv tqdm pageindex
-# pageindex package optional — you can also implement the tree builder yourself,
-# which is the more pedagogical path. The lab below builds it from scratch.
+uv venv
+source .venv/bin/activate         # MANDATORY — uv venv creates the dir but does NOT activate
+which python                      # verify: should print .../lab-02-7-pageindex/.venv/bin/python
+                                  # if it prints ~/.openharness-venv or system python, your shell
+                                  # PATH is shadowing the lab venv — re-source explicitly
 ```
+
+Three scaffold files anchor the rest of the lab. Create them now so every Phase-2+ script imports cleanly.
+
+**`pyproject.toml`** — declares the project as an installable package + pins all retrieval-side dependencies. The `setuptools.packages.find` block is what makes `src/` discoverable; without it, scripts run from project root resolve `from src.<module> import …` with `ModuleNotFoundError`.
+
+```toml
+[project]
+name = "lab02-7-pageindex"
+version = "0.1.0"
+description = "Week 2.7 Structure-Aware RAG (PageIndex / tree-index) lab"
+requires-python = ">=3.11"
+
+dependencies = [
+  "pypdf",
+  "openai",
+  "python-dotenv",
+  "tqdm",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+```
+
+**`src/__init__.py`** — empty file, but mandatory. Marks `src/` as a Python package so `from src.<module> import …` resolves.
+
+```bash
+touch src/__init__.py
+```
+
+**Install + verify**:
+
+```bash
+uv pip install -e .                 # installs declared deps + makes lab installable
+python -c "import pypdf; print('pypdf OK', pypdf.__version__)"
+python -c "from openai import OpenAI; print('openai OK')"
+ls -la pyproject.toml src/__init__.py
+```
+
+`★ Insight ─────────────────────────────────────`
+- **`pyproject.toml` + empty `__init__.py` is the minimum viable Python-package shape.** Without `pyproject.toml`'s `setuptools.packages.find` block, `src/` is not discoverable. Without `__init__.py`, Python's import system rejects `src/` as a package even when `pyproject.toml` claims it. Both files mandatory; both look trivial; both block downstream imports until present. Same pattern as lab-03 (`Week 3 - RAG Evaluation.md` §1.1).
+- **`source .venv/bin/activate` is NOT optional.** `uv venv` creates the directory; activation is a separate step. Without it, `python src/build_tree.py` resolves to whatever python sits earliest on PATH (often `~/.openharness-venv` if OMC harness is installed) — script crashes with `ModuleNotFoundError: No module named 'pypdf'` even though pypdf is installed in the lab venv. Always run `which python` after activation to confirm.
+- **No script_wrap.py needed for this lab.** lab-03 needed it because `02_pipeline.py`, `03_hyde.py`, `04_multiquery.py` start with digits — Python can't `from src.02_pipeline import ...` due to identifier rules. lab-02-7's files (`build_tree.py`, `query_tree.py`, `compare_three.py`) all start with letters — direct import works, no wrapper needed.
+- **PageIndex commercial package optional.** The lab below builds the tree from scratch (more pedagogical). To use the polished PageIndex API instead: `uv pip install pageindex` and replace the `build_tree` + `add_summaries_recursive` calls with `pageindex.build_tree(pdf_path)`. Trade-off: less learning, better OCR + tree quality on scanned PDFs.
+`─────────────────────────────────────────────────`
 
 ### 1.2 Pull a 10-K filing
 
