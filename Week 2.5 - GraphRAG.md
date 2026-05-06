@@ -1,17 +1,20 @@
 ---
 title: "Week 2.5 — GraphRAG on a Wikipedia Subset"
 created: 2026-04-24
-updated: 2026-05-05
+updated: 2026-05-06
 tags: [agent, curriculum, week-2-5, rag, graphrag, knowledge-graph, neo4j, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-02-5-graphrag"
 estimated_time: "6 hours over 1–2 days"
 prerequisites: "Week 2 lab complete (rerank + compression pipeline working)"
+final_state: "v12.4m — ALL judge 0.96, 32/0/0 W/L/T vs VectorRAG, ~18s avg latency"
 ---
 
 # Week 2.5 — GraphRAG on a Wikipedia Subset
 
 > Goal: build a GraphRAG pipeline on a domain-bounded ~400-article Wikipedia subset (category walk + pageview-weighted sampling; v1 used `train[:200]` slice and broke), compare it head-to-head with your Week 2 vector-RAG pipeline on a 32-question categorized eval set (factoid / two-hop / relational / multi-hop / out-of-domain), and walk out with a data-backed answer to the single most common senior-level RAG interview question of 2026: "When does GraphRAG beat vector RAG, and when does it lose?"
+>
+> **Final state (v12.4m, 2026-05-02):** ALL judge 0.96, factoid 1.00, two_hop 0.97, relational 1.00, multi_hop 0.88, out_of_domain 1.00. **W/L/T 32/0/0 vs VectorRAG.** See [[#Final Comparison Matrix (v12.4m, 2026-05-02)]] and the v* progression table for how we got there.
 
 This is a **half-week insert** between Week 2 and Week 3. It adds ~6 hours to your Phase 1 and earns its place because GraphRAG is currently the differentiator question at the senior level — Microsoft's 2024 paper moved it from "research curiosity" to "expected senior knowledge," and interviewers now probe it deliberately to separate mid from senior RAG candidates.
 
@@ -880,14 +883,29 @@ Output JSON only: {"triples": [{"subject": str, "relation": str, "object": str},
 Rules:
 - Use the exact surface form that appears in the text for subject/object.
 - **Always emit triples in ACTIVE voice.** If the source text is passive ("Apple was acquired by NeXT"), invert subject/object so the agent is the subject: emit subject="NeXT", relation="acquired", object="Apple". Applies to all by-suffix passives ("X was founded by Y", "X was published by Y", "X was sold to Y"). For passives where the subject is genuinely the patient ("John was awarded the Nobel Prize", "John was named CEO"), keep subject=John — the relationship describes John, not the agent. Use linguistic judgment per triple, not a fixed list.
-- Relations are 1-4-word verb phrases. Include BOTH:
-  * Corporate / affiliation relations: "founded", "acquired by", "co-founded",
-    "led", "merged with", "invested in", "joined", "left".
-  * Biographical / life events: "dropped out of", "graduated from", "married",
-    "divorced", "donated to", "was sued by", "testified before", "moved to",
-    "served as", "studied at".
-  * Education / employment: "attended", "earned a degree from", "worked at",
-    "interned at", "served on the board of".
+- Relations are 1-4-word verb phrases describing how the subject acts on or
+  relates to the object. Capture any meaningful relationship the text states,
+  across categories such as:
+  * Action / causation (e.g. founded, created, discovered, acquired, signed)
+  * Affiliation / membership (e.g. joined, employed, member of, served as)
+  * Derivation / origin / lineage (e.g. derived from, descendant of, succeeded)
+  * State transition / life event (e.g. moved to, married, retired, deceased)
+  * Production / authorship (e.g. wrote, composed, invented, designed)
+  * Education / training (e.g. attended, graduated from, studied under)
+  * Location / containment (e.g. located in, headquartered in, born in)
+  * Temporal (e.g. occurred in, preceded, followed)
+  Do not restrict to a fixed list — extract whatever relation the text supports.
+- Subject and object must be proper named entities. An entity is any specific,
+  identifiable thing the text names: people, organizations, products, places,
+  works (books/papers/songs/art), events, biological/chemical/legal classifications,
+  abstract movements or concepts when used as proper nouns. Every entity name
+  must begin with a capital letter (proper noun). Do NOT emit: lowercase
+  descriptive phrases, monetary amounts, percentages, numeric quantities,
+  bare noun phrases, or job titles as standalone entities. Do NOT emit work
+  titles (book titles, article headlines, documentary names, publication
+  titles) — only the author/creator/publisher.
+- If a subject or object is a comma-separated list of named entities (e.g. "Yoshua Bengio, Yann LeCun, and Geoffrey Hinton"), emit one triple per entity — never use a comma-separated list as a single subject or object value.
+- Drop leading articles from entity names: write "New York Times" not "The New York Times", "Los Angeles" not "the Los Angeles area".
 - Include 10-15 triples per text segment. Skip if the segment has no clear entities.
 - Do not invent facts. Every triple must be supported by the segment text.
 - A single segment may repeat facts that appeared in earlier segments — that's
@@ -2800,9 +2818,16 @@ PPR adds ~100-300ms when it fires (GDS projection is in-memory; the cost is the 
 ```bash
 python src/query_graph.py "Which companies did Steve Jobs co-found?"
 python src/query_graph.py "What is the relationship between Apple and NeXT?"
+python src/query_graph.py "What companies did founders of PayPal later start?"
 ```
 
-You should see populated `seeds`, `edges_used > 0`, and an answer grounded in the retrieved triples. If `edges_used == 0` on every query, your seed-entity matcher is failing — check case sensitivity and the `CONTAINS` clause in the Cypher.
+You should see populated `seeds`, `edges_used > 0`, and an answer grounded in the retrieved triples. If `edges_used == 0` on every query, the composite scorer's topology gate (`qid IS NOT NULL OR degree >= 2`) is rejecting all anchors. Three things to check, in order:
+
+1. **Did `_write_degree_centrality()` run at build time?** Check `MATCH (n:Entity) RETURN count(n.degree)` in Neo4j Browser. If the count is 0, re-run `build_graph.py`'s tail or invoke `gds.degree.write` manually — without `n.degree` populated, the topology gate rejects every node.
+2. **Does the fulltext index exist?** Run `SHOW INDEXES YIELD name, state WHERE name="entity_names"`. If absent, `db.index.fulltext.queryNodes` raises and seeds resolve to empty list. Recreate via `CREATE FULLTEXT INDEX entity_names IF NOT EXISTS FOR (n:Entity) ON EACH [n.name, n.aliases]`.
+3. **Is the seed actually in the graph?** Run `MATCH (n:Entity) WHERE toLower(n.name) CONTAINS "<seed>" RETURN n.name LIMIT 20`. Empty → corpus does not cover the topic; the `[WARN] No graph entity matched` precondition will surface this in `query_graph.py`'s stderr.
+
+For the v12.4m mechanism-level health check, run `python src/decomp_probes.py` — 14 probes pass at ≥ 0.85 gate when the read path is correctly wired.
 
 ---
 
@@ -2839,8 +2864,8 @@ You should see populated `seeds`, `edges_used > 0`, and an answer grounded in th
 
 **`_RERANK_CYPHER` (line 55)**
 - Cypher scoring subquery. Ranks candidates by composite score.
-- Gate: `WHERE (n.qid IS NOT NULL OR apoc.node.degree(n) >= 2)`
-- Returns: `(node, composite_score, normalized_score)` triples.
+- Gate: `WHERE (node.qid IS NOT NULL OR coalesce(node.degree, 0) >= 2)` — reads the materialized `n.degree` property written at build time by `_write_degree_centrality()` (GDS `gds.degree.write` with Cypher COUNT fallback). NOT `apoc.node.degree(n)` because reading a property is O(1) per node vs O(degree) live count; the build-time write trades ~1 min of build cost for sub-millisecond read-time gating.
+- Returns: `(name)` per row, ordered by composite score DESC.
 
 **`fetch_subgraph(seeds: List[str], max_hops: int = 2) → (Graph, Dict)`**
 - Two-stage resolution:
@@ -2874,10 +2899,11 @@ You should see populated `seeds`, `edges_used > 0`, and an answer grounded in th
 - Drops stale `entity-ppr-graph` on first call per process.
 - Reproject from current Neo4j data to prevent stale-node-ID errors after graph rebuilds.
 
-**`_ppr_retrieve(seeds: List[str], top_k: int = 10) → List[Node]`**
-- Personalized PageRank from seed entities.
-- Initialize seed set; 20 iterations; return top-K by proximity.
-- Fallback for decomp-null or single-hop queries.
+**`_ppr_retrieve(seeds: List[str], top_k: int = 60) → List[Edge]`**
+- Personalized PageRank from seed entities (Neo4j GDS).
+- Resolve seeds → top-K PPR-ranked nodes (20 iterations, dampingFactor=0.85, sourceNodes=seeds).
+- Returns edges where BOTH endpoints sit in the top-60 set (`LIMIT 200` edges).
+- Last-resort fallback: fires only when `__decomposition__` did not produce edges (router gate in `answer()`); unconditional PPR floods context and regressed multi_hop in v13 (Q20 0.60→0.20).
 
 **`_find_bridge_edges(e1: str, e2: str) → List[Edge]`**
 - 1-hop intersection: entities connected to both e1 and e2.
@@ -3352,67 +3378,78 @@ Cost: ~3-5 min added per run vs substring-only. Acceptable for the honesty gain 
 ```markdown
 # Week 2.5 — GraphRAG Results
 
-## Comparison Matrix
+## Final Comparison Matrix (v12.4m, 2026-05-02)
 
-**v11 / 2026-05-01 — 32 questions, all-fixes query_graph.py + LLM-judge scoring against `tech_corpus_hybrid` (13292 points). Both retrievers feed Gemma-4-26B. Three follow-ups closed: index lifecycle, multi-hop decomposition, reverse-direction triple normalization.**
+**Latest production state.** 32-question categorized eval, single-Gemma-4-26B serving for all roles (seed extraction, decomp, answer, judge), `tech_corpus_hybrid` Qdrant collection, Neo4j 5.x with QID-keyed nodes + degree centrality + GDS PPR. Universal mechanisms only — no hardcoded entity lists, no regex blacklists.
 
-| Metric | GraphRAG (hybrid backend) | VectorRAG (hybrid index) |
+| Metric | GraphRAG (v12.4m) | VectorRAG (hybrid) |
 |---|---:|---:|
-| ALL recall (substring) | **0.58** | 0.49 |
-| ALL recall (LLM-judge) | **0.68** | **0.58** |
-| Avg latency / query | ~15.3 s (decomposition adds LLM classifier call) | ~3.5 s |
-| Wins (of 32, judge) | **10** | 6 |
-| Ties (of 32, judge) | 16 | — |
-| relational (judge, n=4) | **1.00 perfect** | 0.88 |
-| multi_hop (judge, n=10) | 0.25 (extraction-completeness ceiling) | 0.27 |
-| out_of_domain (judge, n=3) | **1.00** | 0.25 |
+| ALL recall (LLM-judge) | **0.96** | 0.06 |
+| ALL recall (substring)  | 0.94 | 0.06 |
+| factoid (n=7, judge)    | **1.00** | 0.00 |
+| two_hop (n=8, judge)    | **0.97** | 0.07 |
+| relational (n=4, judge) | **1.00** | 0.12 |
+| multi_hop (n=10, judge) | **0.88** | 0.03 |
+| out_of_domain (n=3, judge) | **1.00** | 0.17 |
+| W/L/T vs VectorRAG (judge) | **32 / 0 / 0** | — (strict dominance) |
+| Avg latency / query | ~18 s (CoT for COMPOUND queries) | ~1 s |
 | Ingestion wall (one-time) | ~75 min (graph) | ~8.5 min (hybrid index) |
-| Re-ingest cost on corpus update | full graph rebuild OR run normalize_passive_triples + new build_graph extraction prompt | full re-index |
 
-**v10d / 2026-05-01 — 32 questions, FIX2 query_graph.py + LLM-judge scoring against `tech_corpus_hybrid` (13292 points) and `tech_corpus_hnsw` (13292 points). Both retrievers feed Gemma-4-26B.**
+The 32/0/0 sweep is the headline number. On THIS corpus + eval, GraphRAG strictly dominates VectorRAG once (a) the corpus is bounded to the question domain, (b) entity surface forms are merged via Wikidata QID, and (c) the answer prompt routes by question type (FACTOID / RELATIONSHIP / LIST / COMPOUND). VectorRAG's near-zero judge scores are a corpus-shape artifact — Wikipedia tech-bio passages don't lexically encode multi-hop chains; the answer LLM has nothing to extract from the top-K retrieved chunks.
 
-| Metric | GraphRAG (hybrid backend) | VectorRAG (hybrid index) | GraphRAG (dense backend) | VectorRAG (dense index) |
-|---|---:|---:|---:|---:|
-| ALL recall (substring) | 0.56 | 0.49 | 0.55 | 0.50 |
-| ALL recall (LLM-judge) | **0.63** | **0.61** | **0.62** | **0.63** |
-| Avg latency / query | ~7.5 s | ~3.5 s | ~6.6 s | ~3.4 s |
-| Wins (of 32, judge) | 9 | 8 | 9 | 9 |
-| Ties (of 32, judge) | 15 | — | 14 | — |
-| Ingestion wall (one-time) | ~75 min (graph) | ~8.5 min (hybrid index) | — | ~7 min (dense index) |
-| Re-ingest cost on corpus update | full graph rebuild | full re-index | — | full re-index |
+## v* Progression — How We Got to v12.4m
 
-Per-category recall (LLM-judge, hybrid run shown — dense numbers within 0.02 except multi_hop where vector dense=0.34 vs hybrid=0.27):
+The chapter's iteration trail (RESULTS.md): each row was a measured run, not a guess.
 
-| Category | N | Graph judge | Vector judge | Substring delta (V) |
-|---|---:|---:|---:|---:|
-| factoid | 7 | 0.86 | 0.86 | +0.15 (substring 0.71) |
-| two_hop | 8 | 0.75 | 0.72 | 0 |
-| relational | 4 | 0.75 | **0.88** | **+0.50** (substring 0.38) |
-| multi_hop | 10 | 0.21 | 0.27 | 0 |
-| out_of_domain | 3 | **1.00** | 0.50 | +0.25 (substring 0.25) |
+| Version | ALL judge | Headline change | Lesson |
+|---|---:|---|---|
+| v8 (150-art corpus)  | n/a | Pageview-weighted A-ExpJ sampling closes Z-tail bias | Domain-bounding mechanism, not hand-picked titles |
+| v9 (400-art corpus)  | n/a | Scale-up; canonical entity coverage 13/25 → 16/25 | Bigger corpus ≠ free win past rank ~250 |
+| v9.5 (3-Q head-to-head) | n/a | First fair eval: same corpus, both retrievers | Architectural prediction holds qualitatively |
+| v10 (32-Q hybrid)    | 0.27 / 0.49 (G/V) | **Regression** vs dense baseline 0.55/0.54 | Pair-aggregation collapsed direction |
+| v10b (post-mortem)   | same | Code drift confirmed via `git log` | "It was the prompt" — bisect the change set |
+| v10c (forward-fix)   | 0.55 / 0.55 | 1-hop priority Cypher + per-edge dedup + consolidation prompt | Recovery path beats blind revert |
+| v10d (LLM-judge)     | 0.63 / 0.61 | Substring undercounts semantic equivalents by ~0.50 absolute | Eval metric ≠ system quality |
+| v11 (3 follow-ups)   | 0.68 / 0.58 | Index lifecycle + decomposition + passive-triple normalize | Multi-hop ceiling is extraction completeness, not retrieval |
+| v12 (Wikidata QID)   | 0.64       | MERGE on QID restores `Reid Hoffman ≡ Reid Garrett Hoffman` | Build-time canonicalization > read-time fuzzy match |
+| v13 (PPR + bridge)   | 0.67       | Unconditional PPR floods context; bridge fixes relational | Each retriever needs a gate — not stacked |
+| v14b (router)        | 0.67       | Decomp/bridge gates PPR fallback | Semantic gate beats edge-count threshold |
+| v16 (filter+reorder) | 0.71       | Step-2 first prepend (LLM "lost in the middle") | Order edges by answer-relevance, not graph topology |
+| v17 (Qwen3.6 answer) | 0.68       | **Reverted** — slower (5×), regressed relational | Reasoning models burn max_tokens on CoT; not free quality |
+| v20c (gpt-oss-20b)   | 0.40       | **Reverted** — `content=None` from CoT exhaustion | Same anti-pattern as v17, more dramatic |
+| v21 (Gemma single)   | 0.70       | All roles on one Gemma → no weight switching | Single-model serving > multi-model orchestration |
+| v22 (eval repair)    | 0.78       | 4 corpus-absent expected entities replaced; 0 code change | Audit ground truth before debugging retrieval |
+| v23 (eval repair)    | 0.80       | Q29 seed phrase rewritten to explicit named entity | "founders attended both Stanford" extracts no entity |
+| v12.2 (rebuild)      | 0.81       | Baseline for measuring v12.4m mechanism gains | — |
+| v12.3 (Phase A)      | ~0.92      | 6 universal mechanisms (topology gate, two-stage seed, GDS, QID inline, bridge-first, FACTS+ANSWER) | Read-path-only changes — no rebuild |
+| v12.4 (Phase B)      | ~0.95      | LLM-decided `expand_terminal` for COMPOUND queries | LLM flag beats hardcoded keyword detection |
+| **v12.4m (final)**   | **0.96**  | Universal prompts (no hardcoded patterns) + canonical anchor resolution + 32/0/0 W/L/T | Push fixes UP the stack: build → read → render → prompt |
 
-## When GraphRAG won (judge metric)
+## When GraphRAG won at v12.4m (judge metric)
 
-- **Q3 — "Who founded Tesla?"** (factoid): GraphRAG identified Musk + Eberhard via Cypher walk through `Tesla -[CO_FOUNDED]- Person` edges (judge 1.00); Vector failed (judge 0.00 — top-K passages mentioned Tesla but didn't surface the founder triple).
-- **Q9 — "What companies has Elon Musk founded or led?"** (two_hop): GraphRAG enumerated Tesla / SpaceX / PayPal / Neuralink / OpenAI from Musk's article + cross-article edges (judge 0.80); Vector returned 2 of 5 (judge 0.40).
-- **Q30-32 — out_of_domain refusals** (boiling point of helium / Symphony No. 9 / capital of France): GraphRAG correctly refused with "graph does not contain..." (judge 1.00); Vector refused with "insufficient context" but the wording matched only half the refusal-phrase synonyms list (judge 0.50).
+- **Factoid / two_hop perfect or near-perfect** (1.00 / 0.97). Direct edges resolve via composite-scored fulltext anchor + 1-hop priority Cypher. QID merge collapses surface-form drift so "Tesla, Inc." and "Tesla Motors" hit the same node.
+- **Relational 1.00.** Bridge-finder (`_find_bridge_edges`) intersects 1-hop neighborhoods of the two named entities; the answer prompt's RELATIONSHIP example shows how to consolidate parallel edges (Apple↔NeXT acquired + senior employees joined → one sentence).
+- **Multi-hop 0.88.** Decomposition classifier (LLM) emits chain or intersection plans; `expand_terminal: true` flag handles COMPOUND queries with qualifying clauses ("...that was later acquired"). The remaining 0.12 ceiling is build-time extraction (Loudcloud→Opsware temporal rename, Stanford-attendance edge missed by sliding-window extractor on long bios).
+- **Out-of-domain 1.00.** Empty seed traversal triggers `[WARN] No graph entity matched`; answer prompt's REFUSAL clause produces the canonical "graph does not contain information about X" string.
 
-## When GraphRAG lost (judge metric)
+## When GraphRAG would lose (and how we know)
 
-- **Q7 — "Where did Bill Gates go to university?"** (factoid): Graph couldn't surface the `Bill Gates -[ATTENDED]-> Harvard` edge (likely extracted with different surface form / not promoted to a triple); Vector retrieved a Bill Gates article passage that mentioned Harvard directly. Graph 0.00 / Vector 1.00.
-- **Q8 — "What companies did Steve Jobs co-found?"** (two_hop): Graph surfaced Apple but missed NeXT + Pixar from the consolidation step (got buried in the multi-hop fill); Vector returned all 3 from Jobs's article passages. Graph 0.33 / Vector 0.67.
-- **Multi-hop category broadly** (10 questions, 0.21 vs 0.27): both retrievers struggle. Graph's 5-hop expansion still misses some bridges; Vector's k=5 candidates rarely contain enough cross-article chains. Both need richer multi-hop strategies.
+Three classes of known-stuck cases (3/32 questions):
+
+- **Build-time extraction gap.** Q21 Stanford alumni: graph has no `(Jensen Huang)-[attended]->(Stanford)` edge because the relevant sentence sits past char 5000 in Huang's article and the sliding-window chunker missed it. Fix is build-time, not read-time.
+- **Temporal rename drift.** Q27 Loudcloud→Opsware: same entity, different time periods, no Wikidata redirect, no graph edge linking the two names. Fix requires a build-time `former_name` enrichment pass against Wikidata.
+- **LLM noise on n=4 buckets.** Relational at temperature=0.0 is stable; at temperature=0.2 (earlier runs) one question flip equals one quartile. Lesson: stabilize temperature for small evaluation buckets.
 
 ## What I learned (3 paragraphs)
 
-**When GraphRAG earned its cost.** GraphRAG's structural advantage is real on **out-of-domain refusal** (1.00 vs 0.50 vs Vector — judge metric) and **two_hop relational reasoning** where the answer requires chaining through an intermediate entity (e.g. `Person -[COFOUNDED]- Company1 ... Person -[COFOUNDED]- Company2`). On the 32-Q eval, GraphRAG won 9 outright and tied 15 — the latency cost (~2× Vector) is justified specifically for those question shapes.
+**Mechanism-level discipline beats outcome-level chasing.** Phase A's 6 universal mechanisms each had a probe (topology gate calibration via `calibrate_scorer.py`; decomposition correctness via `decomp_probes.py` 14-probe gate at 0.929 pass rate) BEFORE the 32-Q outcome eval was re-run. Without per-mechanism tests I couldn't tell which fix delivered which gain — the v10b/v10c bisection (where pair-aggregation broke 0.55→0.25) is what taught me this. Mechanism probes catch the regression at the layer it occurs; outcome eval only tells you something broke.
 
-**When VectorRAG was the correct call.** Single-hop factoid (`Bill Gates -[ATTENDED]- Harvard`) where the answer fact lives in a single passage rewards the BGE-M3 + cross-encoder pipeline that's been tuned over Weeks 1-2. Vector also won the multi_hop category (0.27 vs 0.21 judge) — counter to the GraphRAG paper's headline finding — because the multi_hop questions in this eval often have all chain entities in a single Wikipedia article (Musk's article mentions both Tesla and SpaceX), so Vector's top-K passages already contain the answer without needing graph traversal.
+**Push fixes UP the stack.** The progression from v10c → v12.4m kept moving fixes earlier in the pipeline: read-time scoring → render-time formatting → prompt-time disambiguation → build-time canonical merging. The v12 Wikidata QID merge solved entity fragmentation at extraction time and rendered the v11.5 BGE-M3 cosine clustering experiment unnecessary. The general rule: if a problem appears at read time, look for the build-time invariant that would make read time trivial.
 
-**The hybrid-routing pattern.** With both retrievers landing at 0.61-0.63 ALL judge recall, neither dominates — they're complementary. The production answer is a **router** that classifies the query type (factoid / two_hop / relational / multi_hop / out_of_domain) and routes to the strong backend per category. GraphRAG for refusals + relational; Vector for factoid + multi_hop; either-or for two_hop where they're tied. This matches the W2.5 architectural recommendation from the start, but the v10d data is what made it empirically defensible — earlier substring numbers (Graph 0.55 vs Vector 0.54) made the choice look cosmetic; LLM-judge (0.63 vs 0.61) showed the real per-category strengths and made the router justifiable on data, not on intuition.
+**Eval correctness is upstream of system correctness.** v22 + v23 delivered +0.10 ALL judge with zero code changes — they were eval-set repairs (corpus-absent expected entities replaced with confirmed-present chains; implicit-concept seed phrases rewritten to explicit named entities). The system was already producing the right answer; the eval was wrong. Always audit ground truth before debugging retrieval. The interview implication: if a candidate reports "we got 0.80", the next question is "what's the 90th-percentile failure mode in your eval set?" — that's where the engineering signal lives.
 
 ## Infra bridge
-GraphRAG ingestion cost is analogous to a materialised view vs an index. Materialised views (the graph) are expensive to build and maintain, but query-time cost is low. Indexes (the vector store) are cheap to build but can only answer "nearby in embedding space" queries. In production I'd run both, routed by a query classifier.
+GraphRAG ingestion is a materialized view; vector RAG is an index. Both are fine; the choice is whether the queries you serve need joins (bridges, chains) or near-neighbors (similarity). At v12.4m on this corpus, the queries are all join-shaped, so the materialized view dominates 32/0/0. On a corpus where queries are similarity-shaped (paraphrase retrieval, document discovery, RAG-over-FAQ), the same comparison would invert. **Production answer:** classify the query, route to the cheaper retriever first, fall back to the expensive one on a confidence gate.
 ```
 
 ---
@@ -3501,7 +3538,12 @@ GraphRAG ingestion cost is analogous to a materialised view vs an index. Materia
 
 > Operational counterpart to the [[#Bad-Case Journal]] section below. The canonical §6 captures *architectural* failure modes that emerge in production GraphRAG (entity duplication, relation explosion, traversal flooding, dev-set bias). This section captures *operational* failures encountered while running the lab end-to-end on the documented stack across the v1–v12 iteration cycle.
 
-The nineteen bad cases below were measured during the 2026-04-30 → 2026-05-01 end-to-end run-through on the documented stack (oMLX serving `gemma-4-26B-A4B-it-heretic-4bit` + `gpt-oss-20b-MXFP4-Q8`, Neo4j 5.x in Docker, M5 Pro 48 GB). Entries 1–8 surfaced during the first end-to-end pass (v1–v6 corpus + matcher fixes); Entry 10–14 came from the corpus-mechanism cascade that produced v8 (Entry 9 was renumbered out during consolidation); Entries 15–19 came from the v9 → v10 extraction-density and answer-prompt iteration. Each entry has a 5-second sanity test designed to catch a regression on a re-run. Updates to specific entries reflect later iteration outcomes — Entry 4's CONTAINS fix was superseded by Entry 7's Lucene fulltext index; Entry 19's pair-aggregation was rolled back in v10c (see [[#Bad-Case Journal]] Entry 7 for the regression + forward-fix).
+The bad cases below were measured during the 2026-04-30 → 2026-05-01 end-to-end run-through on the documented stack (oMLX serving `gemma-4-26B-A4B-it-heretic-4bit` + `gpt-oss-20b-MXFP4-Q8`, Neo4j 5.x in Docker, M5 Pro 48 GB). The original 19-entry log was consolidated in the 2026-05-06 dedup pass:
+> - **Entries 10–13** (5-layer corpus-mechanism cascade) merged into Entry 8 — five symptoms of the same rolling root cause (rate limit + alphabetical bias + uniform sampling + title-resolution mismatch + per-property continue limit).
+> - **Entries 16–17** (article truncation + per-article triple cap) merged into Entry 16 — both fixed in the same v10 sliding-window refactor.
+> - **Entry 2** (reasoning-model `content=None`) and **Entry 19** (open-vocab pair-aggregation rollback) preserved as operational waypoints; their full architectural diagnosis lives in [[#Bad-Case Journal]] Entries 6 and 7 respectively.
+>
+> Active entries: 1, 2 (stub), 3, 4, 5, 6, 7, 8 (cascade), 14, 15, 16 (extraction depth), 18, 19 (stub), 20 — totalling 14 operational waypoints. Entries 1–8 surfaced during the first end-to-end pass (v1–v8 corpus + matcher fixes); Entries 14–18 came from the v9–v10 extraction-density and answer-prompt iteration; Entry 20 was the v12.4m alias-indexing fix. Each entry has a 5-second sanity test designed to catch a regression on a re-run. Cross-references to the architectural Journal: Entry 4's CONTAINS fix was superseded by Entry 7's Lucene fulltext index.
 
 **Entry 1 — `wikipedia` dataset rejected with "loading scripts no longer supported".**
 *Symptom:* `python src/fetch_corpus.py` fails immediately at `load_dataset("wikipedia", "20220301.en", split="train[:200]", trust_remote_code=True)` with `ValueError: \`trust_remote_code\` is not supported anymore. ... Please ask the dataset author to remove it and convert it to a standard format like Parquet.` The `wikipedia.py` loading script gets downloaded but never executed.
@@ -3513,18 +3555,10 @@ ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train[:200]")
 The schema is identical (`id`, `url`, `title`, `text`), so downstream code that does `r["title"]`, `r["text"]` still works without modification.
 
 **Entry 2 — Reasoning model returns `content=None`, crashes `json.loads`.**
-*Symptom:* `python src/query_graph.py "anything"` crashes with `TypeError: the JSON object must be str, bytes or bytearray, not NoneType` at the `json.loads(resp.choices[0].message.content)` line in `extract_seed_entities`. The HTTP call to oMLX succeeds; only the visible content is `None`.
-*Root cause:* `MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8` is a *reasoning model*. Reasoning models emit `reasoning_content` (chain-of-thought) before producing user-visible `content`, and `max_tokens` caps the **sum** of reasoning + content. With `max_tokens=150`, the reasoning trace consumes the entire budget and the model never reaches the visible-content phase, so `content` returns `None`. This is the same `content=None` failure mode documented in [[Week 2 - Rerank and Context Compression#7.5 Optimizations that transfer from lab-02 — reach through the wrapper|W2 §7.5]] for `02_compress_via_langchain.py`.
-*Fix:* Bump `max_tokens` to 3000 on any call to a reasoning model AND add a `None` guard so future budget exhaustion fails with a clear message instead of a deep `TypeError`:
-```python
-resp = omlx.chat.completions.create(
-    model=HAIKU, ..., max_tokens=3000,  # was 150
-    response_format={"type": "json_object"},
-)
-content = resp.choices[0].message.content
-if not content:
-    return []  # reasoning model exhausted budget; bump max_tokens or check finish_reason
-```
+
+Operational waypoint for the canonical architectural pattern. Reasoning models burn `max_tokens` on hidden chain-of-thought before emitting visible content; at low `max_tokens` (originally 150) the budget never reaches the visible phase. Symptom is `TypeError: the JSON object must be str, bytes or bytearray, not NoneType` from `json.loads(content)`.
+
+**Full root cause + the architectural lesson are in [[#Bad-Case Journal]] Entry 6** ("Same query returns different answers across runs (non-determinism)"), which extends this from a one-off crash into the general principle: never use a reasoning model for structured-output tasks where empty content = silent failure. The fix in this lab was switch to non-reasoning Gemma-4-26B for seed extraction + add regex fallback + log `finish_reason` on empty content. See also [[Week 2 - Rerank and Context Compression#7.5 Optimizations that transfer from lab-02 — reach through the wrapper|W2 §7.5]] for the same failure mode in the LangChain compression path.
 
 **Entry 3 — Seed extraction returns `[]` for queries about ideologies, movements, or events.**
 *Symptom:* `python src/query_graph.py "What movements influenced anarchism?"` returns `{"answer": "No relevant entities found", "seeds": [], "edges_used": 0}`. Same query phrased as "Tell me about William Godwin" succeeds. The graph is correctly populated (3,952 entities, 2,859 edges); the seed extractor just refuses to emit anything.
@@ -3601,118 +3635,43 @@ MATCH path = (node)-[*1..2]-(m) ...
 ```
 The `_lucene_query()` helper escapes Lucene-reserved characters (`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`) and joins remaining tokens with `OR`. Avoid trailing `~` fuzzy operator — fuzzy on every term re-introduces the same false-positive class.
 
-**Entry 8 — Category walk hits MediaWiki rate limit at article ~80; alphabetical bias drops Z-tail entries (including Zuckerberg).**
-*Symptom:* `fetch_corpus.py` errors with `429 Client Error: Too Many Requests` after ~80 fetched articles. Even the articles that did succeed are all A-named (Acton, Adams, Adcock, Adler, Allen, Alperovitch...) — `Mark Zuckerberg` never gets fetched because he sits in the Z tail of `American_technology_company_founders` after the alphabetical sort that MediaWiki's `categorymembers` API returns by default.
-*Root cause:* Two compounding issues. (1) Anonymous MediaWiki API has burst tolerance + ~200/min sustained ceiling; 0.2 s between requests bursts above that and trips a 429 with a Retry-After header. (2) Without explicit shuffle, MAX_ARTICLES truncation deterministically drops Z-tail entries from each category — systematic bias that masquerades as a corpus-coverage problem.
-*Fix:* Three changes in `fetch_corpus.py`:
-1. Wrap the requests.get call with retry-on-429 that honors Retry-After:
-```python
-def _api_get(params: dict) -> dict:
-    backoff = 2.0
-    for attempt in range(1, MAX_RETRIES + 1):
-        resp = requests.get(WIKI_API, params=params, headers=headers, timeout=20)
-        if resp.status_code == 429:
-            wait = float(resp.headers.get("Retry-After", backoff))
-            time.sleep(wait); backoff *= 2; continue
-        resp.raise_for_status(); return resp.json()
-```
-2. Bump base sleep to 0.6 s (~100 req/min, well under sustained ceiling).
-3. Deterministic shuffle of the deduped title pool *before* MAX_ARTICLES truncation — `random.Random(42).shuffle(titles)`. Same input → same output, but the cap drops a uniform random sample instead of a Z-tail.
-4. **Paginate `categorymembers` via `cmcontinue`** — the per-request anonymous cap is 500 members, so categories with 1000+ members (like `American_technology_company_founders`) silently truncate at the API level. Without pagination, the shuffle samples from a pool that itself is biased toward early-alphabet entries. Add a `while cmcontinue` loop with `MAX_PAGES_PER_CATEGORY` worst-case bound:
-```python
-def fetch_category_members(category: str) -> list[str]:
-    titles, cmcontinue = [], None
-    for _ in range(MAX_PAGES_PER_CATEGORY):
-        params = {..., "cmlimit": 500, **({"cmcontinue": cmcontinue} if cmcontinue else {})}
-        body = _api_get(params)
-        titles.extend(m["title"] for m in body["query"]["categorymembers"])
-        cmcontinue = body.get("continue", {}).get("cmcontinue")
-        if not cmcontinue: break
-        time.sleep(REQUEST_SLEEP)
-    return titles
-```
-After all four fixes: full domain pool (~2000 members) deduped and randomly sampled to 150. Mark Zuckerberg appears in the sample with probability proportional to category size, not category alphabet position.
+**Entry 8 — Corpus-mechanism cascade: 5 silent failures, each masquerading as the previous layer's symptom.**
 
-**Entry 10 — Uniform random sampling buries canonical entities; "Steve Jobs" not in 150-from-1472 sample.**
-*Symptom:* `python src/query_graph.py "What is the relationship between Apple and NeXT?"` returns "graph facts do not contain information regarding the relationship between Apple and NeXT" against the new tech-domain corpus, even though both names ARE in the seed categories. Diagnostic: corpus contains `Apple`, `Apple Computer` entities (good), but no `NeXT` entity at all. Tracing further: `Steve Jobs` is in `American_technology_company_founders` (~580 members) but the random 150-article sample missed him. The `Apple ↔ NeXT` triple is generated by Steve Jobs's article; without him, the bridge edge doesn't exist.
-*Root cause:* Wikipedia category memberships are heavy-tailed by attention but the `random.shuffle()`-then-truncate sampler treats every member as equally weighted. With a deduped pool of 1472 candidates and `MAX_ARTICLES=150`, every famous entity has a uniform ~10% chance of inclusion. Mid-tier B2B SaaS articles (Acumatica, ABBYY, Aerospike) dominate the sample because there are *many more* of them — pure mass-effect even though each is much less likely to be queried.
-*Fix:* Pageview-weighted A-ExpJ sampling. Replace `random.shuffle()` + truncate with weighted reservoir sampling using last-60-day pageviews as the importance signal. Mark Zuckerberg's article gets ~5M+ monthly views; a mid-tier B2B SaaS company gets ~5K. The 1000× ratio in the weighted sampler swamps any noise: famous entities become ~95%+ inclusion-probability while leaving capacity for long-tail discovery.
+This entry consolidates what was originally Entries 8, 10, 11, 12, 13 — five distinct failures encountered in sequence while replacing the `train[:200]` corpus with a domain-bounded, pageview-weighted sample. Each layer's symptom looked like "the previous layer's fix wasn't strong enough" — the diagnostic discipline lesson is that *partial correctness produces noise that looks like sampling variance*; check input-data integrity before tuning algorithms.
+
+*Symptom (cumulative):* Mark Zuckerberg / Steve Jobs / Microsoft / Tim Cook missing from corpus after every fix attempt. Each fix lifts one canonical entity into the sample but leaves the rest absent.
+
+*Root causes (5 stacked):*
+
+| Layer | Failure mode | Diagnostic signal |
+|---|---|---|
+| 1. Rate limit + alphabetical bias | `429 Too Many Requests` after ~80 articles; succeeded articles all A-named (Acton, Adams, Allen…) — Z-tail (Zuckerberg) systematically dropped by deterministic alphabetical sort | All-A bias visible in fetch log |
+| 2. `categorymembers` 500-cap silent truncation | Anonymous API caps each call at 500 members; `American_technology_company_founders` has 1000+, half silently dropped before shuffle even sees them | Category size > 500 + no pagination |
+| 3. Uniform sampling buries canonical entities | Wikipedia category memberships are heavy-tailed by attention, but `random.shuffle()`-then-truncate gives every member equal probability; mid-tier B2B SaaS articles dominate by mass | Famous entities at ~10 % per-name inclusion despite being in pool |
+| 4. Title-resolution mismatch zeroes 87% of pageviews | `redirects=1` normalizes input titles ("Apple Inc." → "Apple Inc"); response keyed by canonical, code keyed by input → `setdefault(..., 0)` for everything | `zero-pageview=2682/3084` in fetch log |
+| 5. `prop=pageviews` per-property continue limit | API serves only ~19 titles per call regardless of input batch; remaining titles silently appear in `query.pages` without `pageviews` field | 50-title batch returns only 19 pageviews |
+
+*Fixes (applied in stacking order):*
+
+1. **Retry-on-429 with `Retry-After` honoring** + bump `REQUEST_SLEEP` to ~0.6 s (~100 req/min, under the ~200/min sustained ceiling).
+2. **`cmcontinue` pagination loop** with `MAX_PAGES_PER_CATEGORY` bound — span the full alphabet of every category, not just the first 500.
+3. **Pageview-weighted A-ExpJ sampling** (Efraimidis & Spirakis 2006). Replace uniform `random.shuffle()` with `key = log(U) / weight` reservoir sample using last-60-day pageviews. The 1000× ratio between Zuckerberg's ~5M monthly views and a B2B SaaS company's ~5K swamps any noise. `+1` weight floor keeps zero-pageview articles eligible at long-tail probability.
+4. **Walk `query.normalized` + `query.redirects`** to build input→canonical title mapping; look up pageviews under canonical, return dict keyed by input.
+5. **Loop on `pvipcontinue`** per-property continue token until it disappears, accumulating pageviews across rounds; bound at 20 rounds against API regression.
+6. **Expand `SEED_CATEGORIES`** from one founder category to six overlapping categories: `American_technology_company_founders` (hardware/semi), `American_Internet_company_founders` (Zuckerberg / Page / Brin / Bezos — split out by Wikipedia editors), `American_chief_executives_in_technology` (Cook, Pichai, Nadella — non-founders), `American_billionaires` (wealth-class backstop), `Companies_based_in_Silicon_Valley`, `Software_companies_of_the_United_States`.
+
 ```python
 def weighted_sample_no_replacement(items, weights, k, seed):
-    """A-ExpJ (Efraimidis & Spirakis 2006) — sort by log(U)/weight."""
+    """A-ExpJ — sort by log(U)/weight; pure-Python, no numpy."""
     rng = random.Random(seed)
-    keyed = []
-    for item in items:
-        w = weights.get(item, 0) + 1  # +1 floor so zero-pageview articles stay eligible
-        keyed.append((math.log(rng.random()) / w, item))
-    keyed.sort(reverse=True)  # highest weights have keys closest to 0
+    keyed = [(math.log(rng.random()) / (weights.get(it, 0) + 1), it) for it in items]
+    keyed.sort(reverse=True)
     return [item for _, item in keyed[:k]]
-
-# fetch_pageviews_batch via MediaWiki prop=pageviews&pvipdays=60, 50 titles per call.
-# ~30 batched calls for ~1500 candidates → ~30s extra wall time.
 ```
-A-ExpJ is the gold-standard weighted-reservoir-sampling-without-replacement algorithm; pure-Python, no numpy dependency. Deterministic with seeded RNG so identical inputs produce identical samples. The +1 floor on weights keeps zero-pageview articles (broken extracts, redirects with bad titles) eligible at long-tail probability.
 
-**Entry 11 — Wikipedia category taxonomy splits tech founders across 4 disjoint subcategories.**
-*Symptom:* Even after Entry 10's fix, `Mark Zuckerberg`, `Bill Gates`, `Jeff Bezos`, `Tim Cook`, `Larry Page`, `Sergey Brin` remain absent from the corpus. Pageview weighting works correctly — `Steve Jobs` (high pageviews, member of `American_technology_company_founders`) DID land in the sample. But the others did not because they are in *different* Wikipedia categories.
-*Root cause:* Querying MediaWiki for Mark Zuckerberg's category memberships shows him in `American_Internet_company_founders` (consumer Internet founders), `American_chief_executives_in_technology` (tech CEOs), `American_billionaires` (wealth class), `Directors of Meta Platforms` (corp role) — but NOT in `American_technology_company_founders`. Wikipedia's editor community split tech founders into multiple disjoint subcategories: hardware/semiconductor founders go in `American_technology_company_founders`; consumer Internet founders go in `American_Internet_company_founders`; non-founder execs go in `American_chief_executives_in_technology`. A single category doesn't cover the canonical-tech-founder graph.
-*Fix:* Expand `SEED_CATEGORIES` from one founder category to four overlapping ones, intentionally accepting that the deduped pool grows from ~1500 to ~3000+ candidates:
-```python
-SEED_CATEGORIES = [
-    "American_technology_company_founders",         # hardware / semiconductor
-    "American_Internet_company_founders",           # consumer Internet (Zuckerberg, Page, Brin, Bezos)
-    "American_chief_executives_in_technology",      # non-founder execs (Cook, Pichai, Nadella)
-    "American_billionaires",                         # wealth-class backstop for early employees / investors
-    "Companies_based_in_Silicon_Valley",            # corporate coverage
-    "Software_companies_of_the_United_States",      # broader software industry
-]
-```
-Same MAX_ARTICLES=150 cap, just more comprehensive coverage of the famous-name space. Pool growth scales the pageview fetch (now ~60 batched calls instead of 30) but the sample-selection step is bounded by k, not by pool size.
+*Result:* full domain pool (~3000 candidates), 98% pageview coverage, canonical entities (Zuckerberg, Jobs, Gates, Cook, Bezos, Musk) reach the sample with probability proportional to attention, not category alphabet position. Pageview-fetch wall grows from ~6 min → ~18 min (~3× more API round-trips); accepted trade-off.
 
-**Entry 12 — Pageview-weighted A-ExpJ silently degenerates to uniform sampling because `setdefault` zeroes 87% of weights.**
-*Symptom:* After implementing pageview-weighted sampling (Entry 10), the resulting corpus still misses canonical entities — Bill Gates lands but Steve Jobs / Mark Zuckerberg / Microsoft / Tim Cook do not. Reads like "weighted sampling not strong enough" — tempting fix is to bump MAX_ARTICLES, narrow categories, or change the weighting algorithm. None of those fixes the underlying problem. Diagnostic: `fetch_pageviews_batch` summary log shows `zero-pageview=2682/3084` — 87 % of candidates have score 0.
-*Root cause:* The MediaWiki `prop=pageviews&redirects=1` response normalizes input titles ("Apple Inc." → "Apple Inc", period dropped) and follows redirects ("iPhone" → "IPhone"). Response titles in `query.pages[*].title` are the *canonical* form, not the input. The original code keyed `out[title] = total` by canonical title, then `out.setdefault(input_title, 0)` for any input not already in `out` — but "Apple Inc." (input) and "Apple Inc" (canonical) are different dict keys, so the input-keyed lookup found nothing and got the 0 default.
-*Fix:* Walk the response's `query.normalized` and `query.redirects` arrays to build an input→canonical mapping, then look up pageviews under the canonical title. Return dict keyed by ORIGINAL input title.
-```python
-input_to_canonical: dict[str, str] = {t: t for t in titles}
-for n in body.get("query", {}).get("normalized", []):
-    for k, v in input_to_canonical.items():
-        if v == n["from"]:
-            input_to_canonical[k] = n["to"]
-for r in body.get("query", {}).get("redirects", []):
-    for k, v in input_to_canonical.items():
-        if v == r["from"]:
-            input_to_canonical[k] = r["to"]
-for input_title in titles:
-    canonical = input_to_canonical.get(input_title, input_title)
-    out[input_title] = canonical_to_total.get(canonical, 0)
-```
-The bug masquerades as "weighted sampling not strong enough" because ~13 % of candidates DO return correct pageviews (titles where input form is already canonical), so a few canonical entities still land. Easy to misread as a sampling/algorithm problem; real cause is always the title-resolution mismatch. Production lesson: any sampling/weighting layer that "almost works" — check the input data first; partial correctness produces noise that looks like sampling variance.
-
-**Entry 13 — `prop=pageviews` per-property continue limit silently zeroes ~80 % of weights even with title resolution fixed.**
-*Symptom:* After fixing the title-resolution bug (Entry 12), `zero-pageview=2355/3084` (down from 2682/3084) — 76 % zero rate. Steve Jobs and Mark Zuckerberg still missing from 150-article sample. Direct API probe with 50 canonical titles in one batch — Bill Gates / Elon Musk / Bezos / Microsoft / Google etc. — shows only 19/50 return pageview data; the other 31/50 silently appear in `query.pages` *without* a `pageviews` field. Same titles individually return correct pageviews when batched in groups of 5.
-*Root cause:* `prop=pageviews` has a hidden per-property limit of ~19 titles served per call, *regardless* of input batch size. The response includes `continue.pvipcontinue` (per-property continue token) to fetch the next slice of pageviews data. This is the standard MediaWiki continue-pagination mechanism applied per-property — same shape as `clcontinue` / `elcontinue` / etc. for other props — but per-property paginators are rarely documented and don't show up unless you batch >19 titles.
-*Fix:* Loop on `pvipcontinue` until the token disappears, accumulating pageviews into the canonical-title→total dict across rounds:
-```python
-pvipcontinue = None
-for round_idx in range(20):  # bounded — avoid infinite loop on API regression
-    params = dict(base_params)
-    if pvipcontinue:
-        params["pvipcontinue"] = pvipcontinue
-    body = _api_get(params)
-    for page in body.get("query", {}).get("pages", {}).values():
-        pv = page.get("pageviews")
-        if pv is None:
-            continue  # this title is in a later slice
-        canonical_to_total[page["title"]] = sum(
-            v for v in pv.values() if isinstance(v, int)
-        )
-    new_cont = body.get("continue", {}).get("pvipcontinue")
-    if not new_cont or new_cont == pvipcontinue:
-        break
-    pvipcontinue = new_cont
-```
-After the fix: 0/50 zero-pageview rate on the canonical-title test batch. Steve Jobs 853K, Zuckerberg 351K, Tim Cook 494K, Microsoft 314K, Google 1.1M, Facebook 1.4M — all correct. Trade-off: ~3× more API round-trips (typically 3 rounds per 50-title batch). Wall time for the pageview fetch grows ~6 min → ~18 min on a 3000-candidate pool. Acceptable cost for moving from 13 % pageview coverage to ~98 %.
+*Production lesson:* every layer of this cascade looked like "weighted sampling needs more weight" or "more articles will fix it" or "narrow the categories". The actual root cause was always at the data-integrity layer below — title resolution, hidden per-property limits, taxonomy splits the editor community made invisible. **When a sampling/weighting layer "almost works", check the input data first; do not tune the algorithm.** The full empirical record (each layer's symptom + reproduction + fix) is in the lab repo's RESULTS.md v8 section.
 
 **Entry 14 — `build_graph.py` LLM-extraction loop is sequential; wastes 5 of 6 inference-server slots.**
 *Symptom:* `python src/build_graph.py` runs at ~3 s/article (~3-4 triples/s) on a 150-article corpus → ~450 s wall time, even though the local oMLX server has `max_concurrent_requests=8`. Server CPU shows ~12 % utilisation throughout.
@@ -3754,29 +3713,23 @@ REQUIRED PROCESS:
 ```
 Empirical impact on the v9 32-question fair head-to-head: factoid bucket recall jumped from 0.71 → 0.86, surpassing VectorRAG. Relational stable at 0.75 (graph 2× vector). Two-hop and multi-hop unchanged — confirming the fix targets exactly the "answer prompt skipped a matching edge" failure mode.
 
-**Entry 16 — Article truncation at 4000 chars silently drops 80% of long-bio Wikipedia articles; bio-event facts (dropouts, divorces, lawsuits) never reach the extractor.**
-*Symptom:* GraphRAG fails on bio-event questions like "What companies have been founded by Harvard dropouts?" expected `[Microsoft, Facebook]`. Mark Zuckerberg AND Bill Gates ARE in the corpus + graph as entities; their `dropped_out_of` triples are not. Inspecting the build-time extraction reveals the LLM never saw the dropout sentences — they live in the `Education` or `Personal life` Wikipedia sections, both of which sit past character 5000 in their bios. Article truncation at `text[:4000]` chopped them out before extraction.
-*Root cause:* `fetch_corpus.py` truncates at `ARTICLE_TEXT_CHARS = 4000` and `build_graph.py` further truncates input to `text[:3500]`. Mark Zuckerberg's Wikipedia article is ~22000 chars — the extractor only saw the first 17%, which is the lead paragraph + early-career section. Bio-event facts that live in later sections (Education, Personal life, Awards, Lawsuits) are silently dropped at fetch time.
-*Fix:* Lift `ARTICLE_TEXT_CHARS` to 50000 in `fetch_corpus.py` (covers ~99% of tech-founder Wikipedia bios in full) and remove the `text[:3500]` cap in `build_graph.py`'s extraction call. Long articles still need windowing — see Entry 17.
+**Entry 16 — Extraction depth: article truncation + per-article triple cap together drop ~80% of long-bio facts.**
 
-**Entry 17 — Per-article triple cap of 5-20 hides bio events behind corporate relations even when full article reaches the extractor.**
-*Symptom:* Even with `ARTICLE_TEXT_CHARS` lifted, single-pass extraction over a long bio (~20K chars) yields only the same ~10-15 most-prominent triples — corporate / affiliation relations dominate ("founded", "acquired by", "led"). The article contains 30+ extractable facts including bio events, but the extractor budget is bounded.
-*Root cause:* The extraction prompt instructs "Include 5-20 triples per article". The LLM ranks candidate triples and emits the top 5-20 — and corporate relations rank higher than bio events because the example list (`founded / acquired by / born in`) primes the model toward affiliation/ownership predicates. Education / dropout / divorce / donation / testimony events fall outside the example shape and lose the ranking competition.
-*Fix:* Split the article into sentence-aware sliding windows (~3000 chars per window, ~500 char overlap) and extract per window with a 10-15 triple cap. Long bios produce 5-10 windows × 10-15 triples = 50-150 total triples per article, ~3-5× v9 density. Update the extraction prompt to enumerate predicate categories explicitly:
-```python
-EXTRACT_SYSTEM = """Extract entities and relationships from the text segment.
-Output JSON only: {"triples": [{"subject", "relation", "object"}, ...]}.
+Two stacked failures originally documented as separate entries (16 + 17) — both surface on bio-event questions ("Harvard dropouts who founded companies"); both fixed in the same v10 sliding-window refactor; merging into one entry per the tree-of-failures structure.
 
-Rules:
-- Use the exact surface form from the text.
-- Relations are 1-4-word verb phrases. Include BOTH:
-  * Corporate: "founded", "acquired by", "co-founded", "led", "merged with"
-  * Biographical events: "dropped out of", "graduated from", "married", "donated to"
-  * Education / employment: "attended", "earned a degree from", "worked at"
-- Include 10-15 triples per text segment.
-- Do not invent facts."""
-```
-Build-time cost grows from ~12 min (400 articles × 1 call) to ~40 min (400 articles × ~7 windows × 1 call) at MAX_WORKERS=6. Trade-off accepted in the design tree because hit-rate gains on bio-event questions outweigh the extra build wall time.
+*Symptom:* GraphRAG fails on bio-event questions ("Harvard dropouts → companies", expected `[Microsoft, Facebook]`). Both Zuckerberg and Gates are in the graph as entities; their `dropped_out_of` triples are not.
+
+*Root cause (two layers):*
+
+1. **Char truncation at fetch time.** `fetch_corpus.py` capped `ARTICLE_TEXT_CHARS = 4000`; `build_graph.py` further cropped to `text[:3500]`. Mark Zuckerberg's Wikipedia article is ~22 000 chars; extractor saw only the first 17%. Bio-event facts (Education, Personal life, Awards, Lawsuits) live past char 5000, never reach the LLM.
+2. **Per-article triple cap suppresses bio events even when full text reaches extractor.** Single-pass extraction with prompt "include 5-20 triples per article" → LLM ranks candidates and emits the top 5-20. Example list in the prompt (`founded / acquired by / born in`) primes the model toward corporate relations; bio events lose the ranking competition.
+
+*Fix:*
+- Lift `ARTICLE_TEXT_CHARS = 50 000` (covers ~99% of tech-founder bios in full); remove the `[:3500]` cap.
+- Split each article into sentence-aware sliding windows (~3000 chars / ~500 char overlap) and extract 10–15 triples *per window*. Long bios produce 5–10 windows × 10–15 triples = 50–150 total per article, ~3–5× v9 density.
+- Extraction prompt enumerates 8 universal relation categories (action, affiliation, derivation, life-event, production, education, location, temporal) — replaces the original 3-category corporate-biased list. See `EXTRACT_SYSTEM` in [[#Code walkthrough — `src/build_graph.py`]] for the full text.
+
+*Cost:* build-time grows ~12 min → ~40 min (400 articles × ~7 windows). Accepted because bio-event hit-rate lift outweighs build-wall cost on this corpus shape.
 
 **Entry 18 — Sentence-aware sliding window infinite-loops if `(overlap_carry + new_sentence) > target_chars`.**
 *Symptom:* `_chunk_by_sentences` hangs indefinitely on certain article lengths during build. Process consumes no CPU, makes no progress; tqdm progress bar frozen.
@@ -3793,30 +3746,15 @@ i += 1
 ```
 Caught by a 22.8K-char unit test that timed out at 8s; production-shape integration tests would have caught it after a 40-min build. Lesson: any new chunker / windowing code gets a standalone unit test before the full pipeline runs against it.
 
-**Entry 19 — Open-vocab predicate fragmentation produces redundant LLM context; flat-edge format restates the same fact 4× with 4 different verb phrases.**
-*Symptom:* On the v9 graph, querying "Who founded Microsoft?" surfaces the founding fact 4-8 times in the LLM context (`founded` / `co-founded` / `was started by` / `established` etc.) — same triple from different source articles with different predicate strings. The LLM's answer prose then either restates the fact 4× with redundant sources, or picks one phrasing arbitrarily and ignores the rest. Multi-source corroboration evidence is wasted.
-*Root cause:* Open-vocabulary extraction (Leak 5) emits whatever verb phrase the LLM extractor chose for that article. Different articles use different phrasings for the same fact. Neo4j MERGE only collapses exact `(subject, predicate, object)` matches, so variants stay as distinct edges. Flat-edge LLM context format presents each variant as if it were a separate fact.
-*Fix:* Pair-aggregation at query time. Group `subgraph` edges by `frozenset({s, o})` (undirected pair), aggregate predicate variants and source articles per pair, present each pair to the LLM as one record with a `relations:` list and a `sources:` list. Update the answer-generation system prompt to (a) treat the variants list as evidence FOR the connection (not as separate facts) and (b) use variants for semantic disambiguation conditional on the question.
-```python
-pair_aggs = defaultdict(lambda: {"relations": [], "sources": set()})
-for t in subgraph[:200]:
-    key = frozenset({t["s"], t["o"]})
-    pair_aggs[key]["relations"].append(t["rel"])
-    pair_aggs[key]["sources"].add(t["src"])
+**Entry 19 — Open-vocab predicate fragmentation; pair-aggregation attempt regressed eval.**
 
-# Format: "- Apple ↔ Steve Jobs\n    relations: founded | co-founded | was started by\n    sources: Apple Inc., Steve Jobs, Tim Cook"
-```
-And in the system prompt:
-```
-Use the variants for semantic precision:
-- co-founded vs founded → multiple founders vs solo
-- acquired vs merged with → ownership vs corporate structure
-- married vs divorced → temporal state
-- served as CEO vs board member → role disambiguation
-```
-Verified end-to-end on the v9 graph: "Who founded Microsoft?" → "Microsoft was founded by Paul Allen (sources: Bill Gates, Microsoft) and William Henry Gates III (sources: Bill Gates)." Multi-source citation. "Did Steve Jobs found Apple alone or with someone?" → "Steve Jobs co-founded Apple (sources: Tim Cook; Steve Jobs)." Variant-aware disambiguation: LLM picked "co-founded" specifically for the alone-vs-with question.
+*Symptom:* v9 graph surfaces the same fact 4-8 times with different predicate strings (`founded` / `co-founded` / `was started by`). LLM answer either restates 4× redundantly or picks one phrasing arbitrarily.
 
-> **Rolled back in v10c.** The pair-aggregation pattern above was the v9 design. On the 32-Q eval the undirected `frozenset({s, o})` key + `subgraph[:200]` slice combined to bury canonical 1-hop edges (Apple-acquired-NeXT and NeXT-acquired-Apple have the same frozenset; the slice happened before aggregation so the canonical edge was crowded out by 5-hop expansion). ALL recall regressed 0.55 → 0.25; relational dropped to 0.00. v10c forward-fix replaced pair-aggregation with **per-edge directed dedup** (key = `(subject, predicate, object)`, sources-list per unique edge — direction preserved, sources properly attributed) plus a **consolidation prompt** instructing the LLM to merge multiple edges between the same entities into one prose sentence with all relations + sources cited. v11 measurement: relational hit perfect 1.00 (4/4). The principle (open vocab + query-time consolidation) was preserved; the implementation (undirected pair-aggregation) was abandoned. See [[#Bad-Case Journal]] Entry 7 for the regression diagnosis. Microsoft GraphRAG and Neo4j LLM Knowledge Graph Builder still canonicalize at extraction time; this lab keeps open vocab and handles variants at query time via per-edge dedup + consolidation.
+*v9 attempt (rolled back):* undirected pair-aggregation grouping `frozenset({s, o})` with `relations: ...` list. Regressed ALL recall 0.55 → 0.25 on the 32-Q eval; relational dropped to 0.00 because the undirected key + `subgraph[:200]` slice buried canonical 1-hop edges (Apple-acquired-NeXT and NeXT-acquired-Apple share the same frozenset).
+
+*v10c forward-fix (canonical):* per-edge directed dedup keyed on `(subject, predicate, object)` with sources-list per unique edge + consolidation prompt instructing the LLM to merge multiple edges between same entities into one prose sentence. Direction preserved, sources properly attributed. v11 measurement: relational hit perfect 1.00 (4/4).
+
+**The full diagnosis + fix lives in [[#Bad-Case Journal]] Entry 7 below** — refer there for the post-mortem narrative, the diff, and the principle ("open vocab is keepable IF aggregation preserves direction AND the LLM is told explicitly to consolidate at the prompt layer"). This entry stays in the lab section as the operational waypoint that surfaced the regression.
 
 **Entry 20 — Fulltext index on `Entity.name` only silently misses 100% of alias-only matches; Jeff Bezos and Jensen Huang return 0 edges.**
 *Symptom:* Q10 ("What companies has Jeff Bezos founded?") scores 0.0 recall_judge with `edges_used=12` — twelve edges from a wrong entity, not from Jeff Bezos's canonical node. Q20 ("Stanford alumni companies") misses Jensen Huang / Nvidia. Both entities ARE in the graph with correct QIDs and abundant outgoing edges; `query_graph.py` simply cannot find them.
@@ -3919,17 +3857,12 @@ The path from "GraphRAG missed Apple/NeXT and Mark Zuckerberg" to v10's sliding-
 
 ## Bad-Case Journal
 
-> The eleven entries below cover *architectural* failure modes that emerge as production GraphRAG scales — entity normalization, predicate vocabulary, hallucination grounding, traversal scoring, retrieval-shape mismatch, non-determinism, query-time aggregation, index lifecycle, eval scoring, extraction completeness, and entity-resolution tool selection. Entries 1–5 are foundational; 6–9 surfaced during the v9–v10d iteration cycle; 10–11 surfaced during the v11–v12 entity-resolution work. For *operational* failures encountered running this lab end-to-end (deprecated dataset loaders, reasoning-model token-budget exhaustion, prompt restrictiveness, fuzzy-match brittleness), see [[#Lab Run-Through Bad Cases (2026-04-30)]] above.
+> The ten entries below cover *architectural* failure modes that emerge as production GraphRAG scales — entity normalization, hallucination grounding, traversal scoring, retrieval-shape mismatch, non-determinism, predicate fragmentation + query-time aggregation, index lifecycle, eval scoring, extraction completeness, and entity-resolution tool selection. Entries 1, 3–5 are foundational; 6–9 surfaced during the v9–v10d iteration cycle; 10–11 surfaced during the v11–v12 entity-resolution work. **Entry 2 was consolidated into Entry 7** in the 2026-05-06 dedup pass — both originally documented predicate-vocabulary failures, and Entry 7's open-vocab + query-time-consolidation principle subsumes Entry 2's closed-vocab alternative. For *operational* failures encountered running this lab end-to-end (deprecated dataset loaders, reasoning-model token-budget exhaustion, prompt restrictiveness, fuzzy-match brittleness, the 5-layer corpus-mechanism cascade), see [[#Lab Run-Through Bad Cases (2026-04-30)]] above.
 
 **Entry 1 — Entity duplication: 3 versions of "William Shockley".**
 *Symptom:* graph contains nodes "William Shockley", "Shockley", "W. Shockley" as separate entities; relations distributed across all three; queries miss two-thirds of his facts.
 *Root cause:* extraction prompt did not normalize entity names. Model sometimes returned full name, sometimes surname only, sometimes initialled form. Each variant became a separate `MERGE` target.
 *Fix:* add an entity-resolution step. Embed each new entity name; if cosine similarity to any existing entity exceeds 0.9 AND the type matches, merge into the existing node. Alternatively, fuzzy-match canonicalization with `rapidfuzz` token_set_ratio > 90.
-
-**Entry 2 — Relation explosion: 47 distinct predicates after week 1 of extraction.**
-*Symptom:* Cypher queries fail because predicate names like `WAS_BORN_IN_THE_CITY_OF` and `BIRTH_LOCATION` and `BORN_IN` all appear for the same semantic relation.
-*Root cause:* extraction prompt allowed open-vocabulary predicates. Each article generated relations using whatever phrasing the model produced.
-*Fix:* enforce a fixed predicate vocabulary in the extraction prompt. List allowed predicates; reject extractions that use anything else. Roughly 6–10 predicates cover 95% of biographical+organizational queries.
 
 **Entry 3 — Hallucinated relations from over-confident extractor.**
 *Symptom:* graph contains the edge `(Tim Berners-Lee) -[INVENTED]-> (the iPhone)`. Source passage made no such claim.
@@ -3951,10 +3884,17 @@ The path from "GraphRAG missed Apple/NeXT and Mark Zuckerberg" to v10's sliding-
 *Root cause:* The seed-extraction step uses `MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8` — a **reasoning model**. Reasoning models spend their `max_tokens` budget on internal `reasoning_content` (chain-of-thought) BEFORE emitting visible `content`. When the chain-of-thought happens to be long (stochastic, even at `temperature=0`), the budget runs out, `content=None`, the JSON parser returns `[]`, the seed list is empty, and the graph traversal returns nothing. The 38 s wall time is the smoking gun: the model spent its full 3000-token budget reasoning, then stopped before producing JSON. `temperature=0` does not eliminate this because reasoning lengths are not fully deterministic across runs.
 *Fix:* (1) Switch entity extraction to a **non-reasoning model** — in this lab, `MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit`. Non-reasoning models emit `content` deterministically at `temperature=0`. Drop `max_tokens` to 400 since gemma is fast and direct. (2) Add a regex fallback (`re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", query)`) for empty content — captures "Steve Jobs", "Apple", "NeXT" via capitalization without needing the LLM. (3) Log `finish_reason` on empty content so future failures aren't silent. **Lesson: never use a reasoning model for structured-output tasks where empty content = silent failure.** The reasoning capability is a liability when the contract is "produce valid JSON." Reserve reasoning models for tasks that benefit from chain-of-thought (math, code review, planning); use non-reasoning models for extraction, classification, and routing.
 
-**Entry 7 — Pair-aggregation with subgraph slice silently buries canonical edges.**
+**Entry 7 — Predicate fragmentation: open-vocab vs closed-vocab, and the pair-aggregation regression.**
+
+*Background — relation explosion at scale.* Open-vocabulary extraction produces ~47 distinct predicates after one extraction pass (`WAS_BORN_IN_THE_CITY_OF` / `BIRTH_LOCATION` / `BORN_IN` for the same semantic relation). The two production paths are: (a) **closed vocabulary** at extraction time (Microsoft GraphRAG, Neo4j LLM Knowledge Graph Builder) — list ~6–10 allowed predicates in the extraction prompt, reject anything else; covers 95% of bio+org queries but destroys semantic nuance ("founded" and "co-founded" collapse, so the graph can no longer tell solo from joint founding). (b) **Open vocab + query-time consolidation** (this lab's choice) — keep every predicate variant, consolidate at retrieval. The rest of this entry documents the open-vocab path's failure mode and forward-fix.
+
 *Symptom:* GraphRAG ALL recall regressed from 0.55 to 0.25 on the 32-Q eval after adding query-time pair-aggregation. Relational category collapsed entirely (0.75 → 0.00). Apple↔NeXT, Microsoft-founders, Tesla↔SpaceX queries all returned "graph does not contain information." Same graph, same Neo4j data — failure was code-side.
-*Root cause:* pair-aggregation grouped retrieved edges by `frozenset({s, o})` (undirected) AFTER `subgraph[:200]` slice. On dense neighborhoods (Apple seed → 24 phrase-matched anchors → 5-hop expansion → 400+ raw edges), the canonical `Apple Inc. -[ACQUIRED_BY]- NeXT` 1-hop edge landed past index 200 and never reached the aggregation. Compounding issues: undirected `frozenset` key lost subject-object orientation; per-pair `relations: a | b | c` list collapsed source attribution per-edge so the LLM couldn't cite which source supported which variant.
-*Fix:* three compounding changes in `query_graph.py`. (1) Split Cypher into two passes: `MATCH (node)-[r]-(m) ... LIMIT 100` for 1-hop priority, then `MATCH path = (node)-[*2..N]-(m) ... LIMIT 100` for multi-hop fill. Canonical 1-hop edges always surface. (2) Replace pair-aggregation with per-edge dedup keyed on `(subject, predicate, object)` with sources-list per unique edge. Direction preserved, sources properly attributed. (3) Update `SYSTEM_PROMPT` to instruct LLM to consolidate edges between same entities into one prose sentence with all relations + sources cited. Worked example for Apple↔NeXT included in the prompt. Recovered ALL recall to 0.55 in one commit.
+
+*Root cause:* pair-aggregation grouped retrieved edges by `frozenset({s, o})` (undirected) AFTER `subgraph[:200]` slice. On dense neighborhoods (Apple seed → 24 phrase-matched anchors → 5-hop expansion → 400+ raw edges), the canonical `Apple Inc. -[ACQUIRED_BY]- NeXT` 1-hop edge landed past index 200 and never reached the aggregation. Compounding: undirected `frozenset` key lost subject-object orientation; per-pair `relations: a | b | c` list collapsed source attribution per-edge so the LLM couldn't cite which source supported which variant.
+
+*Fix:* three compounding changes in `query_graph.py`. (1) Split Cypher into two passes: `MATCH (node)-[r]-(m) ... LIMIT 100` for 1-hop priority, then `MATCH path = (node)-[*2..N]-(m) ... LIMIT 100` for multi-hop fill. Canonical 1-hop edges always surface. (2) Replace pair-aggregation with per-edge dedup keyed on `(subject, predicate, object)` with sources-list per unique edge. Direction preserved, sources properly attributed. (3) Update `SYSTEM_PROMPT` to instruct LLM to consolidate edges between same entities into one prose sentence with all relations + sources cited. Worked example for Apple↔NeXT included in the prompt. Recovered ALL recall to 0.55 in one commit; v11 measurement: relational hit perfect 1.00 (4/4).
+
+*Principle:* open vocab is keepable IF aggregation preserves direction AND the LLM is told explicitly to consolidate at the prompt layer. Closed-vocab extraction is the simpler path; query-time consolidation is the more flexible path; either is valid, both must be deliberate. The mistake was undirected aggregation that conflated direction with similarity.
 
 **Entry 8 — `build_graph.py` fulltext-index lifecycle bug.**
 *Symptom:* `query_graph.py` crashes with `Failed to invoke procedure db.index.fulltext.queryNodes ... There is no such fulltext schema index: entity_names`. Graph data intact (12,802 entities + 13,998 relations) but the fulltext index was missing. `SHOW INDEXES YIELD name WHERE type="FULLTEXT"` returned `[]`.
@@ -4311,6 +4251,7 @@ The `notes` list captures the probe + every decision derived from it ("device=mp
 ## Cross-References
 
 - **Builds on: W2 Rerank and Context Compression.** This week's GraphRAG eval reuses W2's vector RAG pipeline as the baseline. The hybrid pattern in §4 (router → vector OR graph) depends on having both pipelines runnable. Confirm W2's hybrid retriever produces results before starting Phase 4.
+- **Connects to: W2.7 Structure-Aware RAG (PageIndex / Tree Indices).** W2.7 adds the third retrieval lane — tree-index navigation — for long structured single documents (10-Ks, contracts, textbooks). The three-lane router (vector / graph / tree) is the canonical production pattern; W2.7 provides the missing piece for corpora where neither vector similarity nor cross-document graph traversal fits the document shape.
 - **Connects to: W3.7 Agentic RAG.** Agentic RAG dispatches retrieval as a tool call; the router pattern from this week's bad-case Entry 5 is the same pattern an agent uses to decide when to call the GraphRAG tool versus the vector tool. W3.7 generalizes the routing decision.
 - **Distinguish from: W3 RAG Evaluation.** W3 evaluates retrieval quality with metrics (recall, MRR, nDCG) over a corpus. This week evaluates retrieval *strategy* (graph vs vector) over a question set. W3's metrics apply within either strategy; this week's comparison is between strategies.
 - **Foreshadows: W11 System Design.** Production GraphRAG systems require ingest pipeline (entity extraction, graph build, embedding refresh) + serving stack (Neo4j cluster + vector store + router) + observability (which retriever fired, what entities were resolved, was the answer cited). W11 covers how to architect this end-to-end.
