@@ -247,12 +247,29 @@ If `file` prints `HTML document` instead of `PDF document`, the URL changed — 
 ### 1.3 Environment
 
 ```bash
-# .env
+# .env — minimum for tree-index (Phase 2 + 3)
 OMLX_BASE_URL=http://localhost:8001/v1   # your local Gemma-4-26B server
 OMLX_API_KEY=local-no-auth
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gemma-4-26B-A4B-it-heretic-4bit  # use same model for navigation; reasoning models burn max_tokens
 ```
+
+**For Phase 4 three-way comparison only**, also need Neo4j vars (the graph backend reuses W2.5's Neo4j instance via `:BrkEntity` label namespacing). Easiest: pull from W2.5's `.env` if it exists:
+
+```bash
+grep '^NEO4J_' ../lab-02-5-graphrag/.env >> .env
+```
+
+Or set manually:
+
+```bash
+# Append to .env
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<your-pwd>
+```
+
+If you skip Phase 4 (tree-only lab path), Neo4j vars are not needed.
 
 ---
 
@@ -804,6 +821,10 @@ def vector_answer(q, k=5):
 cd ~/code/agent-prep/lab-02-7-pageindex
 source .venv/bin/activate
 uv pip install -e .                  # picks up qdrant-client + sentence-transformers + neo4j
+
+# 0. Phase-4-only env vars: copy Neo4j config from W2.5 (or set manually per §1.3)
+grep '^NEO4J_' ../lab-02-5-graphrag/.env >> .env
+cat .env | grep NEO4J                # verify NEO4J_URI / USER / PASSWORD all present
 
 # 1. Build the tree (already done if you ran §2-§3)
 python src/build_tree.py             # ~2 min — writes data/tree.json
