@@ -1365,7 +1365,57 @@ If "Root Spans" toggle still shows ~150 rows of `ChatCompletion`, the parent-spa
 
 ### 5.2 Screenshot one trace per pipeline
 
-Grab 3 screenshots (baseline, HyDE, multi-query) and save under `results/traces/`. **These go in your portfolio repo's README** — visual evidence beats any line of text about "production-grade observability."
+Grab 3 screenshots (baseline, HyDE, multi-query) and save under `results/trace/`. **These go in your portfolio repo's README** — visual evidence beats any line of text about "production-grade observability."
+
+#### 5.2.1 Phoenix UI — root spans grouped by variant (2026-05-07)
+
+After running `python src/05_trace.py`, the Phoenix UI's "Root Spans" tab shows the 30 variant-tagged parents (10 questions × 3 pipelines) named `pipeline.baseline` / `pipeline.hyde` / `pipeline.mq`:
+
+![3-variant root spans in Phoenix](code/agent-prep/lab-03-rag-eval/results/trace/3-traces.png)
+
+Without the `_tracer.start_as_current_span(f"pipeline.{label}")` wrapper, this view would show ~150 indistinguishable `ChatCompletion` rows with no way to tell which variant produced which span. The wrapper + variant-tagged attributes are what make Phoenix navigation tractable for multi-pipeline comparison work.
+
+#### 5.2.2 Per-variant single-trace screenshots
+
+One trace per variant — click a row in the Spans table to expand its waterfall:
+
+**Baseline pipeline** (`pipeline.baseline` filter, ~1-2s typical):
+
+![baseline trace waterfall](code/agent-prep/lab-03-rag-eval/results/trace/baseline.png)
+
+Single LLM call (the answer synthesis). No rewrite step. The retrieve + rerank stages execute but emit no spans (uninstrumented `SentenceTransformer.encode` + `qd.query_points` + `CrossEncoderReranker._model.predict` — they don't go through the OpenAI SDK that `OpenAIInstrumentor` hooks). Wall time = answer LLM call + invisible retrieval+rerank.
+
+**HyDE pipeline** (`pipeline.hyde` filter, ~3-7s typical):
+
+![HyDE trace waterfall](code/agent-prep/lab-03-rag-eval/results/trace/hyde.png)
+
+Two sequential LLM calls visible: (1) HyDE rewrite — generates the hypothetical-answer sentence used for retrieval; (2) answer synthesis — same shape as baseline. The "rewrite" step is the architectural difference vs baseline; everything after retrieval is identical. The +1 LLM call cost (~100 ms, ~30 tokens for the one-sentence variant) is the cost contributing to HyDE's higher latency.
+
+**Multi-query pipeline** (`pipeline.mq` filter, ~5-9s typical):
+
+![multi-query trace waterfall](code/agent-prep/lab-03-rag-eval/results/trace/mq.png)
+
+Two LLM calls visible — but the gap between them is bigger than HyDE's. (1) Rewrite — generates 3 alternate query phrasings as a JSON array; (2) answer — same as baseline. The 4 invisible Qdrant searches happen in the gap (one per query: original + 3 rewrites), each doing its own `SentenceTransformer.encode` + `qd.query_points`. Add a manual `with _tracer.start_as_current_span("retrieve"):` wrapper around the loop body in `04_multiquery.py::run_pipeline_mq` if you want those 4 retrieval calls visible in the trace.
+
+#### 5.2.3 Waterfall detail screenshots
+
+Click a single trace row to open the timeline detail page — shows parent + child spans as horizontal bars on a time axis, with span attributes panel + per-call input/output JSON:
+
+![waterfall detail — single variant](code/agent-prep/lab-03-rag-eval/results/trace/waterfall-1.png)
+
+The horizontal bars are the actual time bands each call took. Bars stacked vertically share the same time axis. Total trace duration = the bottom bar's right edge minus the top bar's left edge.
+
+![waterfall detail — second variant](code/agent-prep/lab-03-rag-eval/results/trace/waterfall-2.png)
+
+`★ Insight ─────────────────────────────────────`
+- **What you can see in the waterfall vs what's invisible.** Phoenix shows everything that goes through `OpenAIInstrumentor`'s patched `chat.completions.create` call — that's the LLM-side cost. The retrieve / rerank steps execute but stay invisible because `SentenceTransformer` (BGE-M3 encoder) and `CrossEncoder` (BGE-reranker) bypass the OpenAI SDK entirely. To see them, add manual `with _tracer.start_as_current_span("retrieve"):` and `start_as_current_span("rerank")` wrappers in `02_pipeline.py`. Out of W3 scope; standard production-observability extension.
+- **The "gap" between visible spans IS the diagnostic.** When wall time = 8s but LLM spans only show 3s of activity, the missing 5s is uninstrumented work (Qdrant queries, encoder forward passes, reranker scoring). Multi-query's larger gap vs HyDE's gap is the cost asymmetry showing through — multi-query runs 4× retrieval, HyDE runs 1×.
+- **Side-by-side comparison of one query across all 3 variants** (use `attributes["question_index"] == N` filter) — combined view of all three pipelines' traces for the same input. Best single screenshot for portfolio because it shows the architecture difference in one frame:
+
+![3-variant side-by-side waterfall comparison](code/agent-prep/lab-03-rag-eval/results/trace/waterfall-1-3.png)
+
+Three traces vertically stacked. Variant difference visible at a glance: baseline narrow (1 LLM call), HyDE wider (2 sequential calls), multi-query widest (rewrite + 4-way retrieval gap + answer).
+`─────────────────────────────────────────────────`
 
 ---
 
@@ -1489,9 +1539,11 @@ The harder dev set lowered answer relevancy while leaving context recall + preci
 
 ## Phoenix traces
 
-![baseline trace](results/traces/baseline.png)
-![hyde trace](results/traces/hyde.png)
-![multiquery trace](results/traces/mq.png)
+![baseline trace](results/trace/baseline.png)
+![hyde trace](results/trace/hyde.png)
+![multiquery trace](results/trace/mq.png)
+![3-variant root spans](results/trace/3-traces.png)
+![3-variant side-by-side waterfall](results/trace/waterfall-1-3.png)
 
 ## What I learned
 
