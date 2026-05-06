@@ -219,23 +219,26 @@ ls -la pyproject.toml src/__init__.py
 - **PageIndex commercial package optional.** The lab below builds the tree from scratch (more pedagogical). To use the polished PageIndex API instead: `uv pip install pageindex` and replace the `build_tree` + `add_summaries_recursive` calls with `pageindex.build_tree(pdf_path)`. Trade-off: less learning, better OCR + tree quality on scanned PDFs.
 `─────────────────────────────────────────────────`
 
-### 1.2 Pull a 10-K filing
+### 1.2 Pull a long structured PDF
 
-**Use the company's investor-relations PDF, NOT the SEC EDGAR `.htm` file.** SEC EDGAR is HTML-first (iXBRL filing format); their `.htm` files are not PDFs even if you save them with a `.pdf` extension. `pypdf` will crash with `PdfStreamError: Stream has ended unexpectedly` because the file's first bytes are `<!DOCTYPE` instead of `%PDF-`. Apple posts the actual PDF on their IR site:
+**Use Berkshire Hathaway's 2023 Annual Report.** It's the known-stable choice — their IR URL has been the same for 5+ years (Buffett's letter as fixed institution). ~140 pages, real PDF, large structured TOC + sections (Buffett's letter, business segments, financials, governance) — perfect input shape for tree-index RAG.
 
 ```bash
 mkdir -p data
-curl -L --user-agent "Mozilla/5.0" -o data/aapl-10k-2023.pdf \
-  "https://s2.q4cdn.com/470004039/files/doc_financials/2023/q4/_10-K-2023-(As-Filed).pdf"
-file data/aapl-10k-2023.pdf          # verify: should print "PDF document, version X.Y"
+curl -L -o data/brk-2023-ar.pdf "https://www.berkshirehathaway.com/2023ar/2023ar.pdf"
+file data/brk-2023-ar.pdf            # verify: should print "PDF document, version X.Y"
 ```
 
-If `file` prints `HTML document` instead of `PDF document`, you downloaded an EDGAR HTML by mistake — re-curl the IR-site URL above (`--user-agent` flag is mandatory; IR CDNs block default curl UA).
+If `file` prints `HTML document` instead of `PDF document`, the URL changed — re-find via `https://www.berkshirehathaway.com/` → "Annual Report".
 
-Other large 10-Ks that work equivalently (all hosted on the company's IR site as actual PDFs):
-- Microsoft: `https://microsoft.gcs-web.com/static-files/<id>.pdf` (find current via investor.microsoft.com → SEC Filings)
-- NVIDIA: `https://s201.q4cdn.com/141608511/files/doc_financials/2024/ar/NVIDIA-2024-Annual-Report.pdf`
-- Tesla: `https://www.sec.gov/Archives/edgar/data/1318605/000095017024005601/tsla-2023.pdf` (rare case where Tesla DID submit a PDF)
+**Why not SEC EDGAR?** SEC filings are HTML-first (iXBRL filing format); EDGAR `.htm` files are not PDFs even if you save them with a `.pdf` extension. `pypdf` crashes with `PdfStreamError: Stream has ended unexpectedly` because the file's first bytes are `<!DOCTYPE` instead of `%PDF-`. Some companies (Tesla, Apple older filings) submit PDFs to EDGAR alongside the HTML, but Apple's recent 10-Ks are HTML-only. Berkshire posts a true PDF on their own site — works without surprises.
+
+**Other reliable PDF sources** if you want to try a different document later:
+- NVIDIA annual report (q4cdn.com hosted, year-specific URLs — find current via investor.nvidia.com)
+- Microsoft annual report (microsoft.gcs-web.com)
+- Federal Reserve Annual Report (federalreserve.gov, very stable URLs)
+- IMF World Economic Outlook (imf.org, stable across years)
+- Any government / NGO publication PDF — generally more URL-stable than corporate IR sites
 
 5-second sanity test before running build_tree.py: `head -c 5 data/<name>.pdf` should print `%PDF-` (the binary PDF header). If it prints `<!DOC` or any HTML/XML opening, the file is wrong format.
 
@@ -457,7 +460,11 @@ def tree_depth(node: dict) -> int:
 
 
 def main() -> None:
-    pdf_path = "data/aapl-10k-2023.pdf"
+    # Berkshire Hathaway 2023 Annual Report — known-stable PDF URL
+    # (https://www.berkshirehathaway.com/2023ar/2023ar.pdf). SEC EDGAR
+    # serves only iXBRL HTML; company IR sites are the reliable PDF source
+    # but URLs rotate. Berkshire's URL has been stable for 5+ years.
+    pdf_path = "data/brk-2023-ar.pdf"
     out_path = Path("data/tree.json")
 
     if not Path(pdf_path).exists():
@@ -474,7 +481,7 @@ def main() -> None:
     print(f"      {len(headings)} heading candidates (over-recall expected).")
 
     print("[3/3] Building tree (LLM call, ~10-25 s) ...")
-    tree = build_tree(headings, "Apple Inc. 10-K Fiscal 2023", last_page=len(pages))
+    tree = build_tree(headings, "Berkshire Hathaway 2023 Annual Report", last_page=len(pages))
 
     print(f"      Tree skeleton: {count_nodes(tree)} nodes, depth={tree_depth(tree)}.")
 
@@ -494,11 +501,11 @@ Run it once after §1.2 has downloaded the PDF:
 
 ```bash
 python src/build_tree.py
-# [1/3] Parsing data/aapl-10k-2023.pdf ...
+# [1/3] Parsing data/brk-2023-ar.pdf ...
 # [2/3] Detecting heading candidates ...
 # [3/3] Building tree (LLM call, ~10-25 s) ...
-# [4/4] Generating per-node summaries (32 LLM calls) ...
-# Wrote data/tree.json — 32 nodes, depth 4.
+# [4/4] Generating per-node summaries (~25 LLM calls) ...
+# Wrote data/tree.json — N nodes, depth D.
 ```
 
 **Expected metrics on M5 Pro / Gemma-4-26B:**
@@ -578,7 +585,7 @@ below. Cite the node_id and page range. If the content does not support an
 answer, say so explicitly — do not fabricate."""
 
 def answer(query: str, tree_path: str = "data/tree.json",
-           pdf_path: str = "data/aapl-10k-2023.pdf") -> dict:
+           pdf_path: str = "data/brk-2023-ar.pdf") -> dict:
     tree = json.loads(Path(tree_path).read_text())
     leaf, traversal = navigate(query, tree)
 
@@ -611,7 +618,7 @@ def answer(query: str, tree_path: str = "data/tree.json",
 
 if __name__ == "__main__":
     import sys
-    q = " ".join(sys.argv[1:]) or "What were the cybersecurity risks disclosed in fiscal 2023?"
+    q = " ".join(sys.argv[1:]) or "What did Buffett write about acquisition criteria in 2023?"
     out = answer(q)
     print(json.dumps(out, indent=2, default=str))
 ```
@@ -620,14 +627,14 @@ if __name__ == "__main__":
 
 ```bash
 # Direct invocation
-python src/query_tree.py "What were the cybersecurity risks disclosed in fiscal 2023?"
+python src/query_tree.py "What did Buffett write about acquisition criteria in 2023?"
 
 # Or via importable path
 python -c "from src.query_tree import answer; \
-import json; print(json.dumps(answer('What were the cybersecurity risks disclosed in fiscal 2023?'), indent=2, default=str))"
+import json; print(json.dumps(answer('What did Buffett write about acquisition criteria in 2023?'), indent=2, default=str))"
 ```
 
-You should see a populated `traversal_path` (e.g. root → Item 1A Risk Factors → Cybersecurity Risks), a non-empty `answer`, and a `depth` between 2 and 5. If `depth == 1`, the navigation LLM rejected every child at root — check that summaries in `tree.json` are populated and informative.
+You should see a populated `traversal_path` (e.g. root → Buffett's Letter → Acquisition Criteria, or root → Owner's Manual → Acquisition Section), a non-empty `answer`, and a `depth` between 2 and 5. If `depth == 1`, the navigation LLM rejected every child at root — check that summaries in `tree.json` are populated and informative.
 
 **Expected metrics:**
 
@@ -648,10 +655,10 @@ Save as `data/eval.json` — 20 questions over the 10-K filing, stratified by qu
 
 | Category | N | Example |
 |---|---|---|
-| Section-specific factoid | 6 | "What was Apple's total net sales in fiscal 2023?" |
-| Cross-section synthesis | 6 | "How does Apple's risk disclosure compare to its R&D spending discussion?" |
-| Citation-required | 4 | "Which section discusses supply chain concentration?" |
-| Out-of-document | 4 | "What is Apple's stock price today?" (refusal expected) |
+| Section-specific factoid | 6 | "What was Berkshire's net earnings attributable to shareholders in 2023?" |
+| Cross-section synthesis | 6 | "How does Buffett describe the relationship between insurance float and the acquisition strategy?" |
+| Citation-required | 4 | "Which section discusses Berkshire's acquisition criteria?" |
+| Out-of-document | 4 | "What is Berkshire's stock price today?" (refusal expected) |
 
 Starter set — 8 questions across 4 categories (expand to 20 after first run shows where the categories discriminate):
 
@@ -659,37 +666,37 @@ Starter set — 8 questions across 4 categories (expand to 20 after first run sh
 [
   {
     "type": "section-specific factoid",
-    "q": "What was Apple's total net sales in fiscal 2023?",
-    "expected_entities": ["383", "billion", "net sales"]
+    "q": "What was Berkshire's net earnings attributable to shareholders in 2023?",
+    "expected_entities": ["96", "billion", "net earnings"]
   },
   {
     "type": "section-specific factoid",
-    "q": "How many full-time equivalent employees did Apple have at the end of fiscal 2023?",
-    "expected_entities": ["161,000", "full-time"]
+    "q": "How much did Berkshire spend on share repurchases in 2023?",
+    "expected_entities": ["billion", "repurchase", "treasury"]
   },
   {
     "type": "cross-section synthesis",
-    "q": "What cybersecurity risks did Apple disclose, and how does the company describe its mitigation approach?",
-    "expected_entities": ["cybersecurity", "risk", "incident", "mitigation"]
+    "q": "How does Buffett describe the relationship between insurance float and the acquisition strategy in the 2023 letter?",
+    "expected_entities": ["float", "insurance", "acquisition"]
   },
   {
     "type": "cross-section synthesis",
-    "q": "How does Apple's R&D investment relate to its disclosed product innovation strategy?",
-    "expected_entities": ["research and development", "innovation", "spending"]
+    "q": "What did Buffett write about Berkshire Hathaway Energy's 2023 wildfire-related liabilities?",
+    "expected_entities": ["BHE", "wildfire", "PacifiCorp"]
   },
   {
     "type": "citation-required",
-    "q": "Which section of the 10-K discusses supply chain concentration risks?",
-    "expected_entities": ["Item 1A", "Risk Factors", "supply chain"]
+    "q": "Which section of the annual report lists Berkshire's six core acquisition criteria?",
+    "expected_entities": ["Acquisition Criteria", "criteria"]
   },
   {
     "type": "citation-required",
-    "q": "Where in the 10-K does Apple disclose information about cybersecurity governance?",
-    "expected_entities": ["Item 1C", "Cybersecurity"]
+    "q": "Where does the 2023 annual report cover BNSF railway operating results?",
+    "expected_entities": ["BNSF", "railroad", "operating"]
   },
   {
     "type": "out-of-document",
-    "q": "What is Apple's stock price today?",
+    "q": "What is Berkshire Hathaway's stock price today?",
     "expected_entities": ["insufficient", "do not", "cannot"]
   },
   {
@@ -700,7 +707,7 @@ Starter set — 8 questions across 4 categories (expand to 20 after first run sh
 ]
 ```
 
-Curate up to 20 questions by walking the 10-K's table of contents and drafting 5 per category. Validate each by reading the source pages — if you can't answer it from the PDF, it doesn't belong on the eval.
+Curate up to 20 questions by walking the annual report's table of contents and drafting 5 per category. Validate each by reading the source pages — if you can't answer it from the PDF, it doesn't belong on the eval. Verify expected_entities against the source PDF (Berkshire's 2023 numbers may differ slightly from these starter values; cross-check `data/brk-2023-ar.pdf` before scoring).
 
 **On shared/rag_hybrid reuse — explicit boundary.** Tree-index retrieval has NO encoder, NO reranker, NO vector store by design. `shared/rag_hybrid` (encoder + reranker + Retriever + autoconfig) is therefore not applicable to `build_tree.py` or `query_tree.py` — those scripts are pure LLM + JSON tree manipulation. The shared-library reuse for this lab is *cross-lab imports* in `compare_three.py` (next section): pulls vector RAG from W2 and GraphRAG from W2.5 + their shared scoring helpers, so the three-way comparison runs on a single eval set with consistent metrics. If a future tree-index variant adds embedding-based leaf-level retrieval (the typical "hybrid tree" extension), `shared/rag_hybrid.DenseEncoder` would slot in at that layer.
 
