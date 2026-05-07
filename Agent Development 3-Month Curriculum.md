@@ -1497,6 +1497,111 @@ Do this 50+ times a year, you'll be ahead of 95% of people in the field — not 
 
 ---
 
+## Appendix H — Job-Search Execution: Targeting, Reality-Check, Negotiation
+
+> Added 2026-05-07 from the alexeygrigorev/ai-engineering-field-guide gap analysis. The technical curriculum (W0–W12 + supplements) is thorough; this appendix closes the *job-search execution* layer — segment targeting, reality-vs-JD reading, AI-Support sub-track recognition, references, offers, negotiation. Reader profile: cloud infra eng (3 yrs at AWS, exited March 2026 in 14k layoff), local-first MLX stack, currently full-time on the 12-week ramp. The recommendations here are calibrated to that profile, not generic "AI Engineer" advice.
+
+### H.1 — Market Segmentation: Three AI-Engineer Job Buckets
+
+The "AI Engineer" job title spans three distinct company segments with different interview emphases and tech-stack expectations. Spray-applying a single resume across all three is the most common job-search mistake; targeted framing per segment doubles response rates.
+
+| Segment | Examples | Interview emphasis | Stack expectations | Fit for Yuxin's profile |
+|---|---|---|---|---|
+| **Product** (AI-first product companies) | Cursor, Hebbia, Granola, Limitless, Glean | Product judgment + UX + RAG quality | Cloud APIs, vector DBs, LLM-orchestration libs (LangChain / LlamaIndex / DSPy) | Mid — competes with PM/design-fluent candidates; differentiator is the W7+W8 stability work, not the RAG depth |
+| **Infrastructure** (AI-tooling / infra) | Modal, Pinecone, Braintrust, Weaviate, Astronomer, Tecton | Systems design + cost economics + reliability | Distributed systems, GPU infra, SRE tooling, observability | **Strongest fit** — 3-yr AWS infra background maps directly; W7 tool harness + W11 system design + Capstone C are the portfolio anchors |
+| **Model labs** (frontier-model companies) | OpenAI, Anthropic, Meta AI, DeepMind | ML research + scaling laws + paper depth | Distributed training, CUDA, JAX/PyTorch internals, paper-citing fluency | Low — ~4% of jobs are primary-FT roles; curriculum is right to skip pretraining; deprioritize |
+
+**Action:** Maintain a single `target_companies.md` (in `~/Documents/Obsidian Vault/job-search/`) listing 15 companies bucketed by segment. For each, record one resume-bullet → JD-keyword mapping. Build during W11 alongside the system-design rehearsals so the framing is fresh when W12 applications go out.
+
+### H.2 — The AI-Support Sub-Track (28.5% of Jobs, Lower Competition)
+
+The field guide flags a distinct sub-segment: **AI Platform Engineer / AI Infra Engineer / ML Platform Engineer**. These roles work *near* AI but not *on* AI — they build the platforms, observability, evaluation infrastructure, and deployment pipelines that AI Engineers consume. The field guide measured this at ~28.5% of all "AI Engineer"-adjacent JDs.
+
+**Why this matters for Yuxin specifically:**
+- AI-Support roles competition pool is mostly *other infra engineers* who lack hands-on LLM experience. The 12-week curriculum closes that gap.
+- Capstone C (infra-aware SRE agent) qualifies for **both** "AI Engineer" (via the agent) AND "AI Platform Engineer" (via the platform engineering signal).
+- Salary bands often comparable to AI Engineer at a given level; sometimes higher because supply is tighter.
+
+**Action:** Maintain **two README variants** for Capstone C in the same lab repo:
+- `README.md` — leads with the agent, frames as "AI Engineer with platform depth." Use for Product + Infrastructure segment applications.
+- `README-platform.md` — leads with the platform engineering (PromQL integration, k8s rollout correlation, Prometheus alerting, observability story), frames as "Platform Engineer with AI fluency." Use for AI-Support sub-track applications.
+- 30 minutes of work; doubles the addressable JD pool.
+
+### H.3 — Reading JDs Realistically (the "80% Glue Code" Reality Check)
+
+The field guide's role-analysis section (sample of 895–2,445 JDs) finds that the day-to-day work in most "AI Engineer" jobs is *not* prompt engineering or model selection — it is glue code, monitoring, debugging long agent chains, and managing eval pipelines. Three-bucket taxonomy from the field guide:
+
+| Work-type bucket | What the role actually does | Curriculum mapping |
+|---|---|---|
+| **Orchestrator** | Build agent loops, tool integrations, state management | W4 (ReAct), W5 (patterns), W7 (tool harness), W6.5 (Hermes) |
+| **Evals Specialist** | Build offline evals, online monitoring, regression detection | W3 (RAGAS), W9 (faithfulness), W11 (system design rubric) |
+| **Efficiency Wrapper** | Cost reduction, latency optimization, caching, model routing | W2 (rerank/compress), W11 Gate 7 (cost-cut), W2.5 routing |
+
+**Action:** For each of the ≥10 applications in W12, annotate the JD with a 3-line "what this job actually is" guess using the bucket taxonomy. Tailor your cover note to the inferred bucket — a JD that says "build agentic systems" but lists 70% of duties as eval/monitoring/cost-tuning is an Evals Specialist role wearing an Orchestrator title. Frame your application around your W3 + W9 + W11 work, not your W4 ReAct lab.
+
+**Discipline rule:** Never apply to a JD without spending 5 minutes annotating it. Tailored applications convert at 5–10× the rate of spray-applied generic ones, especially with a non-FAANG resume.
+
+### H.4 — References, Offers, Negotiation (the Layoff-Specific Risks)
+
+Post-AWS layoff increases two risks the field guide flagged as common stumbles:
+
+**Risk 1 — References go cold fast.** Top labs (OpenAI, Anthropic, Cursor, Hebbia) require 2–3 references at offer stage. After a layoff, your AWS network is disrupted; warm-call your references within 60 days of separation, not at offer stage. Maintain a `references.md` with 4 contacts (target: 2 strong, 2 backup), each pre-warmed with a 15-min call and a heads-up that you're job-searching.
+
+**Risk 2 — Offer-window pressure + weak BATNA.** Field guide reports candidates accepting first offers under 7-day expiration windows because they had nothing else in pipeline. Compounded by layoff narrative if the candidate signals desperation in negotiation. Mitigations:
+- Apply in batches of 5–10 simultaneously so multiple offer timelines overlap.
+- Always ask for a 2-week extension on offer windows (~70% success rate per field guide). Frame: "I'm in late-stage with two other companies and want to make a thoughtful decision; can we extend to [date]?"
+- Negotiate base + equity together, not separately. Equity-heavy offers from pre-IPO companies are not always better — discount by ~50% for liquidity risk.
+- Comp benchmarking: levels.fyi for big tech, open-comp.org for startups, layoffstracker.com for layoff-affected reset pricing. Don't anchor your ask on your AWS L5 number — anchor on the band for the role you're targeting.
+
+**Action:** Build `offer_decision.md` template with these columns before the first phone screen lands:
+
+```markdown
+| Company | Segment | Base | Equity (4yr) | Bonus | Sign-on | Window | Notes |
+|---|---|---|---|---|---|---|---|
+```
+
+### H.5 — Project Deep-Dive Defense Rehearsal
+
+Field guide identifies "project deep-dive" as one of three dominant interview formats (alongside coding + system design). Interviewers grill on: design decisions, what broke, what would you change, why this approach over alternative X. The bad-case journals across W2/W2.5/W2.7/W7/W8 are raw material; they need to be converted into defendable project narratives.
+
+**Action:** For each major lab (W2, W7, W8, W9, plus the W12 capstone), write a `PROJECT_DEFENSE.md` containing:
+
+```markdown
+# {Lab name} — Project Defense Notes
+
+## Three trade-offs I made and why
+1. {trade-off}: {alternative I rejected and why}
+2. ...
+3. ...
+
+## Three things that broke and how I diagnosed them
+1. {symptom}: {root cause}: {fix} (cite Bad-Case Entry N)
+2. ...
+3. ...
+
+## Three things I would change with more time
+1. ...
+2. ...
+3. ...
+
+## The one number I lead with
+"{specific measured number that anchors the whole story}"
+```
+
+Rehearse one project deep-dive per week during W11 + W12 mocks. Record a 25-min mock per lab: 5 min architecture, 10 min defending decisions, 10 min "what would you change?"
+
+### H.6 — Top 3 Actions This Week
+
+If you only do three things from this appendix:
+
+1. **Build `target_companies.md`** during W11 — 15 companies bucketed by segment, each with one resume-bullet → JD-keyword mapping (~90 min).
+2. **Write `README-platform.md` for Capstone C** during W12 — alternate framing for AI-Support sub-track applications (~30 min).
+3. **Pre-warm 4 references** within the first 30 days of starting the curriculum, not at offer stage (~3 hours total: 4 × 15-min calls + 4 × 30-min email follow-ups).
+
+The technical depth from W0–W12 + W2.7 + W11.7 closes the *capability* gap. This appendix closes the *go-to-market* gap. Both are necessary; neither is sufficient.
+
+---
+
 ## Runbook Generation Pattern
 
 Each weekly runbook in the vault (Weeks 0–3 complete; 4–12 generate on demand) follows the same template so you always know what to expect.

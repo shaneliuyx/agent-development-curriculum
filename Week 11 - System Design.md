@@ -13,7 +13,7 @@ stack: "MacBook M5 Pro; Obsidian for notes; Miro/Excalidraw for diagram capture;
 
 ## Why This Week Matters
 
-Weeks 0–10 trained you on agent loops, retrieval quality, pattern selection, tool integration, schema design, and framework tradeoffs — all topics you can defend technically. This week flips the signal: interviews have *two* evaluation axes, and most engineers optimize for only one. A coding interview measures *what you built*; a system design interview measures *how you think*. The rubrics are orthogonal. You can ship production-grade code and still score 3/5 on design because you led with prompts instead of data flow, or you named one failure mode instead of three, or you skipped the "when *not* to use an LLM" question. This week is not about learning new technical depth — you are done learning new material. It is about recording yourself on whiteboard walkthroughs, playing them back, and internalizing where *you specifically* lose points (not where the rubric says you should, but where *you actually do*). The 6-point rubric exists to make that visible: data flow before prompts, eval strategy up front, three failure modes with mitigations, cost discussion, cold-start + drift, and the counterintuitive senior signal of naming when you *would not* use an LLM. Senior hires are candidates who anticipate the strongest counterargument to their own proposal. This week trains you to be that candidate.
+Weeks 0–10 trained you on agent loops, retrieval quality, pattern selection, tool integration, schema design, and framework tradeoffs — all topics you can defend technically. This week flips the signal: interviews have *two* evaluation axes, and most engineers optimize for only one. A coding interview measures *what you built*; a system design interview measures *how you think*. The rubrics are orthogonal. You can ship production-grade code and still score 3/5 on design because you led with prompts instead of data flow, or you named one failure mode instead of three, or you skipped the "when *not* to use an LLM" question. This week is not about learning new technical depth — you are done learning new material. It is about recording yourself on whiteboard walkthroughs, playing them back, and internalizing where *you specifically* lose points (not where the rubric says you should, but where *you actually do*). The 7-point rubric exists to make that visible: data flow before prompts, eval strategy up front, three failure modes with mitigations, cost discussion, cold-start + drift, the counterintuitive senior signal of naming when you *would not* use an LLM, and the offer-closing senior signal of citing one quotable cost-cut number from a prior lab. Senior hires are candidates who anticipate the strongest counterargument to their own proposal. This week trains you to be that candidate.
 
 ---
 
@@ -21,9 +21,11 @@ Weeks 0–10 trained you on agent loops, retrieval quality, pattern selection, t
 
 ---
 
-## The 6-Point Self-Critique Rubric
+## The 7-Point Self-Critique Rubric
 
-Every design you talk through this week — every single one — gets scored against these six questions after you replay the recording. Print this section. Tape it to the wall next to wherever you record. Do not skip a single point, even when you feel like the answer is obvious. The interviewer who gave you a 3/5 on "system design" last month was probably docking you on point 4 or point 6, and you never knew it.
+Every design you talk through this week — every single one — gets scored against these seven questions after you replay the recording. Print this section. Tape it to the wall next to wherever you record. Do not skip a single point, even when you feel like the answer is obvious. The interviewer who gave you a 3/5 on "system design" last month was probably docking you on point 4 (cost mention) or point 7 (quantified cost-cut), and you never knew it.
+
+> **2026-05-07 update:** Gate 7 was added based on the alexeygrigorev/ai-engineering-field-guide gap analysis — candidates who report a *specific quantified cost-cut from a prior lab* repeatedly cite that single number as the offer-deciding moment. Gate 4 (cost mentioned) is the entry threshold; Gate 7 (cost quantified + routing tree + quotable number) is the senior signal. See [[#Rubric point 7 — Did you give a quotable unit-economics number from a prior lab?]] below.
 
 **Rubric point 1 — Did you draw the data flow before talking about prompts?**
 
@@ -55,7 +57,17 @@ This is the most counterintuitive rubric point and the one that most reliably se
 
 > **Common miss:** Candidates who are excited about LLMs skip rubric point 6 entirely because they do not want to argue against their own proposal. That is exactly backwards. Anticipating the strongest counterargument and addressing it proactively is what "senior" looks like.
 
-### The 6-Gate Whiteboard Mental Flowchart
+**Rubric point 7 — Did you give a quotable unit-economics number from a prior lab?**
+
+Cost handwaving (Gate 4) demonstrates awareness; cost quantification with a real before/after number demonstrates lived experience. The senior signal is the candidate who can cite a specific moment when they cut cost: *"I switched W2.5 entity-extraction from the gpt-oss-20B reasoning model to gemma-4-26B and saw single-call latency drop from 6s to 1.2s with deterministic JSON output."* That's a single-sentence Gate 7 hit. Field-guide candidates report numbers like *"70% OpenAI spend reduction"* or *"$13K/day at 100K daily users × 2K tokens"* as offer-deciding moments. Pull one quotable number from your own labs and have it ready to drop. Curriculum quotables: W2 reranker fp16 2.86× speedup at identical recall (`lab-02-rerank-compress/RESULTS.md` §3.1), W2.5 model swap (Bad-Case Entry 6), W3 HyDE rejection prevented +1 LLM call/query at zero quality cost (`lab-03-rag-eval/RESULTS.md`), W2.7 tree-index 4× faster than graph for similar accuracy (`lab-02-7-pageindex/RESULTS.md` §4.3.1).
+
+Gate 7 also requires a **routing decision tree**, not a hand-wave. Don't say "we'd use the cheap model"; say "route by query shape: cheap-by-default for paraphrase/factoid, escalate to large model only when confidence < 0.7 OR query type is multi-hop OR retrieval recall < 0.5." That's the architectural primitive that makes the unit-economics number defensible at scale, not an after-the-fact optimization. The W2.5 Soundbite 3 routing pattern (Graph for relational/refusal/multi-hop, Vector for paraphrase) is the worked example you can cite verbatim.
+
+> **Interview angle:** Gate 4 mentions cost; Gate 7 quantifies it with a number *you measured* and a routing tree *you designed*. The difference between "we'd watch costs" and "I cut my W2 reranker pass from 112 ms to 38 ms by enabling fp16 on MPS — 2.86× speedup, recall identical, here's the validation table" is the difference between mid-level and senior. The field guide identifies Gate 7 as the line that closes the offer.
+
+> **Common miss:** Candidates conflate Gate 4 and Gate 7. Gate 4 is "I know cost is a constraint." Gate 7 is "I have personally driven a measurable cost-cut, here is the number, here is the routing rule that produced it." Without Gate 7, your Gate 4 reads as theoretical — and the interviewer cannot distinguish you from a candidate who has only read about cost optimization. Forced rule: every recording in Phase 2–6 must end with one Gate 7 sentence, even when the design didn't motivate it. Practice the muscle.
+
+### The 7-Gate Whiteboard Mental Flowchart
 
 Internalize this as a sequential checklist you run in your head at the whiteboard — one gate at a time, in order. Do not proceed to the next gate until you have spoken the current one aloud.
 
@@ -84,8 +96,12 @@ flowchart TD
     G5 -- "Only mentioned<br/>one of the two" --> STOP5([STOP — address both])
 
     G6{Gate 6<br/>When NOT<br/>to use LLM?}
-    G6 -- "Name the condition:<br/>enumerable space /<br/>sub-10ms / full auditability" --> DONE([Strong answer — close with tradeoffs])
+    G6 -- "Name the condition:<br/>enumerable space /<br/>sub-10ms / full auditability" --> G7
     G6 -- "Skipping because<br/>it feels awkward" --> STOP6([STOP — this is the senior signal])
+
+    G7{Gate 7<br/>Quotable cost-cut<br/>from a prior lab?}
+    G7 -- "Cite measured before/after +<br/>routing decision tree<br/>e.g. fp16 2.86× speedup" --> DONE([Strong answer — close with tradeoffs])
+    G7 -- "Only said<br/>'we'd watch costs'" --> STOP7([STOP — drop the number])
 
     %% UML Activity polish — consolidated palette via classDef
     classDef start fill:#dcfce7,stroke:#86efac,stroke-width:1.5px,color:#14532d
@@ -95,8 +111,8 @@ flowchart TD
 
     class START start
     class DONE done
-    class STOP1,STOP2,STOP3,STOP4,STOP5,STOP6 stop
-    class G1,G2,G3,G4,G5,G6 gate
+    class STOP1,STOP2,STOP3,STOP4,STOP5,STOP6,STOP7 stop
+    class G1,G2,G3,G4,G5,G6,G7 gate
 ```
 
 > **Interview angle:** The red STOP nodes are the moments where most candidates lose points. You will not lose points at the green nodes — those are where you have already said the right thing. The discipline is recognizing a STOP moment in real time and correcting course before the interviewer notices. Recording yourself is the only way to learn where your personal STOP moments are.
@@ -105,7 +121,7 @@ flowchart TD
 
 ## Goal
 
-By end of Week 11 you will have five recorded system-design walkthroughs, each self-critiqued against the 6-point rubric, plus a polished 60-second pitch for the infra-aware SRE agent that you can deploy on any phone screen. The recordings do not have to be good. They have to exist. Listening to yourself on recording is the fastest feedback loop available to you outside of an actual interview.
+By end of Week 11 you will have five recorded system-design walkthroughs, each self-critiqued against the 7-point rubric, plus a polished 60-second pitch for the infra-aware SRE agent that you can deploy on any phone screen. The recordings do not have to be good. They have to exist. Listening to yourself on recording is the fastest feedback loop available to you outside of an actual interview.
 
 ## Exit Criteria
 
@@ -114,7 +130,7 @@ By end of Week 11 you will have five recorded system-design walkthroughs, each s
 - [ ] The infra-aware SRE agent story (Exercise 5) is polished enough that you can deliver it without notes
 - [ ] The 1-page system-design cheat sheet is printed and sitting on your desk
 - [ ] RESULTS.md written with all five recording links and consolidated notes
-- [ ] 5 Anki cards added (one per rubric point + one for the 5-tradeoffs cheat sheet)
+- [ ] 6 Anki cards added (one per rubric point 1-7, condensed; plus one for the 5-tradeoffs cheat sheet)
 
 ---
 
@@ -124,7 +140,7 @@ By end of Week 11 you will have five recorded system-design walkthroughs, each s
 
 ---
 
-### Concept 1 — The 6-Gate Rubric as a Senior-Signal Checklist
+### Concept 1 — The 7-Gate Rubric as a Senior-Signal Checklist
 
 The rubric is not a formatting preference. It is a compressed version of what Anthropic's "Building Effective Agents" post (2024, updated 2026) identifies as the six factors that recur across every production agent case study they examined: observable data flow, upfront eval commitment, explicit failure enumeration, cost-awareness, lifecycle planning (cold-start and drift), and the discipline to recognize when an LLM is the wrong tool. The post opens with a blunt observation: most agent failures trace back not to model capability but to a missing constraint in one of these six areas. The case studies that follow — across Anthropic's own deployment teams, Replit's code-assist pipeline, Pinecone's retrieval-augmented systems, and YC postmortems — repeat that same list with different surface details each time.
 
@@ -301,7 +317,7 @@ One thing I'll steal for my designs:
 ### Time allocation
 - 30 minutes: think silently, draw the architecture (box and arrow, paper is fine)
 - 60 minutes: talk through the design aloud, recording
-- 30 minutes: replay, score against the 6-point rubric, write notes
+- 30 minutes: replay, score against the 7-point rubric, write notes
 
 ### Problem statement (the fictional interviewer prompt)
 
@@ -924,13 +940,14 @@ This is the last thing you do this week. Print this page. Bring it to every whit
 
 ### System Design Cheat Sheet — Agent Whiteboard Rounds
 
-**The 6-point rubric (score yourself on each after every design):**
+**The 7-point rubric (score yourself on each after every design):**
 1. Drew data flow before prompts?
 2. Stated eval strategy in first 5 minutes?
 3. Named 3 failure modes + mitigations?
 4. Discussed cost (tokens × latency × QPS)?
 5. Discussed cold-start AND drift?
 6. Stated when NOT to use LLM?
+7. Cited one quotable cost-cut number from a prior lab + named the routing rule?
 
 ---
 
@@ -994,7 +1011,7 @@ This week is whiteboard-heavy, not code-heavy. But two small scripts make the se
 
 ### Code walkthrough: rubric-scorer.py
 
-After each recording you fill in six scores by hand. This script reads a simple YAML file you edit, computes your total, flags any point below 3, and appends the result to a running `scores.md` log. It takes 30 seconds to fill in the YAML and 2 seconds to run. The value is not the computation — it is the forcing function of having to assign a number to each rubric point.
+After each recording you fill in seven scores by hand. This script reads a simple YAML file you edit, computes your total, flags any point below 3, and appends the result to a running `scores.md` log. It takes 30 seconds to fill in the YAML and 2 seconds to run. The value is not the computation — it is the forcing function of having to assign a number to each rubric point.
 
 ```python
 #!/usr/bin/env python3
@@ -1011,9 +1028,11 @@ YAML format:
     cost_discussed: 2
     cold_start_drift: 4
     when_not_llm: 3
+    quotable_cost_cut: 4
   notes:
     data_flow_first: "Drew boxes but forgot to label the ACL filter"
     cost_discussed: "Skipped QPS math entirely — fix next time"
+    quotable_cost_cut: "Cited W2 fp16 2.86× — clean drop, but forgot routing rule"
 """
 
 import sys
@@ -1028,6 +1047,7 @@ RUBRIC_KEYS = [
     ("cost_discussed",     "4. Cost discussed (tokens × latency × QPS)"),
     ("cold_start_drift",   "5. Cold-start + drift discussed"),
     ("when_not_llm",       "6. Stated when NOT to use LLM"),
+    ("quotable_cost_cut",  "7. Cited quotable cost-cut + routing rule"),
 ]
 
 THRESHOLD = 3  # flag scores below this
@@ -1055,13 +1075,13 @@ def score_file(path: Path) -> None:
             flags.append(label)
         lines.append(f"| {label} | {val}/5 | {note} |")
 
-    lines.append(f"\n**Total: {total}/30**")
+    lines.append(f"\n**Total: {total}/35**")
     if flags:
         lines.append("\n**Fix before next recording:**")
         for f in flags:
             lines.append(f"- {f}")
 
-    print(f"\n  Total: {total}/30")
+    print(f"\n  Total: {total}/35")
     if flags:
         print(f"  Below threshold ({THRESHOLD}): {', '.join(flags)}")
 
@@ -1077,7 +1097,7 @@ if __name__ == "__main__":
     score_file(Path(sys.argv[1]))
 ```
 
-**How it fits the workflow.** After your 30-minute self-critique session, open `exercise-N.yaml`, fill in the six scores and one-line notes, then run `python rubric-scorer.py exercise-N.yaml`. The output tells you instantly which points you missed below threshold and appends a formatted row to `scores.md`, which becomes your week-over-week improvement tracker. The script is intentionally simple — no dependencies beyond the standard library and PyYAML.
+**How it fits the workflow.** After your 30-minute self-critique session, open `exercise-N.yaml`, fill in the seven scores and one-line notes, then run `python rubric-scorer.py exercise-N.yaml`. The output tells you instantly which points you missed below threshold and appends a formatted row to `scores.md`, which becomes your week-over-week improvement tracker. The script is intentionally simple — no dependencies beyond the standard library and PyYAML.
 
 ---
 
@@ -1222,13 +1242,13 @@ Lesson:
 
 ## Lock-In: Anki + Spoken Questions
 
-### 5 Anki cards
+### 6 Anki cards
 
-Add these five cards to your deck before closing the week. Do not skip this — these six rubric points need to be on immediate recall, not recognition.
+Add these six cards to your deck before closing the week. Do not skip this — these seven rubric points need to be on immediate recall, not recognition.
 
 **Card 1**
-Front: Name the 6-point system-design self-critique rubric in order.
-Back: (1) Data flow before prompts. (2) Eval strategy up front. (3) 3 failure modes + mitigations. (4) Cost: tokens × latency × QPS. (5) Cold-start + drift. (6) When NOT to use LLM.
+Front: Name the 7-point system-design self-critique rubric in order.
+Back: (1) Data flow before prompts. (2) Eval strategy up front. (3) 3 failure modes + mitigations. (4) Cost: tokens × latency × QPS. (5) Cold-start + drift. (6) When NOT to use LLM. (7) Quotable cost-cut number from a prior lab + named routing rule.
 
 **Card 2**
 Front: An interviewer asks you to design an agent. What are your first four sentences?
@@ -1669,4 +1689,5 @@ Most pragmatic shape for teams without GPU infra: run compute-light data-heavy s
 - **Builds on:** W1-W10 — every prior week contributes a component: retrieval (W2-W3), memory + state (W3.5), tool harness (W6-W7), evals (W9), orchestration patterns (W5), cost + context management (W8).
 - **Distinguish from:** ML system design — no human-in-the-loop training loop; agent systems face inference-time drift from silent provider weight updates, not training-distribution shift; evals run as CI jobs, not retraining pipelines.
 - **Connects to:** W11.5 Agent Security — security is a system design concern; allowlist permission model, capability scoping, audit logging from this chapter are W11.5's implementation targets.
-- **Foreshadows:** W12 Capstone — six-gate rubric, five trade-off patterns, cheat sheet from this chapter are the evaluation scaffold for the capstone system design artifact.
+- **Connects to:** [[Week 11.7 - Take-Home Dress Rehearsal]] — W11.7 applies the 7-point rubric (especially Gate 7 quotable cost-cut) at take-home scope; the 4-hour timed exercise rehearses the format reviewers see in 33% of disclosed interview processes.
+- **Foreshadows:** W12 Capstone — seven-gate rubric, five trade-off patterns, cheat sheet from this chapter are the evaluation scaffold for the capstone system design artifact. Gate 7 specifically becomes the offer-closing line in W12 mocks.
