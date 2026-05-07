@@ -1272,7 +1272,94 @@ The two pre-migration reproduction scripts (`04_multiquery_premigration.py`, `04
 
 ## Phase 5 — Phoenix Tracing (~2 hours)
 
-Wire every step so you have a visual trace for each pipeline run.
+Wire every step so you have a visual trace for each pipeline run. Phoenix is **the production-default observability layer** for RAG / agent systems in 2026 — same role Datadog plays for traditional services. Without traces you can read RAGAS scores but cannot see *why* a query failed (wrong retrieval? slow rerank? hallucinated synthesis? RAGAS judge-LLM error?). With traces, every metric becomes a click into the actual request waterfall.
+
+### 5.0 Phoenix Setup + Integration
+
+**What Phoenix is + why it sits where it does:**
+
+| Layer | Component | Where it runs |
+|---|---|---|
+| Pipeline code | `src/02_pipeline.py` etc. | Your Python venv |
+| Trace emission | OpenTelemetry SDK + OpenInference auto-instrumentors | Inside your Python process (zero-config after `register()`) |
+| Trace collector | Phoenix collector server (HTTP at `:6006`) | Local Docker container OR `phoenix.launch_app()` in-process |
+| Trace storage | SQLite (default) or Postgres (production) | Phoenix server's persistent volume |
+| UI | Phoenix web app | Browser at `http://127.0.0.1:6006` |
+
+The integration is a **publisher/subscriber pattern**: your pipeline emits OpenTelemetry spans → spans flow over HTTP to the Phoenix collector → Phoenix indexes them in SQLite → the UI queries the index. Spans are *additive* (your pipeline keeps running if Phoenix is down — emission is fire-and-forget) and *low-overhead* (~1-3% latency on instrumented calls).
+
+**Installation + first-run setup (~10 min):**
+
+```bash
+cd ~/code/agent-prep/lab-03-rag-eval
+source .venv/bin/activate
+
+# 1. Install Phoenix + the instrumentors
+uv pip install \
+  arize-phoenix \
+  arize-phoenix-otel \
+  openinference-instrumentation-openai \
+  openinference-instrumentation-langchain \
+  opentelemetry-sdk
+
+# 2. Start the Phoenix collector (option A: long-running standalone server)
+python -m phoenix.server.main serve &
+# Phoenix UI then lives at http://127.0.0.1:6006
+# Persistent storage at ~/.phoenix/phoenix.db (SQLite)
+
+# 2-alt. Option B: embedded in your script (auto-stops with Python exit)
+# python -c "import phoenix as px; px.launch_app()"
+# — fine for one-off runs but loses traces when the script exits
+
+# 3. Verify the collector is up
+curl -s http://127.0.0.1:6006/healthz && echo "  Phoenix OK"
+```
+
+Standalone server (Option A) is recommended for the lab because traces persist across script runs — you can compare today's run to yesterday's run in the UI, run regression checks, etc. The embedded launcher (Option B) is fine for a single-shot debug session.
+
+**Wire it into your pipeline (one-line per project):**
+
+```python
+from phoenix.otel import register
+
+# Configure once at the top of any script that should emit traces
+tracer_provider = register(
+    project_name="lab-03-rag-eval",   # groups runs in the UI by project
+    auto_instrument=True,             # auto-detect OpenAI / LangChain / etc.
+    endpoint="http://127.0.0.1:6006/v1/traces",
+)
+```
+
+That's the complete integration. No decorators needed on your functions; the `register()` call patches the OpenAI client + LangChain runnables to emit spans automatically. For custom parent spans (e.g. wrapping a multi-pipeline comparison run), see §5.1 below.
+
+**What to look for in the UI (5-min walkthrough):**
+
+| Tab | What it shows | When to use |
+|---|---|---|
+| **Projects** | List of projects (`lab-03-rag-eval`, `lab-02-7-pageindex`, etc.) | Switch between labs |
+| **Traces** | Flat list of root spans (one per top-level call) — sortable by name, latency, error | Find slow / errored runs |
+| **Trace detail (click a row)** | Waterfall of nested spans + timing + attributes + LLM input/output | Debug a single call end-to-end |
+| **Datasets** | Curated dev sets you can re-run experiments against | Compare runs across versions |
+| **Evals** | RAGAS-style judge results visualized per trace | See which questions failed which metric |
+
+**The single most useful UI action:** click any trace row → switch to "Attributes" tab → see `llm.input_messages`, `llm.output_messages`, `retrieval.documents` for every LLM call in the waterfall. Cuts debug time on a "why did this answer hallucinate?" question from ~30 min (re-running with prints) to ~30 sec (read the actual prompt + retrieved context the LLM saw).
+
+**Common integration issues (catch in setup, not at debug time):**
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `ConnectionRefusedError` on first `register()` call | Phoenix collector not running | Run `python -m phoenix.server.main serve` first |
+| Traces appear but `llm.input_messages` is empty | OpenAI SDK version older than the instrumentor expects | Pin `openai>=1.0` and `openinference-instrumentation-openai>=0.1.20` |
+| Traces appear but no LangChain spans (only OpenAI) | RAGAS internal calls not captured | Add `LangChainInstrumentor().instrument()` explicitly (see §5.1) |
+| Traces appear in raw form but no waterfall structure | Auto-instrumentation only — no manual parent span around your pipeline | Wrap pipeline calls in `_tracer.start_as_current_span(...)` (see §5.1) |
+| Phoenix UI shows 150 ChatCompletion spans, no way to tell which variant | No variant-tagged parent span | Same fix — wrap in named parent span with `pipeline.variant` attribute |
+| Disk fills up after a long run | SQLite collector + many traces | Either rotate `~/.phoenix/phoenix.db` or move to Postgres backend (`PHOENIX_SQL_DATABASE_URL=postgresql://...`) |
+
+`★ Insight ─────────────────────────────────────`
+- **Phoenix is the "view from the LLM's seat".** RAGAS tells you the answer was unfaithful; Phoenix tells you exactly which retrieved chunk the LLM looked at and what prompt it received. The metric is the alarm; the trace is the diagnosis. You need both — a metric without traces is "the system is broken somewhere" and a trace without metrics is "this single call worked, but does the average?".
+- **Auto-instrumentation hides the wiring; explicit instrumentation reveals it.** `auto_instrument=True` in `register()` is fine for getting started, but in production you want `OpenAIInstrumentor().instrument()` + `LangChainInstrumentor().instrument()` explicit calls so attribute schemas survive SDK version bumps. The auto path silently regresses on schema drift; the explicit path fails loudly.
+- **Phoenix's "Datasets + Evals" tabs are the production-grade analog to your `RESULTS.md` table.** Once you've ingested your `dev_set.jsonl` as a Phoenix Dataset and your RAGAS scores as Phoenix Evals, the UI gives you per-question deltas across runs — directly comparable to the regression contract in §2.6 of the lab. Worth migrating once you exceed ~5 runs to compare.
+`─────────────────────────────────────────────────`
 
 ### 5.1 Instrument
 
