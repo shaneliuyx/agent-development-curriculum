@@ -1534,7 +1534,7 @@ The work is not.
 
 ## Cross-References
 
-- **Builds on:** ALL prior weeks (W0-W11.5) — every lab, RESULTS.md, bad-case entry, mock-prep recording made during W1-W11.5 is consumed here. W8 schema-reliability benchmark is direct source for public write-up. W11 system design recordings are direct prep for system design rounds.
+- **Builds on:** ALL prior weeks (W0-W11.7) — every lab, RESULTS.md, bad-case entry, mock-prep recording made during W1-W11.7 is consumed here. W8 schema-reliability benchmark is direct source for public write-up. W11 system design recordings are direct prep for system design rounds. [[Week 11.7 - Take-Home Dress Rehearsal]] (`lab-11-7-takehome-rehearsal`) is the canonical project-defense lab — pick it as one of the 30 mock-interview deep-dive subjects in Phase 4.
 - **Distinguish from:** generic ML interview prep — agent interviews center on system design (eval methodology, tool reliability, context management, observability) rather than modeling (training, loss functions, hyperparameters). Six Appendix A categories map to production agent concerns, not academic ML.
 - **Connects to:** `Bad-Case Journal.md` — best entry becomes Card 4 in Lock-In Anki set + behavioral answer to "production failure" question. `Engineering Decision Patterns.md` — use both during mock prep; pattern library supplies tradeoffs section of every system design answer.
 - **Foreshadows:** post-curriculum — first 30/60/90-day plan in `RESULTS.md` is operational roadmap for the new role. Open-source contribution to Outlines, Instructor, Phoenix, Qdrant, or LangGraph is recommended next public artifact. Teaching (internal tech talk, second post at 6 months) is the final proof of mastery.
