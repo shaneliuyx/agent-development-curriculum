@@ -4457,6 +4457,36 @@ Open [[Week 3 - RAG Evaluation]] when this week's `RESULTS.md` is committed. Kee
 
 ---
 
+## Bad-Case Journal
+
+> Six entries from `lab-02-rerank-compress/RESULTS.md` Bad-case journal (2026-04-12 lab run on M5 Pro, 48 GB unified). All anchored to measured events; no pre-experiment speculation. Imported in the 2026-05-07 audit pass.
+
+**Entry 1 — FiQA upsert dies with `httpx.ReadTimeout` after 31 minutes of clean ingest.**
+*Symptom:* `python src/01_ingest_fiqa.py` runs cleanly for 31 min, then throws `httpx.ReadTimeout: The read operation timed out` mid-batch. Re-running silently skips ingest — `points_count > 0` so the empty-or-not gate believes it's done. FiQA collection has ~40% of expected 57,638 points but reports as "ingested."
+*Root cause:* Default `QdrantClient` timeout is 5 s. Once Qdrant's HNSW indexing kicks in (after `indexing_threshold=10000` points accumulate), upsert calls compete with indexer threads and exceed the 5s budget on individual batches. The empty-or-not gate (`if points_count == 0: ingest()`) treats partial state as completed — incorrect for retry semantics.
+*Fix:* (a) Bump client timeout: `QdrantClient(url=..., timeout=60)`. (b) Wrap upsert in `_upsert_with_retry` with exponential backoff (3 retries, 2-4-8s). (c) Replace empty-or-not gate with resumability check: `start = (points_count // BATCH) * BATCH` rounds down to the last completed batch and resumes; same-id upserts are idempotent so re-upserting the partial last batch is safe.
+
+**Entry 2 — RRF hybrid LOSES MRR vs dense on MS MARCO (-7.9 pp); fusion-tuning doesn't help.**
+*Symptom:* MS MARCO 10K eval: dense-only MRR@10 = 0.318, hybrid (RRF k=60) MRR@10 = 0.239. Negative lift -7.9 pp. Initial hypothesis: RRF k parameter needs tuning (try k=10, k=100, learned weights).
+*Root cause:* Disproven by recall@100 measurement — at k=100 dense already captures 98% of relevant documents on MS MARCO (a saturated benchmark). Sparse contributions can only displace correct dense top-1 picks with weaker votes; equal-weight RRF (`1/(60+rank)`) treats both retrievers as equally informative regardless of corpus regime. Hybrid regression isn't a fusion-tuning issue — it's a corpus regime issue.
+*Fix:* Drop hybrid for MS MARCO; switch eval to BEIR-FiQA (ceiling-free, dense recall@100 = 0.61). On FiQA, hybrid showed +6 pp lift — direction reversed. **Lesson:** test fusion benefit on ceiling-free corpora; saturated benchmarks invert the signal. Architectural fix is corpus-aware routing, not RRF k tuning.
+
+**Entry 3 — Reranker batch-size sweep: predicted "group=1 → 5-8 min total" but got 34 min.**
+*Symptom:* Phase 2 reranker latency optimization. Mental model: padding penalty dominates at large batch sizes, so per-query group=1 should minimize compute. Predicted 5-8 min total wall on 6,980 queries; measured 34 min. 24% latency regression vs initial baseline, opposite of prediction.
+*Root cause:* Padding-penalty theory was incomplete. Per-call CPU overhead (Python → MPS dispatch + tensor allocation + result marshaling) competes with padding savings. At group=1 the per-call overhead dominates; padding savings only matter when call count is much smaller than padding cost. Refined hypothesis (group=8 sweet spot at 22-26 min) was ALSO falsified — measured 33.9 min. Per-call overhead is ~2 ms not the assumed ~50 ms.
+*Fix:* Run the experiment, don't reason from the model. §2.2.2 + §2.2.3 in RESULTS document both disproofs. Final confirmed model (§2.2.4): GPU pipelining — scheduler needs N in-flight requests to hide latency, identical to database connection pool sizing. Sweet spot at batch=128 by measurement, not theory.
+
+**Entry 4 — MLX port hits `Model type xlm-roberta not supported` from `mlx-lm`.**
+*Symptom:* Attempt to port the BGE-reranker-v2-m3 cross-encoder to MLX (Apple Silicon native framework) for the latency win. `mlx_lm.load("BAAI/bge-reranker-v2-m3")` throws `ValueError: Model type xlm-roberta not supported`.
+*Root cause:* `mlx-lm` is scoped to decoder-only language models (Llama, Mistral, Gemma); cross-encoder XLM-RoBERTa is encoder-only with a classification head. `mlx-embeddings` partially supports encoder models but lacks the `XLMRobertaForSequenceClassification` head needed for reranking score output.
+*Fix:* Investigated three paths: (a) hand-port the classifier head (~3 days work, 1.5× speedup estimated, defer until QPS justifies). (b) Wait for `mlx-embeddings` upstream support (`forward markers` row in RESULTS tracks this). (c) Stay on PyTorch+MPS+fp16 (current path; 2.86× over fp32 baseline already). Decision: defer hand-port; document in `forward markers` so the cost calculation gets re-run when `mlx-community/bge-reranker-v2-m3` ships or QPS jumps. **Lesson:** framework-port investigation = same shape as evaluating any external library — try → fail → diagnose → estimate → defer-or-implement.
+
+**Entry 5 — Empty-or-not ingest gate masks partial state across all collections.**
+*Symptom:* After Entry 1's `ReadTimeout`, FiQA collection had partial points. `python src/01_ingest_fiqa.py` re-ran but `points_count > 0` so the script returned immediately with "already ingested." Same gate exists in `00_hybrid_ingest.py` and `02_compress_eval.py`. Risk: any partial-ingest scenario silently underseats every downstream eval.
+*Root cause:* `if points_count == 0: ingest()` is a one-shot gate that conflates "never ran" with "ran fully." It cannot represent partial completion. Symptom is invisible until eval results look anomalous.
+*Fix:* Replace gate with resumability check across all ingest scripts: `start = (points_count // BATCH) * BATCH; for batch in batches[start:]: upsert(batch)`. Round down to last completed batch boundary; re-upsert is idempotent because Qdrant point IDs are content-derived. Sanity check post-ingest: assert `points_count == expected_doc_count` and fail loud if not.
+---
+
 ## Interview Soundbites (Consolidated)
 
 **Soundbite 1 — On hybrid retrieval (RRF mechanics).**

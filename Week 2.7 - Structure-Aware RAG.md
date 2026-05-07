@@ -1,7 +1,7 @@
 ---
 title: "Week 2.7 — Structure-Aware RAG (PageIndex / Tree Indices)"
 created: 2026-05-06
-updated: 2026-05-06
+updated: 2026-05-07
 tags: [agent, curriculum, week-2-7, rag, pageindex, tree-index, raptor, structure-aware, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-02-7-pageindex"
@@ -275,7 +275,19 @@ If you skip Phase 4 (tree-only lab path), Neo4j vars are not needed.
 
 ## Phase 2 — Tree Construction (~1.5 hours)
 
-Save as `src/build_tree.py` — single runnable file with PDF parse + heading detection + LLM tree builder + per-node summary pass + main entry point. Read end-to-end below; the section breakdown after the code block walks through each function in order.
+Save as `src/build_tree.py` — single runnable file with PDF parse + heading detection + LLM tree builder + per-node summary pass + main entry point.
+
+**Architecture:**
+
+```mermaid
+flowchart LR
+  PDF["PDF<br/>~150 pages"] -->|pypdf parse| Pages["pages<br/>[{page_num, text}, ...]"]
+  Pages -->|"regex + heuristics<br/>(over-recall)"| Cands["heading candidates<br/>noisy, over-eager"]
+  Cands -->|LLM consolidation<br/>1 call, JSON-mode| Tree["clean tree<br/>{node_id, title, nodes}"]
+  Tree -->|recursive summary<br/>~25 LLM calls| Final["data/tree.json<br/>50 nodes, depth 4"]
+```
+
+**Code:**
 
 ```python
 """Build a hierarchical Table-of-Contents tree from a long PDF.
@@ -536,6 +548,30 @@ if __name__ == "__main__":
     main()
 ```
 
+**Walkthrough:**
+
+- **Block 1 — `extract_pages`.** PDF-to-text via `pypdf`. Plain text sufficient for the heuristic detector; font metadata would help if production-grade heading detection were the goal, but the over-recall + LLM-filter design absorbs that.
+- **Block 2 — `detect_heading_candidates`.** Two over-recall heuristics: all-caps short lines (level 1) + numbered prefixes (`1.`, `1.1.`, `1.1.1.`). Both produce false positives ("PAGE 5", "1. Buy more milk"). The LLM in Block 3 filters them out — optimizing the heuristic for precision would burn engineering effort the LLM can absorb cheaply. Title Case branch added after first lab run found Buffett's letter sub-sections invisible to all-caps + numbered alone.
+- **Block 3 — `build_tree`.** One LLM call consolidates candidates into a clean tree. Three load-bearing rules in `TREE_BUILDER_SYSTEM`: (a) drop spurious matches by category not pattern; (b) consolidate near-duplicates; (c) infer `end_page` from next sibling's `start_page`. JSON-mode `response_format` is mandatory — without it Gemma-4-26B emits prose preamble ~10% of the time at temp=0. Coverage rule + annual-report structural priors added after first lab run produced a 2-node tree (root + TOC only).
+- **Block 4 — `summarize_node`.** Recurse over the tree, one LLM call per node with text spanning the node's page range. Head-truncate at 12,000 chars — longest 10-K section fits, longer sections get the head where the topic sentence lives. Summaries 80–120 words, sized for the navigation prompt at all depths.
+
+**Result (Berkshire 2023, ~148 pages):**
+
+| Stage | Wall time |
+|---|---|
+| PDF parse + heading detection | ~5 s |
+| Tree builder LLM call | ~8–15 s |
+| Per-node summary pass (~25 LLM calls) | ~90 s |
+| **Total** | **~2 min** |
+
+Output: `data/tree.json` — 50 nodes, depth 4. Captures TOC (p1-3), Chairman's Letter with sub-sections "Our Not-So-Secret Weapon" + "Non-controlled Businesses That Leave Us Comfortable" (p4-22), Shareholder Event (p21-22), Form 10-K Items 1-15 + MD&A + Financial Statements + Notes (p23-148), Corporate Governance (p148-152).
+
+`★ Insight ─────────────────────────────────────`
+- **Heuristic-first, LLM-second is the cost-saving design choice.** Detecting heading candidates with regex on font-size proxies + numbered-prefix patterns is ~free; running an LLM over every line of a 150-page document to "find headings" would cost 50–200× more. The LLM's job is consolidation, not detection.
+- **Per-node summaries are the load-bearing artifact.** The navigation LLM at query time sees only `{node_id, title, summary}`, never raw content. Vague summaries ("This section discusses business operations") starve the navigator; concrete summaries ("Apple's $200B operations footprint, supplier concentration risk, three pending litigation matters") route correctly. Spend prompt tokens on summary specificity.
+- **The tree is one JSON file.** Versioning, diff'ing, inspection all work with `git`, `jq`, and any text editor. No database to maintain, no schema migration when the document updates — just rebuild the tree. This is the operational simplicity "vectorless" earns.
+`─────────────────────────────────────────────────`
+
 Run it once after §1.2 has downloaded the PDF:
 
 ```bash
@@ -547,22 +583,29 @@ python src/build_tree.py
 # Wrote data/tree.json — N nodes, depth D.
 ```
 
-**Expected metrics on M5 Pro / Gemma-4-26B:**
-
-| Stage | Wall time |
-|---|---|
-| PDF parse + heading detection | ~5 s |
-| Tree builder LLM call (one) | ~8–15 s |
-| Per-node summary pass (~30 nodes × ~3 s) | ~90 s |
-| **Total ingestion per document** | **~2 min** |
-
 ---
 
 ## Phase 3 — Reasoning-Based Tree Traversal (~1.5 hours)
 
 ### 3.1 Query-time navigation
 
-Save as `src/query_tree.py`:
+Save as `src/query_tree.py`.
+
+**Architecture:**
+
+```mermaid
+flowchart TD
+  Q["query"] --> N1["root → LLM picks child<br/>(sees children's titles + summaries)"]
+  N1 --> N2["child → LLM picks child<br/>(recursive)"]
+  N2 --> N3["… until leaf reached<br/>or null returned"]
+  N3 -->|leaf| Fetch["fetch_leaf_text<br/>(re-open PDF, slice page range,<br/>head-truncate 16K chars)"]
+  N3 -->|"null<br/>(refuse)"| Refuse["refusal path<br/>answer LLM sees parent node"]
+  Fetch --> Ans["answer LLM<br/>cites node_id + page range"]
+  Refuse --> Ans
+  Ans --> Out["{answer, traversal_path,<br/>leaf_id, page_range, depth}"]
+```
+
+**Code:**
 
 ```python
 """Tree-search retrieval: LLM navigates a TOC tree to find the relevant leaf,
@@ -661,6 +704,32 @@ if __name__ == "__main__":
     out = answer(q)
     print(json.dumps(out, indent=2, default=str))
 ```
+
+**Walkthrough:**
+
+- **Block 1 — `navigate`.** Recursive heart of the lane. Takes a node, formats children as `{node_id, title, summary}`, asks LLM to pick one. Three failure modes handled: (a) leaf reached (no children) → return current; (b) `chosen_id` null → caller treats current as best (refusal path); (c) hallucinated id (LLM returns id not in children) → return current node. Without the hallucination guard, function would either recurse forever or crash on `KeyError`.
+- **Block 2 — `NAV_SYSTEM` prompt.** "Prefer specificity" rule is load-bearing — without it, LLM ties between two equally-broad children and choice becomes arbitrary. "Return null if none relevant" is the refusal escape hatch — without it, LLM picks closest child even when query is out of scope, and answer LLM gets handed irrelevant content.
+- **Block 3 — Leaf fetch.** Re-open PDF, extract text spanning `start_page..end_page`, head-truncate 16K chars. 16K sized for Gemma-4-26B's effective context with system prompt; 32K works on larger models but invites "lost in the middle" attention issues. Sections >16K need extra summarize-then-answer pass — outside lab scope.
+- **Block 4 — `ANSWER_SYSTEM`.** Three rules: cite node_id + page range, refuse explicitly when content doesn't support, do not fabricate. Citation traceability is the production differentiator — for legal/audit use cases, "answer came from page 47–52" is a hard requirement vector + graph don't natively satisfy.
+
+**Result (Berkshire 2023, per query):**
+
+| Stage | Wall time |
+|---|---|
+| Navigate depth 1 (LLM call) | ~1.5 s |
+| Navigate depth 2 | ~1.5 s |
+| Navigate depth 3 (typical leaf reach) | ~1.5 s |
+| Leaf text fetch (PDF re-parse) | ~0.2 s |
+| Answer LLM call | ~3–6 s |
+| **Total** | **~8–15 s** |
+
+Aggregate over 8-question Berkshire eval: tree judge=0.44 (per §4.3.1). Wins out-of-document refusal (1.00) and ties graph on cross-section synthesis (0.50). Loses factoid lookup (0.00) — tree never sees body text, only titles + summaries.
+
+`★ Insight ─────────────────────────────────────`
+- **Each navigation step is one LLM call, depth-bounded.** A 4-deep tree on a 10-K = 4 nav calls + 1 answer call = 5 LLM calls per query. This is the cost ceiling. Vector RAG pays 1 LLM call per query (the answer); GraphRAG pays 2–4 (decomp + bridge + answer). Tree-index is *deliberately* the most expensive lane — that is the trade-off for the precision win on long structured documents.
+- **Refusal is built in by design.** The navigation LLM can return `{"chosen_id": null}` when no child looks relevant; the answer LLM then sees the current node's content (often the document root) and faithfully refuses. Out-of-document queries fail clean. Vector RAG has to be coaxed into refusing via prompt; tree-index gets it for free — and the empirical 1.00 refusal score on out-of-document questions confirms this.
+- **The depth counter is a safety net, not a feature.** `MAX_DEPTH=6` bounds runaway loops on malformed trees (self-referencing node, circular ids). Should never fire in healthy operation; if it fires, audit the tree.
+`─────────────────────────────────────────────────`
 
 ### 3.2 Smoke test
 
@@ -775,10 +844,36 @@ Walks `data/tree.json` (built by `build_tree.py`), extracts the page text spanni
 
 Reuses shared/rag_hybrid wholesale (Ingestor + chunk_corpus + char_window_chunks + autoconfig'd HybridEncoder). Mirrors lab-03's `ingest_to_vector.py` exactly except for spec/collection name. ~70 LOC.
 
+**Architecture:**
+
+```mermaid
+flowchart LR
+  Corpus["data/brk_corpus.json<br/>44 articles<br/>(from _brk_corpus.py)"] -->|chunk_corpus<br/>512c, 64 overlap| Chunks["3,857 windows"]
+  Chunks -->|HybridEncoder<br/>BGE-M3 dense-only| Vecs["1024-dim<br/>cosine vectors"]
+  Vecs -->|"Ingestor.run<br/>(autoconfig batch + fp16)"| Qdrant["Qdrant collection<br/>brk_2023_dense<br/>HNSW m=16"]
+```
+
+**Code:**
+
 ```python
 SPEC = CollectionSpec(name="brk_2023_dense", model=BGE_M3)
 # load corpus → chunk → encode → upsert via Ingestor
 ```
+
+**Walkthrough:**
+
+- `CollectionSpec(name="brk_2023_dense", model=BGE_M3)` — schema declares 1024-dim cosine via the BGE_M3 model spec; Ingestor materializes the Qdrant collection on first run.
+- `chunk_corpus(corpus, chunker=lambda t: char_window_chunks(t, 512, 64))` — char-window chunking sized to balance retrieval granularity vs context cost. Payload schema mirrors W2 + lab-02-5 (`article_title` rename for cross-lab consistency).
+- `HybridEncoder(autoconfig.encoder_config_for(BGE_M3))` — autoconfig picks device (mps on M5 Pro), batch size (128 in 48GB tier), fp16 (on with NaN-safety note for sparse head). For dense-only ingest, sparse head is unused — fp16 safe.
+- `Ingestor.run(payloads, SPEC)` — orchestrates create-collection-if-missing + batched upsert + payload persistence. ~5 min wall on M5 Pro for Berkshire 2023.
+
+**Result:** Qdrant collection `brk_2023_dense`: 3,857 points, 1024-dim cosine, HNSW m=16, ef_construct=100. Indexed_vectors_count=0 immediately after ingest (HNSW builds lazily on first query). Ingest wall time ~5 min.
+
+`★ Insight ─────────────────────────────────────`
+- **Same shared/rag_hybrid library used in W2 + lab-02-5 + lab-03.** Adding a fourth corpus required only a `CollectionSpec` + corpus path — zero changes to chunking, encoding, or ingest orchestration code. This is the proof that the library is the single source of truth for dense ingest across the curriculum.
+- **Dense-only on a sparse-capable encoder.** BGE-M3 supports dense + sparse + multi-vector simultaneously, but for this lab dense alone is enough — graph and tree backends supply the lexical/structural retrieval that sparse would otherwise add. Keeping ingest dense-only saves ~30% wall time.
+- **No schema migration on document update.** `Ingestor` upserts by stable point IDs derived from chunk content + position. Re-running on an updated PDF replaces affected chunks atomically without touching the collection schema.
+`─────────────────────────────────────────────────`
 
 #### `src/build_brk_graph.py` + `src/query_brk_graph.py` — Berkshire-namespaced GraphRAG
 
@@ -788,7 +883,22 @@ Trade-off: ~1400 LOC duplicated vs env-var-parameterizing W2.5. Picked copy beca
 
 #### `src/compare_three.py` — runner
 
-Imports vector backend (autoconfig'd shared/rag_hybrid against `brk_2023_dense`), graph backend (`from query_brk_graph import answer`), tree backend (`from query_tree import answer`). Cross-lab import for scoring helpers from `lab-02-5/src/compare.py`. Per-category aggregation surfaces the architectural thesis (tree wins citation + refusal; vector wins factoid; graph degenerates on single-document star).
+Imports vector backend (autoconfig'd shared/rag_hybrid against `brk_2023_dense`), graph backend (`from query_brk_graph import answer`), tree backend (`from query_tree import answer`). Cross-lab import for scoring helpers from `lab-02-5/src/compare.py`. Per-category aggregation surfaces the empirical findings reported in §4.3.1 — vector wins factoid; graph wins aggregate (refuted the "graph degenerates" pre-lab hypothesis); tree wins refusal and ties graph on cross-section synthesis.
+
+**Architecture:**
+
+```mermaid
+flowchart LR
+  Q["query"] --> V["vector_answer<br/>Qdrant kNN + BGE rerank<br/>+ answer LLM"]
+  Q --> G["graph_answer<br/>(query_brk_graph)<br/>BrkEntity fulltext + traversal"]
+  Q --> T["tree_answer<br/>(query_tree)<br/>LLM nav over tree.json"]
+  V --> Score["score_substring +<br/>score_llm_judge<br/>(reused from lab-02-5/compare.py)"]
+  G --> Score
+  T --> Score
+  Score -->|aggregate| Out["per-category +<br/>aggregate table<br/>+ results/three_way.json"]
+```
+
+**Code:**
 
 ```python
 # Canonical setup — full source in lab-02-7-pageindex/src/compare_three.py
@@ -812,6 +922,29 @@ def vector_answer(q, k=5):
     top = [h for h, _ in sorted(zip(hits, scores), key=lambda x: -x[1])[:k]]
     # ... LLM answer call against top-k ctx ...
 ```
+
+**Walkthrough:**
+
+- **Three retriever wrappers, identical signature.** Each backend exposes `def answer(q: str) -> dict` returning `{question, answer, contexts}`. Same shape lets the per-question loop call all three uniformly: `for retriever in (vector_answer, graph_answer, tree_answer): out = retriever(q)`. Common interface = pluggable backends.
+- **Cross-lab import for scoring.** `from compare import score_substring, score_llm_judge` reuses RAGAS-style scoring from lab-02-5 verbatim. Adding a sys.path bootstrap to lab-02-5/src is enough — no copy-paste of scoring logic, no drift between labs.
+- **Vector backend is the most complex retriever wrapper here.** Dense kNN against Qdrant returns 30 candidates; BGE-reranker scores each (query, passage) pair; top-K=5 by rerank score becomes the LLM's context. This mirrors lab-03's pattern exactly.
+- **Per-category aggregation in `main()`.** After the per-question loop, aggregate by `item["type"]` ("section-specific factoid", "cross-section synthesis", etc.). Per-category surfaces architectural strengths that aggregate alone hides — vector's 0.50 on factoid disappears in the 0.25 aggregate.
+
+**Result (8-question Berkshire eval, 2026-05-07):**
+
+| Backend | Aggregate judge | Latency |
+|---|---|---|
+| Vector | 0.25 | 1.8s |
+| **Graph** | **0.48** | 13.1s |
+| Tree | 0.44 | 3.4s |
+
+Per-category in §4.3.1. Pre-req: a sed-rename bug in `build_brk_graph.py` (double-prefixed Neo4j fulltext index `brk_brk_entity_names` vs query asking for `brk_entity_names`) caused the first run to report graph=0.00 across the board — see Bad-Case Entry 6.
+
+`★ Insight ─────────────────────────────────────`
+- **Same-corpus three-way comparison is the load-bearing experimental design.** The earlier `compare_three.py` template imported W2's vector backend (Wikipedia tech-founders), W2.5's graph backend (Wikipedia tech-founders), and W2.7's tree backend (Berkshire 2023). Three different corpora — comparison was meaningless. Reusing the Berkshire corpus across all three (Qdrant `brk_2023_dense`, Neo4j `:BrkEntity`, `tree.json`) is what makes the per-category numbers comparable.
+- **Neo4j Community Edition is single-database.** W2.5's `:Entity` graph and W2.7's `:BrkEntity` graph coexist under the same `neo4j` default database via label namespacing. Multi-database is Enterprise-only. Trade-off: graph queries must always specify the label, but data is fully isolated and W2.5 lab data (23,435 :Entity nodes) survived the W2.7 build untouched.
+- **Build-summary text is not authoritative — the database is.** The `compare_three.py` first-run found graph=0.00 not because the architecture failed but because the index name in code was double-sed-prefixed. Build script printed a hardcoded summary that lied about the index name. Discipline: smoke-test the actual artifact (`db.index.fulltext.queryNodes` against a known entity) before trusting any aggregate metric over it.
+`─────────────────────────────────────────────────`
 
 ### 4.2.5 Pre-req sequence — must run in this order
 
@@ -866,136 +999,86 @@ The lab does not need to reproduce FinanceBench's 98.7% absolutely — single 10
 
 If your tree backend hits ≥ 0.80 on category-specific and citation-required while vector + graph land at ≤ 0.65 on the same, the architectural lesson has reproduced.
 
----
+### 4.3.1 Empirical results — actual three-way numbers (2026-05-07 run, M5 Pro)
 
-## Phase 5 — Code Walkthroughs
+The lab actually ran. Numbers refined the §4.3 prediction in two ways: graph performed **much better** than predicted (it was the highest aggregate scorer, not the worst), and tree's "wins category-specific" prediction did **not** hold on a single 10-K.
 
-### Code walkthrough — `src/build_tree.py`
+**Build artifacts (Berkshire Hathaway 2023 Annual Report, ~148 pages):**
 
-`build_tree.py` converts a long PDF into a hierarchical JSON tree that captures the document's structural skeleton plus per-section summaries. It is the entire ingestion pipeline for tree-index RAG: no embeddings, no vector DB, no graph database — one JSON file is the index. The script's three passes (PDF parse → heading detection → LLM consolidation → summary) each do one concrete job; the LLM only enters in passes 2 and 3, where it does work that heuristics cannot.
-
-`★ Insight ─────────────────────────────────────`
-- **Heuristic-first, LLM-second is the cost-saving design choice.** Detecting heading candidates with regex on font-size proxies + numbered-prefix patterns is ~free; running an LLM over every line of a 150-page document to "find headings" would cost 50–200× more. The LLM's job is not detection — it is consolidation and cleanup of an over-eager candidate list.
-- **Per-node summaries are the load-bearing artifact.** The navigation LLM at query time sees only `{node_id, title, summary}`, never raw content. If summaries are vague ("This section discusses business operations") the navigator cannot disambiguate; if they are concrete ("Discusses Apple's $200B operations footprint, supplier concentration risk, and three pending litigation matters") the navigator routes correctly. Spend prompt tokens on summary specificity.
-- **The tree is one JSON file.** Versioning, diff'ing, and inspection all work with `git`, `jq`, and any text editor. No database to maintain, no schema migration when the document updates — just rebuild the tree. This is the operational simplicity that the "vectorless" framing earns.
-`─────────────────────────────────────────────────`
-
-**High-level architecture:**
-
-```
-PDF (binary)
-   ↓ pypdf parse
-[{page_num, text}, ...]
-   ↓ detect_heading_candidates (regex + font heuristics)
-[{page_num, line_text, candidate_level}, ...]   <-- noisy, over-eager
-   ↓ build_tree (LLM, one call)
-{title, node_id, nodes: [...]}                   <-- clean structural skeleton
-   ↓ add_summaries_recursive (LLM, one call per node)
-{title, node_id, summary, nodes: [...]}          <-- final tree.json
-```
-
-**Block 1 — `extract_pages`.** PDF-to-text is a solved problem; `pypdf` is the standard. The only design choice is whether to capture font/size metadata along with text. For a TOC-extraction use case, font metadata helps the heading-candidate detector (large fonts ≈ headings); for the lab's heuristic detector based on all-caps + numbered prefixes, plain text is sufficient. Production deployments add OCR for scanned filings — PageIndex's commercial API does this.
-
-**Block 2 — `detect_heading_candidates`.** Two heuristics with deliberate over-recall: all-caps short lines (level 1) + numbered prefixes like `1.`, `1.1.`, `1.1.1.` (level = nesting depth). Both produce false positives — a header like "PAGE 5" matches all-caps; a list item "1. Buy more milk" matches numbered prefix. **The LLM in the next block filters these out.** Optimizing the heuristic for precision would burn engineering effort that the LLM can absorb cheaply.
-
-**Block 3 — `build_tree`.** One LLM call consolidates the candidate list into a clean tree. The system prompt's three load-bearing rules: (a) drop spurious matches by category, not by pattern (lets the LLM use judgment); (b) consolidate near-duplicates; (c) infer `end_page` from the next sibling's `start_page`. JSON-mode `response_format` is mandatory — without it Gemma-4-26B emits prose preamble ~10% of the time at temp=0.
-
-**Block 4 — `summarize_node`.** Recurse over the tree, calling the LLM once per node with the text spanning that node's page range. Head-truncate at 12000 chars — a 10-K's longest section fits, and longer sections get the head where the topic sentence usually lives. Summaries average 80–120 words, sized to fit comfortably in the navigation prompt at all depths without bloating context.
-
-**Common modifications.**
-
-- **PageIndex commercial API.** For production-grade OCR + tree quality, swap blocks 1–3 with `pageindex.build_tree(pdf_path)` (paid API, better than the local Gemma pipeline on scanned or low-quality PDFs). Block 4 stays local — summaries are easy.
-- **Larger documents.** For 500-page+ filings, run `build_tree` per chapter (use top-level numbered prefixes as chapter boundaries) and merge the results, to keep the LLM call's input size under the model's effective context.
-- **Cross-document corpora.** Wrap each document's tree in a parent `corpus_root` node with the document's title and a 200-word summary. PageIndex calls this layer the "File System" — it lets a single navigation LLM call route between documents *before* descending into one.
-
-**Expected runtime on M5 Pro / Gemma-4-26B:**
-
-| Stage | 150-page 10-K | 500-page document |
+| Backend | Index size | Build wall time |
 |---|---|---|
-| PDF parse | ~3 s | ~12 s |
-| Heading detection | ~1 s | ~3 s |
-| Tree builder LLM call | ~10 s | ~25 s (chunked) |
-| Per-node summaries (~30 / ~120 nodes) | ~90 s | ~360 s |
-| **Total** | **~2 min** | **~7 min** |
+| Vector (Qdrant `brk_2023_dense`) | 3,857 chunks | ~5 min |
+| Graph (Neo4j `:BrkEntity`) | 4,479 nodes, 11,680 triples, 1,355 unique relations | 71.9 min |
+| Tree (`data/tree.json`) | 50 nodes, depth 4 | ~3 min |
 
-### Code walkthrough — `src/query_tree.py`
+**Aggregate (RAGAS LLM-judge over 8 questions):**
 
-`query_tree.py` runs the retrieval-by-reasoning loop: starting at the tree root, an LLM picks the most relevant child, recurse until a leaf is reached, fetch the leaf's text, hand it to the answer LLM. The traversal path is the audit trail — every answer cites which sub-tree was navigated and why. There is no embedding, no similarity score, no chunk store; the only state is the tree JSON and the running depth counter.
+| Backend | Judge score | Substring recall | Latency |
+|---|---|---|---|
+| Vector | 0.25 | 0.25 | **1.8s** |
+| **Graph** | **0.48** | **0.40** | 13.1s |
+| Tree | 0.44 | 0.31 | 3.4s |
 
-`★ Insight ─────────────────────────────────────`
-- **Each navigation step is one LLM call, depth-bounded.** A 4-deep tree on a 10-K = 4 nav calls + 1 answer call = 5 LLM calls per query. This is the cost ceiling. Vector RAG pays 1 LLM call per query (the answer); GraphRAG pays 2–4 (decomp + bridge + answer). Tree-index is *deliberately* the most expensive lane — that is the trade-off for the precision win on long structured documents.
-- **Refusal is built in by design.** The navigation LLM can return `{"chosen_id": null}` when no child looks relevant; the answer LLM then sees the current node's content (often the document root) and faithfully refuses. Out-of-document queries fail clean. Vector RAG has to be coaxed into refusing via prompt; tree-index gets it for free.
-- **The depth counter is a safety net, not a feature.** `MAX_DEPTH=6` bounds runaway loops on malformed trees (e.g. a self-referencing node, a tree built with circular ids). It should never fire in healthy operation; if it fires, audit the tree.
-`─────────────────────────────────────────────────`
+**Per-category:**
 
-**High-level architecture:**
+| Category | Vector | Graph | Tree | Winner |
+|---|---|---|---|---|
+| Section-specific factoid | **0.50** | 0.00 | 0.00 | Vector |
+| Cross-section synthesis | 0.00 | **0.50** | **0.50** | Graph + Tree (tie) |
+| Citation-required | 0.17 | **0.42** | 0.25 | Graph |
+| Out-of-document refusal | 0.33 | **1.00** | **1.00** | Graph + Tree (tie) |
 
-```
-query
-   ↓ navigate (recursive)
-   ├─ root → "which child?" → LLM call → child A
-   ├─ child A → "which child?" → LLM call → child A.2
-   ├─ child A.2 → "which child?" → LLM call → leaf A.2.1
-   └─ leaf reached
-   ↓ fetch_leaf_text (PDF page range)
-section text (≤ 16K chars)
-   ↓ answer LLM
-{answer, traversal_path, leaf_id, page_range}
-```
+**What the prediction got right:**
+- Vector wins factoid (semantic dense retrieval is the only backend that treats body text as primary content; graph drops dollar amounts during entity extraction; tree only sees section titles + page ranges)
+- Tree refuses out-of-document cleanly (1.00) — predicted "high"
+- Vector is fastest
 
-**Block 1 — `navigate`.** The recursive heart of the lane. Takes a node, formats its children as `{node_id, title, summary}`, asks the LLM to pick one. Three failure modes handled: (a) leaf reached (no children) → return current; (b) `chosen_id` null → caller treats current node as best; (c) hallucinated id (LLM returns an id not in children) → return current node (never recurse into a non-existent path). The hallucination guard is essential — without it the function would either recurse forever or crash on `KeyError`.
+**What the prediction got wrong:**
+- Graph predicted "low" across the board → actually **highest aggregate (0.48)**. Graph's entity-expansion ran multi-hop on `MENTIONED_IN` / `OWNS` / `HOLDS_STAKE_IN` edges and surfaced cross-section synthesis answers (Apple, Coca-Cola, American Express in non-controlled holdings) that vector's dense rerank missed.
+- Tree predicted "high" on section-specific factoid → actually **0.00**. Tree only sees titles + page ranges; it cannot answer "what was net earnings?" because dollar amounts live in the body, not the heading.
+- Graph also tied tree on refusal (1.00) — entity-search returning empty results triggers the same "insufficient context" path as tree's LLM walk landing on irrelevant leaves.
 
-**Block 2 — `NAV_SYSTEM` prompt.** The "prefer specificity" rule is the load-bearing instruction. Without it, the LLM ties between two equally-broad children and the choice becomes arbitrary; with it, the LLM is forced to pick the child whose summary mentions concrete query terms. The "return null if none relevant" branch is the refusal escape hatch — without it, the LLM picks the closest child even when the query is out of scope, and the answer LLM is then handed irrelevant content.
+**Architectural implications (revised):**
 
-**Block 3 — Leaf fetch.** Re-open the PDF, extract the text spanning `start_page..end_page`, head-truncate at 16K chars. The 16K limit is sized for Gemma-4-26B's effective context window when combined with the system prompt; bumping to 32K works on larger models but invites "lost in the middle" attention issues. For sections that exceed 16K, an extra summarization-then-answer pass yields better results than naive head-truncation — outside the lab's scope.
-
-**Block 4 — `ANSWER_SYSTEM`.** Three rules: cite node_id + page range, refuse explicitly when content does not support an answer, do not fabricate. Citation traceability is the production differentiator — for legal/audit/regulatory use cases, "the answer came from page 47–52 of the filing" is a hard requirement that vector RAG and GraphRAG do not natively satisfy. (You can bolt citation onto vector RAG by tracking chunk-to-page mapping; tree-index gets it natively because the leaf node carries the page range.)
-
-**Common modifications.**
-
-- **Beam search instead of greedy.** At each depth, ask the LLM to pick the *top-2* children (not just one) and run answer LLM against both, keeping the higher-confidence answer. ~2× cost, modest precision gain. Worth it on questions where the relevant content might span two sibling sections.
-- **Multi-document trees.** Lift the navigation loop to start at a `corpus_root` (PageIndex's "File System" layer) and route to one document's tree, then descend. Adds one navigation call per query but lets the same lane handle a corpus of N documents instead of one.
-- **Pre-cache common-query paths.** For repeated queries (FAQ-style), cache the traversal path keyed on a query embedding. Hits skip the navigation calls entirely; misses fall back to the full LLM-reasoning loop. Production pattern; not lab-scope.
-
-**Expected runtime per query on M5 Pro / Gemma-4-26B:**
-
-| Stage | Wall time |
+| Use case | Recommended backend |
 |---|---|
-| Navigate depth 1 (LLM call) | ~1.5 s |
-| Navigate depth 2 | ~1.5 s |
-| Navigate depth 3 (typical leaf reach) | ~1.5 s |
-| Leaf text fetch (PDF re-parse) | ~0.2 s |
-| Answer LLM | ~4–6 s |
-| **Typical total** | **~9–12 s** |
+| Numeric / exact-figure questions | Vector |
+| "Where in the document is X?" citation | Graph (or Tree if budget-constrained) |
+| Multi-section entity-relationship synthesis | Graph or Tree |
+| Refusal on out-of-scope questions | Graph or Tree (Vector hallucinates partials) |
+| Latency-critical UX | Vector (7× faster than Graph) |
+| Build from scratch in <10 min | Tree (no embedding step, no entity extraction) |
+
+The original "graph degenerates on single-document star corpus" hypothesis was **wrong** — graph performed best in aggregate. See bad-case Entry 5 below for why this finding almost got reported the other way around.
 
 ---
 
 ## Bad-Case Journal
 
-**Entry 1 — Tree builder hallucinates section titles that do not exist in the document.**
-*Symptom:* `tree.json` contains a node titled "Risk Factors Continued" but Cmd+F on the source PDF returns zero matches. Subsequent navigation chooses this hallucinated node, leaf fetch returns content that does not match the title, answer LLM either refuses or fabricates.
-*Root cause:* `TREE_BUILDER_SYSTEM` does not enforce that titles must be verbatim from the heading-candidate list. The LLM "cleans up" titles by inventing plausible variants, especially when the source heading is ALL-CAPS and looks ugly.
-*Fix:* Add a verbatim rule to the system prompt: *"Every node title must appear verbatim (case-insensitive substring) in the heading-candidate list. Do not invent or paraphrase titles. If a heading needs cleanup (e.g. ALL CAPS → Title Case), use the candidate's exact text and apply the case transformation; do not change words."* Add a post-hoc validation pass that asserts every node's title appears in the candidates and quarantines hallucinated nodes.
+**Entry 1 — `build_tree.py` produced a 2-node tree (root + TOC only) on Berkshire 2023.**
+*Symptom:* First run of `build_tree.py` against the 148-page Berkshire 2023 annual report wrote `data/tree.json` with two nodes total: root and "Table of Contents." Every subsequent query landed on TOC because no other node existed. `query_tree.py` returned page-1 TOC content for "What did Buffett say about non-controlled businesses?" — pure failure mode but no error thrown.
+*Root cause:* Two compounding bugs. (a) `detect_heading_candidates` only matched ALL-CAPS short lines and numbered prefixes (`1.`, `1.1.`, `Item 1A.`). Buffett's Chairman's Letter sub-section headings ("Our Not-So-Secret Weapon," "Non-controlled Businesses That Leave Us Comfortable") are Title Case prose — invisible to both heuristics. (b) Even with the few candidates found, `TREE_BUILDER_SYSTEM` over-consolidated them into a single TOC node because the prompt lacked an explicit coverage rule.
+*Fix:* Two-layer. (a) Added Title Case branch to `detect_heading_candidates` — short lines (≤8 words) where every meaningful word starts uppercase. (b) Added "coverage rule" to `TREE_BUILDER_SYSTEM`: *"Every meaningful section in the document must be represented; do not consolidate distinct sections under a generic parent."* Plus annual-report structural priors as few-shot guidance (Letter, Form 10-K Items 1-15, MD&A, Financial Statements, Notes, Governance). Result: tree grew from 2 → 50 nodes, depth 4. Navigation queries then landed on actual content sections, not TOC.
 
-**Entry 2 — Navigation LLM picks the same wrong sub-tree on every query.**
-*Symptom:* For 8 of 20 eval queries, traversal terminates at "Item 1A — Risk Factors / General Risks" regardless of query content. The leaf is generic boilerplate; answers are weak.
-*Root cause:* "General Risks" subsection has a vague summary like "Discusses general risks to the company's business operations" that semantically matches almost any business question. The navigation LLM, picking by surface specificity, lands here whenever a more-specific child does not exist.
-*Fix:* Two-step. (a) Re-run `add_summaries_recursive` with a tighter `SUMMARIZE_SYSTEM` prompt: *"Summary must mention three specific topics, products, or risk types named in the section. Reject generic summaries — if the section truly is generic boilerplate, say so explicitly: 'Generic risk-factor boilerplate; refer to specific risk subsections instead.'"* (b) Add a heuristic in `navigate`: if a node's summary contains the phrase "refer to specific subsections", deprioritize it relative to its siblings.
+**Entry 2 — Eval question scored 0 because Buffett restructured the 2023 letter and removed the literal phrase.**
+*Symptom:* Eval question "What are Berkshire's acquisition criteria?" scored 0.00 across vector + graph + tree backends. Manual inspection of `tree.json` showed no "Acquisition Criteria" node and no near-equivalent. The question was authored against generic Buffett knowledge, not against the actual 2023 letter.
+*Root cause:* Buffett restructured the Chairman's Letter format in 2023 — the literal phrase "Acquisition Criteria" appears in many earlier letters but was removed from the 2023 edition. The eval set was authored before `tree.json` was inspected; questions did not match the actual document's section coverage.
+*Fix:* Re-calibrated the entire 8-question eval against the actual `tree.json` AFTER the tree fix landed. Replaced "Acquisition Criteria" with "Our Not-So-Secret Weapon" and "Non-controlled Businesses That Leave Us Comfortable" — real sub-section names verified present in the 2023 letter. **Discipline rule:** never author eval questions before inspecting the actual ingested tree/index. Eval-document calibration is a pre-flight check, not a post-hoc adjustment.
 
-**Entry 3 — Tree depth blows out on documents with deep numbering.**
-*Symptom:* On a 250-page legal contract, the heuristic detector produces candidates with prefixes like `5.4.2.1.3` — depth 5. The tree builder honors this nesting; navigation hits `MAX_DEPTH=6` and terminates at a non-leaf. Answers come from sub-section summaries, not actual content.
-*Root cause:* Some document classes (legal contracts, IRS regulations) use deep nesting structurally that does not correspond to meaningful semantic boundaries; depth 5 is often "minor exception clause" not "major section".
-*Fix:* Cap heuristic-detected depth at 3 in `detect_heading_candidates` (`candidate_level = min(depth + 1, 3)` — already in the code; the bug was setting it to 4). Bump `MAX_DEPTH` only when the document genuinely benefits from deeper navigation, audited per-document.
+**Entry 3 — Forked W2.5 `MATCH (n) DETACH DELETE n` would have wiped 23,435 coexisting `:Entity` nodes from the W2.5 lab graph.**
+*Symptom:* `lab-02-7-pageindex/src/build_brk_graph.py` was a sed-rename of `lab-02-5-graphrag/src/build_graph.py`. The sed renamed `Entity → BrkEntity` and `entity_names → brk_entity_names`. The first thing the build script does on each run is wipe prior data: `MATCH (n) DETACH DELETE n`. That statement is unscoped — it deletes *every* node, not just BrkEntity nodes. Running it on the shared Neo4j Community-edition default database would have wiped 23,435 `:Entity` nodes from W2.5's still-active GraphRAG lab.
+*Root cause:* Neo4j Community Edition supports only one user database (`neo4j`); W2.5's `:Entity` graph and W2.7's `:BrkEntity` graph have to coexist in that single database via label namespacing. The W2.5-original `MATCH (n) DETACH DELETE n` is correct in the W2.5 lab where Neo4j is single-tenant, but unsafe when the database is shared.
+*Fix:* Scoped the wipe to the W2.7 namespace BEFORE running: `MATCH (n:BrkEntity) DETACH DELETE n`. Verified W2.5 data preservation post-build via `MATCH (n:Entity) RETURN count(n)` → 23,435 (intact). **Discipline rule:** any `DELETE` against a database shared across labs MUST be label-scoped. Run a count-by-label query before the first delete to inventory what coexists.
 
-**Entry 4 — Summary pass costs more than expected because nodes overlap heavily.**
-*Symptom:* `add_summaries_recursive` runs ~30 LLM calls on a 150-page 10-K but each call sees ~10000-char content; total wall time = 90 s, ~3× expected. Profiling shows 60% of the wall time is in summarize calls, not navigation.
-*Root cause:* Parent node `start_page..end_page` covers a span that includes its children's spans — so summary content is fetched and re-summarized at every level. The root's content includes the whole document; Item 1's content includes Items 1A, 1B, 1C; etc. Nested summarization is *O(depth)* in content read time.
-*Fix:* Skip summary generation for *non-leaf* nodes during the recursion; instead, compose parent summaries by concatenating + re-summarizing the children's summaries (cheap, ~500 tokens of input). Saves ~60% of summary-pass wall time, no quality loss because navigation reads parent summaries to decide which sub-tree to enter, not for direct answer content.
+**Entry 4 — Neo4j container exited mid-build; volume preservation across container recreation required reading mount IDs BEFORE `docker rm`.**
+*Symptom:* During Phase 4 graph build, `docker ps -a | grep neo4j` showed the `neo4j-graphrag` container in `Exited (1)` status. `bolt://localhost:7687` connection refused. A naive recovery — `docker rm neo4j-graphrag && docker run -d --name neo4j-graphrag neo4j` — would have spun up a fresh container with empty volumes, losing both W2.5's `:Entity` data and W2.7's in-progress `:BrkEntity` data.
+*Root cause:* Container ephemeral filesystem holds runtime state (PID files, lock files); the data lives in named volumes mounted at `/data` and `/logs`. Removing the container without preserving volume bindings on the replacement container creates fresh empty volumes. The volume IDs (e.g. `d6cdbff...` for `/data`, `b10ddfeb...` for `/logs`) are only visible via `docker inspect` of the existing container — once removed, the IDs are recoverable only from `docker volume ls` orphan output, by guess.
+*Fix:* Read mount IDs via `docker inspect neo4j-graphrag | jq '.[0].Mounts'` BEFORE `docker rm`. Then `docker run` the new container with explicit `-v <volume-id>:/data -v <volume-id>:/logs` plus matching `NEO4J_AUTH=neo4j/graphrag-lab` and `NEO4J_PLUGINS=apoc,graph-data-science`. Verified post-recreation: W2.5's 23,435 `:Entity` nodes intact, W2.7's in-progress `:BrkEntity` graph preserved. **Discipline rule:** for any container holding stateful data, capture `docker inspect` output to a file before any destructive Docker operation.
 
-**Entry 5 — `RESULTS.md` shows tree-index losing on cross-section synthesis questions.**
-*Symptom:* On the 6 cross-section synthesis questions in the 20-Q eval, tree achieves judge 0.42 vs vector 0.58. Tree's answers cite one section correctly but miss the second. Vector's top-K retrieval lands chunks from both sections.
-*Root cause:* Tree-index's traversal is greedy and commits to one branch; for queries that genuinely require synthesizing content from two distant sub-trees, tree-index structurally cannot retrieve both. This is the architectural loss case.
-*Fix:* Two paths. (a) Adopt beam search at navigation (top-2 children at each depth, parallel retrieval, answer LLM sees both) — partial mitigation, ~2× cost. (b) Route cross-section synthesis questions to a different lane via the W2.7 query classifier; vector RAG with a reranker can sometimes catch these. The cleaner production answer is to *route by query shape*: tree for section-specific, vector for cross-section synthesis.
+**Entry 5 — Three-way comparison reports graph judge=0.00; bug masquerades as architectural finding.**
+*Symptom:* First-pass `compare_three.py` aggregate shows `graph judge=0.00, latency=0.6s` across all 8 eval questions. Per-question result is identical: `[ERROR ClientError: Failed to invoke procedure 'db.index.fulltext.queryNodes': There is no such fulltext schema index: brk_entity_names]`. The narrative writes itself: "graph degenerates on single-document corpora." It is plausible. It is also wrong.
+*Root cause:* `build_brk_graph.py` was a sed-rename of `lab-02-5/src/build_graph.py` — `Entity → BrkEntity` and `entity_names → brk_entity_names`. The CREATE INDEX statement was processed by both substitutions and produced `brk_brk_entity_names`. Build summary printed `brk_entity_names` (line 452 was a hardcoded display string, not derived from the SQL); Neo4j held `brk_brk_entity_names`; query script `query_brk_graph.py` asked for `brk_entity_names`. Three layers of inconsistency, no integration smoke test.
+*Fix:* (a) Rename the index in Neo4j: `DROP INDEX brk_brk_entity_names; CREATE FULLTEXT INDEX brk_entity_names FOR (n:BrkEntity) ON EACH [n.name, n.aliases]`. (b) Patch line 362 of `build_brk_graph.py` to match. (c) Re-run compare. Real numbers: graph aggregate 0.48 (highest of the three), refuting the "single-document graph collapses" hypothesis. **Discipline rule:** before reporting a clean architectural finding from a forked build script, run the smallest possible smoke test — a single `db.index.fulltext.queryNodes` against a known entity — to prove the index actually exists. The 30-second check would have caught this.
 
 ---
 
@@ -1003,11 +1086,11 @@ section text (≤ 16K chars)
 
 **Soundbite 1 — "When does PageIndex / tree-index RAG beat vector and graph?"**
 
-"Tree-index wins on long structured documents — SEC filings, contracts, textbooks — where the document's hierarchy is the answer to most queries. My lab on a 150-page 10-K: tree-index hit 0.85+ judge on section-specific factoids and citation-required questions; vector hit 0.55-0.65; graph collapsed because single-document graphs are degenerate stars. PageIndex's published 98.7% on FinanceBench is the canonical reference. The cost is 5–30× per query, so route by corpus shape, do not default to it."
+"Tree-index wins on refusal and citation, not on factoid lookup like I'd expected. My lab on Berkshire's 2023 10-K — three backends, same corpus, same 8-question eval: vector won factoid (0.50 vs 0.00 on 'what was net earnings?'); graph won aggregate (0.48) by surfacing entity-relationship answers across sections; tree tied graph on cross-section synthesis (0.50) and out-of-document refusal (1.00). Tree was 4× faster than graph for similar accuracy on synthesis. The architectural takeaway: route by query shape, not by corpus shape — vector for numeric lookup, graph for entity relationships, tree for citations and refusal."
 
 **Soundbite 2 — "What's the failure mode of tree-index retrieval?"**
 
-"Two structural losses. First, cross-section synthesis: tree commits to one branch greedily, so a query that legitimately needs content from two distant sub-trees retrieves only one. In my eval it scored 0.42 on cross-section questions where vector hit 0.58. Second, summary quality cascades — vague summaries like 'discusses business operations' starve the navigator and route every query into a generic boilerplate node. My fix is the summary prompt: force three concrete topics per summary, refuse generic phrasings, and reject the section if it really is boilerplate."
+"Two structural losses I measured. First, factoid lookup: tree only sees section titles + page ranges, so it cannot answer 'what was Berkshire's net earnings?' — vector got 1.00 on that, tree got 0.00. The body text never enters the navigator's context. Second, cross-section synthesis under greedy navigation: tree commits to one branch, so a query that legitimately needs two sub-trees retrieves one. Beam search at navigation (top-2 children parallel) is partial mitigation at ~2× cost; the cleaner answer is to route cross-section synthesis to vector or graph via a haiku-tier classifier."
 
 **Soundbite 3 — "Why three retrieval lanes instead of one universal pipeline?"**
 

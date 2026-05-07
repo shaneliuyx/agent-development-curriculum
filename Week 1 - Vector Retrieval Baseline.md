@@ -947,30 +947,6 @@ python src/04_eval.py            # Nomic recall should now land at ~0.95+
 ```
 Quick diagnostic before committing to a 10-min ingest: encode the same string twice and check if outputs are bit-identical (max abs diff < 1e-5). If they differ, the model has random-init layers and the cache is stale.
 
-**Entry 2 — Nomic v2 recall drops ~30 points; missing `search_query:` prefix.**
-*Symptom:* Nomic Embed v2 eval script runs without errors but produces recall@10 = 0.52 instead of expected 0.95+. No error messages.
-*Root cause:* Nomic v2's training baked asymmetric prefixes into the embedding space: documents are encoded with `"search_document: "` prefix, queries with `"search_query: "`. The model was trained on data with these prefixes; without them, the query and document embeddings live in different parts of the space. Using the doc prefix on queries (or no prefix at all) produces meaningless similarity scores.
-*Fix:* Prepend the correct prefix in the eval script's query-embedding step. In `04_eval.py`, line 570: `texts = [prefix + queries[qid] for qid in qids]` where `prefix = "search_query: "` for Nomic configs. Verify the prefix in the ingest script matches: `src/03_ingest_nomic.py` line 416 uses `f"search_document: {d['text']}"`.
-
-**Entry 3 — Nomic v2 loads but with `UNEXPECTED` and `MISSING` weight warnings.**
-*Symptom:* `SentenceTransformer(model_path, trust_remote_code=True)` succeeds; no exception is raised. Downstream, model produces embeddings but with nonsensical recall. Console output includes `Some weights are not expected:` or `Some weights are missing:` warnings.
-*Root cause:* `trust_remote_code=True` is mandatory for Nomic v2 because its MoE architecture is not in the stock transformers model registry. Forgetting it falls back to loading the base model without custom modeling code, and the layer mappings fail. The `trust_remote_code` flag must be set **everywhere** the model loads — both the ingest scripts AND the eval script. An ingest-vs-eval mismatch causes the same model to load with different layer mappings on each side, putting query and document embeddings in incomparable spaces.
-*Fix:* Set `trust_remote_code=True` on every `SentenceTransformer()` instantiation for Nomic models. Use the `model_config.py` spec to enforce this across all scripts: `m = SentenceTransformer(model.path, device="mps", trust_remote_code=model.trust_remote_code)`.
-
-**Entry 4 — Qdrant scroll copies empty vectors; recall@10 = 0.00 in fast-index ablation.**
-*Symptom:* Phase 3.3 script (copying vectors from `bge_m3_hnsw` to `bge_m3_hnsw_fast`) completes without error. Both collections report the same point count in Phase 4. But eval on `bge_m3_hnsw_fast` returns recall@10 = 0.00 across all queries — no results match any gold docs.
-*Root cause:* Qdrant's `scroll()` call defaults to `with_vectors=False` to save bandwidth when you only need payloads. If you forget the flag, `scroll()` returns points with `vector=None`, and upserting `None` vectors creates points with no vector data. HNSW search then has no vectors to compare and returns nothing. The failure is silent: `points_count` on the destination collection is non-zero (points exist), but they are empty shells.
-*Fix:* Always set `with_vectors=True` in `scroll()` calls when copying vectors:
-```python
-points, offset = qd.scroll(
-    collection_name=SRC,
-    limit=BATCH,
-    with_vectors=True,   # CRITICAL — default is False
-    with_payload=True,
-    offset=offset,
-)
-```
-
 ---
 
 ## What's next

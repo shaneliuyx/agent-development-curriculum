@@ -599,6 +599,41 @@ points, offset = qd.scroll(
 
 ---
 
+## 2026-05-07 — Week 2.7 — sed-rename of forked build script produces double-prefixed Neo4j fulltext index; bug masquerades as architectural finding
+
+**Symptom:** First-pass `lab-02-7-pageindex/src/compare_three.py` aggregate over an 8-question Berkshire 2023 10-K eval reports `vector judge=0.25, graph judge=0.00, tree judge=0.44, latency: V=2.1s G=0.6s T=4.5s`. Per-question raw output shows every graph answer is the same `[ERROR ClientError: Failed to invoke procedure 'db.index.fulltext.queryNodes': There is no such fulltext schema index: brk_entity_names]`. The aggregate is internally consistent and tells a clean architectural story: "graph degenerates on single-document corpora, vector wins factoid, tree wins synthesis + refusal." The story is plausible. The story is also wrong.
+
+**Why it's a bad case:** The build's INGEST SUMMARY printed `Full-text index: brk_entity_names (over BrkEntity.name, BrkEntity.aliases)` — an explicit positive confirmation. The query script asked Neo4j for `brk_entity_names`. The error said `brk_entity_names` does not exist. Three sources of agreement, one disagreement source (Neo4j itself), and a tempting "graph collapses" narrative that confirmed the expected lab outcome. Pattern: forked-build-script-with-sed + hardcoded summary text + downstream consumer that trusts the build summary instead of the database.
+
+**False leads:**
+1. "Neo4j is broken" — checked `SHOW INDEXES`, server returned 3 BrkEntity indexes including a fulltext one, dropped it.
+2. "Graph backend is architecturally weak on this corpus" — accepted because it matched the predicted §4.3 result shape. Started writing it up before re-running.
+3. "Build summary is authoritative" — the build summary is a hardcoded `print()` at line 452 of `build_brk_graph.py`, not derived from the actual SQL.
+
+**Root cause:** `lab-02-7-pageindex/src/build_brk_graph.py` was created by sed-renaming `lab-02-5-graphrag/src/build_graph.py` with two substitutions: `Entity → BrkEntity` and `entity_names → brk_entity_names`. The CREATE INDEX statement was originally `CREATE FULLTEXT INDEX entity_names ...`. After substitution one (`entity_names → brk_entity_names`) it became `CREATE FULLTEXT INDEX brk_entity_names ...`. After substitution two (`Entity → BrkEntity`) the FOR clause got renamed correctly but the index name had already been processed by substitution one — and a separate sed pass over the same line during a later edit pass turned `brk_entity_names` → `brk_brk_entity_names`. Final state in code (line 362 before fix): `"CREATE FULLTEXT INDEX brk_brk_entity_names IF NOT EXISTS "`. Final state in Neo4j: `brk_brk_entity_names`, ONLINE, 100%. Final state in query script (line 56, 177): `db.index.fulltext.queryNodes("brk_entity_names", ...)`. Three layers of name strings, one mismatch, no integration smoke test.
+
+**Fix:**
+```bash
+docker exec neo4j-graphrag cypher-shell -u neo4j -p graphrag-lab \
+  "DROP INDEX brk_brk_entity_names; \
+   CREATE FULLTEXT INDEX brk_entity_names FOR (n:BrkEntity) ON EACH [n.name, n.aliases];"
+```
+Also patch `build_brk_graph.py` line 362: `brk_brk_entity_names` → `brk_entity_names`. Re-run `compare_three.py`. Real numbers: `vector judge=0.25, graph judge=0.48, tree judge=0.44`. Graph is highest aggregate, refuting the "single-document graph collapse" hypothesis.
+
+**Time cost:** ~10 min from running buggy compare to noticing the error pattern in raw `results/three_way.json`. Cost-with-lesson would have been ~30 sec — a single `db.index.fulltext.queryNodes("brk_entity_names", "Berkshire")` smoke check after build.
+
+**5-second sanity test:** After any forked-build script that touches Neo4j indexes, run one fulltext query against a known-present entity name. If it returns zero hits or throws "no such index," the rename diverged. Bake into the build script as a final assertion.
+
+**Generalizes to:** Any forked + sed-renamed infrastructure script — Postgres schema migrations, Elasticsearch index templates, Kubernetes manifests, Terraform modules. Whenever you sed-rename a build artifact, the build's success log is *not* sufficient evidence that the artifact is functionally correct. Verify by *reading* the artifact (database, cluster, kube-api), not by trusting the script's own summary text.
+
+**Captured in curriculum at:** [[Week 2.7 - Structure-Aware RAG#Bad-Case Journal]] Entry 5
+
+**Lab artifact:** `lab-02-7-pageindex/src/build_brk_graph.py` line 362 — `CREATE FULLTEXT INDEX brk_entity_names IF NOT EXISTS`
+
+**Tags:** #infrastructure #graph #sed-rename #integration-gap #lab-02-7
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.

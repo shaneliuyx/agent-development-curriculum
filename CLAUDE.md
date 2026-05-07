@@ -42,31 +42,21 @@ Phases are numbered and time-budgeted (`## Phase 1 — <name> (~2 hours)`). Each
 - Verification commands at the end of the phase
 - An expected metrics table (recall@K, latency, cost, etc — measured on M5 Pro hardware)
 
-### Section 5 — Code Walkthroughs (REQUIRED — W2 format, block-by-block per script)
+**Per-Python-block bundle (NORMATIVE).** Each Python script (or substantive Python snippet) inside a Lab Phase MUST be presented as one self-contained bundle, in this exact order, before moving to the next block:
 
-For every phase script in §4, add a corresponding walkthrough that follows W2's `00_hybrid_ingest.py` walkthrough structure exactly. The reference is at `Week 2 - Rerank and Context Compression.md` — open it before writing any new walkthrough.
+1. **Architecture diagram** — Mermaid (non-ASCII) showing the data flow / call graph for THIS script. Place immediately before the code. Edge labels containing parens (`...(over-recall)...`) MUST be quote-wrapped (`-->|"text<br/>(parens)"| Node`) — bare parens in unquoted edge labels break the Mermaid parser.
+2. **Code** — full `\`\`\`python` block. Annotate `**Code:**` header above for visual delineation.
+3. **Walkthrough** — `**Walkthrough:**` header, then bullet-per-block analysis (`**Block 1 — <title>.**` + 2–4 sentences answering *why*, not what). Cover gotchas a copy-paster would miss.
+4. **Result** — `**Result:**` header, then measured numbers from the actual lab run (wall time per stage, output sizes, aggregate scores). Pull from `RESULTS.md` in the lab repo. Mark `~estimated` if not yet measured; update after the run.
+5. **Insight callout** — `\`★ Insight ─────────────────────────────────────\`` / `\`─────────────────────────────────────────────────\`` border around 2–3 bullets calling out non-obvious design choices, model superpowers being exploited, deliberate trade-offs.
 
-**Required walkthrough shape (mandatory order):**
+The bundle is one continuous reading unit — do not split mermaid into one section, code into another, walkthrough into a separate `## Phase 5 — Code Walkthroughs` section. The old `## Phase 5` separate-section pattern is **deprecated** as of 2026-05-07. Reference: `Week 2.7 - Structure-Aware RAG.md` Phase 2/3/4 — every Python block follows this bundle shape.
 
-1. **Opening paragraph (~80 words).** Name the script, state what it builds, explain why this script is foundational to the chapter (not just what it does).
+**The non-negotiable bar:** the walkthrough portion must answer "why is this code shaped this way?" — a reader who copy-pastes the script must come away understanding the design choices, not just having a working script. If you cannot answer "why" for a block, you do not understand it well enough; spike the code first, then write.
 
-2. **`★ Insight ───────` callout.** 2–3 bullets calling out the *non-obvious* design choices the script encodes — model superpower being exploited, infrastructure feature being used, deliberate trade-offs the script makes against pedagogical clarity vs production scale. Use the exact `★ Insight ─────────────────────────────────────` / `─────────────────────────────────────────────────` border from the W2 walkthrough.
+### Section 5 — (deprecated)
 
-3. **High-level architecture (ASCII diagram or mermaid).** Before line-by-line: show the shape of what's being built. ASCII boxes + arrows are preferred over mermaid here because they're inline and don't require renderer-specific syntax. The W2 example shows a 2-vector point being assembled — copy that compositional shape.
-
-4. **Block-by-block analysis** with these exact heading conventions:
-   - `**Block 1 — <descriptive title>.**` followed by code excerpt
-   - 2–4 explanatory paragraphs per block answering **why**, not what. Cover gotchas a copy-paster would miss.
-   - Tables comparing flag/option choices when the block has tunable parameters (e.g., `use_fp16=False` row table from W2).
-   - Inline code excerpts shown verbatim, not summarized.
-
-5. **Common modifications.** A short paragraph listing what to change for different hardware tiers, corpus sizes, or backend swaps. The W2 example covers M1/M2 vs M3/M5 batch sizes and fp16 caveats.
-
-6. **Expected runtime table.** Concrete wall-time numbers per stage on the user's hardware (M5 Pro, 48 GB unified). When numbers aren't measured yet, mark them `~estimated` and update after the lab actually runs.
-
-**The non-negotiable bar:** every block must answer "why is this code shaped this way?" — a reader who copy-pastes the script must come away understanding the design choices, not just having a working script. If you cannot answer "why" for a block, you do not understand it well enough to walkthrough it; spike the code first, then write.
-
-This is the section most commonly skipped or written too thinly. W2's walkthroughs are the canonical example. Do NOT write walkthroughs that just describe what each block does in one sentence — that is a tutorial, not a reference, and fails the §5 requirement.
+The previous `## Phase 5 — Code Walkthroughs` separate section is no longer used. Walkthroughs live inline next to their code per the §4 per-block-bundle rule above. Existing chapters with a standalone §5 should be migrated when next touched: move each walkthrough back into the Phase that contains its code, then delete §5.
 
 ### Section 6 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
 
@@ -136,7 +126,8 @@ Update `updated:` on every substantive edit. Tags should overlap with sibling ch
 [ ] §3  Mermaid diagram present and labeled
 [ ] §4  Lab phases numbered, time-budgeted, with runnable code
 [ ] §4  Expected metrics table present
-[ ] §5  Code walkthrough exists for every script in §4
+[ ] §4  Per-Python-block bundle present (Architecture mermaid → Code → Walkthrough → Result → Insight) for every Python script
+[ ] §4  Mermaid edge labels with parens are quote-wrapped (`-->|"text<br/>(parens)"|`)
 [ ] §6  Bad-Case Journal — 3–5 entries in exact 3-field format
 [ ] §6  New entries copied to global Bad-Case Journal.md
 [ ] §7  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored

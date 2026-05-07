@@ -1708,17 +1708,7 @@ Parallelizing LLM-backed checks (faithfulness, relevance) recovers ~30% of the l
 
 ### Bad-Case Journal
 
-**Entry 1 — Faithfulness gate rejects paraphrase of correct answer.**
-*Symptom:* User asks "What is the cancellation window?" Retrieved context says "48 hours". Model answers "two-day window" (semantically equivalent, factually correct). Faithfulness judge scores the claim as unsupported. Gate fires; user sees refusal for factually correct response.
-*Root cause:* LLM-judge faithfulness metric decomposes answers into atomic claims and checks entailment. Judge sees "two days" and "48 hours" as distinct claims; no explicit equivalence relation or few-shot example teaches numeric/temporal conversion. Entailment check fails on paraphrases requiring domain knowledge or unit reasoning.
-*Fix:* Add few-shot examples of numeric equivalence to the judge prompt: `{claim: "two days", context: "48 hours", entailed: true}`. Alternatively, two-pass approach where first pass rewrites the answer in exact context vocabulary ("two-day window" → "48-hour window" using retrieved phrase) before faithfulness scoring.
-
-**Entry 2 — Toxicity classifier false-positives on clinical Q&A.**
-*Symptom:* Clinical decision-support system retrieves context with medication overdose thresholds ("lethal dose is X mg"). User asks legitimate dosing question. Llama Guard toxicity classifier flags context as self-harm content. Guardrail blocks response before retrieval/generation runs.
-*Root cause:* Llama Guard trained on consumer safety (preventing self-harm promotion). Medical language (overdose, lethal dose, thresholds) triggers identical patterns as self-harm instructions, but in clinical context is legitimate reference material. Domain-agnostic classifier cannot distinguish and has no mechanism to condition on document provenance or domain tags.
-*Fix:* Three options: (1) Use domain-specific toxicity classifier fine-tuned on clinical data. (2) Add pre-classification context tag ("clinical professional mode") that shifts decision boundary. (3) Reorder pipeline: run toxicity check *after* retrieval so guardrail can condition on retrieved document metadata. Route clinical corpora through separate guardrail pipeline tuned for medical language.
-
-**Entry 3 — HyDE added cost without improving the default pipeline.**
+**Entry 1 — HyDE added cost without improving the default pipeline.**
 *Symptom:* HyDE preserved `context_recall = 1.0000`, but answer relevancy stayed below baseline. The long 3–5 sentence HyDE prompt scored `answer_relevancy = 0.7286`; the shorter one-sentence HyDE prompt scored `0.7293`; baseline prompt v2 scored `0.7494`.
 *Root cause:* The baseline retriever already found the needed evidence for every question, so HyDE had no recall gap to close. The longer hypothetical answer introduced extra vocabulary that slightly hurt context precision; shortening it reduced drift but did not improve answer targeting.
 *Fix:* Reject HyDE as the default for this corpus/dev set. Keep the one-sentence HyDE prompt only as an optional variant for future low-recall or vocabulary-mismatch query clusters. Ensure HyDE eval writes to `results/ragas_hyde.json` and `results/ragas_hyde_debug.jsonl`, not baseline filenames.
