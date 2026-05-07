@@ -119,40 +119,42 @@ Each lane has its own ingestion path. Vector lanes ingest once and serve many qu
 ```mermaid
 flowchart LR
     DOC[Long PDF<br/>~150 pages 10-K filing] --> PARSE[PDF parse<br/>extract text + page positions]
-    PARSE --> HEADINGS[Structural heading detection<br/>regex + font-size heuristics<br/>OR LLM-based section detection]
-    HEADINGS --> TREE[LLM tree builder<br/>Gemma-4-26B<br/>JSON-mode, T=0.0]
-    TREE --> SUMMARIZE[Per-node summary<br/>Gemma-4-26B<br/>~100 tokens per node]
-    SUMMARIZE --> JSON[(tree.json<br/>title + node_id +<br/>page_range + summary)]
+    PARSE --> HEADINGS[Structural heading detection<br/>regex + heuristics<br/>over-recall expected]
+    HEADINGS --> TREE[LLM tree builder<br/>JSON-mode, T=0.0<br/>~35 nodes / depth 3]
+    TREE --> SPLIT[split_large_nodes<br/>shared/tree_index<br/>splits leaves > 5p / > 20K chars<br/>~5-10 LLM calls]
+    SPLIT --> SUMMARIZE[Per-node fact-rich summary<br/>FACT_RICH_SUMMARIZE_SYSTEM<br/>~62 LLM calls × ~5s ea]
+    SUMMARIZE --> JSON[(tree.json<br/>62 nodes / depth 5<br/>id + title + page_range + summary)]
 
     style PARSE fill:#9b59b6,color:#fff
     style TREE fill:#f5a623,color:#fff
+    style SPLIT fill:#f5a623,color:#fff
     style SUMMARIZE fill:#f5a623,color:#fff
     style JSON fill:#27ae60,color:#fff
 ```
 
-Key properties: runs once per document, **LLM-bound** (~30–50 LLM calls for a 150-page document), idempotent, output is a single JSON file (no database).
+Key properties: runs once per document, **LLM-bound** (~70 LLM calls for a 150-page 10-K — 1 tree-builder + ~5–10 split + ~62 summary), idempotent, output is a single JSON file (no database). Wall time ~10 min on M5 Pro / Qwen3.6 4-bit.
 
 ### Diagram 2 — Query-Time Tree Traversal (expensive per query, no precomputation)
 
 ```mermaid
 flowchart TD
-    Q([User query]) --> ROOT[Load tree.json<br/>start at root]
-    ROOT --> PROMPT[Format children as<br/>id + title + summary list]
-    PROMPT --> LLM1[Navigation LLM<br/>'Which child best answers?']
-    LLM1 --> CHOICE{Leaf node?}
-    CHOICE -->|no| RECURSE[Recurse into chosen child]
-    RECURSE --> PROMPT
-    CHOICE -->|yes| FETCH[Fetch leaf's text<br/>by page_range]
-    FETCH --> ANSWER[Answer LLM<br/>Gemma-4-26B<br/>cites node_id + pages]
-    ANSWER --> OUT([Cited answer<br/>+ traversal path])
+    Q([User query]) --> LOAD[Load compact tree view<br/>id / title / page-range / summary<br/>NO body text]
+    LOAD --> LOOP[Agentic multi-turn loop<br/>shared/tree_index.AgenticTreeRetriever<br/>MAX_ITERATIONS=6]
+    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH[page_provider<br/>slices PDF text<br/>head-truncate 8K chars]
+    FETCH -->|tool result injected into msgs| LOOP
+    LOOP -->|"LLM emits no tool_call<br/>(content is final answer)"| ANSWER[Answer with inline<br/>citation pages X-Y]
+    LOOP -->|"out-of-scope detected<br/>(no plausible section)"| REFUSE[Explained refusal<br/>'doc is X, does not contain Y'<br/>+ insufficient context]
+    ANSWER --> OUT([Cited answer<br/>+ tool_calls log<br/>+ iterations])
+    REFUSE --> OUT
 
-    style LLM1 fill:#f5a623,color:#fff
+    style LOOP fill:#f5a623,color:#fff
     style ANSWER fill:#f5a623,color:#fff
     style FETCH fill:#4a90d9,color:#fff
+    style REFUSE fill:#7f8c8d,color:#fff
     style OUT fill:#27ae60,color:#fff
 ```
 
-Cost asymmetry: every query pays *tree_depth* navigation LLM calls + 1 answer LLM call. For a 4-deep tree on a 10-K filing, that is 5 LLM calls per query, ~5–15 seconds end-to-end. Vector RAG pays one ANN search + one answer call, ~0.5–2 seconds. **Tree-index is 5–30× slower per query.**
+Cost asymmetry: every query pays 2-6 LLM iterations (each = one tool_call + one tool result OR one final-answer emission). Typical factoid converges in 2 iterations (1 fetch, 1 synthesis); cross-section synthesis can take 4-6 iterations; OOD refusal short-circuits to 1 iteration. Mean wall time ~14.6s on Qwen3.6 4-bit. Vector RAG pays one ANN search + one answer call, ~1.8s. **Tree-index is ~8× slower per query** — but achieves judge=0.79 on Berkshire 2023 vs vector 0.25 (lab-02-7-pageindex/RESULTS.md), because body text becomes visible to the decision-maker via the tool-call loop instead of being hidden behind greedy descent.
 
 ---
 
