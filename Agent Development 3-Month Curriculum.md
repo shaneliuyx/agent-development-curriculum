@@ -1505,7 +1505,7 @@ Do this 50+ times a year, you'll be ahead of 95% of people in the field — not 
 
 The "AI Engineer" job title spans three distinct company segments with different interview emphases and tech-stack expectations. Spray-applying a single resume across all three is the most common job-search mistake; targeted framing per segment doubles response rates.
 
-| Segment | Examples | Interview emphasis | Stack expectations | Fit for Yuxin's profile |
+| Segment | Examples | Interview emphasis | Stack expectations | Fit for the reader profile |
 |---|---|---|---|---|
 | **Product** (AI-first product companies) | Cursor, Hebbia, Granola, Limitless, Glean | Product judgment + UX + RAG quality | Cloud APIs, vector DBs, LLM-orchestration libs (LangChain / LlamaIndex / DSPy) | Mid — competes with PM/design-fluent candidates; differentiator is the W7+W8 stability work, not the RAG depth |
 | **Infrastructure** (AI-tooling / infra) | Modal, Pinecone, Braintrust, Weaviate, Astronomer, Tecton | Systems design + cost economics + reliability | Distributed systems, GPU infra, SRE tooling, observability | **Strongest fit** — 3-yr AWS infra background maps directly; W7 tool harness + W11 system design + Capstone C are the portfolio anchors |
@@ -1517,7 +1517,7 @@ The "AI Engineer" job title spans three distinct company segments with different
 
 The field guide flags a distinct sub-segment: **AI Platform Engineer / AI Infra Engineer / ML Platform Engineer**. These roles work *near* AI but not *on* AI — they build the platforms, observability, evaluation infrastructure, and deployment pipelines that AI Engineers consume. The field guide measured this at ~28.5% of all "AI Engineer"-adjacent JDs.
 
-**Why this matters for Yuxin specifically:**
+**Why this matters for the reader profile specifically:**
 - AI-Support roles competition pool is mostly *other infra engineers* who lack hands-on LLM experience. The 12-week curriculum closes that gap.
 - Capstone C (infra-aware SRE agent) qualifies for **both** "AI Engineer" (via the agent) AND "AI Platform Engineer" (via the platform engineering signal).
 - Salary bands often comparable to AI Engineer at a given level; sometimes higher because supply is tighter.
@@ -1633,7 +1633,8 @@ Useful modifiers you can add to any generation request:
 
 | Week | Runbook file | Core phases the runbook will contain |
 |---|---|---|
-| 2.5 | [[Week 2.5 - GraphRAG]] | Neo4j + Wikipedia subset; entity/relation extraction with local Gemma; 2-hop subgraph traversal; 25-Q multi-hop head-to-head vs Week 2 vector RAG; comparison matrix in `RESULTS.md` |
+| 2.5 | [[Week 2.5 - GraphRAG]] | Neo4j + Wikipedia subset; entity/relation extraction with local Gemma; 2-hop subgraph traversal; 25-Q multi-hop head-to-head vs Week 2 vector RAG; comparison matrix in `RESULTS.md`; v12 Wikidata QID linking closed entity-fragmentation ceiling |
+| 2.7 | [[Week 2.7 - Structure-Aware RAG]] | PageIndex / tree-index RAG on Berkshire 2023 annual report (~148 pages); LLM tree-walk over hierarchical TOC tree (no embeddings); same-corpus three-way comparison vs vector + graph; per-Python-block bundle structure (mermaid → code → walkthrough → result → insight); refuted "graph degenerates on single-document corpora" hypothesis with measured numbers |
 | 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests |
 | 3.7 | [[Week 3.7 - Agentic RAG]] | LangChain official 5-node Agentic RAG notebook running end-to-end; head-to-head vs Week 3 single-pass on 50-Q dev set; one CRAG variant; decision tree for when Agentic RAG helps vs hurts |
 | 4 | [[Week 4 - ReAct From Scratch]] | (1) 150-line `react.py` with no framework; (2) 4 local tools (search, repl, read_file, write_file); (3) SQLite trace logging; (4) 15+ bad-case scenarios with a before/after diff per patch; (5) `RESULTS.md` with failure-mode table |
@@ -1648,9 +1649,10 @@ Useful modifiers you can add to any generation request:
 | 8.5 | [[Week 8.5 - Voice AI Agents]] | Local cascaded pipeline (faster-whisper + Claude + ElevenLabs/Coqui); 20-turn latency measurement; OpenAI Realtime API head-to-head; barge-in handling implemented |
 | 9 | [[Week 9 - Faithfulness Checker]] | Claim-splitter prompt; NLI-based entailment scorer; SelfCheckGPT-lite (3× sample + BERTScore); abstention router; 30-Q hand-labeled test set |
 | 10 | [[Week 10 - Framework Shootout]] | Re-implement Week 4 loop in LangGraph, LlamaIndex agent worker, OpenAI Agents SDK pointing at local mlx server; LOC + traceability + testability decision matrix |
-| 11 | [[Week 11 - System Design]] | 5 × 2-hour whiteboard exercises (doc-QA / multi-agent triage / coding agent / financial-research / infra-aware); self-recorded; 6-point self-critique rubric |
+| 11 | [[Week 11 - System Design]] | 5 × 2-hour whiteboard exercises (doc-QA / multi-agent triage / coding agent / financial-research / infra-aware); self-recorded; **7-point self-critique rubric** (Gate 7 = quotable cost-cut from a prior lab + named routing rule, the offer-closing senior signal) |
 | 11.5 | [[Week 11.5 - Agent Security]] | 10-attack red-team suite extending W7 tool harness (5 attack classes + 3 indirect-injection variants); three defense layers (pydantic input validation / firejail sandbox / Llama Guard output filter); kill-rate-per-layer table |
-| 12 | [[Week 12 - Capstone and Mocks]] | Pick capstone (A/B/C), polish to portfolio bar; 30 mock-interview recordings; 10 job applications submitted with 1 tailored number each |
+| 11.7 | [[Week 11.7 - Take-Home Dress Rehearsal]] | 4-hour timed take-home rehearsal: small RAG with citations + RAGAS eval committed BEFORE main code (evals-first discipline visible in `git log`) + 5-min Loom defense screencast + RESULTS.md scored against the 30/30/25/15 take-home rubric; one quotable cost-cut number captured for W12 mock funnel |
+| 12 | [[Week 12 - Capstone and Mocks]] | Pick capstone (A/B/C), polish to portfolio bar; 30 mock-interview recordings; 10 job applications submitted with 1 tailored number each; one mock = project deep-dive on the W11.7 take-home repo |
 
 ### How runbooks grow over the quarter
 
