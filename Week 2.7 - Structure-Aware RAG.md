@@ -315,6 +315,17 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
 
+# Bootstrap shared/tree_index onto sys.path (cross-lab reuse layer)
+import sys
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "shared"))
+
+from tree_index import (  # noqa: E402
+    FACT_RICH_SUMMARIZE_SYSTEM,
+    SPLIT_SYSTEM,
+    split_large_nodes as _shared_split_large_nodes,
+)
+
 load_dotenv()
 omlx = OpenAI(
     base_url=os.getenv("OMLX_BASE_URL"),
@@ -444,18 +455,11 @@ def build_tree(headings: list[dict], doc_title: str, last_page: int) -> dict:
 
 # ---------------------------------------------------------- Per-node summaries
 
-SUMMARIZE_SYSTEM = """Summarize this document section in 80-120 words. Focus on
-WHAT the section discusses, not generic statements. The summary will be read by
-a navigation LLM deciding whether this section is relevant to a user query, so
-include enough specific content to enable that decision.
-
-Rules:
-- Mention three specific topics, products, risk types, or numeric facts named
-  in the section.
-- Do NOT start with "This section discusses" — write the summary directly.
-- If the section is generic boilerplate with no specific content, say so
-  explicitly: "Generic boilerplate; refer to specific subsections instead."
-"""
+# SUMMARIZE_SYSTEM is the fact-rich version battle-tested in W2.7's
+# optimization run (3 numeric facts verbatim + 5 named entities + structural
+# location, all required). Lives in shared/tree_index/prompts.py for cross-lab
+# reuse; aliased here so summarize_node continues to read SUMMARIZE_SYSTEM.
+SUMMARIZE_SYSTEM = FACT_RICH_SUMMARIZE_SYSTEM
 
 
 def summarize_node(node: dict, pages: list[dict]) -> str:
@@ -495,6 +499,26 @@ def add_summaries_recursive(node: dict, pages: list[dict]) -> None:
         add_summaries_recursive(child, pages)
 
 
+# ---------------- Recursive node split (PageIndex pattern, opt #2)
+
+MAX_PAGES_PER_LEAF = 5    # PageIndex equivalent: max_page_num_each_node
+MAX_CHARS_PER_LEAF = 20000  # PageIndex equivalent: ~20K tokens
+
+def split_large_nodes(node: dict, pages: list[dict], doc_root: bool = True) -> None:
+    """Thin wrapper around shared/tree_index.split_large_nodes — supplies this
+    lab's model client + Berkshire-tuned thresholds. The actual split logic
+    lives in shared/tree_index/builder.py for cross-lab reuse."""
+    _shared_split_large_nodes(
+        node, pages,
+        model_client=omlx,
+        model_name=MODEL or "",
+        split_system_prompt=SPLIT_SYSTEM,
+        max_pages=MAX_PAGES_PER_LEAF,
+        max_chars=MAX_CHARS_PER_LEAF,
+        doc_root=doc_root,
+    )
+
+
 # ---------------------------------------------------------- Main entry
 
 def count_nodes(node: dict) -> int:
@@ -531,12 +555,17 @@ def main() -> None:
     headings = detect_heading_candidates(pages)
     print(f"      {len(headings)} heading candidates (over-recall expected).")
 
-    print("[3/3] Building tree (LLM call, ~10-25 s) ...")
+    print("[3/5] Building tree (LLM call, ~10-25 s) ...")
     tree = build_tree(headings, "Berkshire Hathaway 2023 Annual Report", last_page=len(pages))
 
     print(f"      Tree skeleton: {count_nodes(tree)} nodes, depth={tree_depth(tree)}.")
 
-    print(f"[4/4] Generating per-node summaries ({count_nodes(tree)} LLM calls) ...")
+    print(f"[4/5] Splitting large leaves (> {MAX_PAGES_PER_LEAF} pages or "
+          f"> {MAX_CHARS_PER_LEAF} chars) — PageIndex pattern ...")
+    split_large_nodes(tree, pages, doc_root=True)
+    print(f"      After split: {count_nodes(tree)} nodes, depth={tree_depth(tree)}.")
+
+    print(f"[5/5] Generating per-node summaries ({count_nodes(tree)} LLM calls) ...")
     add_summaries_recursive(tree, pages)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -553,34 +582,42 @@ if __name__ == "__main__":
 - **Block 1 — `extract_pages`.** PDF-to-text via `pypdf`. Plain text sufficient for the heuristic detector; font metadata would help if production-grade heading detection were the goal, but the over-recall + LLM-filter design absorbs that.
 - **Block 2 — `detect_heading_candidates`.** Two over-recall heuristics: all-caps short lines (level 1) + numbered prefixes (`1.`, `1.1.`, `1.1.1.`). Both produce false positives ("PAGE 5", "1. Buy more milk"). The LLM in Block 3 filters them out — optimizing the heuristic for precision would burn engineering effort the LLM can absorb cheaply. Title Case branch added after first lab run found Buffett's letter sub-sections invisible to all-caps + numbered alone.
 - **Block 3 — `build_tree`.** One LLM call consolidates candidates into a clean tree. Three load-bearing rules in `TREE_BUILDER_SYSTEM`: (a) drop spurious matches by category not pattern; (b) consolidate near-duplicates; (c) infer `end_page` from next sibling's `start_page`. JSON-mode `response_format` is mandatory — without it Gemma-4-26B emits prose preamble ~10% of the time at temp=0. Coverage rule + annual-report structural priors added after first lab run produced a 2-node tree (root + TOC only).
-- **Block 4 — `summarize_node`.** Recurse over the tree, one LLM call per node with text spanning the node's page range. Head-truncate at 12,000 chars — longest 10-K section fits, longer sections get the head where the topic sentence lives. Summaries 80–120 words, sized for the navigation prompt at all depths.
+- **Block 4 — `summarize_node` + fact-rich `SUMMARIZE_SYSTEM`.** Recurse over the tree, one LLM call per node with text spanning the node's page range. Head-truncate at 12,000 chars — longest 10-K section fits, longer sections get the head where the topic sentence lives. `SUMMARIZE_SYSTEM = FACT_RICH_SUMMARIZE_SYSTEM` aliases the version battle-tested in W2.7's optimization run: every summary requires 3 numeric facts verbatim (with units) + 5 named entities + structural-location sentence. Forbids "This section discusses" + generic phrases. Eliminates vague summaries that confused the navigator pre-optimization. Lives in `shared/tree_index/prompts.py` for cross-lab reuse.
+- **Block 5 — `split_large_nodes` (recursive node split, PageIndex pattern).** After the initial heuristic + LLM tree build, walk the tree and split any leaf spanning > 5 pages OR > 20K chars into 2-5 topical sub-sections via LLM. Thin lab wrapper around `shared/tree_index.split_large_nodes` that supplies this lab's model client + Berkshire-tuned thresholds (`MAX_PAGES_PER_LEAF=5`, `MAX_CHARS_PER_LEAF=20000`). On Berkshire 2023 this splits Chairman's Letter into 5 sub-sections (Coca-Cola, AmEx, Occidental, Japanese, Scorecard) and Notes to Consolidated Financial Statements into 9 sub-sections — tree grows from ~35 → 62 nodes, depth 3 → 5. The split fixes the agentic loop's "navigator can't find the right leaf because the leaf spans too many pages" failure mode for factoid + citation queries.
 
-**Result (Berkshire 2023, ~148 pages):**
+**Result (Berkshire 2023, ~148 pages, post-2026-05-07 build with split + Qwen3.6 summaries):**
 
 | Stage | Wall time |
 |---|---|
 | PDF parse + heading detection | ~5 s |
 | Tree builder LLM call | ~8–15 s |
-| Per-node summary pass (~25 LLM calls) | ~90 s |
-| **Total** | **~2 min** |
+| **Recursive split pass (~5–10 LLM calls × ~30 s)** | **~3–5 min** |
+| Per-node summary pass (~62 LLM calls × ~5 s on Qwen3.6) | ~5 min |
+| **Total** | **~10 min** |
 
-Output: `data/tree.json` — 50 nodes, depth 4. Captures TOC (p1-3), Chairman's Letter with sub-sections "Our Not-So-Secret Weapon" + "Non-controlled Businesses That Leave Us Comfortable" (p4-22), Shareholder Event (p21-22), Form 10-K Items 1-15 + MD&A + Financial Statements + Notes (p23-148), Corporate Governance (p148-152).
+Output: `data/tree.json` — **62 nodes, depth 5** (was 50/4 pre-split). Captures TOC (p1-3), Chairman's Letter split into 5 sub-sections (Coca-Cola, American Express, Occidental, Japanese trading houses, Scorecard), Shareholder Event (p21-22), Form 10-K Items 1-15 + MD&A + Item 8 Financial Statements + Notes split into 9 sub-sections, Corporate Governance (p148-152). Each summary contains 3 quoted numeric facts + 5 named entities, making the navigator's keyword matching reliable on factoid + citation queries.
 
 `★ Insight ─────────────────────────────────────`
 - **Heuristic-first, LLM-second is the cost-saving design choice.** Detecting heading candidates with regex on font-size proxies + numbered-prefix patterns is ~free; running an LLM over every line of a 150-page document to "find headings" would cost 50–200× more. The LLM's job is consolidation, not detection.
-- **Per-node summaries are the load-bearing artifact.** The navigation LLM at query time sees only `{node_id, title, summary}`, never raw content. Vague summaries ("This section discusses business operations") starve the navigator; concrete summaries ("Apple's $200B operations footprint, supplier concentration risk, three pending litigation matters") route correctly. Spend prompt tokens on summary specificity.
-- **The tree is one JSON file.** Versioning, diff'ing, inspection all work with `git`, `jq`, and any text editor. No database to maintain, no schema migration when the document updates — just rebuild the tree. This is the operational simplicity "vectorless" earns.
+- **Per-node summaries are the load-bearing artifact — and the fact-rich contract is what makes them work.** Navigator at query time sees `{node_id, title, summary}`, never raw content. Vague summaries ("This section discusses business operations") starve the navigator; the fact-rich contract (3 numeric facts + 5 named entities verbatim) makes navigator decisions keyword-matchable. Spend prompt tokens on summary specificity; the post-build cost amortizes across every query.
+- **Recursive split is the most-impactful build-time addition.** The single LLM split-pass after initial tree-build (5–10 calls, ~3 min wall) splits monolithic leaves into per-topic sub-sections. On Berkshire it lifted citation accuracy from 0.25 to 0.67 (chapter §4.3.2). PageIndex's `process_large_node_recursively` is the upstream reference.
+- **The tree is one JSON file → portable + auditable + reusable.** Versioning, diffing, and inspection all work with `git`, `jq`, and any text editor. The whole tree-index pipeline (`SUMMARIZE_SYSTEM`, `SPLIT_SYSTEM`, `split_large_nodes`) is now reused via `shared/tree_index/` — a future tree-index lab on a different corpus imports them and supplies a corpus-specific `page_provider` + a built `tree.json`. Operational simplicity "vectorless" earns + cross-lab reuse the shared lib earns.
 `─────────────────────────────────────────────────`
 
 Run it once after §1.2 has downloaded the PDF:
 
 ```bash
 python src/build_tree.py
-# [1/3] Parsing data/brk-2023-ar.pdf ...
-# [2/3] Detecting heading candidates ...
-# [3/3] Building tree (LLM call, ~10-25 s) ...
-# [4/4] Generating per-node summaries (~25 LLM calls) ...
-# Wrote data/tree.json — N nodes, depth D.
+# [1/5] Parsing data/brk-2023-ar.pdf ...
+# [2/5] Detecting heading candidates ...
+# [3/5] Building tree (LLM call, ~10-25 s) ...
+#       Tree skeleton: ~35 nodes, depth=3.
+# [4/5] Splitting large leaves (> 5 pages or > 20000 chars) — PageIndex pattern ...
+#       split Chairman's Letter to Shareholders: 5 sub-sections
+#       split Notes to Consolidated Financial Statements: 9 sub-sections
+#       After split: ~62 nodes, depth=5.
+# [5/5] Generating per-node summaries (~62 LLM calls) ...
+# Wrote data/tree.json — 62 nodes, depth 5.
 ```
 
 ---
