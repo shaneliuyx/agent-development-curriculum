@@ -281,6 +281,49 @@ Each pattern has the same structure:
 
 ---
 
+## Pattern 13 — Storage-Scale Match (right backend for current scale, no premature scaling)
+
+> Distilled 2026-05-07 from [[Week 2.7 - Structure-Aware RAG#Production Considerations — Storage, Concurrency, Observability]]. Generalizes beyond tree-index — applies to any persistent-state decision (vector indexes, graph data, eval harnesses, agent memory).
+
+**The pattern.** When a system has multiple storage candidates (filesystem / SQLite / Postgres / object store / cache layer), match the choice to the *current* scale, not the *eventual* scale. Build the decision boundary around concrete numbers (doc count, QPS, concurrency, dataset size), not vibes. Three or four scale tiers with explicit thresholds beat one "production-ready" backend that's wrong for both prototype and prod.
+
+**Three-tier template:**
+
+| Scale | Backend | Why |
+|---|---|---|
+| **Dev / lab / single-user** | Local filesystem (JSON / SQLite / disk file) | Operational simplicity. `git diff` shows changes; full rebuild is one command; zero infrastructure. |
+| **Single-tenant prod (10–1,000 units)** | SQLite or Postgres `jsonb` / on-disk index | Concurrent reads. Per-record version history. ACID. No multi-tenancy load yet. |
+| **Multi-tenant prod (1,000+ units, multi-user)** | Postgres + S3/blob + Redis cache | Tier the storage by access pattern. Hot in cache, warm in DB, cold in object store. |
+
+**Decision matrix specifics from W2.7 tree-index:**
+
+| Artifact | Property | Storage choice |
+|---|---|---|
+| `tree.json` (50–100 KB, hierarchical, read-mostly) | Document-shape, indexable JSON | Filesystem → Postgres `jsonb` (with index on `tree -> 'title'` for cross-doc title search) |
+| Source PDF (10s–100s MB, immutable, page-range access) | Append-only blob | Filesystem → S3 with byte-range reads + Redis LRU cache for hot ranges |
+| Cross-document index | Doc registry | None → SQLite → Postgres |
+
+**Why it works.** A premature production backend forces *every* developer running the lab to bring up infrastructure that has no value at single-user scale (Postgres for one document is theatrical). A premature filesystem backend at 1,000-doc scale destroys concurrency. The match-to-scale decision lets each user pay only for the complexity their scale actually demands. The abstraction seam (in W2.7's case, the `page_provider` Protocol) is what makes scale transitions cheap — same `AgenticTreeRetriever` works against any of the three storage tiers; only the closure around the page fetch changes shape.
+
+**Anti-pattern A — premature production scaffolding.** "We might scale to 100K docs someday, so let's start with Postgres + S3 + Redis." Now every developer setting up the lab needs three services running. The next 6 months of dev time is spent fighting infrastructure for the value of "we're production-ready" — which is fictional value if you have one user.
+
+**Anti-pattern B — locked-in dev simplicity.** Filesystem-only design that has no abstraction seam between storage and the application logic. When you DO need to scale, the lift is a multi-week refactor, not a single closure swap. The fix at design time: introduce the seam (Protocol, callable, ABC) even if the filesystem implementation is the only one shipped. The seam is free; the absence of the seam costs a refactor.
+
+**Anti-pattern C — wrong backend for the data shape.** Common mistake: putting structurally non-vector data (a tree, a graph, an event log) into a vector database because that's the database the project already runs. Vector DBs are for embeddings; trees go in jsonb / document stores; graphs go in graph DBs; event logs go in append-only logs. The blast radius is silent — the system "works" but every read pays JSON ↔ vector conversion overhead and cross-record queries break.
+
+**5-second sanity test before adopting a backend:**
+1. **What's the unit of work?** If hierarchical → document store / jsonb; if relational multi-hop → graph DB; if embedding similarity → vector DB; if append-only event → log store; if immutable blob → object store.
+2. **What's the access pattern?** Read-mostly per-record vs read-many cross-record; concurrent vs single-writer; hot-tail vs uniform.
+3. **What's the concurrency requirement?** 1 reader = file is fine. Multiple concurrent writers = need ACID. Multiple processes reading + occasional writes = SQLite is fine until QPS > ~100.
+4. **What's the data size at the upper end of the current tier?** Filesystem fine to ~100 GB; SQLite to ~10 GB; Postgres jsonb to ~1 TB. Above those, scale tier up.
+
+**See also:**
+- Pattern 9 — Bounded Scope Reduction (don't bring production-grade infrastructure into a dev-grade lab; reduce scope to fit current need)
+- Pattern 8 — Trade-off Transparency (state the rejected alternatives in the decision record so future-you knows why filesystem was chosen at first)
+- Pattern 11 — Atomic Decision Records (commit the *why* the storage tier was picked, not just the choice)
+
+---
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
@@ -297,6 +340,7 @@ Each pattern has the same structure:
 | 10 — Real Verification | When feedback received | Trusting false signals |
 | 11 — Atomic Decision Records | When decision is made | Future-self / future-team un-doing the decision |
 | 12 — Evidence-Driven | When question can be checked | Speculation-as-laziness |
+| 13 — Storage-Scale Match | Picking persistent-state backend | Premature production scaffolding / locked-in dev simplicity |
 
 These patterns compound. The teams (or solo engineers) who use them feel "calm and deliberate" to work with; the ones who don't feel "frantic and surprising." The difference isn't IQ or experience — it's the discipline of slowing down at the right 5-10% of moments.
 
