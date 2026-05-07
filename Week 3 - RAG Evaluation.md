@@ -1417,27 +1417,34 @@ print("Filter root spans by name: baseline | hyde | mq")
 
 ### Code walkthrough — `src/05_trace.py`
 
-**① Phoenix registration** (`register(project_name=..., auto_instrument=True)`)
-`register` creates an OpenTelemetry `TracerProvider` configured to send spans to your local Phoenix collector. `auto_instrument=True` hooks into the OpenAI SDK's HTTP layer automatically — you get spans for every `chat.completions.create` call without decorating your own functions.
+**① `sys.path` bootstrap to `shared/phoenix_tracing/`** (`sys.path.insert(0, str(_REPO_ROOT / "shared"))`)
+Same cross-lab import pattern used for `shared/rag_hybrid` (W2/W2.5/W2.7) and `shared/tree_index` (W2.7). The lab is a thin wrapper; the OpenTelemetry + Phoenix integration logic lives in `shared/phoenix_tracing/tracing.py` for reuse across labs. Adding tracing to a future lab is now `from phoenix_tracing import trace_run` plus one call site, not 30 lines of imports.
 
-**② Explicit instrumentors** (`OpenAIInstrumentor` / `LangChainInstrumentor`)
-Even with `auto_instrument=True`, explicit instrumentors are best practice: they guarantee the correct attribute names (Phoenix understands `llm.model_name`, `llm.token_count.prompt`, etc.) and survive SDK version bumps that would otherwise break auto-detection.
+**② `trace_run(PROJECT, PHOENIX_URL, label, fn, q["question"], attrs={...})`** — the load-bearing one-call API
+Inputs: project name (groups runs in Phoenix UI), server URL, span label (root-span name + `pipeline.variant` attribute), the function to trace, positional args forwarded to `fn`, optional `attrs` dict for additional span attributes. The shared lib does all four pieces of ceremony internally:
 
-> **Why instrument both OpenAI and LangChain?** Your pipeline uses the raw `openai` client for retrieval-side LLM calls (HyDE draft, rewrite generation, synthesis) and LangChain wrappers for RAGAS's internal evaluation calls. Without `LangChainInstrumentor`, the RAGAS scoring sub-calls are invisible in Phoenix — you'd see pipeline traces but not the eval traces, making it hard to debug why a metric returned an unexpected value.
+| Step | What happens inside `trace_run` |
+|---|---|
+| (a) | First call: `init_phoenix(...)` → `phoenix.otel.register()` → `OpenAIInstrumentor().instrument()` → `LangChainInstrumentor().instrument()` |
+| (b) | Subsequent calls: cached state — re-init is a no-op (idempotent) |
+| (c) | Open parent span with `label` as name + `pipeline.variant=label` attribute + custom `attrs` keys/values |
+| (d) | Call `fn(*args, **kwargs)` inside the span context — auto-instrumented OpenAI / LangChain children nest under the parent automatically |
+| (e) | Return `fn`'s result unchanged; close span |
 
 **③ `dev[:10]` — first 10 only for visual inspection**
 Running all 50 queries × 3 pipelines = 150 traces is noisy for manual review. 10 × 3 = 30 traces is enough to visually compare span trees across the three variants. Run the full 50 only when you need quantitative latency data.
 
-**④ Variant-tagged parent span** (`with _tracer.start_as_current_span(f"pipeline.{label}") as span: ...`)
-Every pipeline call is wrapped in a NAMED parent span. Without this, OpenAI auto-instrumentation emits ~5 raw `ChatCompletion` spans per query — Phoenix UI shows 150 indistinguishable rows with no way to tell which variant produced which span. With the wrapper, root-span names are `pipeline.baseline` / `pipeline.hyde` / `pipeline.mq`, and the `pipeline.variant` attribute makes filtering trivial.
+**④ Pipeline-loader pattern** (`baseline = load("02_pipeline.py"); hyde = load("03_hyde.py"); mq = load("04_multiquery.py")`)
+The `load()` helper from `src/script_wrap.py` imports numeric-prefixed Python files (which Python's normal import system rejects). All three pipelines expose a top-level callable (`run_pipeline` / `run_pipeline_hyde` / `run_pipeline_mq`) that takes `question` and returns a result; `trace_run` calls them uniformly.
 
-**⑤ Side-effect-only result** (`_ = fn(q["question"])`)
-The return values are intentionally discarded — this script's only purpose is trace emission. The actual answers were already scored in Phases 2–4.
+**⑤ Why `LangChainInstrumentor` matters even though the pipelines use raw `openai`**
+Your pipelines call the raw `openai` client for retrieval-side LLM calls (HyDE draft, rewrite generation, synthesis). RAGAS's internal scoring code uses LangChain wrappers. Without `LangChainInstrumentor` (which `init_phoenix` enables by default), the RAGAS scoring sub-calls would be invisible in Phoenix — you'd see pipeline traces but not the eval traces, making metric debugging hard. The shared lib enables both by default.
 
 `★ Insight ─────────────────────────────────────`
-- **OpenAI auto-instrumentation alone is insufficient for variant comparison.** It emits one span per `chat.completions.create` call — every variant produces those, named identically (`ChatCompletion`). Without a manual parent-span wrapper that owns a `name` and a variant attribute, the UI is a sea of identical-looking rows. Add the wrapper *every time* you trace multiple pipelines against the same dev set.
-- **`set_attribute` over `set_attributes` for explicit names.** `span.set_attribute("pipeline.variant", label)` is more readable in the Phoenix UI than passing a dict. Phoenix's filter input understands `attributes["pipeline.variant"] == "baseline"` syntax — exact-string filter, no ambiguity.
-- **`question_index` is the cheap join key.** When you compare a query's baseline trace vs HyDE trace vs MQ trace side-by-side, you need to find all three. Filtering by `attributes["question_index"] == 7` gives you the same query across all three variants instantly.
+- **The W3 → shared/phoenix_tracing extraction follows the same pattern as W2 → shared/rag_hybrid and W2.7 → shared/tree_index.** A working lab implementation gets lifted into `shared/`, the lab refactors to import from shared, the abstraction proves itself by the lab still working. Future labs that want tracing get it free; the W3 lab loses no functionality but loses 30 lines of boilerplate.
+- **`trace_run`'s one-call shape is what the user asked for explicitly.** "inputs are project name, server url, label and function. then we can get tracing data." The shared lib offers two more ergonomic levels (`phoenix_span` context manager, `init_phoenix` setup-only) for cases where one-call doesn't fit — see `shared/phoenix_tracing/README.md` for when each shape wins.
+- **Idempotent `init_phoenix` is the load-bearing design choice.** Without it, calling `trace_run` 30 times would re-register Phoenix 30 times. With it, first call sets up + caches; subsequent calls hit cached state. Re-init with conflicting args raises a clear `RuntimeError` so a user accidentally trying to switch projects mid-process gets immediate feedback.
+- **Pyright "Import phoenix_tracing could not be resolved" is sys.path-bootstrap noise.** Same pattern as `from rag_hybrid import HybridEncoder` and `from tree_index import AgenticTreeRetriever` across all labs. Resolves at runtime via the `sys.path.insert(0, ...)` line; Pyright's editor-time analysis doesn't follow runtime sys.path mutations. Acceptable trade-off — alternative would be making each lab a uv workspace member, which forces a single shared virtualenv.
 `─────────────────────────────────────────────────`
 
 ```bash
@@ -1447,12 +1454,12 @@ open http://127.0.0.1:6006
 
 In the Phoenix UI:
 
-1. **Project filter:** `project=lab-03-rag-eval` (set in the breadcrumb).
-2. **Root spans only:** click the "Root Spans" toggle in the upper-right of the Spans table. You should see **30 rows** named `pipeline.baseline` / `pipeline.hyde` / `pipeline.mq` (10 queries × 3 variants), each with nested children for retrieve → rerank → LLM call.
-3. **Filter to one variant:** type `name == "pipeline.baseline"` in the filter bar — shows only the 10 baseline traces. Repeat with `pipeline.hyde` / `pipeline.mq` for variant comparison.
+1. **Project filter:** `project=lab-03-rag-eval` (set in the breadcrumb; matches the `PROJECT` constant in the script).
+2. **Root spans only:** click the "Root Spans" toggle in the upper-right of the Spans table. You should see **30 rows** named `baseline` / `hyde` / `mq` (10 queries × 3 variants), each with nested children for retrieve → rerank → LLM call.
+3. **Filter to one variant:** type `name == "baseline"` in the filter bar — shows only the 10 baseline traces. Repeat with `hyde` / `mq` for variant comparison.
 4. **Same query, all variants:** type `attributes["question_index"] == 0` (or any 0–9) to see one question across all 3 pipelines side-by-side. Click each row to inspect the waterfall and compare retrieve+rerank+LLM nesting.
 
-If "Root Spans" toggle still shows ~150 rows of `ChatCompletion`, the parent-span wrapper didn't fire — check that `_tracer.start_as_current_span(...)` is BEFORE `fn(q["question"])`, not after, and that the `with` block covers the call.
+If "Root Spans" toggle shows ~150 rows of `ChatCompletion` (i.e., parent spans missing), the `trace_run` integration didn't fire — most likely cause is the `sys.path` bootstrap pointing at the wrong directory; verify `_REPO_ROOT / "shared" / "phoenix_tracing"` exists and contains `tracing.py`.
 
 ### 5.2 Screenshot one trace per pipeline
 
