@@ -789,67 +789,7 @@ The first call `uv venv` creates `.venv/` locally. The second call `uv sync` ins
 
 ## Bad-Case Journal
 
-**Entry 1 — Stale Model Weights Cause Silent Failures (W0).**
-
-*Symptom:* After downloading Qwen weights to `~/.omlx/models/`, a network blip interrupts the download. The file is 5GB but only 2.3GB was written. Next time you run a lab, oMLX loads the truncated weights. Inference hangs for 30 seconds, then returns junk: `"zzzzzzzzzzzzzzz"` or `None`. Lab produces wrong results. Weeks of debugging before you discover corrupted weights.
-
-*Root cause:* oMLX does not validate checksums on startup. It loads whatever file is at the expected path, even if the file is incomplete. The truncation is silent — no error, just garbage output.
-
-*Fix:* (1) Delete corrupt files: `rm ~/.omlx/models/Qwen*`. (2) Re-download via oMLX UI or `ollama pull model-name`. (3) Verify checksum after download: `shasum -a 256 ~/.omlx/models/qwen-model.safetensors` against the official published hash. (4) Add a startup script that verifies file sizes: if Qwen weighs 35GB and your file is 25GB, alert and stop.
-
-*The diagnostic muscle:* When inference returns garbage or hangs, the first probe is not your code — it's the model weights. Check file sizes: `ls -lh ~/.omlx/models/`. If a weight file is smaller than expected (lookup official size from huggingface.co), delete and re-download.
-
-**Tags:** #weights #caching #silent-failure #disk-integrity #w0 #ops-pattern
-
-**Lab artifact:** `lab-00-setup/scripts/verify_weights.py` — checks all downloaded weights against official sizes
-
----
-
-**Entry 2 — Wrong Python Version Picked by uv (W0).**
-
-*Symptom:* Lab uses a package (e.g., pydantic v2) that requires Python 3.11+. Your system Python is 3.14.3, and uv is told to use 3.11. But uv finds a globally-installed 3.10 first (from an old Conda install) and uses that instead. Import fails: `pydantic.v1` does not exist in Pydantic v2. Weeks of debugging, "pydantic must be broken."
-
-*Root cause:* `uv` searches the PATH for Python interpreters. If multiple versions are installed, the search order is: first in PATH, system default, then uv-installed Python. If an old Conda or pyenv installation is in PATH, uv picks it instead of your intended 3.11.
-
-*Fix:* (1) Check which Python uv is using: `uv python list`. (2) Explicitly specify Python: create a `.python-version` file in the project root with `3.11` on a single line. uv respects this. (3) Or pin explicitly in uv.toml: `python = "3.11"`. (4) Verify in the venv: `source .venv/bin/activate && python --version` should print `3.11.*`.
-
-*The diagnostic muscle:* When an import fails because a package version is wrong, check `python --version` immediately. If you're in the lab's venv and it says 3.10, the venv is misconfigured. Delete `.venv/` and re-run `uv venv`.
-
-**Tags:** #venv #version-management #python-discovery #w0 #ops-pattern
-
-**Lab artifact:** `.python-version` file in all labs, pinning 3.11
-
----
-
-**Entry 3 — Qdrant Port Collision Blocks Phase 3 (W0).**
-
-*Symptom:* Phase 3 tries to start Qdrant in Docker on port 6333. Command fails: `Error response from daemon: driver failed programming external connectivity on endpoint qdrant: Error starting userland proxy: listen tcp4 0.0.0.0:6333: bind: address already in use`. Another Docker container (from a previous lab run, not properly stopped) is using port 6333. You spend 30 minutes killing random containers.
-
-*Root cause:* `docker-compose up` in Phase 3 does not kill the old container if the Compose project was not cleaned up. Running Phase 3 twice without `docker-compose down` leaves a zombie container. The second run fails.
-
-*Fix:* (1) Always clean up: after a lab, run `docker-compose down` in the Qdrant folder. (2) Or force a new container: `docker-compose up --force-recreate`. (3) Before Phase 3, check what's running: `docker ps` — if qdrant is listed and you didn't start it this session, kill it: `docker stop qdrant && docker rm qdrant`.
-
-*The diagnostic muscle:* When Docker fails with "address already in use," the port is bound by a zombie container, not a rogue process. Never use `lsof` — use `docker ps` to list all containers and check if one is the culprit.
-
-**Tags:** #docker #port-collision #cleanup #w0 #ops-pattern
-
-**Lab artifact:** `lab-00-setup/scripts/cleanup.sh` — runs `docker-compose down` for all services
-
----
-
-**Entry 4 — Missing Cloud API Keys Block W7/W8 Labs (W0).**
-
-*Symptom:* Phase 6 asks you to add API keys for OpenAI, Anthropic Cloud, Google Vertex. You skip it (thinking it's optional). Week 7 (Computer Use, W7.5) uses Claude API. Lab crashes: `AuthenticationError: API key not found in ANTHROPIC_API_KEY`. You lose a day because the error appears deep in inference code, not at startup.
-
-*Root cause:* Phase 6 is marked "only for Weeks 7 & 8" and is optional. But optional does not mean "skip if you want." It means "skip if you plan to never use the cloud APIs." If you do W7.5 (Computer Use), you need the API key.
-
-*Fix:* (1) Before starting W1, finish Phase 6 (cloud API setup). (2) Add startup validation: create a script that checks all required API keys are present. Code: `import os; assert os.getenv("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY missing"`. Run this at the start of every lab. (3) Document in each lab's README: "You need ANTHROPIC_API_KEY set before running this lab."
-
-*The diagnostic muscle:* When a lab crashes with "API key not found," the fix is not code — it's environment setup. Check: `echo $ANTHROPIC_API_KEY` in the terminal. If empty, the key was never set. Source your `.zshrc` or `.bash_profile` again: `source ~/.zshrc`.
-
-**Tags:** #api-keys #environment-variables #w0 #w7-w8-dependency #ops-pattern
-
-**Lab artifact:** `lab-00-setup/scripts/validate_keys.sh` — checks all required API keys before lab startup
+> _W0 has no runnable lab — it is environment setup only. Bad-case entries will be added as users hit real setup failures and document them with reproducible symptoms and fixes. Pre-experiment speculation about "what could go wrong" was removed in the 2026-05-07 audit pass; the chapter spec ([[CLAUDE.md]] §6) requires entries to be anchored to observed events, not predicted ones._
 
 ---
 
