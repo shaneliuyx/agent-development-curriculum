@@ -591,144 +591,101 @@ python src/build_tree.py
 
 Save as `src/query_tree.py`.
 
-**Architecture:**
+**Architecture (post-2026-05-07 refactor — agentic tool-calling loop):**
 
 ```mermaid
 flowchart TD
-  Q["query"] --> N1["root → LLM picks child<br/>(sees children's titles + summaries)"]
-  N1 --> N2["child → LLM picks child<br/>(recursive)"]
-  N2 --> N3["… until leaf reached<br/>or null returned"]
-  N3 -->|leaf| Fetch["fetch_leaf_text<br/>(re-open PDF, slice page range,<br/>head-truncate 16K chars)"]
-  N3 -->|"null<br/>(refuse)"| Refuse["refusal path<br/>answer LLM sees parent node"]
-  Fetch --> Ans["answer LLM<br/>cites node_id + page range"]
-  Refuse --> Ans
-  Ans --> Out["{answer, traversal_path,<br/>leaf_id, page_range, depth}"]
+  Q["query + tree.json<br/>(compact view: id/title/<br/>page-range/summary)"] --> Loop["AgenticTreeRetriever<br/>multi-turn loop<br/>(shared/tree_index)"]
+  Loop -->|"LLM emits tool_call<br/>get_page_content(start, end)"| Fetch["page_provider<br/>(slices PDF text,<br/>head-truncate 8K chars)"]
+  Fetch -->|"tool result<br/>injected into msgs"| Loop
+  Loop -->|"LLM emits no tool_call<br/>(content is final answer)"| Ans["answer with<br/>inline citation [pages X-Y]"]
+  Loop -->|"LLM emits explained refusal<br/>+ 'insufficient context'"| Refuse["refusal:<br/>'this is the 2023 AR,<br/>does not contain ...'"]
+  Ans --> Out["{answer,<br/>tool_calls,<br/>iterations}"]
+  Refuse --> Out
 ```
 
-**Code:**
+**Code (lab wrapper — full agentic loop in `shared/tree_index/agentic.py`):**
 
 ```python
-"""Tree-search retrieval: LLM navigates a TOC tree to find the relevant leaf,
-fetches that leaf's full text, hands it to the answer LLM."""
-import json, os
+"""Tree-search retrieval — thin Berkshire-specific wrapper around
+shared/tree_index/AgenticTreeRetriever (multi-turn agentic tool-calling loop)."""
+from __future__ import annotations
+import json, os, sys
 from pathlib import Path
-from pypdf import PdfReader
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
+from pypdf import PdfReader
+
+# Bootstrap shared/tree_index onto sys.path
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "shared"))
+
+from tree_index import AGENTIC_SYSTEM_TEMPLATE, AgenticTreeRetriever
 
 load_dotenv()
 omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
-MODEL = os.getenv("MODEL_SONNET")
-MAX_DEPTH = 6  # bounded so a malformed tree cannot loop
+# Tree backend uses MODEL_TREE (isolated KV cache pool from MODEL_SONNET) to
+# avoid Qwen3.6 KV-cache pollution observed when all 3 backends shared one model.
+MODEL = os.getenv("MODEL_TREE") or os.getenv("MODEL_SONNET")
 
-NAV_SYSTEM = """You are navigating a Table-of-Contents tree to find the section
-most relevant to the user's query.
+_PDF_CACHE: dict[str, list[str]] = {}
 
-You will see the user's query and a list of child nodes (id, title, summary).
-Pick the ONE child whose content most directly answers the query. Return strict
-JSON: {"chosen_id": "<node_id>", "rationale": "<one sentence>"}.
+def _pdf_pages(pdf_path: str) -> list[str]:
+    if pdf_path not in _PDF_CACHE:
+        _PDF_CACHE[pdf_path] = [p.extract_text() or "" for p in PdfReader(pdf_path).pages]
+    return _PDF_CACHE[pdf_path]
 
-If none of the children look relevant — the query is out of scope for this
-sub-tree — return {"chosen_id": null, "rationale": "..."}.
-
-Prefer specificity. If two children look relevant, pick the one whose summary
-mentions the query's key terms more concretely."""
-
-def navigate(query: str, node: dict, depth: int = 0) -> tuple[dict, list[dict]]:
-    """Recurse from `node`, returning (leaf_node, traversal_path)."""
-    path = [{"node_id": node["node_id"], "title": node["title"]}]
-    children = node.get("nodes", [])
-    if not children or depth >= MAX_DEPTH:
-        return node, path
-
-    children_view = [{"node_id": c["node_id"], "title": c["title"],
-                      "summary": c.get("summary", "")} for c in children]
-    user_msg = (f"Query: {query}\n\n"
-                f"Children:\n{json.dumps(children_view, indent=1)}")
-    resp = omlx.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": NAV_SYSTEM},
-                  {"role": "user", "content": user_msg}],
-        temperature=0.0, max_tokens=400,
-        response_format={"type": "json_object"},
-    )
-    decision = json.loads(resp.choices[0].message.content or "{}")
-    chosen_id = decision.get("chosen_id")
-    if not chosen_id:
-        return node, path  # current node is the best we have
-    chosen = next((c for c in children if c["node_id"] == chosen_id), None)
-    if not chosen:
-        return node, path  # LLM hallucinated an id
-    leaf, sub_path = navigate(query, chosen, depth + 1)
-    return leaf, path + sub_path
-
-ANSWER_SYSTEM = """Answer the user's question using ONLY the section content
-below. Cite the node_id and page range. If the content does not support an
-answer, say so explicitly — do not fabricate."""
+def _make_page_provider(pdf_path: str):
+    pages = _pdf_pages(pdf_path)
+    def provider(start: int, end: int) -> str:
+        sp, ep = max(0, int(start) - 1), min(len(pages), int(end))
+        if ep < sp + 1:
+            return f"[ERROR] Invalid range: end ({end}) < start ({start})"
+        return "\n\n".join(f"[page {i+1}]\n{pages[i]}" for i in range(sp, ep))
+    return provider
 
 def answer(query: str, tree_path: str = "data/tree.json",
            pdf_path: str = "data/brk-2023-ar.pdf") -> dict:
     tree = json.loads(Path(tree_path).read_text())
-    leaf, traversal = navigate(query, tree)
-
-    pages = PdfReader(pdf_path).pages
-    start, end = leaf.get("start_page", 1), leaf.get("end_page", 1)
-    section_text = "\n".join(pages[i].extract_text() or ""
-                             for i in range(start - 1, min(end, len(pages))))
-    if len(section_text) > 16000:
-        section_text = section_text[:16000]  # answer LLM context limit
-
-    resp = omlx.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": ANSWER_SYSTEM},
-                  {"role": "user",
-                   "content": (f"Query: {query}\n\n"
-                               f"Section: {leaf['title']} "
-                               f"(node_id {leaf['node_id']}, pages {start}-{end})\n\n"
-                               f"Content:\n{section_text}")}],
-        temperature=0.0, max_tokens=600,
+    retriever = AgenticTreeRetriever(
+        tree=tree,
+        page_provider=_make_page_provider(pdf_path),
+        model_client=omlx,
+        model_name=MODEL or "",
+        system_prompt=AGENTIC_SYSTEM_TEMPLATE,
+        debug_log_path="/tmp/tree_debug.log",
     )
-    return {
-        "answer": resp.choices[0].message.content,
-        "leaf_node_id": leaf["node_id"],
-        "leaf_title": leaf["title"],
-        "page_range": (start, end),
-        "traversal_path": traversal,
-        "depth": len(traversal),
-    }
-
+    return retriever.answer(query)
 
 if __name__ == "__main__":
-    import sys
-    q = " ".join(sys.argv[1:]) or "What did Buffett describe as Berkshire's not-so-secret weapon in 2023?"
-    out = answer(q)
-    print(json.dumps(out, indent=2, default=str))
+    q = " ".join(sys.argv[1:]) or "What was Berkshire's net earnings in 2023?"
+    print(json.dumps(answer(q), indent=2, default=str))
 ```
 
 **Walkthrough:**
 
-- **Block 1 — `navigate`.** Recursive heart of the lane. Takes a node, formats children as `{node_id, title, summary}`, asks LLM to pick one. Three failure modes handled: (a) leaf reached (no children) → return current; (b) `chosen_id` null → caller treats current as best (refusal path); (c) hallucinated id (LLM returns id not in children) → return current node. Without the hallucination guard, function would either recurse forever or crash on `KeyError`.
-- **Block 2 — `NAV_SYSTEM` prompt.** "Prefer specificity" rule is load-bearing — without it, LLM ties between two equally-broad children and choice becomes arbitrary. "Return null if none relevant" is the refusal escape hatch — without it, LLM picks closest child even when query is out of scope, and answer LLM gets handed irrelevant content.
-- **Block 3 — Leaf fetch.** Re-open PDF, extract text spanning `start_page..end_page`, head-truncate 16K chars. 16K sized for Gemma-4-26B's effective context with system prompt; 32K works on larger models but invites "lost in the middle" attention issues. Sections >16K need extra summarize-then-answer pass — outside lab scope.
-- **Block 4 — `ANSWER_SYSTEM`.** Three rules: cite node_id + page range, refuse explicitly when content doesn't support, do not fabricate. Citation traceability is the production differentiator — for legal/audit use cases, "answer came from page 47–52" is a hard requirement vector + graph don't natively satisfy.
+- **Block 1 — Shared lib bootstrap.** `sys.path.insert(0, str(_REPO_ROOT / "shared"))` lets the lab import `tree_index` without making each lab a uv workspace member. Same pattern that loads `rag_hybrid` across W2/W2.5/W2.7. The lab-specific code is the wrapper; the agentic-loop logic + tool schema + battle-tested system prompt all live in `shared/tree_index/agentic.py` + `prompts.py`.
+- **Block 2 — `MODEL = os.getenv("MODEL_TREE") or os.getenv("MODEL_SONNET")`.** Tree backend reads a separate env var so it can run on a different model than vector + graph. This is the W2.7-discovered "model isolation per request-shape" pattern (Bad-Case Entry 6): when vector/graph issue no-tools calls and tree issues tools calls against the same model on an oMLX server, KV-cache reuse pollutes tool-routing on the tools call. Different model = different cache pool = no pollution.
+- **Block 3 — `_make_page_provider(pdf_path)`.** Closure that wraps `pypdf.PdfReader` + a `_PDF_CACHE` dict (PDF parsed once per process). Returns a callable matching the `PageProvider` Protocol from `shared/tree_index/agentic.py`. The protocol is the seam — any future lab can supply HTML, Markdown, or already-extracted text via the same shape.
+- **Block 4 — `AgenticTreeRetriever(...)` instantiation.** Hands the retriever everything it needs: tree, page_provider, model_client, model_name, system_prompt. The agentic loop itself (multi-turn tool-call → tool-result → final-answer flow) is opaque from this lab's POV. Optional `debug_log_path` gets per-call `[Nit/Mtc]` debug breadcrumbs that surfaced the cross-call cache pollution issue mid-debug.
 
-**Result (Berkshire 2023, per query):**
+**Result (Berkshire 2023, per query, post-2026-05-07 optimization):**
 
 | Stage | Wall time |
 |---|---|
-| Navigate depth 1 (LLM call) | ~1.5 s |
-| Navigate depth 2 | ~1.5 s |
-| Navigate depth 3 (typical leaf reach) | ~1.5 s |
-| Leaf text fetch (PDF re-parse) | ~0.2 s |
-| Answer LLM call | ~3–6 s |
-| **Total** | **~8–15 s** |
+| First iteration (LLM emits tool_call) | ~5–8 s |
+| Tool execution (page fetch + truncate) | <0.1 s |
+| Second iteration (LLM synthesizes from fetched page) | ~5–8 s |
+| Refusal-only path (no tool calls, 1 iteration) | ~1–2 s |
+| **Mean total per query** | **~14.6 s** (multi-turn typical), 1–2s on OOD refuse |
 
-Aggregate over 8-question Berkshire eval: tree judge=0.44 (per §4.3.1). Wins out-of-document refusal (1.00) and ties graph on cross-section synthesis (0.50). Loses factoid lookup (0.00) — tree never sees body text, only titles + summaries.
+Aggregate over 8-question Berkshire eval (compare10, both prompt fixes): tree judge=**0.79** (was 0.44 pre-opt). Wins or ties every category — factoid 1.00 (vs vector 0.50), citation 0.67 (vs graph 0.42), synthesis 0.50 (tied with graph), refusal 1.00 (tied with graph). Closes the original "navigator only sees titles" architectural blind spot. Latency cost vs greedy nav: ~14.6s vs ~3.4s (4.3×). Acceptable when accuracy lift is +0.35 absolute / +77% relative.
 
 `★ Insight ─────────────────────────────────────`
-- **Each navigation step is one LLM call, depth-bounded.** A 4-deep tree on a 10-K = 4 nav calls + 1 answer call = 5 LLM calls per query. This is the cost ceiling. Vector RAG pays 1 LLM call per query (the answer); GraphRAG pays 2–4 (decomp + bridge + answer). Tree-index is *deliberately* the most expensive lane — that is the trade-off for the precision win on long structured documents.
-- **Refusal is built in by design.** The navigation LLM can return `{"chosen_id": null}` when no child looks relevant; the answer LLM then sees the current node's content (often the document root) and faithfully refuses. Out-of-document queries fail clean. Vector RAG has to be coaxed into refusing via prompt; tree-index gets it for free — and the empirical 1.00 refusal score on out-of-document questions confirms this.
-- **The depth counter is a safety net, not a feature.** `MAX_DEPTH=6` bounds runaway loops on malformed trees (self-referencing node, circular ids). Should never fire in healthy operation; if it fires, audit the tree.
+- **Body text now visible to the decision-maker.** Greedy `navigate()` gave the LLM only `{node_id, title, summary}` for routing — body text was unreachable until AFTER leaf selection. Q1+Q2 ("net earnings") missed because no node title contained the literal phrase. The agentic loop hands the LLM a `get_page_content(start, end)` tool, so the LLM can FETCH `Item 8 / Consolidated Statements` page 96 mid-decision, see "$96.2 billion", and answer correctly. Architectural blind spot eliminated.
+- **Iteration-bounded, not depth-bounded.** Old greedy nav used `MAX_DEPTH=6` to prevent infinite descent on malformed trees. New agentic loop uses `MAX_ITERATIONS=6` — same safety net, different shape. Each iteration = one LLM call (tool-call OR final-answer) plus optional tool execution. Typical question converges in 2 iterations (one fetch, one synthesis); cross-section synthesis can take 4–6 iterations.
+- **Refusal still works architecturally — but now needs explanation, not bare keyword.** When no section in the tree could plausibly contain the answer, the LLM emits no tool_call and goes straight to "this is the 2023 AR, doesn't contain X. insufficient context". `score_llm_judge` rewards that shape with 1.00; bare "insufficient context" scores only 0.33. `AGENTIC_SYSTEM_TEMPLATE` has explicit "two-part refusal: explanation + close-phrase" rule (Bad-Case Entry 6).
+- **The lab file is now ~80 LOC; the architecture-defining ~250 LOC lives in `shared/tree_index/`.** Adding a second tree-index lab (legal contracts, IRS regulations, academic textbooks) is now: write a `page_provider`, build a `tree.json` with `build_tree.py`, instantiate `AgenticTreeRetriever`, ship. The shared lib's `AGENTIC_SYSTEM_TEMPLATE` carries the hard-won prompt-engineering lessons (TOC-trap, explained refusal, synthesis-from-fragments) so the second lab inherits them automatically.
 `─────────────────────────────────────────────────`
 
 ### 3.2 Smoke test
@@ -1157,6 +1114,94 @@ abstraction is solid.
 - **Model isolation is a serving-layer pattern, not a tree-index pattern — but tree-index labs surface it first.** The KV-cache-pollution-across-request-shapes failure mode (Bad-Case Entry 6) hit when tree's tools call ran after vector/graph's no-tools calls on the same model. Will hit any agentic backend running alongside non-agentic backends on the same model. Worth landing in `Engineering Decision Patterns.md` as a cross-cutting serving-layer rule, not just a W2.7 footnote.
 - **The split-merge tradeoff is the unsolved architectural tension.** Recursive split helped factoid (+1.00) but fragmented synthesis (−0.38 in compare8 before the synthesis-from-fragments prompt fix). The prompt fix recovered synthesis to parity; the deeper structural fix would be a `get_subtree_text(parent_id)` tool that returns all leaves under a parent in one fetch — restores synthesis-as-single-fetch while keeping per-leaf precision. Worth flagging as W2.7-followup work; not in v1 of the shared lib.
 `─────────────────────────────────────────────────`
+
+---
+
+## Production Considerations — Storage, Concurrency, Observability
+
+The lab uses local filesystem (`data/tree.json` + `data/brk-2023-ar.pdf`) because the lab's scope is a single document on a single machine. A production deployment of tree-index RAG needs to make explicit decisions about (a) where the tree lives, (b) where the source documents live, (c) how concurrent reads are served. None of these decisions invalidate the agentic-loop architecture; the `page_provider` Protocol in `shared/tree_index/agentic.py` is the seam.
+
+### Storage decision matrix — match scale to backend
+
+| Scale                                  | Tree storage                                                                       | PDF storage                                   | Why                                                                                                                                                                                                                                                                     |
+| -------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **<10 docs / single user / dev / lab** | Local filesystem (`data/trees/{doc_id}.json`)                                      | Local filesystem (`data/pdfs/{doc_id}.pdf`)   | What W2.7 does. tree.json is human-readable JSON; `git diff` shows version changes; no infra to maintain; full rebuild is one command (`python src/build_tree.py`). Operational simplicity is the "vectorless" sales pitch — preserving it at small scale is the point. |
+| **10–1,000 docs / single-tenant prod** | SQLite or Postgres `jsonb` column                                                  | Local filesystem with content-addressed paths | Concurrent reads. Per-document version history (tree v1/v2/v3 as the source PDF revises). ACID guarantees. PDFs stay as files because they're append-only blobs and re-fetching from object storage isn't worth the latency at this scale.                              |
+| **1,000+ docs / multi-tenant prod**    | Postgres `jsonb` (with index on `tree -> 'title'` for cross-document title search) | S3 / blob store with byte-range reads         | Tree querying scales (jsonb indexable). PDFs cold-storable with hot-doc cache (Redis LRU on `(doc_id, page_range)` tuples) hides S3 byte-range latency on the `get_page_content` tool path.                                                                             |
+
+### Why tree-index storage is decoupled from PDF storage
+
+Tree-index has two artifacts with distinct access patterns:
+
+- **`tree.json`** — ~50–100 KB per document, hierarchical, read-mostly (rebuilt only when source changes). Fits a document store / `jsonb` column natively. Concurrent reads scale linearly. Strongly versioned in production (tree v1/v2/v3 audit trail).
+- **PDF source** — large immutable blob (10s–100s of MB), accessed by page range at query time. Object store + byte-range reads is the cost-optimal shape; CDN-fronting at scale.
+
+Splitting these means tree-storage choice (jsonb) and PDF-storage choice (S3) can scale independently. The `page_provider` callable in the lab wrapper is the abstraction boundary — a Postgres-backed deployment supplies a `page_provider` that does S3 byte-range reads with Redis caching; the lab supplies one that does local PdfReader extraction. `AgenticTreeRetriever` doesn't care.
+
+### Production layout that scales without rewrite
+
+Concrete suggested layout for stages 2 (single-tenant) and 3 (multi-tenant):
+
+```text
+# Stage 2 — single-tenant prod (10–1,000 docs)
+data/
+  index.sqlite                  # rows: (doc_id, tree_path, pdf_path, last_built_at, version)
+  trees/{doc_id}/v{N}.json      # versioned trees; current version pointed by index
+  pdfs/{doc_id}.pdf             # immutable; same file across tree versions
+
+# Stage 3 — multi-tenant prod (1,000+ docs)
+postgres:
+  trees(doc_id, version, tree_jsonb, built_at, retrieval_count)
+  documents(doc_id, s3_key, page_count, sha256)
+s3:
+  pdfs/{doc_id}.pdf             # byte-range readable
+redis:
+  cache:tree:{doc_id} → tree_jsonb (TTL 1h, LRU eviction)
+  cache:pages:{doc_id}:{start}-{end} → text (TTL 10min)
+```
+
+The `page_provider` closure changes shape but the agentic-loop logic does not:
+
+```python
+# Stage 2 — single-tenant
+def page_provider(start: int, end: int) -> str:
+    pdf_path = sqlite_lookup_pdf(doc_id)
+    return _extract_pages(pdf_path, start, end)
+
+# Stage 3 — multi-tenant
+def page_provider(start: int, end: int) -> str:
+    cached = redis.get(f"cache:pages:{doc_id}:{start}-{end}")
+    if cached: return cached
+    pdf_bytes = s3.get_object(Bucket="...", Key=f"pdfs/{doc_id}.pdf",
+                              Range=f"bytes={page_to_byte_range(start, end)}")
+    text = _extract_pages_from_bytes(pdf_bytes)
+    redis.setex(f"cache:pages:{doc_id}:{start}-{end}", 600, text)
+    return text
+```
+
+### What NOT to do
+
+- **Don't put tree.json in a vector database.** Tree is structurally non-vector data — relational hierarchy, not embeddings. Putting it in Qdrant/Pinecone/Weaviate wastes the index, forces JSON ↔ vector conversion at every query, and breaks the "one JSON file IS the index" simplicity. Vector DBs are for embedded text chunks; trees stay in document stores or jsonb.
+- **Don't conflate tree storage with PDF storage.** Different access patterns (read-mostly hierarchical reads vs page-range blob fetches), different scaling axes (concurrent reads vs hot-cache hit rate), different consistency needs (jsonb update semantics vs immutable blobs). One abstraction (`page_provider`) hides the difference from the agentic loop, but the storage decisions are independent.
+- **Don't skip versioning of tree.json in production.** Source documents revise (annual reports get amended; contracts get countersigned). Tree v1 may cite "page 96" but v2 of the same document has the answer at "page 102". Cite the tree version + doc version in every answer.
+
+### Observability hooks worth instrumenting
+
+The agentic-loop's `tool_calls` log is the natural observability surface — each entry already records `iter`, `tool`, `args`, `content_chars`. Production additions:
+
+- **Tool-call distribution per question type** — surfaces over-fetching (synthesis questions consuming all 6 iterations) vs under-fetching (factoid questions hitting the answer in iter 1).
+- **Page-range hit-rate distribution** — which page ranges get fetched most? Hot ranges → preload into Redis; cold ranges → leave on S3.
+- **Refusal rate per corpus** — should sit at ~5–15% on a healthy tree-index deployment. Spike to 30%+ signals tree-quality regression (vague summaries causing over-refusal).
+- **Cache pollution detection** — Bad-Case Entry 6's failure mode (KV-cache pollution between request shapes) only surfaced because of per-call `[Nit/Mtc]` debug breadcrumbs. Production should keep a sample of these as structured logs, not just for debug runs.
+
+### When NOT to use tree-index in production
+
+The lab's findings show tree-index winning every category on Berkshire 2023 — but that's a single-document eval against a structured 10-K. Production guidance:
+
+- **Use tree-index when**: long structured documents (SEC filings, contracts, regulations, technical specs, textbooks) where the document's table of contents IS the natural retrieval primitive. Citation + audit traceability matter. Latency budget allows ~5–15s per query.
+- **Don't use tree-index when**: large heterogeneous corpora (Wikipedia, web crawl) where there's no canonical TOC; sub-second latency required (vector with reranker is faster); query mix is dominated by paraphrase / similarity questions where dense embedding's strength dominates. Route those to vector RAG and use tree-index only for the citation-heavy minority.
+
+The W2.5 Soundbite 3 routing pattern (Graph for relational, Vector for paraphrase, Tree for citation/refusal) is the production answer — not "pick one." A 5-line haiku-tier classifier router on each query costs <0.5s and saves 10s+ on misrouted questions. Tree-index in production is one lane behind a router, not the only lane.
 
 ---
 
