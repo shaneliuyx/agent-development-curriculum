@@ -1051,6 +1051,113 @@ The lab actually ran. Numbers refined the §4.3 prediction in two ways: graph pe
 
 The original "graph degenerates on single-document star corpus" hypothesis was **wrong** — graph performed best in aggregate. See bad-case Entry 5 below for why this finding almost got reported the other way around.
 
+### 4.3.2 PageIndex optimization run — tree judge 0.44 → 0.79 (2026-05-07)
+
+After §4.3.1 results, applied four PageIndex-inspired optimizations to the tree backend (full RESULTS.md in `lab-02-7-pageindex/RESULTS.md`):
+
+1. **Agentic tool-calling loop** — replaced greedy `navigate()` + `answer()` with multi-turn agent loop exposing `get_page_content(start, end)` tool. Body text now visible to decision-maker.
+2. **Recursive node split** — leaves spanning >5 pages get LLM-split into sub-sections (50 → 62 nodes, depth 4 → 5).
+3. **Fact-rich summaries** — every summary requires 3 numeric facts + 5 named entities verbatim.
+4. **AGENTIC_SYSTEM rules** — TOC-trap guard + explained refusal (not bare keyword) + synthesis-from-fragments instruction.
+
+**Model split:** tree backend isolated to `Qwen3.6-35B-A3B-UD-MLX-4bit` via new `MODEL_TREE` env var; vector + graph stay on Gemma. Different model = different KV cache pool on oMLX server, prevents the cross-call cache pollution observed when all 3 backends shared one model (see chapter Bad-Case Entry 6).
+
+**Aggregate (10-run convergence):**
+
+| Backend | Pre-opt judge | Post-opt judge | Δ | Latency |
+|---|---|---|---|---|
+| Vector | 0.25 | 0.25 | 0 | 1.8s |
+| Graph | 0.48 | 0.48 | 0 | 6.3s |
+| **Tree** | **0.44** | **0.79** | **+0.35 (+77%)** | 14.6s |
+
+**Per-category lift:**
+
+| Category | Pre-opt T | **Post-opt T** | Lift |
+|---|---|---|---|
+| section-specific factoid | 0.00 | **1.00** | **+1.00** |
+| cross-section synthesis | 0.50 | 0.50 | 0 |
+| citation-required | 0.25 | **0.67** | +0.42 |
+| out-of-document refusal | 1.00 | 1.00 | 0 |
+
+Tree now wins or ties every category. The pre-opt architectural blind spot — navigator only sees titles + summaries, never body text — is closed by the agentic-loop pattern. Latency cost 3.4s → 14.6s (4.3×) is the price of multi-turn retrieval; acceptable when accuracy lift is +0.35 absolute.
+
+**PageIndex's 98.7% on FinanceBench is not apples-to-apples** — their pipeline uses GPT-4o + Cloud OCR + 150-question multi-doc eval; ours uses local Qwen3.6 + PyPDF + 8-question single-doc. 0.79 on the local stack with PageIndex-pattern optimizations is the realistic ceiling for this eval shape.
+
+### 4.3.3 Reusable design patterns + shared-lib candidates
+
+The optimization run exposed five patterns that generalize beyond W2.7 — any hierarchical-index RAG implementation can adopt them — and four functions clean enough to package as a `shared/tree_index/` library reused by future labs.
+
+**Reusable design patterns:**
+
+| Pattern | What it is | Where it generalizes | One-line takeaway |
+|---|---|---|---|
+| **Structure-tool + content-tool agentic loop** | LLM gets a compact hierarchical map (tree.json with id/title/page-range/summary, no body text) plus a `get_page_content(start, end)` tool. Iterates: read structure → identify candidate range → fetch text → synthesize or refetch. | Any hierarchical document corpus (10-Ks, contracts, textbooks, codebases, technical specs). Replaces greedy descent for any structure-aware retrieval. | "The LLM should see structure cheaply and fetch content on-demand, not the inverse." |
+| **Recursive size-bounded node split** | After heuristic+LLM tree build, walk the tree; any leaf spanning >K pages or >M chars gets LLM-split into 2-5 topical sub-sections via prompt asking for verbatim sub-titles + non-overlapping page ranges. Idempotent. | Any tree-builder where leaf granularity is uneven. PageIndex `process_large_node_recursively` is the upstream reference. | "Heuristic detection produces uneven leaves; one extra LLM pass evens them out at build time, saving query-time latency." |
+| **Fact-rich summary contract** | Summary system-prompt requires N numeric facts verbatim (with units) + M named entities verbatim + one structural-location sentence. Forbids vague phrases ("various financial metrics", "the company's operations"). | Any retrieval system where the summary is what the navigator decides on. Fixes the "all summaries say similar things, navigator picks arbitrarily" failure mode. | "Make summaries searchable in the literal sense — navigator should be able to keyword-match concrete entities and numbers, not paraphrase generalities." |
+| **Three-rule agentic system prompt** | (a) TOC-trap guard: "TOC pages list section names but DO NOT contain answer text — descend past them." (b) Explained refusal: "Refuse with one-sentence explanation + 'insufficient context', never bare keyword." (c) Synthesis-from-fragments: "After 3+ partial-info fetches, combine them rather than refuse." | Any agentic-RAG system prompt. Each rule fixes a measured failure mode in the lab; all three together are mutually reinforcing. | "Three short rules in the system prompt eliminated the three highest-frequency failure modes; cheaper than retraining." |
+| **Model isolation per request-shape** | Route tools-using backend to a different model than no-tools backends (separate env vars: `MODEL_TREE` vs `MODEL_SONNET`). Different model = different KV cache pool on the server, prevents cross-shape pollution. | Any multi-backend system sharing a single inference server. Particularly relevant for oMLX, vLLM, and other serving frameworks that do prefix-caching or KV reuse across requests. | "Server-side cache reuse can pollute tool-routing across heterogeneous request shapes; isolate by model." |
+
+**Shared-lib candidates** — functions clean enough to lift into `shared/tree_index/`:
+
+```python
+# shared/tree_index/agentic.py — opt #1 generalized
+class AgenticTreeRetriever:
+    """Multi-turn agent loop with structure + content tools.
+
+    Args:
+        tree: dict with node_id/title/start_page/end_page/summary fields
+        page_provider: Callable[[int, int], str] returning text for a page range
+        model_client: OpenAI-compatible client
+        model_name: target model
+        system_prompt: AGENTIC_SYSTEM template (TOC-trap + explained refusal +
+            synthesis-from-fragments)
+        max_iterations: bounded loop ceiling
+        max_range_chars: per-fetch char cap
+    """
+    def answer(self, query: str) -> dict: ...   # returns {answer, tool_calls, iterations}
+```
+
+```python
+# shared/tree_index/builder.py — opt #2 generalized
+def split_large_nodes(
+    tree: dict, pages: list[dict], *,
+    max_pages: int = 5, max_chars: int = 20_000,
+    model_client, model_name, split_system_prompt: str,
+) -> dict:
+    """Walk tree; split any leaf spanning > max_pages OR > max_chars chars
+    into 2-5 sub-sections via LLM. Idempotent. Doc-root excluded."""
+```
+
+```python
+# shared/tree_index/builder.py — opt #3 generalized
+FACT_RICH_SUMMARIZE_SYSTEM = """Summarize this document section in 100-150 words.
+REQUIRED: {n_facts} numeric facts verbatim with units; {n_entities} named entities
+verbatim; one sentence of structural location. PROHIBITED: 'This section discusses',
+generic phrases like 'various financial metrics'. ..."""
+```
+
+```python
+# shared/tree_index/prompts.py — opt #4 generalized
+AGENTIC_SYSTEM_TEMPLATE = """You answer questions by navigating a document tree
+and fetching pages on demand.
+... [full template with TOC-trap rule + explained refusal + synthesis-from-fragments]
+"""
+```
+
+A lab that ports tree-index RAG to a new corpus (legal contracts, IRS regulations,
+academic textbooks) would import these four pieces, supply the corpus's
+`page_provider` + a `tree.json` built by `build_tree.py` (which itself becomes the
+fifth shared piece — a `build_tree(pdf_path) -> tree.json` entry point), and have
+a working agentic-loop tree-index backend in <100 lines of lab-specific code. The
+W2.7 lab is essentially the first concrete instance; the second lab confirms the
+abstraction is solid.
+
+`★ Insight ─────────────────────────────────────`
+- **The biggest reuse win is the AGENTIC_SYSTEM template, not the code.** The four functions above are 50-150 LOC each — straightforward to re-author per lab. The system prompt is what encodes the hard-won lessons (TOC-trap, explained refusal, synthesis-from-fragments) and is the part most likely to be mis-derived if a downstream lab tries to write its own prompt from scratch. Package the prompt as a *string template* with explicit placeholders for corpus name + structure-aid hints; hardest part to derive, easiest part to reuse.
+- **Model isolation is a serving-layer pattern, not a tree-index pattern — but tree-index labs surface it first.** The KV-cache-pollution-across-request-shapes failure mode (Bad-Case Entry 6) hit when tree's tools call ran after vector/graph's no-tools calls on the same model. Will hit any agentic backend running alongside non-agentic backends on the same model. Worth landing in `Engineering Decision Patterns.md` as a cross-cutting serving-layer rule, not just a W2.7 footnote.
+- **The split-merge tradeoff is the unsolved architectural tension.** Recursive split helped factoid (+1.00) but fragmented synthesis (−0.38 in compare8 before the synthesis-from-fragments prompt fix). The prompt fix recovered synthesis to parity; the deeper structural fix would be a `get_subtree_text(parent_id)` tool that returns all leaves under a parent in one fetch — restores synthesis-as-single-fetch while keeping per-leaf precision. Worth flagging as W2.7-followup work; not in v1 of the shared lib.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Bad-Case Journal
@@ -1080,13 +1187,18 @@ The original "graph degenerates on single-document star corpus" hypothesis was *
 *Root cause:* `build_brk_graph.py` was a sed-rename of `lab-02-5/src/build_graph.py` — `Entity → BrkEntity` and `entity_names → brk_entity_names`. The CREATE INDEX statement was processed by both substitutions and produced `brk_brk_entity_names`. Build summary printed `brk_entity_names` (line 452 was a hardcoded display string, not derived from the SQL); Neo4j held `brk_brk_entity_names`; query script `query_brk_graph.py` asked for `brk_entity_names`. Three layers of inconsistency, no integration smoke test.
 *Fix:* (a) Rename the index in Neo4j: `DROP INDEX brk_brk_entity_names; CREATE FULLTEXT INDEX brk_entity_names FOR (n:BrkEntity) ON EACH [n.name, n.aliases]`. (b) Patch line 362 of `build_brk_graph.py` to match. (c) Re-run compare. Real numbers: graph aggregate 0.48 (highest of the three), refuting the "single-document graph collapses" hypothesis. **Discipline rule:** before reporting a clean architectural finding from a forked build script, run the smallest possible smoke test — a single `db.index.fulltext.queryNodes` against a known entity — to prove the index actually exists. The 30-second check would have caught this.
 
+**Entry 6 — oMLX KV-cache pollution between request shapes destroys tool-routing on shared models.**
+*Symptom:* During the PageIndex optimization run (2026-05-07), tree backend with the new agentic tool-calling loop scored judge=0.08 in `compare_three.py` — every per-question call returned `1it/0tc` empty content despite identical questions returning correct answers (`2it/1tc`, real text with citations) when run standalone via `python src/query_tree.py "<q>"`. Standalone same-process repro of `vector → graph → tree` for one question also worked correctly; only the full 8-question compare loop reproduced the failure. Initial hypothesis "model swap broke tool calling" was disproven by 4/4 PASS smoke test of Qwen3.6 (JSON / tools / multi-turn / 16K context).
+*Root cause:* When all three backends shared `MODEL_SONNET=Qwen3.6-35B-A3B-UD-MLX-4bit`, the oMLX server appears to reuse KV-cache state across requests for the same model. Vector backend issues a no-tools call with a short user prompt; graph backend issues a no-tools call with seed-extraction prompt; tree backend then issues a tools call with a long agentic system prompt. The cache state from preceding no-tools shapes interfered with tool-routing on the tools call — Qwen3.6 emitted empty content with no `tool_calls` field set. Standalone runs only invoked tree, so cache state was consistent.
+*Fix:* Route tree backend to a separate model. Added `MODEL_TREE=Qwen3.6-35B-A3B-UD-MLX-4bit` to `.env` and changed `query_tree.py` to read `os.getenv("MODEL_TREE") or os.getenv("MODEL_SONNET")`. Reverted `MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit` for vector + graph. Different model = different KV cache pool on the oMLX server. Tree judge immediately recovered to 0.61, then climbed to 0.79 with the prompt-engineering fixes (explained refusal + synthesis-from-fragments). **Discipline rule:** when running multi-backend comparisons against an oMLX-served stack with mixed request shapes (no-tools call alongside tools call), give the tools-using backend its own model. Generalizes to: any LLM-serving framework that does cache-reuse across requests for the same model can pollute tool-routing across request shapes.
+
 ---
 
 ## Interview Soundbites
 
 **Soundbite 1 — "When does PageIndex / tree-index RAG beat vector and graph?"**
 
-"Tree-index wins on refusal and citation, not on factoid lookup like I'd expected. My lab on Berkshire's 2023 10-K — three backends, same corpus, same 8-question eval: vector won factoid (0.50 vs 0.00 on 'what was net earnings?'); graph won aggregate (0.48) by surfacing entity-relationship answers across sections; tree tied graph on cross-section synthesis (0.50) and out-of-document refusal (1.00). Tree was 4× faster than graph for similar accuracy on synthesis. The architectural takeaway: route by query shape, not by corpus shape — vector for numeric lookup, graph for entity relationships, tree for citations and refusal."
+"Tree-index can win every category once you adopt PageIndex's agentic-loop pattern instead of greedy descent. My lab on Berkshire's 2023 10-K — three backends, same corpus, 8-question eval — pre-optimization tree scored 0.44 aggregate, losing factoid (0.00) because the navigator only saw section titles, never body text. After applying four PageIndex-pattern optimizations (agentic tool-calling loop with `get_page_content`, recursive node split, fact-rich summaries, TOC-trap + explained-refusal + synthesis-from-fragments rules), tree judge climbed to 0.79 — wins or ties every category, including factoid (1.00 vs vector 0.50), citation (0.67 vs graph 0.42), refusal (1.00 tied), and synthesis (0.50 tied). The architectural lesson: greedy tree-walk's 'navigator only sees titles' blind spot is real but fixable — give the answer-LLM a `fetch_page_range` tool and let it iterate. Cost: 4× higher latency than greedy (14.6s vs 3.4s)."
 
 **Soundbite 2 — "What's the failure mode of tree-index retrieval?"**
 
