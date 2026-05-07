@@ -283,8 +283,9 @@ Save as `src/build_tree.py` — single runnable file with PDF parse + heading de
 flowchart LR
   PDF["PDF<br/>~150 pages"] -->|pypdf parse| Pages["pages<br/>[{page_num, text}, ...]"]
   Pages -->|"regex + heuristics<br/>(over-recall)"| Cands["heading candidates<br/>noisy, over-eager"]
-  Cands -->|LLM consolidation<br/>1 call, JSON-mode| Tree["clean tree<br/>{node_id, title, nodes}"]
-  Tree -->|recursive summary<br/>~25 LLM calls| Final["data/tree.json<br/>50 nodes, depth 4"]
+  Cands -->|LLM consolidation<br/>1 call, JSON-mode| Skel["tree skeleton<br/>~35 nodes, depth 3"]
+  Skel -->|"split_large_nodes<br/>(shared/tree_index)<br/>~5–10 LLM calls<br/>splits leaves > 5p / > 20K chars"| Split["split tree<br/>62 nodes, depth 5"]
+  Split -->|"recursive summary<br/>fact-rich SUMMARIZE_SYSTEM<br/>~62 LLM calls"| Final["data/tree.json<br/>62 nodes, depth 5,<br/>fact-rich summaries"]
 ```
 
 **Code:**
