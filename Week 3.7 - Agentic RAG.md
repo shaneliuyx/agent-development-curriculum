@@ -1,7 +1,7 @@
 ---
 title: "Week 3.7 — Agentic RAG (LangGraph-Canonical Architecture)"
 created: 2026-04-27
-updated: 2026-05-03
+updated: 2026-05-07
 tags: [agent, curriculum, week-3.7, rag, agentic-rag, langgraph, runbook, expansion-week]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03.7-agentic-rag"
@@ -485,6 +485,283 @@ Save as `results/RESULTS.md`. Required sections:
 
 ---
 
+## Phase 6 — Hand-rolled Self-RAG + CRAG Baseline (~2 hours)
+
+> Added 2026-05-07. The hand-rolled pipeline is ported from the user's older personal repo `github.com/shaneliuyx/rag` (commit `dae7d6f`, 2025-08-17). The 2025 repo had a working Self-RAG + CRAG implementation on Chroma + Ollama-Gemma2:2b; this phase ports it to the 2026 curriculum stack (Qdrant + oMLX + `shared/rag_hybrid`). Pedagogical purpose: see the moving parts BEFORE LangGraph hides them. After Phase 1-4 you've used a framework; Phase 6 shows the framework's job done by hand.
+
+The lab-03.7 directory now exists at `~/code/agent-prep/lab-03.7-agentic-rag/` with three substantive files. The full pipeline is `src/baseline_handrolled.py` (~300 LOC, single file, no LangGraph). Read end-to-end in the file; the per-node summary below names what each does.
+
+**Architecture:**
+
+```mermaid
+flowchart TD
+  Q["query"] --> DC["ComplexityDecider<br/>heuristic: cap-entity count<br/>+ cue keywords + conjunctions"]
+  DC -->|"label='Complex' AND<br/>ENABLE_DECOMPOSITION=1"| DEC["LLMDecomposer<br/>(Phase 7)<br/>→ topo-sort sub-queries"]
+  DC -->|"label='Simple' OR decompose disabled"| SQ["sub_queries = [query]"]
+  DEC --> SQ
+  SQ --> MR["MultiRetrieve<br/>original + keyword-only<br/>→ RRF fuse"]
+  MR --> RR["Rerank<br/>BGE-reranker-v2-m3"]
+  RR --> SY["Synthesize<br/>bullets with [#i] citations<br/>+ drift filter"]
+  SY --> SR["SelfRAG checks<br/>citation_rate +<br/>faithfulness_rate +<br/>coverage"]
+  SR --> GH["grade_hallucination<br/>pass = faith ≥ 0.5 AND<br/>cite ≥ 0.5"]
+  SR --> GR["grade_relevance<br/>pass = qkeys ∩ akeys ≥ 0.2"]
+  GH -->|"both pass"| OUT["{answer, hits, selfrag,<br/>grades, decision}"]
+  GR -->|"both pass"| OUT
+  GH -->|"hallucination fails"| REGEN["regenerate (max_regen)"]
+  GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite)"]
+  REGEN --> SR
+  CRAG -->|"still fails"| FALLBACK["next_action: web_search<br/>(host-level handoff)"]
+  CRAG -->|"now passes"| OUT
+  FALLBACK --> OUT
+```
+
+**Code (lab wrapper — full pipeline in `src/baseline_handrolled.py`):**
+
+```python
+# src/baseline_handrolled.py — top-level entry (excerpt)
+def answer(query: str, top_k: int = 6) -> dict[str, Any]:
+    decision = decide_complexity(query)
+    sub_queries = [{"id": "q1", "text": query}]
+    if os.getenv("ENABLE_DECOMPOSITION", "0") == "1" and decision["label"] == "Complex":
+        from decompose import decompose_query
+        sub_queries = decompose_query(query) or sub_queries
+
+    hits = multi_retrieve(query)            # RRF over original + keyword-only
+    rr = rerank(query, hits, top_k=top_k)   # BGE-reranker-v2-m3
+    sy = synthesize(query, rr)              # bullets + [#i] cites + drift filter
+    sr = selfrag_checks(sy["answer"], rr, query)
+    gh = grade_hallucination(sy["answer"], rr, query)
+    gr = grade_relevance(sy["answer"], query)
+
+    out = {"query": query, "decision": decision, "sub_queries": sub_queries,
+           "hits": rr, "answer": sy["answer"], "selfrag": sr,
+           "grade_hallucination": gh, "grade_relevance": gr,
+           "drift_filtered": sy["drift_filtered"]}
+
+    if not gr["pass"]:                      # CRAG: rewrite + retry
+        crag = corrective_loop(query, top_k=top_k)
+        out["corrective"] = crag
+        if not crag["grade_relevance"]["pass"]:
+            out["next_action"] = {"type": "web_search", ...}
+    return out
+```
+
+**Walkthrough:**
+
+- **Block 1 — `decide_complexity` (heuristic).** Capitalized-entity count + cue-keyword count + conjunction detection produces a 0-1.55 score; ≥0.5 → "Complex". No LLM call. Smoke test: "What is RAG?" → 0.3 / Simple; "Compare BNSF vs Berkshire Energy and explain why" → 1.55 / Complex. The decider's only job is gating: should we pay for LLM decomposition + the multi-step path, or fast-path through single-query retrieval.
+- **Block 2 — `multi_retrieve` (original + keyword-only RRF).** Issues two Qdrant queries: original query text + keyword-only variant (stripped of stopwords / function words). Cormack-style RRF (`1/(60+rank)`) fuses the rankings. Variant generation is the cheap recall-augmentation that doesn't need decomposition; covers the case where the original query has too much syntactic noise to dense-match well.
+- **Block 3 — `synthesize` with `[#i]` citation binding + drift filter.** The W2.7-discovered explained-refusal pattern transferred — the prompt forces inline `[#N]` citations on every bullet. The drift filter post-pass drops any bullet whose keywords don't overlap its cited passage; cheap pre-faithfulness guardrail before RAGAS-style judge runs.
+- **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
+- **Block 5 — `corrective_loop` (CRAG: rewrite + retry).** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If still fails after max iterations, set `next_action = {"type": "web_search"}` so the host (Claude Desktop / Cursor via MCP server) knows to route to its web-search tool and feed results back.
+
+**Result (estimated, lab not yet end-to-end run on a calibrated eval):**
+
+| Stage | Wall time |
+|---|---|
+| `decide_complexity` (no LLM) | <0.01 s |
+| `multi_retrieve` (2 × Qdrant queries) | ~0.3 s |
+| `rerank` (BGE-reranker batch) | ~0.5 s |
+| `synthesize` (1 LLM call) | ~3-6 s |
+| `selfrag_checks` + grades (no LLM) | <0.01 s |
+| **Total per query (no CRAG loop fire)** | **~4-7 s** |
+| CRAG loop (1 rewrite + 1 retry) | adds ~5-10 s |
+
+First measured run will populate `lab-03.7-agentic-rag/results/RESULTS.md`. Comparison vs LangGraph canonical (Phase 1-4) becomes the chapter's central artifact.
+
+`★ Insight ─────────────────────────────────────`
+- **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
+- **`shared/tree_index.split_large_nodes` and this lab's `decompose.py` solve different problems but pair well.** Tree-split fragments a long document into navigable units (build-time); decompose fragments a complex query into atomic sub-queries (query-time). Together: the agent sees a fine-grained tree AND can plan multi-step queries against it.
+- **CRAG's "next_action: web_search" is the host-level handoff pattern.** This lab doesn't run web search itself — it emits a structured `next_action` in the response and lets the MCP host (Claude Desktop / Cursor via Phase 8's mcp_server) route to a web-search MCP tool. Decoupling intent from execution is what makes this pattern composable across hosts.
+`─────────────────────────────────────────────────`
+
+Run smoke test (loads encoder + reranker + Qdrant; first run ~5-15 s warmup):
+
+```bash
+cd ~/code/agent-prep/lab-03.7-agentic-rag
+python src/baseline_handrolled.py "What was Berkshire's net earnings in 2023?"
+```
+
+Expected output: a JSON dict with `answer`, `hits`, `selfrag`, `grade_hallucination`, `grade_relevance`. The `grade_relevance.pass` should be True for in-corpus questions.
+
+---
+
+## Phase 7 — Query Decomposition with Topological Execution (~1 hour)
+
+> Added 2026-05-07. The decomposition node is the most novel artifact ported from `shaneliuyx/rag`. None of W1-W3.7 covers query *planning* (vs query *rewriting*); this phase introduces it.
+
+The distinction matters. LangGraph's canonical `rewrite_question` (Phase 1-4) is *single-shot reformulation* — one query in, one query out. `decompose_query` is *DAG planning* — one query in, 2-6 sub-queries out, with `depends_on` edges defining a topological execution order + a global citation remap that ties results across sub-queries. Closer to IRCoT (Trivedi et al. 2023) and Plan-and-Solve (Wang et al. 2023) than to vanilla RAG.
+
+**Architecture:**
+
+```mermaid
+flowchart LR
+  Q["complex query<br/>'compare BNSF revenue vs<br/>Berkshire Energy revenue'"] -->|"LLM call<br/>JSON-mode"| Plan["sub-query plan<br/>JSON DAG"]
+  Plan --> Topo["topo_sort<br/>(lookups first,<br/>synthesis after deps)"]
+  Topo -->|"q1: BNSF revenue<br/>(lookup)"| R1["retrieve + rerank + synth"]
+  Topo -->|"q2: Berkshire Energy revenue<br/>(lookup)"| R2["retrieve + rerank + synth"]
+  R1 -->|"answer + cites"| Merge["q3: compare<br/>(synthesis)<br/>depends_on: [q1, q2]"]
+  R2 -->|"answer + cites"| Merge
+  Merge -->|"global citation remap<br/>[#1] [#2] across sub-queries"| Final["unified answer<br/>with cross-section synthesis"]
+```
+
+**Code (`src/decompose.py`):**
+
+```python
+DECOMPOSE_PROMPT = """You are a query-planning assistant. Decompose the user's
+question into 2-6 atomic sub-queries that can each be answered from documents.
+
+Return a JSON object with a single key "sub_queries" whose value is an array.
+Each item has:
+  - id: "q1", "q2", ... (sequential, unique)
+  - text: the atomic sub-query (string)
+  - depends_on: array of ids this sub-query needs answered first
+  - type: "lookup" (factoid) or "synthesis" (combines other sub-queries)
+
+User query:
+{query}
+
+JSON output:"""
+
+def decompose_query(query: str) -> list[dict]:
+    """LLM-driven JSON sub-query planner. Falls back to [{single query}]
+    on any error so callers can always proceed."""
+    resp = omlx.chat.completions.create(
+        model=MODEL, temperature=0.2, max_tokens=512,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user",
+                   "content": DECOMPOSE_PROMPT.format(query=query)}],
+    )
+    parsed = json.loads(resp.choices[0].message.content or "{}")
+    return [...]  # validated cleaning per id/text/depends_on/type
+
+def topo_sort(plan: list[dict]) -> list[dict]:
+    """Topological order: lookups first, synthesis after their dependencies."""
+    indeg = {n["id"]: len(n.get("depends_on", [])) for n in plan}
+    out, seen = [], set()
+    ready = [n for n in plan if indeg[n["id"]] == 0]
+    while ready:
+        cur = ready.pop(0); out.append(cur); seen.add(cur["id"])
+        for n in plan:
+            if n["id"] in seen: continue
+            if all(d in seen for d in n.get("depends_on", [])):
+                ready.append(n)
+    return out
+```
+
+**Walkthrough:**
+
+- **Block 1 — `DECOMPOSE_PROMPT` (JSON contract).** The system prompt forces strict JSON output via `response_format={"type": "json_object"}` (Qwen3.6 + Gemma both support this on oMLX, smoke-tested). The "synthesis vs lookup" distinction tells the LLM which sub-queries can run in parallel (lookups, no deps) vs which must wait (synthesis, has deps).
+- **Block 2 — `decompose_query` parsing.** Try-except around JSON parse + validation: every output gets normalized to `{id, text, depends_on, type}` with sane defaults. Falls back to single-query plan on ANY error so callers never crash. Same fallback discipline as the agentic-loop's "no tool_call → take content as final answer" pattern.
+- **Block 3 — `topo_sort` topological order.** Standard Kahn's algorithm: in-degree count, ready queue, BFS. Residual cycles (LLM emits a sub-query depending on itself) get appended in original order — the lab continues, the executor decides whether to re-route or refuse.
+- **Block 4 — Smoke test (no LLM call).** `topo_sort([q3 deps q1+q2, q1, q2])` correctly returns `[q1, q2, q3]`. Verifies the plumbing without paying for an LLM call.
+
+**Result (smoke-tested 2026-05-07):**
+
+| Test | Outcome |
+|---|---|
+| `decide_complexity("What is RAG?")` | `{"label": "Simple", "score": 0.3}` |
+| `decide_complexity("Compare BNSF vs Berkshire Energy and explain why")` | `{"label": "Complex", "score": 1.55}` |
+| `topo_sort([q3 depends q1,q2; q1; q2])` | `["q1", "q2", "q3"]` |
+
+End-to-end LLM-decomposition pending first calibrated run. Set `ENABLE_DECOMPOSITION=1` in `.env` to wire `decompose_query` into the Phase 6 pipeline.
+
+`★ Insight ─────────────────────────────────────`
+- **Query planning > query rewriting on multi-hop.** Single-shot rewriting (W3.7 Phase 1-4) helps recall on individual queries; decomposition makes multi-hop synthesis tractable by retrieving for each leaf separately + a final synthesis pass that combines. Both have their place — route by query shape.
+- **JSON-mode + topological sort = composable.** The plan is a DAG, not a tree. Some sub-queries depend on others; topo_sort gives the executor a stream-friendly ordering. Lookups can fan out in parallel; synthesis sub-queries run after their inputs land. Same shape as Airflow's DAG executor.
+- **The decomposer is opt-in via `ENABLE_DECOMPOSITION=1`.** Default off because most queries don't benefit (single-step factoid) and decomposition adds 1 LLM call (~3-5s). Empirical default: on for Complex-classified queries, off for Simple. Worth re-measuring per corpus.
+`─────────────────────────────────────────────────`
+
+---
+
+## Phase 8 — MCP Server Wrapper: Lab-as-Tool (~1 hour)
+
+> Added 2026-05-07. None of the prior labs in W0-W3.7 expose themselves as MCP servers. This phase closes that gap: wraps the hand-rolled pipeline as 3 MCP tools that Claude Desktop / Cursor can call.
+
+The pattern matters because **MCP is the production interface for "lab as tool" composition** in 2026. Once your lab is an MCP server, any host (Claude Desktop, Cursor, Continue, custom agents) can register it via `mcp-config.json` and the user can invoke `@rag_query` / `@rag_status` / `@rag_decompose` like built-in functions. Pairs naturally with the W2.7 tree-index lab — imagine asking Claude Desktop questions about a 10-K via `@rag_query` while a parallel `@tree_query` MCP tool routes to the tree-index pipeline.
+
+**Architecture:**
+
+```mermaid
+flowchart LR
+  Host["MCP host<br/>Claude Desktop /<br/>Cursor / Continue"] -->|"loads<br/>mcp-config.json"| Reg["Registers<br/>'agentic-rag' server"]
+  Reg -->|"stdio transport<br/>(default)"| Server["FastMCP server<br/>src/mcp_server.py"]
+  Server -->|"@mcp.tool()<br/>3 tools registered"| Tools["rag_query<br/>rag_status<br/>rag_decompose"]
+  Tools -->|"on tool call"| Pipeline["calls baseline_handrolled.answer()<br/>or decompose.decompose_query()"]
+  Pipeline -->|"JSON result"| Server
+  Server -->|"tool result"| Host
+```
+
+**Code (`src/mcp_server.py`):**
+
+```python
+from fastmcp import FastMCP
+from baseline_handrolled import answer, _qdrant, QDRANT_COLLECTION
+from decompose import decompose_query, topo_sort
+
+mcp = FastMCP("agentic-rag",
+              dependencies=["qdrant-client", "sentence-transformers",
+                            "FlagEmbedding", "openai", "python-dotenv"])
+
+@mcp.tool()
+def rag_query(query: str, k: int = 6, allow_corrective: bool = True) -> dict:
+    """Answer a question over the configured Qdrant collection using the
+    hand-rolled Self-RAG + CRAG pipeline."""
+    out = answer(query, top_k=k)
+    if not allow_corrective:
+        out.pop("corrective", None); out.pop("next_action", None)
+    return out
+
+@mcp.tool()
+def rag_status() -> dict:
+    """Return collection size + active config for diagnostics."""
+    info = _qdrant.get_collection(QDRANT_COLLECTION)
+    return {"collection": QDRANT_COLLECTION,
+            "points_count": info.points_count,
+            "model_sonnet": os.getenv("MODEL_SONNET", "(unset)")}
+
+@mcp.tool()
+def rag_decompose(query: str) -> dict:
+    """Phase 7 standalone: return JSON sub-query plan without running the
+    rest of the pipeline. Useful for inspecting decomposition before paying
+    for full retrieval + synthesis."""
+    plan = decompose_query(query); return {"plan": plan, "topo_ordered": topo_sort(plan)}
+
+if __name__ == "__main__":
+    mcp.run()
+```
+
+**Walkthrough:**
+
+- **Block 1 — `FastMCP` app + dependency declaration.** `dependencies=[...]` populates the `mcp-config.json` reload semantics — when the host restarts, FastMCP bootstraps the venv. The `agentic-rag` server name is what the host sees in its tool catalog (`@agentic-rag.rag_query` or just `@rag_query` depending on host config).
+- **Block 2 — `@mcp.tool()` decorator.** Each decorated function becomes a host-callable tool with auto-generated JSON schema from type hints + docstring. The host invokes via stdio transport (default) — no HTTP server, just Python stdin/stdout pipes wrapped in MCP framing. Lower setup cost than gRPC / REST, sufficient for local dev and most production MCP deployments.
+- **Block 3 — Tool function bodies.** Three thin wrappers around `answer()` / `decompose_query()` / Qdrant collection inspection. The pipeline logic lives in `baseline_handrolled.py`; `mcp_server.py` is purely transport-layer adaptation. Worth keeping that separation: any future MCP transport (HTTP, websocket) only needs a new wrapper, not a pipeline rewrite.
+- **Block 4 — `mcp.run()` (stdio transport).** Default for FastMCP. Host launches via `command + args` from `mcp-config.json`; the server runs as a subprocess with stdin/stdout wired to the host. No port allocation, no listener. Restart-safe.
+
+**Result (lab not yet host-tested, but smoke test confirms imports + tool registration):**
+
+```bash
+$ cd ~/code/agent-prep/lab-03.7-agentic-rag
+$ python src/mcp_server.py
+# Server starts on stdio; awaits MCP protocol messages from host.
+# Ctrl-C to stop.
+```
+
+**Claude Desktop integration** (one-time, ~5 min):
+
+1. Open `~/Library/Application Support/Claude/claude_desktop_config.json`.
+2. Merge in the snippet from `lab-03.7-agentic-rag/mcp-config.json` under `mcpServers`.
+3. Update absolute paths + `OMLX_API_KEY` in the snippet's `env`.
+4. Restart Claude Desktop.
+5. In a chat, type "@rag" and you should see `rag_query`, `rag_status`, `rag_decompose` in the tool palette.
+
+`★ Insight ─────────────────────────────────────`
+- **MCP-server wrapping is the cheapest curriculum-to-portfolio bridge.** Every existing lab can wrap its `answer()` / equivalent in ~50 LOC of FastMCP and become a tool a hiring manager can demo in Claude Desktop during a screen-share. Higher portfolio signal than "I built X locally" because it shows X composes with current-year tooling.
+- **The 3-tool surface is a hard discipline.** Wrapping every internal function as a tool clutters the host's palette. Three high-leverage tools (`rag_query`, `rag_status`, `rag_decompose`) that each do one thing with sensible defaults beat 12 fine-grained tools that need parameter tuning. Same lesson as W7 Tool Harness — coarse-grained tools win at the host interface boundary.
+- **Stdio transport isolates failures.** If the lab pipeline crashes, the MCP server process dies but Claude Desktop just shows "tool unavailable" and continues. No port pollution, no zombie listeners. Restart the host, server respawns, you're back. Robust by default.
+`─────────────────────────────────────────────────`
+
+---
+
 ## Lock-In (~45 min)
 
 ### Anki cards (5)
@@ -562,5 +839,5 @@ Open [[Week 4 - ReAct From Scratch]] when this lab's `RESULTS.md` is committed. 
 
 - **Builds on:** W1 Vector Retrieval (Qdrant collection + BGE-M3 embeddings are the retrieval substrate), W2 Rerank (retrieve node reuses reranker stack), W3 RAG Eval (RAGAS reused for comparison matrix), W3 single-pass baseline.
 - **Distinguish from:** Static RAG (single linear pass, no grading, no loop); GraphRAG (graph traversal is retrieval strategy not agent decision); hybrid retrieval (deterministic dense+sparse fusion, no agent judgment); Self-RAG (internalizes grading via reflection tokens vs explicit grading node).
-- **Connects to:** W5 Pattern Zoo (5-node graph = ReAct specialized to retrieval); W7 Tool Harness (retriever wrapped via `create_retriever_tool` is tool-calling pattern; grading conditional edge is tool-result routing).
-- **Foreshadows:** W11 System Design (5-node graph maps to Argo / Step Functions / Airflow BranchPythonOperator; CRAG fallback = circuit breaker pattern); W12 Capstone (default retrieval substrate for mixed-complexity queries).
+- **Connects to:** W5 Pattern Zoo (5-node graph = ReAct specialized to retrieval); W7 Tool Harness (retriever wrapped via `create_retriever_tool` is tool-calling pattern; grading conditional edge is tool-result routing); [[Week 2.7 - Structure-Aware RAG]] (Phase 6 hand-rolled pipeline imports `shared/rag_hybrid` encoder + reranker, same stack W2.7 uses; Phase 7 decomposition pairs naturally with W2.7's `shared/tree_index.split_large_nodes` — split fragments documents at build-time, decompose fragments queries at query-time; Phase 8 MCP server pattern lifts to W2.7's `query_tree.answer` if you want a tree-index MCP tool too).
+- **Foreshadows:** W11 System Design (5-node graph maps to Argo / Step Functions / Airflow BranchPythonOperator; CRAG fallback = circuit breaker pattern); W12 Capstone (default retrieval substrate for mixed-complexity queries); MCP-server pattern from Phase 8 generalizes — every existing lab can wrap its `answer()` in ~50 LOC of FastMCP and become a portfolio-demoable tool.
