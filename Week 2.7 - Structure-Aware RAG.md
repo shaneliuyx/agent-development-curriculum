@@ -1156,6 +1156,8 @@ abstraction is solid.
 
 ## Production Considerations — Storage, Concurrency, Observability
 
+> **Cross-ref:** the storage decision below is tree-index-specific (tree.json + PDF + page_provider). The cross-cutting generalization for any persistent-state decision (vector indexes, graph data, eval harnesses, agent memory, audit logs) lives at [[Engineering Decision Patterns#Pattern 13 — Storage-Scale Match (right backend for current scale, no premature scaling)]] — three-tier template + four data-shape mapping rules + three documented anti-patterns + 5-second sanity test. Read Pattern 13 first if you're making the storage decision for a non-tree-index artifact; come back here for the W2.7-specific shape.
+
 The lab uses local filesystem (`data/tree.json` + `data/brk-2023-ar.pdf`) because the lab's scope is a single document on a single machine. A production deployment of tree-index RAG needs to make explicit decisions about (a) where the tree lives, (b) where the source documents live, (c) how concurrent reads are served. None of these decisions invalidate the agentic-loop architecture; the `page_provider` Protocol in `shared/tree_index/agentic.py` is the seam.
 
 ### Storage decision matrix — match scale to backend
