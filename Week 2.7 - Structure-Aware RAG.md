@@ -2652,6 +2652,116 @@ lab-02-7-pageindex/
 - **`max_tokens` values are scattered across `agentic.py` lines 431, 565, 696, 882** (200 for entity lookup probe, 1000 for chunk-fallback synthesis, 1500 for main agent loop, 800 for BUDGET forced synthesis). Each is tuned for the call's purpose. If you bump one without considering the others, you'll get partial fixes (Phase 9 first attempt: only bumped BUDGET-path to 800, left main loop at 800 — Q4 still truncated. Phase 9 final: bumped main loop to 1500, Q4 PASSed.).
 `─────────────────────────────────────────────────`
 
+### Reference 2C — File-by-File Content Shape (what's actually inside each artifact)
+
+Reference 2 and 2B named the artifacts and the code locations. Reference 2C is the **physical disk layout**: which file holds what, with concrete content examples and the exact size/shape on the Berkshire 2023 corpus. Use this when you need to debug an index by `cat`-ing or `python -c "import json; print(json.load(open(...)))"`-ing the file directly.
+
+**Mapping table — 4 disk files → 4 logical index layers**:
+
+| Disk file (under `lab-02-7-pageindex/data/`) | Size | Logical layer | Runtime class | Top-level shape |
+|---|---|---|---|---|
+| **`tree.json`** | 118 KB | Layer 1 — Tree (hierarchical structural map) | `shared/tree_index/index.py:22` `TreeIndex` | `{title, node_id, nodes: [...]}` recursive. 46 nodes total. Each node: `{title, node_id, start_page, end_page, summary, nodes[]}`. Body text NOT stored — only metadata. |
+| **`summary_index.json`** | 269 KB | Layer 2 — Cluster (RAPTOR Level-2) | `shared/tree_index/summary_index.py:22` `SummaryIndex` | `{build_meta, clusters: [...]}`. 8 K-means clusters. Each cluster: `{cluster_id, member_node_ids, primary_pages, summary, centroid_embedding}`. |
+| **`page_vectors.npy`** | 623 KB | Layer 4a — Page Vector (DENSE) | `shared/tree_index/page_vector_index.py:41` `PageVectorIndex` (dense portion) | NumPy `(152, 1024)` float32. Row N = BGE-M3 dense embedding of PDF page N+1 (0-indexed). |
+| **`page_vectors.sparse.json`** | 932 KB | Layer 4b — Page Vector (SPARSE) | `PageVectorIndex` (sparse portion, same class) | JSON list of 152 dicts. List index N = page N+1's sparse lexical weights as `{token_id (str) → weight (float)}`. |
+| *(no file)* | — | Layer 3 — Entity Index | `shared/tree_index/entity_index.py:78` `EntityIndex` | Built lazily at process start from `tree.json` via constructor `EntityIndex(tree_index)`. Stored in RAM only. |
+
+**Concrete example — same node across all four artifacts**
+
+Take Berkshire's "Chairman's Letter" (pages 4-22 of the source PDF, `node_id=0003`):
+
+In `tree.json`:
+```json
+{
+  "node_id": "0003",
+  "title": "Chairman's Letter",
+  "start_page": 4,
+  "end_page": 22,
+  "summary": "Buffett discusses Berkshire's long-term shareholder base, the 'Not-So-Secret Weapon', non-controlled businesses (Coca-Cola, AmEx, Occidental, 5 Japanese trading houses), and the Scorecard table...",
+  "nodes": [ /* children — Chairman's Letter subsections */ ]
+}
+```
+
+In `summary_index.json` (node 0003 is a member of cluster C1):
+```json
+{
+  "cluster_id": "C1",
+  "member_node_ids": ["0002", "0003", "0005", "0006", "0008"],
+  "primary_pages": [[1,3], [4,22], [7,7], [9,9], [18,18]],
+  "summary": "Annual report navigation + Chairman's Letter narrative + Scorecard table...",
+  "centroid_embedding": [ /* 1024 floats */ ]
+}
+```
+
+In `page_vectors.npy` — pages 4-22 occupy rows 3-21 (0-indexed):
+```python
+import numpy as np
+a = np.load('data/page_vectors.npy')          # shape (152, 1024), float32
+chairman_letter_dense = a[3:22]                # shape (19, 1024) — pages 4-22
+# Each row is the BGE-M3 dense embedding of that page's text
+```
+
+In `page_vectors.sparse.json` — list indices 3-21:
+```python
+import json
+sparse = json.load(open('data/page_vectors.sparse.json'))   # list of 152 dicts
+page_4_sparse = sparse[3]
+# e.g. {'20080': 0.148, '605': 0.093, '69939': 0.146, ...}
+# Each key is a BGE-M3 vocabulary token_id (as string); each value is its lexical weight
+```
+
+**Build lineage (which script produces which file)**
+
+```mermaid
+flowchart LR
+    PDF[(brk-2023-ar.pdf<br/>152 pages, ~5 MB)]
+
+    PDF -->|"src/build_tree.py main()<br/>line 401"| TREE[(tree.json<br/>118 KB)]
+    TREE -->|"src/build_summary_index.py<br/>main() line 412<br/>K-means + tag extraction"| CLUSTER[(summary_index.json<br/>269 KB)]
+    TREE -.->|"lazy at process start<br/>EntityIndex constructor<br/>entity_index.py:89"| ENTITY[(RAM only — no disk file)]
+
+    PDF -->|"build_summary_index.py<br/>build_page_vector_index()<br/>line 372<br/>BGE-M3 hybrid encoder"| DENSE[(page_vectors.npy<br/>623 KB)]
+    PDF -->|"same call as above<br/>writes sparse alongside dense"| SPARSE[(page_vectors.sparse.json<br/>932 KB)]
+
+    style PDF fill:#bdc3c7,color:#222
+    style TREE fill:#27ae60,color:#fff
+    style CLUSTER fill:#27ae60,color:#fff
+    style ENTITY fill:#9b59b6,color:#fff
+    style DENSE fill:#27ae60,color:#fff
+    style SPARSE fill:#27ae60,color:#fff
+```
+
+**Query-time read pattern (which file is opened at which stage)**
+
+| Stage | File(s) read | Read mode | Frequency |
+|---|---|---|---|
+| Process startup | `tree.json` | Full load into `TreeIndex(tree)` | Once per retriever instance |
+| Process startup | `summary_index.json` | Full load into `SummaryIndex(...)` | Once per retriever instance |
+| Process startup | `page_vectors.npy` + `page_vectors.sparse.json` | Full load (npy via `np.load`, sparse via `json.load`) | Once per retriever instance |
+| Process startup | (no file — entity index built from `tree.json` in RAM) | RAM construction | Once per retriever instance |
+| Every query — entity hint | RAM only (`EntityIndex`) | Lookup | Every query (if capitalized phrases in query) |
+| Every query — cluster routing | RAM only (`SummaryIndex` already loaded) | Cosine similarity over 8 centroids | Every query |
+| Every query — agent reads tree | RAM only (`TreeIndex` already loaded) | Compact-view serialization | Every query, on iter 0 |
+| Every query — page fetch tool | `brk-2023-ar.pdf` via `page_provider` closure | `PdfReader(...).pages[s-1:e].extract_text()` | 1-3 times per query |
+| Low-quality fallback (rare) | RAM only (`PageVectorIndex` already loaded) | Dense kNN + sparse lookup + RRF | Only when `_is_low_quality()` fires |
+
+**Why each file is the size it is — sanity check**
+
+| File | Why this size | Bound by |
+|---|---|---|
+| `tree.json` 118 KB | 46 nodes × ~2.5 KB each (title + page-range + ~2KB summary + child list). LLM summary length is the dominant term. | Number of nodes × per-node summary length |
+| `summary_index.json` 269 KB | 8 clusters × (~12 KB centroid_embedding as JSON floats + ~2 KB summary + tag list + member_node_ids). The 1024-dim float embedding dominates — 8 × 12 KB ≈ 96 KB just for centroids. | Number of clusters × (embedding dim + summary length) |
+| `page_vectors.npy` 623 KB | 152 pages × 1024 float32 = 152 × 4096 bytes = 622 KB exactly. Pure dense matrix, no overhead. | Number of pages × embedding dim × 4 bytes |
+| `page_vectors.sparse.json` 932 KB | 152 pages × ~100 nonzero tokens × ~30 bytes per `"id": weight,` JSON entry ≈ 456 KB content + JSON brackets + numeric overhead. Variable per page — pages with more unique terms produce bigger dicts. | Number of pages × avg nonzero token count × JSON entry overhead |
+
+`★ Insight ─────────────────────────────────────`
+- **Page-vector splits across 2 files because data shapes differ**: dense is uniform `(N, 1024)` float32 — perfect for NumPy. Sparse is variable-length `{token_id → weight}` per page — perfect for JSON. Forcing both into one format wastes either disk (dense as JSON = ~5× bloat) or expressivity (sparse as padded NumPy = vocab-size-padded). The two-file split is the right physical layout for this data.
+- **Sparse file (932 KB) > Dense file (623 KB) is counterintuitive** — sparse representations are supposed to be smaller. Reason: BGE-M3 hybrid emits 50-200 weighted tokens per page on average, and JSON's `"12345": 0.183,` has ~25 bytes of overhead per entry. At ~100 entries × 25 bytes × 152 pages ≈ 380 KB pure overhead; plus the float values themselves. NumPy dense is just 152 × 1024 × 4 = 623 KB, no JSON overhead. The sparse file would benefit from binary encoding (Parquet, msgpack, or a custom `.sparse.npy` layout); JSON was picked for human-debuggability, not size.
+- **`summary_index.json` (269 KB) is larger than `tree.json` (118 KB) despite having fewer items (8 clusters vs 46 nodes)** because each cluster stores a 1024-dim `centroid_embedding` serialized as JSON floats (~12 KB each). Tree nodes don't store embeddings (would be 46 × 12 KB ≈ 552 KB if they did, exceeding the cluster file). The current design embeds at the cluster level, not node level — fewer embeddings, coarser routing.
+- **Entity index has no file** is a deliberate Phase-6 decision: rebuild cost is sub-second (regex over node bodies in `tree.json`), rebuild size is ~50 KB; the disk I/O round-trip would cost more than the in-RAM rebuild. If you wanted persistence (e.g. cross-process reuse, hot reload), you'd add `data/entity_index.json` + a `save()`/`load()` pair to `entity_index.py:78` — the seam is clean and the change is local.
+- **Every disk file is read ONCE at retriever startup and then lives in RAM**. Per-query I/O is zero (except the page fetch via `page_provider`, which reads the PDF). This is what makes the retriever's per-query latency dominated by LLM calls (60s mean), not by disk reads (negligible). For production with concurrent retrievers, you'd want to share the loaded indexes across processes via shared-memory or a sidecar service — currently each retriever instance reloads independently.
+`─────────────────────────────────────────────────`
+
 ### Reference 3 — Query Flow (end-to-end, Phase-9 final form)
 
 This is the full pipeline a query traverses, including all conditional branches. Reading this diagram top-to-bottom is the fastest way to understand the production system shape.
