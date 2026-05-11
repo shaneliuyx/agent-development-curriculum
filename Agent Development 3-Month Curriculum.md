@@ -226,9 +226,9 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 ## Phase 1 — Foundations & RAG Mastery (Weeks 1–3)
 
-**Phase goal.** Make RAG your strongest interview dimension. You're a cloud infrastructure engineer — own the retrieval pipeline like you own a Terraform module.
+**Phase goal.** Make RAG your strongest interview dimension. You're a cloud infrastructure engineer — own the retrieval pipeline like you own a Terraform module. By end of Phase 1 you have empirically-measured numbers on **five RAG backends** (vector + hybrid + GraphRAG + structure-aware tree-index + agentic) and you can defend each one's failure mode in interviews, anchored to your own measured ceilings: vector hybrid recall@10 (W1-2), GraphRAG multi-hop W/L (W2.5), tree-v3 **16/16 = 1.000 GT-judge** on Berkshire 2023 (W2.7), RAGAS faithfulness deltas (W3), and the 5-node grade-rewrite agentic loop (W3.7).
 
-> **Runbook pattern.** Each week has a dedicated step-by-step runbook in the vault: [[Week 1 - Vector Retrieval Baseline]], [[Week 2 - Rerank and Context Compression]], [[Week 3 - RAG Evaluation]]. The text below is the *overview*; the runbooks are the *how*. Treat each runbook like a preflight checklist — tick phases, don't just read. Runbooks for Weeks 4–12 follow the same template and are generated on demand (see §"Runbook Generation Pattern" at the bottom of this file).
+> **Runbook pattern.** Each week has a dedicated step-by-step runbook in the vault: [[Week 1 - Vector Retrieval Baseline]], [[Week 2 - Rerank and Context Compression]], [[Week 2.5 - GraphRAG]], [[Week 2.7 - Structure-Aware RAG]], [[Week 3 - RAG Evaluation]], [[Week 3.5 - Cross-Session Memory]], [[Week 3.7 - Agentic RAG]]. The text below is the *overview*; the runbooks are the *how*. Treat each runbook like a preflight checklist — tick phases, don't just read. Runbooks for Weeks 4–12 follow the same template and are generated on demand (see §"Runbook Generation Pattern" at the bottom of this file).
 
 ### Week 1 — Embedding & Vector Retrieval Fundamentals
 > Detailed runbook: [[Week 1 - Vector Retrieval Baseline]]
@@ -281,6 +281,28 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** GraphRAG ingestion is a materialised view: expensive to build, cheap at query time. Vector RAG is an index: cheap to build, only answers nearness queries. In production you run both, routed by a query classifier — same as dual-writing to Kafka for hot and cold-path analytics.
 
+> **Connects to W2.7.** This week's "when does GraphRAG beat vector" hypothesis is **re-tested** in Week 2.7 with a stricter judge (GT-judge) and a third backend (structure-aware tree). The Week 2.7 result reverses the May 7 "graph wins on Berkshire" reading — under GT-judge, Graph 0.375 / Vector 0.500 / Tree-v3 1.000 — confirming graph DOES degenerate on single-document corpora once the entity-recall judge stops favoring its broad keyword retrieval. The discipline rule: revisit refuted hypotheses when the eval set OR the judging methodology changes.
+
+### Week 2.7 — Structure-Aware RAG (PageIndex / Tree-Index) (half-week insert, ~8–10h)
+> Detailed runbook: [[Week 2.7 - Structure-Aware RAG]]
+
+**Theory (2–3h).**
+- Read: PageIndex (Couchbase 2024) — agentic tree-index, RAPTOR (Sarthi et al. 2024) — recursive hierarchical clustering, Anthropic's "Contextual Retrieval" — why fine chunks lose document context.
+- Master: why both vector and graph backends degenerate on long *structured* documents (10-Ks, RFCs, research papers), the agentic-loop vs greedy-tree-walk distinction (PageIndex's "navigator only sees titles" failure mode), Level-2 RAPTOR-style cluster pre-fetch, top-K δ-band cluster routing for noise-floor tiebreak, BGE-M3 dense+sparse hybrid as a chunk-level fallback layer.
+
+**Lab (6–7h) — `lab-02-7-pageindex`.**
+1. Pull a long structured PDF (Berkshire's 2023 10-K, 152 pages) and parse via `pypdf` → page-position map.
+2. Build the tree index: LLM-driven heading detection → JSON tree builder → `split_large_nodes` for oversized leaves → per-node fact-rich summarization. ~70 LLM calls, `tree.json` ~100 KB.
+3. Build the cluster index (`summary_index.json`): K-means on BGE-M3 node-summary embeddings (k=8 or `--auto-k` via silhouette), per-cluster TF-IDF tags + centroid summary.
+4. Build the page-vector index (`page_vectors.npy` + `.sparse.json`): BGE-M3 hybrid encoder (dense + sparse in one forward pass) for the chunk-level fallback layer.
+5. Wire `AgenticTreeRetriever` — multi-iter loop (max_iter=4) with `get_page_content(start, end)` tool, cluster-hint pre-fetch, BUDGET EXHAUSTED forced synthesis with 5 strict rules (anti-hallucination + output-format pressure), composite-signal low-quality detection, chunk-level fallback with neighbor-page expansion.
+6. Run the **3-way comparison v3**: Vector vs GraphRAG (lab-02-5) vs Tree-v3 on a hand-curated 16-Q eval (4 categories: section-specific factoid, cross-section synthesis, citation-required, out-of-document refusal). Score with GT-judge (binary pass/fail against pre-authored `pass_criteria` per question) anchored to PDF-grounded ground truth, not entity-recall.
+7. `RESULTS.md` includes the per-category comparison table, the eval methodology (GT-judge vs entity-recall disagreement analysis), and a phase-progression log showing 0.44 → 0.79 → 0.885 → 0.938 → 1.000 across Phases 1-9.
+
+**Exit criteria.** 90-second answer to "When does tree-index RAG beat vector and graph?" — name the cluster-pre-fetch + BUDGET-prompt + chunk-fallback combo, cite the **16/16 = 1.000 GT-judge final** on Berkshire 2023 vs Vector 0.500 / Graph 0.375, name the per-category breakdown (cross-section 1.00 vs vector/graph 0.00 — categorical win), and name the latency tradeoff (~40× vector — production routing sends factoid + OOD to vector and reserves tree for cross-section synthesis). Bonus: explain why entity-recall judging is structurally broken for synthesis questions and why GT-judge `pass_criteria` is permission-to-be-partial encoded as natural-language predicates.
+
+**Infra bridge.** Tree-index re-build is a **DAG of materialized views** with distinct refresh frequencies: tree (~10 min, LLM-bound, refresh on PDF change) → cluster (~30s, K-means over tree summaries, refresh on K-knob tuning) → entity (~3 min, regex over tree bodies, refresh on tree change) → page-vector (~5 min, BGE-M3 over PDF pages, independent of tree). The atomic-swap deployment pattern (build all four to `data/staging/`, run the 16-Q eval gate, swap to `data/` only on pass_rate ≥ baseline − tolerance) is exactly the **blue-green deployment** discipline applied to retrieval indexes — same primitive, different artifact.
+
 ### Week 3 — Advanced RAG & Evaluation
 > Detailed runbook: [[Week 3 - RAG Evaluation]]
 
@@ -295,6 +317,8 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 4. Write a 1-page "RAG architecture decision record" (ADR) explaining your final pipeline.
 
 **Exit criteria.** Cold-answer 25 RAG interview questions from Appendix A. Have one repo with a green `make eval` showing real RAGAS numbers.
+
+> **Eval-methodology cross-ref.** RAGAS's faithfulness / context-precision / answer-relevancy metrics all still rest on lexical-or-embedding signals over candidate vs reference text — fast and broadly correct, but they undercount substantive synthesis (long answers that paraphrase) and overcount confident hallucinations (right keywords arranged into wrong claims). See [[Week 2.7 - Structure-Aware RAG#Evaluation Reference — GT-Judge Methodology]] for the **GT-judge** complement: binary pass/fail with hand-curated `pass_criteria` per question that encodes the author's judgment about what counts as a correct answer. Use RAGAS for continuous regression-detection on every commit; reserve GT-judge for release-gate runs and architectural-decision evidence. Two-tier eval is the production discipline.
 
 **Infra bridge.** Your RAG eval harness = your OPA policy checks. The ADR format = your standard data architecture decision record. Bring both to interviews.
 
@@ -321,6 +345,8 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 **Theory (2–3h).**
 - Read: LangChain's `langgraph_agentic_rag.ipynb`, Singh et al. *Agentic Retrieval-Augmented Generation* survey (2025), CRAG (Yan et al., 2024), Adaptive-RAG, GeAR.
 - Master: the canonical 5-node graph (decide → retrieve → grade → rewrite → answer), where single-pass RAG breaks (ambiguous queries, low-confidence retrieval), the four named architectures (CRAG / Adaptive-RAG / Self-RAG / GeAR) and the tradeoffs between them.
+
+> **Builds on:** W2.7's agentic multi-iter loop is the underlying primitive that the 5-node graph formalizes. W2.7 hand-rolls the loop (LLM emits tool_call → fetch → observation → next LLM call) without explicit decide/grade/rewrite nodes; this week graduates that primitive to a typed state graph. The W2.7 BUDGET EXHAUSTED + low-quality detection + chunk-level fallback chain is the manual version of CRAG's confidence-threshold + retrieve-fallback pattern — read W2.7's Phase 8 Block 4 + Phase 9 Block 2 before this lab to internalize WHY the formal graph matters.
 
 **Lab (4–5h) — `lab-03.7-agentic-rag`.**
 1. Run LangChain's official Agentic RAG notebook end-to-end against your Week 1 corpus + Qdrant + BGE-M3.
@@ -1634,7 +1660,7 @@ Useful modifiers you can add to any generation request:
 | Week | Runbook file | Core phases the runbook will contain |
 |---|---|---|
 | 2.5 | [[Week 2.5 - GraphRAG]] | Neo4j + Wikipedia subset; entity/relation extraction with local Gemma; 2-hop subgraph traversal; 25-Q multi-hop head-to-head vs Week 2 vector RAG; comparison matrix in `RESULTS.md`; v12 Wikidata QID linking closed entity-fragmentation ceiling |
-| 2.7 | [[Week 2.7 - Structure-Aware RAG]] | PageIndex / tree-index RAG on Berkshire 2023 annual report (~148 pages); LLM tree-walk over hierarchical TOC tree (no embeddings); same-corpus three-way comparison vs vector + graph; per-Python-block bundle structure (mermaid → code → walkthrough → result → insight); refuted "graph degenerates on single-document corpora" hypothesis with measured numbers |
+| 2.7 | [[Week 2.7 - Structure-Aware RAG]] | PageIndex / tree-index RAG on Berkshire 2023 annual report (152 pages); 4-index architecture (LLM tree + K-means cluster + entity reverse-index + BGE-M3 hybrid page-vector fallback); agentic multi-iter loop with cluster pre-fetch + BUDGET EXHAUSTED 5-rule synthesis + chunk-level fallback; same-corpus three-way comparison vs vector + graph; per-Python-block bundle structure (mermaid → code → walkthrough → result → insight); GT-judge methodology (binary pass/fail against PDF-grounded `pass_criteria`) replaces entity-recall; Phase 9 ceiling = **16/16 = 1.000** (vector 0.500, graph 0.375 — graph DOES degenerate on single-document corpora under GT-judge; the May 7 "refuted" reading was an entity-recall artifact, see Phase 8 Block 1) |
 | 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests |
 | 3.7 | [[Week 3.7 - Agentic RAG]] | Phase 1-4: LangChain official 5-node Agentic RAG notebook end-to-end + head-to-head vs Week 3 single-pass on 50-Q dev set + CRAG variant + decision tree (when help vs hurt). Phase 6: hand-rolled Self-RAG + CRAG baseline ported from `shaneliuyx/rag` to current stack (Qdrant + oMLX + `shared/rag_hybrid`). Phase 7: query decomposition with topological execution (DAG-based planning, IRCoT-style). Phase 8: FastMCP server wrapper exposing the lab as 3 tools (`rag_query`, `rag_status`, `rag_decompose`) consumable from Claude Desktop / Cursor — first MCP-server pattern in the curriculum |
 | 4 | [[Week 4 - ReAct From Scratch]] | (1) 150-line `react.py` with no framework; (2) 4 local tools (search, repl, read_file, write_file); (3) SQLite trace logging; (4) 15+ bad-case scenarios with a before/after diff per patch; (5) `RESULTS.md` with failure-mode table |
