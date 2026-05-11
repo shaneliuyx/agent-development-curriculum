@@ -2408,6 +2408,231 @@ lab-02-7-pageindex/
 
 ---
 
+## Architecture Reference — Versions, Indexes, Flows, Rebuilds
+
+This section is the reference index for the lab as it stands at end of Phase 9 (Tree-v3 = 1.000 on 16-Q GT-judge). Use it to (a) trace which Phase added which mechanism and why, (b) understand what each storage layer actually contains and how it's built, (c) walk a typical query through the full pipeline, and (d) plan a re-build when the source PDF changes.
+
+### Reference 1 — Version Evolution Timeline
+
+```mermaid
+flowchart TD
+    P1[Phase 1<br/>Lab scaffold + PDF acquisition<br/>2026-05-06]
+    P2[Phase 2<br/>Tree construction<br/>LLM-built hierarchy + fact-rich<br/>per-node summaries]
+    P3[Phase 3<br/>Reasoning-based traversal<br/>Agentic multi-turn loop<br/>get_page_content tool]
+    P4[Phase 4<br/>Three-way comparison v1<br/>Vector vs Graph vs Tree<br/>baseline = 8-Q entity-recall]
+    P5[Phase 5<br/>PageIndex optimization<br/>judge 0.44 → 0.79<br/>2026-05-07]
+    P6[Phase 6<br/>v2 architecture<br/>entity-graph + multi-query<br/>+ multi-pass summarization<br/>2026-05-08]
+    P7[Phase 7<br/>Cluster pre-fetch + 2-model split<br/>K-means + top-K δ-band<br/>9B-GLM hot path<br/>Gemma-26B judge baseline<br/>2026-05-09]
+    P8[Phase 8<br/>GT-judge methodology<br/>+ 3-way comparison v3<br/>0.938 single-run<br/>2026-05-09]
+    P9[Phase 9<br/>Hallucination prevention<br/>+ KV-cache discipline<br/>+ max_tokens fixes<br/>1.000 / 16 of 16<br/>2026-05-09 evening]
+
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9
+
+    style P1 fill:#bdc3c7,color:#222
+    style P2 fill:#9b59b6,color:#fff
+    style P3 fill:#9b59b6,color:#fff
+    style P4 fill:#bdc3c7,color:#222
+    style P5 fill:#f5a623,color:#fff
+    style P6 fill:#f5a623,color:#fff
+    style P7 fill:#4a90d9,color:#fff
+    style P8 fill:#4a90d9,color:#fff
+    style P9 fill:#27ae60,color:#fff
+```
+
+| Phase | What was added | Why | Result |
+|---|---|---|---|
+| **P1** | Lab scaffold, PDF (`brk-2023-ar.pdf`, 152 pages), MLX vMLX stack, eval skeleton | Need a real long structured doc to test "structure-aware" claims against. | Repeatable lab harness. No retrieval metrics yet. |
+| **P2** | `tree.json` — LLM-built hierarchy with fact-rich per-node summaries. `split_large_nodes` for >5p / >20K char leaves. | Vector RAG hides body from the decision-maker; tree-index needs structured node metadata. Greedy navigators that see only titles miss answers. | 62 nodes / depth 5. Wall-time ~10 min ingestion. Foundation for traversal. |
+| **P3** | `AgenticTreeRetriever` — multi-turn agent loop with `get_page_content(start, end)` tool. `max_iterations=6`. | Replace greedy descent with an LLM that can read titles + summaries, decide where to fetch, then synthesize from full body text. | First end-to-end working retriever. Smoke test passed. No comparative numbers. |
+| **P4** | 3-way comparison v1 (vector vs graph vs tree, 8 questions, entity-recall judge). | Need to prove the structure-aware claim. Pick the right backend for the right query shape. | Tree 0.44, Vector 0.625, Graph 0.75. Tree lost — diagnosed as greedy-tree-walk + judge-methodology problem. |
+| **P5** | PageIndex optimization run — variant generator + entity prefetch + answer-grounded scoring. | Phase 4 showed naïve agent loop wasn't enough; PageIndex's published patterns close the gap. | Tree judge 0.44 → 0.79 (+0.35 absolute). Tree now beats vector, ties graph. |
+| **P6** | v2 architecture — entity-graph (Hermes parser), multi-query expansion, multi-pass summarization with TAGS field. | Single-pass summarization missed cross-section topics. Entity graph + multi-query gives the agent better routing hints. | Tree judge 0.79 → 0.83 (single 16-Q run). Latency stuck at 83s/q. |
+| **P7** | Cluster pre-fetch (Level-2 RAPTOR), top-K δ-band tiebreak (δ=0.07), 2-model split (9B-GLM hot path + Gemma-26B judge baseline). | Synthesis cost was 4-6 iters even with entity-prefetch. Need to short-circuit navigation by routing directly to the right cluster of leaves. | Tree 0.83 → 0.885 (single run, entity-recall). Latency 83s → 47s/q. σ ≈ 0.03 (DWQ MoE non-determinism). |
+| **P8** | GT-judge methodology (binary pass/fail anchored to PDF-grounded `pass_criteria` per question). 3-way comparison v3 (16-Q, GT-judge primary). Composite-signal `_is_low_quality()` trigger + neighbor-page expansion for chunk-fallback. | Entity-recall systematically underrated cross-section synthesis (Q3=0.25, Q12=0.50 with substantively-correct answers) and overrated hallucinations (Q9=0.67 on a fabricated answer). | Tree-v3 0.938 GT-judge (15/16). Vector 0.500. Graph 0.375. Tree strictly dominates every category. |
+| **P9** | `max_range_chars` 8K → 25K. BUDGET EXHAUSTED prompt with 5 strict rules (anti-hallucination Rules 1-4 + Rule 5 output-format pressure). `max_tokens` bumps on main loop (800→1500) and chunk-fallback (400→1000). KV-cache reset hook (soft eviction + hard process kill). GT-judge wired as PRIMARY in `run_one_variant.py`. | Phase 8 surfaced (a) Q9 hallucination ($37.4B fabrication with fake citation pages 6-7) caused by truncation + BUDGET prompt rewarding fabrication, (b) Q12 meta-commentary dump caused by missing format pressure, (c) cross-run σ ≈ 0.04 from KV pollution. | **Tree-v3 = 1.000 (16/16)**. All four categories at 1.00. Mean latency 60s. Entity-recall (legacy) dropped 0.865 → 0.818 even as GT-judge climbed 0.938 → 1.000 — confirms entity-recall mismeasures synthesis quality. |
+
+### Reference 2 — Index Layers (what each one stores, how it's built, how it's queried)
+
+The end-state architecture has **four distinct index artifacts** built from the same source PDF. Each addresses a different stage of the query pipeline and has different rebuild cost.
+
+```mermaid
+flowchart LR
+    PDF[(brk-2023-ar.pdf<br/>152 pages<br/>~5 MB)]
+
+    subgraph BUILD["Build pipeline — runs once per corpus update"]
+        direction TB
+        B1[Tree builder<br/>LLM hierarchy + summaries]
+        B2[K-means clusterer<br/>on BGE-M3 node embeddings]
+        B3[Entity extractor<br/>regex + capitalized phrases]
+        B4[Page vectorizer<br/>BGE-M3 hybrid<br/>per-page dense + sparse]
+    end
+
+    PDF --> B1 --> TREE[(tree.json<br/>62 nodes / depth 5<br/>~100 KB<br/>title + page_range + summary)]
+    TREE --> B2 --> CLUSTER[(summary_index.json<br/>8 clusters<br/>~50 KB<br/>tags + member_ids + centroid)]
+    TREE --> B3 --> ENTITY[(entity_index.json<br/>~500 entities<br/>~50 KB<br/>entity → node_ids)]
+    PDF --> B4 --> PVI[(page_vectors.npy<br/>+ .sparse.json<br/>152 pages × 1024-dim<br/>~600 KB)]
+
+    style PDF fill:#bdc3c7,color:#222
+    style B1 fill:#f5a623,color:#fff
+    style B2 fill:#4a90d9,color:#fff
+    style B3 fill:#9b59b6,color:#fff
+    style B4 fill:#4a90d9,color:#fff
+    style TREE fill:#27ae60,color:#fff
+    style CLUSTER fill:#27ae60,color:#fff
+    style ENTITY fill:#27ae60,color:#fff
+    style PVI fill:#27ae60,color:#fff
+```
+
+| Layer | File | What's stored | Build algorithm | Query API | Size | Added in |
+|---|---|---|---|---|---|---|
+| **Tree** | `data/tree.json` | Hierarchical nodes: `{id, title, page_range, summary, children, parent}`. Body text NOT stored — only metadata for the decision-maker. | LLM tree-builder (JSON mode, T=0.0) over heading-detected outline → `split_large_nodes` (leaves > 5p / > 20K chars get re-split via LLM) → per-node fact-rich summarization with `FACT_RICH_SUMMARIZE_SYSTEM` prompt. ~70 LLM calls total, ~10 min wall time. | `TreeIndex.compact_view()` (title + page-range + summary, no body), `TreeIndex.get_node(id)`, `TreeIndex.subtree(id)` | ~100 KB | Phase 2 |
+| **Cluster** | `data/summary_index.json` | 8 K-means clusters over BGE-M3 embeddings of node summaries. Each cluster: `{cluster_id, tags (top-3 TF-IDF terms from member summaries), member_node_ids, centroid_summary, centroid_embedding}`. | (1) Encode every node's summary with BGE-M3 dense. (2) K-means with k=8 OR `--auto-k` (silhouette score over k=5..12, pick first local max with ≥1% improvement). (3) Per-cluster: extract top-3 TF-IDF tags + pick highest-degree member as centroid_summary. ~30s wall time after tree exists. | `SummaryIndex.find_clusters_for_query(query, threshold=0.5, top_k=2, delta=0.07)` → list of cluster dicts. Returns top-K candidates within δ noise-floor of the best match. | ~50 KB | Phase 7 |
+| **Entity** | `data/entity_index.json` | Reverse index: `{entity_text → [node_ids that mention it]}`. Built from cleaned capitalized phrases + named-entity extraction. | Hermes parser pass: scan every node body, extract `\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b` candidates, filter via stopword list + length, dedupe across nodes. Optional LLM cleanup pass for borderline cases. ~3 min wall time. | `EntityIndex.lookup(entity)` → list of node_ids; injected into agent prompt as `entity_hint` when query contains a capitalized entity. | ~50 KB | Phase 6 |
+| **Page-vector** | `data/page_vectors.npy` + `data/page_vectors.sparse.json` | Per-page vectors: `{page_num → dense (1024-dim float32) + sparse (token_id → weight dict)}`. Hybrid representation. | BGE-M3 (`BGEM3FlagModel`) hybrid encoder: one forward pass per page returns both `dense_vecs` and `lexical_weights`. Pages are kept granular (not chunked further) because tree-fetch already does page-range slicing. ~5 min wall time on M5 Pro. | `PageVectorIndex.search(query, top_k=3)` → list of `(page_num, fused_score)`. Internally: dense kNN + sparse BM25-like score, fused via Reciprocal Rank Fusion (RRF, k=60). | ~600 KB | Phase 8 (chunk-level fallback) |
+
+`★ Insight ─────────────────────────────────────`
+- **Tree is the only artifact the agent reads directly.** Cluster + entity + page-vector indexes route the agent TO the tree; the agent never sees their raw bytes. This is why the agent stays cheap — the routing layers don't bloat the context.
+- **Cluster index is computed FROM the tree, not from the PDF.** That makes K-means cheap (only 62 embeddings to cluster). It also means re-clustering doesn't require re-summarizing — see Reference 4 for the dependency DAG.
+- **Page-vector index is the only artifact computed from PDF directly.** It's the fallback layer that catches what tree-fetch missed (variant-generator failures, paraphrased terms). 152 page vectors are cheaper than chunking the PDF into 1000+ chunks.
+- **Entity index is intentionally lightweight.** It's a hint generator, not a retriever. Bad entity matches at worst inject a noisy hint; they never bypass the tree.
+`─────────────────────────────────────────────────`
+
+### Reference 3 — Query Flow (end-to-end, Phase-9 final form)
+
+This is the full pipeline a query traverses, including all conditional branches. Reading this diagram top-to-bottom is the fastest way to understand the production system shape.
+
+```mermaid
+flowchart TD
+    Q([User query]) --> ENTITY{Entity in query?<br/>capitalized phrase<br/>matches EntityIndex}
+    ENTITY -->|"yes"| EHINT[entity_hint = list of node_ids<br/>that mention this entity]
+    ENTITY -->|no| CLUSTER
+
+    EHINT --> CLUSTER[SummaryIndex.find_clusters_for_query<br/>top-K within δ=0.07 of best match]
+    CLUSTER -->|"top-1 strong<br/>(gap > δ)"| HINT1[cluster_hint = single cluster<br/>tags + member_node_ids]
+    CLUSTER -->|"top-2 close<br/>(gap ≤ δ)"| HINT2["AMBIGUOUS hint<br/>'2 candidates tied — pick<br/>via tags + members<br/>or fetch from each'"]
+    CLUSTER -->|"no match<br/>(score < 0.5)"| NOHINT[no cluster_hint]
+
+    HINT1 --> LOOP
+    HINT2 --> LOOP
+    NOHINT --> LOOP
+
+    LOOP{{Agentic multi-iter loop<br/>max_iterations=4<br/>max_tokens=1500 per call<br/>temperature=0.0}}
+
+    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH[page_provider<br/>slices PDF.pages[start-1:end]<br/>head-truncate at 25000 chars]
+    FETCH -->|"observation: [page N]<br/>+ body text"| LOOP
+
+    LOOP -->|"LLM emits final answer<br/>with citation"| LQ{_is_low_quality?<br/>refusal phrase OR<br/>len<80 OR<br/>no [page N] citation}
+
+    LOOP -->|"iters == max_iterations<br/>+ no final answer set"| BUDGET[BUDGET EXHAUSTED prompt<br/>5 strict rules:<br/>1 verbatim-only<br/>2 cite-fetched-only<br/>3 partial > refuse<br/>4 refuse on no-answer<br/>5 prose format pressure<br/>max_tokens=800]
+    BUDGET --> LQ
+
+    LQ -->|low quality<br/>and page_vector_index wired| FALLBACK[chunk-level fallback<br/>PageVectorIndex.search<br/>dense + sparse RRF<br/>+ _expand_with_neighbors<br/>window=1 → contiguous ranges]
+    FALLBACK --> FBSYNTH[chunk-fallback synthesis<br/>max_tokens=1000<br/>'Answer ONLY from these passages']
+    FBSYNTH --> OUT
+
+    LQ -->|"good answer"| OUT([Cited answer<br/>+ tool_calls log<br/>+ iterations<br/>+ fallback_used flag])
+
+    style Q fill:#bdc3c7,color:#222
+    style ENTITY fill:#9b59b6,color:#fff
+    style CLUSTER fill:#4a90d9,color:#fff
+    style LOOP fill:#f5a623,color:#fff
+    style FETCH fill:#4a90d9,color:#fff
+    style BUDGET fill:#e74c3c,color:#fff
+    style LQ fill:#9b59b6,color:#fff
+    style FALLBACK fill:#e67e22,color:#fff
+    style FBSYNTH fill:#e67e22,color:#fff
+    style OUT fill:#27ae60,color:#fff
+```
+
+**Walkthrough — what happens per stage**:
+
+1. **Entity hint check (Phase 6)**: capitalized phrases in the query are looked up against the entity index. If the query mentions "Apple" or "Occidental", the agent gets a hint list of node IDs that contain that entity. Cheap; injects 1-3 IDs at most. No-op for entity-free queries.
+2. **Cluster routing (Phase 7)**: BGE-M3 cosine of query vs centroid_embeddings, top-K=2 within δ=0.07. Two outcomes:
+   - **Top-1 strong** (gap > δ): single cluster_hint with tags + member_node_ids → agent uses this to fetch the right pages on iteration 0.
+   - **Top-2 close** (gap ≤ δ): AMBIGUOUS hint listing both candidates → forces the LLM to tiebreak via tags + member names, or fetch from each cluster and synthesize across both. δ=0.07 is the empirical noise floor of sibling Chairman's Letter clusters (calibrated in Phase 7 Block 2).
+3. **Agentic multi-iter loop (Phase 3, hardened in Phases 6-9)**: up to 4 iterations of `(LLM call → tool_call → page fetch → observation)`. Each LLM call uses `temperature=0.0`, `max_tokens=1500` (Phase 9 bump from 800 — fixes Q4 truncation). The tool surface is `get_page_content(start, end)` + `get_entity_pages(entity)`. Tool observations are truncated at 25000 chars per fetch (Phase 9 bump from 8000 — fixes Q9 hidden Scorecard).
+4. **Normal exit — model emits final answer**: agent decides it has enough evidence, emits a content message (no tool_call), pipeline proceeds to low-quality check.
+5. **Forced exit — BUDGET EXHAUSTED (Phase 9)**: if `max_iterations` is reached without a final answer, the agent is given a forced-synthesis prompt with 5 strict rules forbidding hallucination + bad format. `max_tokens=800` here is intentionally smaller than the main loop's 1500 because BUDGET answers should be short prose summaries, not exhaustive dumps.
+6. **Low-quality detection (Phase 8)**: composite signal — answer is "low quality" if any of: contains a refusal phrase (from `_LOW_QUALITY_REFUSAL_PATTERNS` tuple), shorter than 80 chars, or longer than 80 chars but missing any `[page N]` citation marker. Catches both refusals AND ungrounded synthesis.
+7. **Chunk-level fallback (Phase 8)**: only if `PageVectorIndex` is wired AND low-quality is true AND tree-loop failed. `PageVectorIndex.search(query, top_k=3)` returns the top-3 page hits via dense+sparse RRF fusion. Hits are then expanded via `_expand_with_neighbors(window=1)` which merges adjacent hits into contiguous `(start, end)` ranges — catches multi-page topics that single-page retrieval misses (Phase 8 Block 4). Fallback synthesis call uses `max_tokens=1000` (Phase 9 bump from 400).
+8. **Output**: structured dict with `answer`, `iterations`, `tool_call_log` (every fetch with its start/end), and `fallback_used` flag for tracing.
+
+**Latency profile (Phase 9 final, mean 60s)**:
+
+| Query type | Typical iters | Fetch calls | Wall time | Example |
+|---|---|---|---|---|
+| Out-of-document refusal | 1 | 0 | 25-40s | "What is BRK stock price today?" |
+| Section-specific factoid | 2 | 1-2 | 25-80s | "What were total revenues?" |
+| Citation-required | 2 | 0-1 | 25-60s | "Which Item covers Risk Factors?" |
+| Cross-section synthesis | 3-4 | 2-3 | 65-160s | "Buffett's view on non-controlled businesses" |
+
+### Reference 4 — Re-build Flow (when the PDF changes)
+
+A real production deployment rebuilds when source PDFs revise (annual report year-over-year, 10-K amendments, etc.). The four index artifacts have different dependencies — knowing them lets you skip cheap rebuilds and only invalidate what's actually stale.
+
+```mermaid
+flowchart TD
+    NEWPDF[(New PDF version<br/>e.g. brk-2024-ar.pdf)]
+
+    NEWPDF -->|"always rebuild"| TREE_REBUILD[Rebuild tree.json<br/>LLM hierarchy + summaries<br/>~10 min / ~70 LLM calls]
+    NEWPDF -->|"always rebuild"| PVI_REBUILD[Rebuild page_vectors.npy<br/>BGE-M3 hybrid per page<br/>~5 min on M5 Pro]
+
+    TREE_REBUILD --> CLUSTER_REBUILD[Rebuild summary_index.json<br/>K-means over node embeddings<br/>~30s — only after tree exists]
+    TREE_REBUILD --> ENTITY_REBUILD[Rebuild entity_index.json<br/>regex + capitalized phrase scan<br/>~3 min — depends on node bodies]
+
+    CLUSTER_REBUILD --> VERIFY{Verify with eval set<br/>16-Q GT-judge}
+    ENTITY_REBUILD --> VERIFY
+    PVI_REBUILD --> VERIFY
+
+    VERIFY -->|"pass_rate ≥ 0.85"| DEPLOY[Deploy new indexes<br/>atomic swap]
+    VERIFY -->|"regression"| ROLLBACK[Investigate per-Q failures<br/>compare to prior eval<br/>fix or rollback to prior version]
+
+    style NEWPDF fill:#bdc3c7,color:#222
+    style TREE_REBUILD fill:#f5a623,color:#fff
+    style PVI_REBUILD fill:#4a90d9,color:#fff
+    style CLUSTER_REBUILD fill:#4a90d9,color:#fff
+    style ENTITY_REBUILD fill:#9b59b6,color:#fff
+    style VERIFY fill:#e67e22,color:#fff
+    style DEPLOY fill:#27ae60,color:#fff
+    style ROLLBACK fill:#e74c3c,color:#fff
+```
+
+**Dependency rules** — when partial rebuilds are safe:
+
+| Change type | What must rebuild | What can be reused | Why |
+|---|---|---|---|
+| **New PDF year (e.g. 2023 → 2024 annual report)** | Everything: tree, cluster, entity, page-vectors | Nothing | Source content changed — every downstream artifact is stale. |
+| **PDF re-parse with no content change** (different OCR pass, same text) | Page-vectors (numeric instability across re-parse) | Tree, cluster, entity (text-identical) | Heading positions identical; only the BGE-M3 vectors might shift slightly due to whitespace normalization. |
+| **Tree builder prompt changed** | Tree, cluster, entity | Page-vectors (independent of tree) | Tree summaries shifted → cluster K-means centroids shift → entity extraction shifts. Page-vectors are PDF-direct, unaffected. |
+| **K-means k changed** (8 → 12, or `--auto-k`) | Cluster only | Tree, entity, page-vectors | Cluster index is built FROM tree; re-clustering doesn't touch nodes. |
+| **BGE-M3 model version upgraded** (`bge-m3` → `bge-m3-v2`) | Cluster (node embeddings change), page-vectors (page embeddings change) | Tree, entity (no embeddings used) | Embedding space is different — anything embedded with old model is stale. |
+| **Page-vector encoder swapped** (`dense-only` → `dense+sparse hybrid`) | Page-vectors only | Tree, cluster, entity | Cluster uses dense-only on node summaries; entity uses no embeddings. |
+| **Entity extraction regex updated** | Entity only | Tree, cluster, page-vectors | Tree bodies unchanged; only the entity → node_ids map regenerates. |
+| **Summarization prompt changed** (`FACT_RICH_SUMMARIZE_SYSTEM` v1 → v2) | Tree (per-node summaries), cluster (centroids embed summaries), entity (no — extracts from body, not summary) | Page-vectors | Summary changes propagate to cluster centroids via BGE-M3 re-embedding. |
+
+**Cost breakdown per layer** (M5 Pro / 152-page PDF):
+
+| Artifact | Build cost | Re-trigger frequency | Storage size |
+|---|---|---|---|
+| Tree | ~10 min, ~70 LLM calls (~$0.40 cloud equivalent, ~free local) | Per-PDF | ~100 KB |
+| Cluster | ~30 sec, 1 K-means + 8 TF-IDF scans | Per-tree | ~50 KB |
+| Entity | ~3 min, regex scans + 1 LLM cleanup pass | Per-tree | ~50 KB |
+| Page-vectors | ~5 min, 152 BGE-M3 forward passes | Per-PDF | ~600 KB |
+| **Full rebuild** | ~18 min total | New PDF version | ~800 KB |
+| **Tree-only rebuild** | ~10 min | Prompt change | — |
+| **Cluster-only rebuild** | ~30 sec | K knob tuning | — |
+
+**Atomic-swap deployment pattern**: write all four new artifacts to `data/staging/`, run the eval set against the staged indexes, swap to `data/` only if `pass_rate ≥ prior_baseline - tolerance`. Tolerance can be 0.05 absolute or 1 σ; do NOT auto-deploy on regression. The lab uses a manual eval gate today; production would automate the diff with the same 16-Q eval set as the gate.
+
+`★ Insight ─────────────────────────────────────`
+- **Tree is the bottleneck — 10 min of LLM calls.** Everything else is sub-5-min. If you're optimizing for fast-revision cycles (daily PDF updates), invest in incremental tree updates: only re-summarize nodes whose page ranges intersect the PDF diff. Out of scope for this lab — but the seam is clean (per-node summary fn).
+- **Cluster rebuild is cheap and safe to re-run on K-knob changes.** Tune K (or enable `--auto-k`) without rebuilding tree. Re-run the eval gate after.
+- **Page-vector rebuild is independent of every other artifact.** You can swap embedding models or add new pages (e.g. supplemental schedules added mid-year) without disturbing tree/cluster/entity. This is why Phase 8's BGE-M3 hybrid integration was zero-risk to the tree-side architecture.
+- **The 18-min full-rebuild + eval-gate cycle is the unit of integration testing for this architecture.** When you change ANYTHING — prompt, model, K, parser, fallback threshold — the gate is "did the 16-Q eval drop > tolerance vs prior baseline?". This is the production discipline that prevents what Phase 7 Bad-Case Entry 17 caught (Approach B regressed 0.885 → 0.781 — without the eval gate, that ships).
+`─────────────────────────────────────────────────`
+
+---
+
 ## Production Considerations — Storage, Concurrency, Observability
 
 > **Cross-ref:** the storage decision below is tree-index-specific (tree.json + PDF + page_provider). The cross-cutting generalization for any persistent-state decision (vector indexes, graph data, eval harnesses, agent memory, audit logs) lives at [[Engineering Decision Patterns#Pattern 13 — Storage-Scale Match (right backend for current scale, no premature scaling)]] — three-tier template + four data-shape mapping rules + three documented anti-patterns + 5-second sanity test. Read Pattern 13 first if you're making the storage decision for a non-tree-index artifact; come back here for the W2.7-specific shape.
