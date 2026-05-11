@@ -228,8 +228,8 @@ Key properties: runs once per document, **LLM-bound** (~70 LLM calls for a 150-p
 ```mermaid
 flowchart TD
     Q([User query]) --> LOAD[Load compact tree view<br/>id / title / page-range / summary<br/>NO body text]
-    LOAD --> LOOP[Agentic multi-turn loop<br/>shared/tree_index.AgenticTreeRetriever<br/>MAX_ITERATIONS=6]
-    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH[page_provider<br/>slices PDF text<br/>head-truncate 8K chars]
+    LOAD --> LOOP[Agentic multi-turn loop<br/>shared/tree_index.AgenticTreeRetriever<br/>max_iterations=4 Phase-9 default]
+    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH["page_provider<br/>slices PDF text<br/>head-truncate 25K chars Phase-9 cap"]
     FETCH -->|tool result injected into msgs| LOOP
     LOOP -->|"LLM emits no tool_call<br/>(content is final answer)"| ANSWER[Answer with inline<br/>citation pages X-Y]
     LOOP -->|"out-of-scope detected<br/>(no plausible section)"| REFUSE[Explained refusal<br/>'doc is X, does not contain Y'<br/>+ insufficient context]
@@ -816,7 +816,7 @@ Aggregate over 8-question Berkshire eval (compare10, both prompt fixes): tree ju
 
 `★ Insight ─────────────────────────────────────`
 - **Body text now visible to the decision-maker.** Greedy `navigate()` gave the LLM only `{node_id, title, summary}` for routing — body text was unreachable until AFTER leaf selection. Q1+Q2 ("net earnings") missed because no node title contained the literal phrase. The agentic loop hands the LLM a `get_page_content(start, end)` tool, so the LLM can FETCH `Item 8 / Consolidated Statements` page 96 mid-decision, see "$96.2 billion", and answer correctly. Architectural blind spot eliminated.
-- **Iteration-bounded, not depth-bounded.** Old greedy nav used `MAX_DEPTH=6` to prevent infinite descent on malformed trees. New agentic loop uses `MAX_ITERATIONS=6` — same safety net, different shape. Each iteration = one LLM call (tool-call OR final-answer) plus optional tool execution. Typical question converges in 2 iterations (one fetch, one synthesis); cross-section synthesis can take 4–6 iterations.
+- **Iteration-bounded, not depth-bounded.** Old greedy nav used `MAX_DEPTH=6` to prevent infinite descent on malformed trees. New agentic loop uses `MAX_ITERATIONS=6` at Phase 3 — same safety net, different shape. Each iteration = one LLM call (tool-call OR final-answer) plus optional tool execution. Typical question converges in 2 iterations (one fetch, one synthesis); cross-section synthesis can take 4–6 iterations. **Phase 7+ update:** with cluster pre-fetch shaving 2-3 navigation iterations, `max_iterations` was reduced to 4 (current Phase-9 default in `shared/tree_index/agentic.py:348`). No measured cross-section query hits the new ceiling — the cluster hint front-loads enough routing context.
 - **Refusal still works architecturally — but now needs explanation, not bare keyword.** When no section in the tree could plausibly contain the answer, the LLM emits no tool_call and goes straight to "this is the 2023 AR, doesn't contain X. insufficient context". `score_llm_judge` rewards that shape with 1.00; bare "insufficient context" scores only 0.33. `AGENTIC_SYSTEM_TEMPLATE` has explicit "two-part refusal: explanation + close-phrase" rule (Bad-Case Entry 6).
 - **The lab file is now ~80 LOC; the architecture-defining ~250 LOC lives in `shared/tree_index/`.** Adding a second tree-index lab (legal contracts, IRS regulations, academic textbooks) is now: write a `page_provider`, build a `tree.json` with `build_tree.py`, instantiate `AgenticTreeRetriever`, ship. The shared lib's `AGENTIC_SYSTEM_TEMPLATE` carries the hard-won prompt-engineering lessons (TOC-trap, explained refusal, synthesis-from-fragments) so the second lab inherits them automatically.
 `─────────────────────────────────────────────────`
