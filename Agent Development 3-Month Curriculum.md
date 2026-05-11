@@ -339,6 +339,25 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** User memory is a slowly-changing dimension (SCD-2). Every contradiction archives the old row and writes a new one — identical to how a data warehouse tracks customer addresses. Archive-don't-delete isn't ops hygiene; it's SCD-2 by another name, and that framing lands with senior interviewers.
 
+### Week 3.5.5 — Multi-Agent Shared Memory (Guild MCP) (half-week insert, ~4–6h)
+> Detailed runbook: [[Week 3.5.5 - Multi-Agent Shared Memory]] *(brief; runbook generated on demand)*
+
+**Theory (1–2h).**
+- Read: [`mathomhaus/guild`](https://github.com/mathomhaus/guild) README + `internal/store/sqlite/` schema + `internal/retrieve/` (BM25 + dense + RRF fusion k=60) + `internal/mcp/` tool surface. Anthropic's MCP spec — focus on the resource + tool primitives.
+- Master: where multi-agent memory diverges from single-agent W3.5 memory (atomic claims on concurrent task acquisition, scroll-versioning across timeline-overlapping sessions, oath as procedural principle vs lore as semantic archive), why MCP-protocol-native memory beats library-bound memory when agents span multiple harnesses (Claude Code / Cursor / Codex sharing one substrate).
+
+**Lab (3–4h) — `lab-03.5.5-guild-multiagent`.**
+1. Install guild via the pre-built `install.sh` (with `-tags=withembed` for semantic retrieval). Verify with `guild --version`. Run `guild init` in a fresh test project; answer the MCP-client-registration prompts.
+2. Open the test project in TWO MCP clients (e.g. Claude Code + Cursor). Confirm both clients see the same `guild_session_start()` output. Demonstrate "same state, any agent" with a 5-line scripted scenario.
+3. **Atomic-claim scenario**: spawn two agent sessions in parallel; have each call `quest_accept` on the same available quest within 2 seconds. Demonstrate that exactly ONE wins the lock and the other receives a "claimed by..." rejection. Trace the SQLite WAL to show the atomicity guarantee.
+4. **Cross-session handoff**: run a 3-act session — agent A completes a quest, writes a scroll, exits. Spawn agent B; it picks up the scroll, completes a dependent quest, writes another scroll. Spawn agent C; it sees the full chain. Document the handoff in `RESULTS.md`.
+5. Write a comparison `RESULTS.md` matrix: your W3.5 single-agent lab vs guild on (a) memory primitive count, (b) retrieval latency, (c) concurrent-agent support, (d) MCP-client portability, (e) installation overhead.
+6. Compose a 15-Q multi-agent recall benchmark (5 same-agent recall, 5 cross-agent handoff, 5 contradiction-during-parallel-work). Target ≥ 12/15 passing.
+
+**Exit criteria.** 90-second answer to "how do you give MULTIPLE agents a shared memory substrate?" — name the atomic-lock primitive (compare to W3.5's single-agent recall/remember), the MCP-protocol-as-memory-API pattern (every harness consumes the same tools), and the SCD-2 versioning that survives concurrent edits. Cite the side-by-side W3.5-lab-vs-guild comparison table in `RESULTS.md`.
+
+**Infra bridge.** Multi-agent shared memory is a distributed-systems primitive in miniature. SQLite WAL + atomic-claim locks is the same pattern as Postgres advisory locks or DynamoDB conditional writes. Guild proves you don't need a Raft cluster or a service mesh to coordinate agents — embedded SQLite + careful schema design handles single-host parallel-agent workloads. When you DO need cross-host coordination, the pattern transfers to a real distributed lock service (Consul / etcd) without architectural rework — same primitive, different physical substrate.
+
 ### Week 3.7 — Agentic RAG (half-week insert, ~6–8h)
 > Detailed runbook: [[Week 3.7 - Agentic RAG]]
 
@@ -1661,7 +1680,8 @@ Useful modifiers you can add to any generation request:
 |---|---|---|
 | 2.5 | [[Week 2.5 - GraphRAG]] | Neo4j + Wikipedia subset; entity/relation extraction with local Gemma; 2-hop subgraph traversal; 25-Q multi-hop head-to-head vs Week 2 vector RAG; comparison matrix in `RESULTS.md`; v12 Wikidata QID linking closed entity-fragmentation ceiling |
 | 2.7 | [[Week 2.7 - Structure-Aware RAG]] | PageIndex / tree-index RAG on Berkshire 2023 annual report (152 pages); 4-index architecture (LLM tree + K-means cluster + entity reverse-index + BGE-M3 hybrid page-vector fallback); agentic multi-iter loop with cluster pre-fetch + BUDGET EXHAUSTED 5-rule synthesis + chunk-level fallback; same-corpus three-way comparison vs vector + graph; per-Python-block bundle structure (mermaid → code → walkthrough → result → insight); GT-judge methodology (binary pass/fail against PDF-grounded `pass_criteria`) replaces entity-recall; Phase 9 ceiling = **16/16 = 1.000** (vector 0.500, graph 0.375 — graph DOES degenerate on single-document corpora under GT-judge; the May 7 "refuted" reading was an entity-recall artifact, see Phase 8 Block 1) |
-| 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests |
+| 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests; production-comparator section reading `mathomhaus/guild` after lab completion |
+| 3.5.5 | [[Week 3.5.5 - Multi-Agent Shared Memory]] | Install `mathomhaus/guild` (Go MCP server, single binary, embedded SQLite, BM25+dense+RRF retrieval); two parallel MCP clients (Claude Code + Cursor) sharing one substrate; atomic-claim scenario proving exactly-one-winner lock; 3-act cross-session handoff (A → B → C scroll chain); side-by-side W3.5-vs-guild comparison matrix; 15-Q multi-agent recall benchmark (same-agent + cross-agent + contradiction-during-parallel-work) |
 | 3.7 | [[Week 3.7 - Agentic RAG]] | Phase 1-4: LangChain official 5-node Agentic RAG notebook end-to-end + head-to-head vs Week 3 single-pass on 50-Q dev set + CRAG variant + decision tree (when help vs hurt). Phase 6: hand-rolled Self-RAG + CRAG baseline ported from `shaneliuyx/rag` to current stack (Qdrant + oMLX + `shared/rag_hybrid`). Phase 7: query decomposition with topological execution (DAG-based planning, IRCoT-style). Phase 8: FastMCP server wrapper exposing the lab as 3 tools (`rag_query`, `rag_status`, `rag_decompose`) consumable from Claude Desktop / Cursor — first MCP-server pattern in the curriculum |
 | 4 | [[Week 4 - ReAct From Scratch]] | (1) 150-line `react.py` with no framework; (2) 4 local tools (search, repl, read_file, write_file); (3) SQLite trace logging; (4) 15+ bad-case scenarios with a before/after diff per patch; (5) `RESULTS.md` with failure-mode table |
 | 5 | [[Week 5 - Pattern Zoo]] | 4 parallel implementations (ReAct, Plan-and-Solve, Reflexion, Orchestrator-Worker) on one task ("research + 1-page summary"); LLM-as-judge rubric scoring; cost/latency/quality 4-way comparison |
