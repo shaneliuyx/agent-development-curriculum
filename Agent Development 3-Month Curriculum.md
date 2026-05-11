@@ -638,6 +638,29 @@ Final deliverable: a comparison table + the **canonical "5-layer defense" diagra
 
 **Infra bridge.** Faithfulness checking = data-lineage validation. Each claim must trace back to a source span — same as your column-level lineage in Terraform. Abstention = your "data quality circuit breaker."
 
+### Week 9.5 — Agentic RL Fine-Tuning (half-week insert, ~8–10h)
+> Detailed runbook: [[Week 9.5 - Agentic RL Fine-Tuning]] *(brief; runbook generated on demand)*
+
+**Theory (3h).**
+- Read: hello-agents Ch 11 [Agentic-RL](https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter11/Chapter11-Agentic-RL.md) (the canonical SFT→GRPO walkthrough). DeepSeek-R1 paper (GRPO algorithm origin). RLHF survey (Ouyang et al. 2022 — InstructGPT). DPO paper (Rafailov et al. 2023 — preference learning without RL). Anthropic's Constitutional AI paper for the RLAIF variant.
+- Master:
+  - The two-stage LLM training pipeline (pretrain → post-train) and what post-train accomplishes (instruction-following + alignment + multi-step reasoning)
+  - SFT vs RLHF vs DPO vs GRPO — what each optimizes, where each breaks
+  - **Agentic RL framing**: LLM as policy in (state = current context + scratchpad, action = next token / next tool call, reward = task success). Multi-step credit assignment via group-relative advantages.
+  - **GRPO's group-relative trick**: skip the value-function critic; for each prompt, sample N completions, score them, normalize advantages within the group. ~50% less compute than PPO, comparable quality on reasoning tasks.
+  - When agentic RL is the right move (cold-start reasoning tasks, tool-use refinement) and when SFT alone suffices (instruction-following, format compliance, refusal patterns)
+
+**Lab (5–7h) — `lab-09.5-agentic-rl`.**
+1. **Pre-train baseline measurement**: pick a small open-source base model (Qwen3-0.5B or gpt-oss-3B). Run it zero-shot on the GSM8K-mini test set (50 questions). Record pass rate, mean tokens per answer, refusal rate. This is the floor.
+2. **SFT stage**: curate 200-500 (problem, chain-of-thought, answer) tuples from GSM8K-train. Fine-tune the base model via mlx-lm or unsloth (use LoRA r=16 for memory efficiency). Re-run on test set. Record delta.
+3. **GRPO stage**: implement GRPO on the SFT model. For each problem in a small training set (~50 problems × 8 epochs), sample N=8 completions, score each by answer correctness (1.0 if correct, 0.0 otherwise), normalize advantages within the group, apply policy update. Re-run on test set. Record delta from SFT.
+4. **Ablation table**: 4-row comparison of pre-train / SFT / GRPO / SFT+GRPO on (pass rate, mean tokens, refusal rate, train wall-time, train cost). Write `RESULTS.md`.
+5. **Tool-use extension** (optional, advanced): swap the math task for a tool-using task. Define reward = (correct answer AND valid tool calls AND no hallucinated tool args). Measure improvement on tool reliability — this is the production-relevant signal that pure math reasoning misses.
+
+**Exit criteria.** 90-second answer to "how do you train an agent's reasoning capability beyond what its base model gives?" — name the three stages (pretrain / SFT / RL), name the GRPO group-relative trick (skip the critic, sample N per prompt, normalize within-group), cite your measured delta (pre-train → SFT → GRPO on GSM8K-mini), name the tradeoff (RL training requires a clean reward signal — works for math/code/games, breaks on open-ended subjective tasks). Bonus: when interviewers ask "have you trained an agent?", answer YES and cite the lab.
+
+**Infra bridge.** Agentic RL training is a feedback-loop system identical to CI/CD: training data flows in (the training set + reward signal), the policy gets updated (the deploy), eval metrics gate the next iteration (the test stage), failures route to investigation (debugging a low-reward batch is the same shape as debugging a flaky test suite). The "8-epoch GRPO loop" is a CI pipeline with cost-per-run on the order of single-digit GPU-hours; same operational discipline applies (atomic commits, reproducible runs, eval-as-gate). Local MLX on M-series Macs makes this affordable for self-study; cloud cost would be ~$10-30 per SFT+GRPO run on Modal or RunPod.
+
 ---
 
 ## Phase 4 — Frameworks, System Design, Mock Interviews (Weeks 10–12)
@@ -1694,6 +1717,7 @@ Useful modifiers you can add to any generation request:
 | 8 | [[Week 8 - Schema Reliability Bench]] | **The signature-question lab.** 5-way comparison (naive prompt / provider-native / Outlines+xgrammar / Instructor+retry / post-validation+repair) across 4 local models + GPT-4o-mini, 100 prompts; draws the 5-layer defense diagram |
 | 8.5 | [[Week 8.5 - Voice AI Agents]] | Local cascaded pipeline (faster-whisper + Claude + ElevenLabs/Coqui); 20-turn latency measurement; OpenAI Realtime API head-to-head; barge-in handling implemented |
 | 9 | [[Week 9 - Faithfulness Checker]] | Claim-splitter prompt; NLI-based entailment scorer; SelfCheckGPT-lite (3× sample + BERTScore); abstention router; 30-Q hand-labeled test set |
+| 9.5 | [[Week 9.5 - Agentic RL Fine-Tuning]] | Pretrain → SFT (LoRA r=16, 200-500 CoT tuples on GSM8K-train) → GRPO (N=8 group-relative advantages, 8 epochs); 4-row ablation table (pretrain / SFT / GRPO / SFT+GRPO) on pass-rate + tokens + refusal-rate + wall-time + cost; optional tool-use extension swapping math reward for tool-reliability reward. Anchored to hello-agents Ch 11 |
 | 10 | [[Week 10 - Framework Shootout]] | Re-implement Week 4 loop in LangGraph, LlamaIndex agent worker, OpenAI Agents SDK pointing at local mlx server; LOC + traceability + testability decision matrix |
 | 11 | [[Week 11 - System Design]] | 5 × 2-hour whiteboard exercises (doc-QA / multi-agent triage / coding agent / financial-research / infra-aware); self-recorded; **7-point self-critique rubric** (Gate 7 = quotable cost-cut from a prior lab + named routing rule, the offer-closing senior signal) |
 | 11.5 | [[Week 11.5 - Agent Security]] | 10-attack red-team suite extending W7 tool harness (5 attack classes + 3 indirect-injection variants); three defense layers (pydantic input validation / firejail sandbox / Llama Guard output filter); kill-rate-per-layer table |
