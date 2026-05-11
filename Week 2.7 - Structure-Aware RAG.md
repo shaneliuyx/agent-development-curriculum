@@ -72,6 +72,95 @@ Two stages, each a deliberate design choice:
 
 PageIndex's framing is **"vectorless reasoning RAG"**. The retrieval primitive is *LLM reasoning over structural metadata*, not similarity search over content embeddings.
 
+### Concept 2B — Greedy Descent vs Agentic Multi-Turn Loop (the load-bearing distinction)
+
+The Concept 2 description above ("recurse down the chosen branch until a leaf is reached") is the **canonical PageIndex pattern** — greedy single-path descent. In our lab measurements (Phase 4 baseline: tree judge 0.44, Phase 5 PageIndex optimization: 0.79), this pattern was the bottleneck. Phase 7 onwards uses an **agentic multi-turn loop** where the LLM has tool calls to fetch arbitrary page ranges and is free to re-route mid-query. The choice between these two patterns is the single biggest architectural decision in the W2.7 lab; the rest of the chapter is consequences.
+
+**Pattern A — Greedy descent (canonical PageIndex)**:
+
+```mermaid
+flowchart TD
+    Q([Query: 'What does Item 1C say about cybersecurity?'])
+    Q --> ROOT["Navigator LLM<br/>sees ROOT children titles<br/>'Item 1', 'Item 1A', 'Item 1B',<br/>'Item 1C', 'Item 2'..."]
+    ROOT -->|"pick one"| L1["Item 1A — Risk Factors<br/>(picked because<br/>'risk' in titles)"]
+    L1 --> NAV2["Navigator LLM<br/>sees Item 1A children<br/>'Cybersecurity Risks',<br/>'Regulatory Risks',<br/>'Climate Risks'..."]
+    NAV2 -->|"pick one"| L2["Cybersecurity Risks<br/>(picked correctly)"]
+    L2 --> LEAF["Leaf node — body text fetched<br/>~3-5 pages"]
+    LEAF --> ANS["Answer LLM<br/>uses fetched leaf body"]
+    ANS --> OUT([Cited answer])
+
+    L1 -.->|"WRONG PICK?<br/>no recovery —<br/>committed to subtree"| DEAD["Dead-end<br/>Item 1A doesn't contain<br/>the cybersecurity-specific<br/>answer; Item 1C does"]
+
+    style Q fill:#bdc3c7,color:#222
+    style ROOT fill:#f5a623,color:#fff
+    style NAV2 fill:#f5a623,color:#fff
+    style LEAF fill:#4a90d9,color:#fff
+    style ANS fill:#f5a623,color:#fff
+    style OUT fill:#27ae60,color:#fff
+    style DEAD fill:#e74c3c,color:#fff
+```
+
+**Pattern B — Agentic multi-turn loop (our lab Phase 7+)**:
+
+```mermaid
+flowchart TD
+    Q([Query: 'What does Item 1C say about cybersecurity?'])
+    Q --> CTX["Agent LLM<br/>sees FULL compact tree<br/>titles + page-ranges + summaries<br/>for ALL nodes at once<br/>+ cluster_hint + entity_hint"]
+    CTX --> ITER1["Iter 1: agent emits tool_call<br/>get_page_content(start=15, end=18)<br/>fetches Item 1C body"]
+    ITER1 --> OBS1["Observation:<br/>'page 15 — Cybersecurity Disclosures...<br/>page 16 — incident response...<br/>page 17 — third-party assessment...'"]
+    OBS1 --> ITER2{"Agent LLM:<br/>sufficient evidence?"}
+    ITER2 -->|"need more — broaden to Item 1A for context"| ITER3["Iter 2: tool_call<br/>get_page_content(start=4, end=8)<br/>fetches Item 1A general risk language"]
+    ITER3 --> OBS2["Observation:<br/>Item 1A risk-factor framework"]
+    OBS2 --> ITER4{"Agent LLM:<br/>sufficient evidence?"}
+    ITER2 -->|"enough"| ANS["Synthesis LLM<br/>uses both fetched ranges<br/>+ cites page numbers inline"]
+    ITER4 -->|"enough"| ANS
+    ITER4 -->|"still missing"| BUDGET["max_iter reached →<br/>BUDGET EXHAUSTED prompt<br/>5 strict rules<br/>(forces honest refusal<br/>OR synthesis from fetched)"]
+    BUDGET --> ANS
+    ANS --> LQ{"_is_low_quality?<br/>refusal phrase OR<br/>no page citation"}
+    LQ -->|"good"| OUT([Cited answer])
+    LQ -->|"low quality"| FB["Chunk-level fallback<br/>BGE-M3 hybrid search<br/>+ neighbor expansion"]
+    FB --> ANS2["Fallback synthesis<br/>from page-vector hits"]
+    ANS2 --> OUT
+
+    style Q fill:#bdc3c7,color:#222
+    style CTX fill:#f5a623,color:#fff
+    style ITER1 fill:#4a90d9,color:#fff
+    style ITER3 fill:#4a90d9,color:#fff
+    style ITER2 fill:#9b59b6,color:#fff
+    style ITER4 fill:#9b59b6,color:#fff
+    style BUDGET fill:#e74c3c,color:#fff
+    style LQ fill:#9b59b6,color:#fff
+    style FB fill:#e67e22,color:#fff
+    style ANS fill:#f5a623,color:#fff
+    style ANS2 fill:#e67e22,color:#fff
+    style OUT fill:#27ae60,color:#fff
+```
+
+**Side-by-side comparison**:
+
+| Property | Greedy descent (Pattern A) | Agentic multi-turn (Pattern B) |
+|---|---|---|
+| **What the LLM sees at decision time** | Children titles ONLY of the current node | FULL compact tree (titles + page-ranges + summaries) of every node + cluster_hint + entity_hint |
+| **Number of LLM calls per query** | tree_depth + 1 (e.g. 5: navigate × 4 + answer × 1) | 2-4 iters (each = LLM call + tool_call + observation) + 1 synthesis = 3-5 calls typical, capped at 4 iters |
+| **Tool surface available to LLM** | None — pure title-picking | `get_page_content(start, end)` + `get_entity_pages(entity)` |
+| **What body text the answer LLM sees** | Exactly ONE leaf's body (the descended-to one) | Whatever the agent CHOSE to fetch — can be cross-section, can be ranges from siblings, can be re-fetched on second iter |
+| **Recovery from wrong pick** | None — committed to subtree | Free — agent can fetch from a different range on next iter |
+| **Hallucination risk under pressure** | Low (forced to refuse if leaf doesn't have answer) | Higher (model under BUDGET pressure may fabricate from training memory) — explicit anti-hallucination prompt needed (Phase 9 Rules 1-4) |
+| **Cross-section synthesis (question spans 2 sections)** | Impossible — single leaf only | Native — agent fetches multiple ranges and synthesizes |
+| **Latency per query** | ~5 LLM calls × ~500ms = ~2.5s | 3-5 LLM calls × ~10-30s each = 30-160s (multi-turn observation handling is expensive) |
+| **Failure mode — wrong navigation at depth 1** | Catastrophic (whole subtree wrong) | Recoverable (agent sees the misroute in observation, picks a different range) |
+| **Failure mode — leaf truncation** | The leaf body might exceed context but isn't usually the issue | Was the Q9 bug: 8K char cap hid the Scorecard. Fixed in Phase 9 (25K cap) |
+| **Failure mode — agent "feels done" too early** | N/A | Real — model exits loop on iter 2 declaring "sufficient evidence" when it isn't. Mitigated by `_is_low_quality()` + chunk-fallback (Phase 8) |
+| **Eval score on our 16-Q Berkshire eval** | 0.44 (Phase 4 baseline) | **1.000** (Phase 9 final, after fixes) |
+
+`★ Insight ─────────────────────────────────────`
+- **The single-biggest lift in this lab — 0.44 → 1.000 — comes from replacing greedy descent with the agentic loop**, even more than from any individual prompt or index optimization. Greedy descent's "navigator only sees titles" blind spot is the structural failure mode the rest of the chapter is recovering from.
+- **The cost is real and asymmetric**: greedy descent runs ~2.5s and gives a wrong answer half the time; agentic loop runs ~60s and gives a right answer ~100% of the time. For production: route by query type (factoid → vector at 1.4s, cross-section → agentic tree at 60s) — see Concept 4 Three-Lane Production RAG.
+- **Greedy descent isn't dead** — it's the right pattern when (a) the tree is shallow (depth ≤ 2), (b) the query is deterministically section-named ("What does Item 1C say..."), (c) latency budget is tight (sub-3s). PageIndex's 98.7% on FinanceBench uses greedy descent on a corpus + query distribution that fits this profile. Our lab corpus (Berkshire 10-K + cross-section synthesis queries) does not.
+- **Multi-turn loops introduce a new failure class: hallucination under iteration-budget pressure** (Q9 fabricating $37.4B). Greedy descent doesn't have this failure because there's no "must say something" pressure — the answer LLM either answers from the fetched leaf or refuses. The agentic loop's BUDGET EXHAUSTED prompt is the load-bearing fix (Phase 9 Block 2). Without it, multi-turn loops are unsafe at scale.
+- **The "agent sees the compact tree at iter 0" trick is what makes the loop work**: greedy descent commits to a subtree on iter 1 with only sibling titles visible. The agent loop sees ALL nodes' titles + page-ranges + summaries at once — that global view is what lets it bypass wrong navigations and fetch the right pages directly. Cost: ~3-5K tokens of context per call. Tradeoff: token cost vs navigation correctness.
+`─────────────────────────────────────────────────`
+
 ### Concept 3 — When Tree-Index Wins (and When It Loses)
 
 **Wins when:**
