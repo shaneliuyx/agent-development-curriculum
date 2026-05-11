@@ -2783,7 +2783,7 @@ flowchart TD
 
     LOOP{{Agentic multi-iter loop<br/>max_iterations=4<br/>max_tokens=1500 per call<br/>temperature=0.0}}
 
-    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH[page_provider<br/>slices PDF.pages[start-1:end]<br/>head-truncate at 25000 chars]
+    LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH["page_provider<br/>slices PDF.pages start-1 to end<br/>head-truncate at 25000 chars"]
     FETCH -->|"observation: [page N]<br/>+ body text"| LOOP
 
     LOOP -->|"LLM emits final answer<br/>with citation"| LQ{"_is_low_quality?<br/>refusal phrase OR<br/>len &lt; 80 OR<br/>no page-N citation"}
