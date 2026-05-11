@@ -2896,6 +2896,81 @@ flowchart TD
 - **The 18-min full-rebuild + eval-gate cycle is the unit of integration testing for this architecture.** When you change ANYTHING — prompt, model, K, parser, fallback threshold — the gate is "did the 16-Q eval drop > tolerance vs prior baseline?". This is the production discipline that prevents what Phase 7 Bad-Case Entry 17 caught (Approach B regressed 0.885 → 0.781 — without the eval gate, that ships).
 `─────────────────────────────────────────────────`
 
+### Reference 5 — Cluster Routing Internals (centroid_embeddings + δ-band tiebreak)
+
+Reference 2 named the cluster index; Reference 2B/2C mapped its file shape. Reference 5 zooms into the two non-obvious mechanics that make cluster routing actually work: what `centroid_embedding` is (and how it's computed), and what `δ=0.07` means at query time. Phase 7 Block 2 has the empirical calibration story; Reference 5 is the standalone pedagogical reference.
+
+**Centroid embedding — definition + computation**
+
+Each cluster in `summary_index.json` carries a `centroid_embedding` field — a 1024-dim float32 vector. This is the cluster's representative point in BGE-M3 embedding space, used at query time to compute cluster-vs-query cosine.
+
+Computation is **pure K-means centroid: arithmetic mean of member node embeddings**.
+
+```python
+# lab-02-7-pageindex/src/build_summary_index.py line 528
+# After K-means produces cluster labels for each node,
+# the centroid is the mean of its members' embeddings:
+centroids = np.zeros((k, embeddings.shape[1]), dtype=np.float32)
+for i in range(k):
+    mask = labels == i
+    if mask.any():
+        centroids[i] = embeddings[mask].mean(axis=0)
+```
+
+| Step | What | Why |
+|---|---|---|
+| 1. Encode every node summary | BGE-M3 dense (1024-dim, L2-normalized) → matrix shape `(46, 1024)` for 46 nodes | Embedding space is shared between query and centroid; cosine becomes meaningful |
+| 2. Run K-means (k=8 or `--auto-k`) | Standard K-means clustering on the (46, 1024) matrix | Produces cluster labels for each node |
+| 3. Per cluster — mean of member embeddings | `embeddings[mask].mean(axis=0)` → (1024,) vector | The centroid is the "average direction" all member nodes point in |
+| 4. Stored as JSON in cluster record | `"centroid_embedding": [0.012, -0.084, ...]` (1024 floats) | At query time, no rebuild needed — just one cosine per cluster |
+
+**Geometric interpretation**: BGE-M3 embeddings are L2-normalized (unit-norm vectors on the 1024-dim hypersphere). The arithmetic mean of unit vectors is NOT generally unit-length — it sits inside the hypersphere, pulled toward whichever member points most agree on. For tight clusters (member directions cluster around a common axis), the mean has length ~0.7-0.9. For loose clusters (member directions spread over a hemisphere), the mean has length ~0.2-0.4 — and cosine similarity vs that short mean is structurally lower.
+
+`★ Insight ─────────────────────────────────────`
+- **Why "mean of L2-normalized vectors" works for cosine routing**: cosine similarity is invariant to scalar magnitude — `cos(query, centroid) = (query · centroid) / (|query| × |centroid|)`. Even if the centroid is sub-unit-length, the normalization in the denominator restores the comparison to the unit-sphere geometry. The shorter the centroid, the more its norm penalizes the cosine — naturally encoding "this cluster is internally diverse" as "lower cosine signal".
+- **Alternative — medoid instead of mean**: K-medoids picks the EXISTING member whose summary is most central as the centroid, rather than computing an average. This lab uses mean (cheaper, default K-means). For clusters with one obvious "representative" node and many outliers, medoid would route more sharply; mean handles distributed clusters more gracefully.
+- **Could be "centroid_summary's embedding" instead**: another option is to embed the `centroid_summary` text (the cluster's TF-IDF-extracted descriptive prose) rather than averaging member embeddings. This decouples routing from member composition — useful if you want to hand-tune cluster identities. This lab uses mean-of-members; the centroid_summary is for human-readable display only, not for routing.
+`─────────────────────────────────────────────────`
+
+**Delta-band tiebreak — calibration table**
+
+At query time, the system computes cosine of the query embedding vs every cluster's centroid_embedding, sorts descending. The `delta` parameter (`δ=0.07` in this lab) is a **noise-tolerance band** that determines whether top-1 is decisive or whether top-2 is "close enough" to also be considered.
+
+```python
+# shared/tree_index/summary_index.py:134 — find_clusters_for_query
+def find_clusters_for_query(self, query, threshold=0.5, top_k=2, delta=0.10):
+    # 1. Cosine of query vs every centroid
+    # 2. Sort descending, keep candidates with score ≥ threshold
+    # 3. Return top_k IF top-2 is within delta of top-1; else top-1 only
+```
+
+| Scenario | Gap (top-1 score − top-2 score) | Compared to δ=0.07 | Outcome | Agent sees |
+|---|---|---|---|---|
+| Decisive top-1 | 0.781 − 0.690 = 0.091 | 0.091 > 0.07 | Top-1 only | Single `cluster_hint` with tags + member_node_ids |
+| Ambiguous top-2 | 0.690 − 0.638 = 0.052 | 0.052 ≤ 0.07 | Top-1 + Top-2 both returned | AMBIGUOUS hint listing both candidates + "tiebreak via tags/members OR fetch from each" |
+| Below threshold | top-1 = 0.42 | 0.42 < 0.5 threshold | No match | No `cluster_hint` at all → agent uses tree compact view only |
+
+**Why δ=0.07 specifically — calibration on Berkshire 2023 corpus**
+
+| δ value | Trigger rate (AMBIGUOUS) on 16-Q eval | Effect | Outcome on Q4 (gap 0.052) | Outcome on Q3 (gap 0.091) |
+|---|---|---|---|---|
+| **0.05** | ~1 in 16 (rare) | Only sub-noise-floor ties return ambiguous | ❌ Misses runner-up — Q4 routes wrongly to C1 → judge=0.00 | ✅ Top-1 only (correct) |
+| **0.07** ✅ (lab choice) | ~3 in 16 (sparse, calibrated) | Matches BGE-M3 sibling-cluster noise floor + small variance pad | ✅ Both returned → 9B-GLM picks C2 via tags+members → judge=0.75 | ✅ Top-1 only (correct) |
+| **0.10** | ~6 in 16 (frequent) | Even well-separated clusters trigger ambiguity | ✅ Both returned (over-trigger, but harmless on Q4) | ❌ Wrongly triggers AMBIGUOUS — 9B-GLM wanders trying to tiebreak → quality drops |
+
+`★ Insight ─────────────────────────────────────`
+- **0.07 is empirically calibrated, not arbitrary**. Phase 7 Block 2 measured: BGE-M3's 75th-percentile cosine gap between sibling Chairman's Letter clusters on this corpus is ~0.05. δ=0.07 = noise floor + small variance pad. Recipe for other corpora: probe a handful of same-type queries, compute leader-vs-runner-up gap distribution, set δ to ~75th percentile.
+- **It's a precision-recall lever**:
+  - **Smaller δ** (e.g. 0.05) = HIGHER precision per single cluster pick (less chance of injecting a noisy second candidate), LOWER recall when the right cluster is a near-tie sibling. Q4-class failure mode.
+  - **Larger δ** (e.g. 0.10) = MORE cross-cluster synthesis (helps when answer truly spans two clusters), but COSTS context tokens (9B-GLM has to read both clusters and tiebreak). Over-trigger paralyzes the consumer LLM. Phase 7 Block 5's Approach B autopsy showed this failure: LLM-grouped tighter clusters caused δ=0.07 to fire on ALL cross-section questions, regressing aggregate 0.885 → 0.781.
+- **It's MODEL-DEPENDENT in TWO directions**:
+  - **Embedding model**: BGE-M3's noise floor would shift under nomic-embed-v2 or sentence-transformers. Re-calibrate δ on swap.
+  - **Consumer LLM**: 9B-GLM tolerates AMBIGUOUS hint well; Gemma-26B would tolerate it even better; a haiku-tier model (gpt-oss-20B) might wander more. Tighter δ when the consumer is weaker.
+- **It's CORPUS-DEPENDENT**: 0.07 is right for 152-page single-document Berkshire 2023 + 8 K-means clusters. Multi-document corpora with denser cluster spaces (e.g. 200 clusters over 1000 documents) need different δ — likely smaller, because BGE-M3 noise floor scales with cluster count.
+- **Code default vs lab actual**: `shared/tree_index/summary_index.py:134` declares `delta=0.10` as the default. The lab explicitly passes `delta=0.07`. The default-vs-actual gap exists because the function was designed to be conservative-by-default (under-trigger AMBIGUOUS); the lab tunes it to its measured corpus profile. Worth flagging to anyone who calls the function without explicit `delta=`.
+- **Bad-Case Entry 14 is the empirical justification for δ existing at all**. Q4 with single-cluster top-1 routing scored 0.00 (wrong cluster picked); with top-K + δ=0.07 it scored 0.75. The delta-band tiebreak IS the architecture, not a polish knob.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Evaluation Reference — GT-Judge Methodology
