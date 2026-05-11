@@ -236,8 +236,10 @@ The sequence diagram choreographs a single agent turn: the agent reads existing 
 mkdir -p ~/code/agent-prep/lab-03-5-memory/{src,data,results,tests}
 cd ~/code/agent-prep/lab-03-5-memory
 uv venv --python 3.11 && source .venv/bin/activate
-uv pip install mem0ai qdrant-client openai python-dotenv pytest
+uv pip install mem0ai qdrant-client openai python-dotenv pytest sentence-transformers
 ```
+
+> **Why `sentence-transformers`**: oMLX (the menu-bar app on :8000) serves **chat** models only by default — embedding models are NOT registered. The lab originally called `omlx.embeddings.create(model="bge-m3", ...)` which fails with `404 Model 'bge-m3' not found` on a stock oMLX install. The fix is to load BGE-M3 **in-process** via `sentence-transformers` (~1 GB model + torch + MPS backend on Apple Silicon). Trade-off: one extra GB of resident memory; benefit: zero second-server dependency. See Phase 2.1 `embed()` for the in-process pattern.
 
 ### 1.2 Environment
 
@@ -249,9 +251,22 @@ MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
 QDRANT_URL=http://localhost:6333
 SQLITE_PATH=data/memory.db
+# NOTE: no embedding-server URL — BGE-M3 runs in-process via sentence-transformers.
+# If you later switch to an embedding server (mlx-openai-server with bge-m3
+# on a different port), add EMBED_BASE_URL=... and edit embed() accordingly.
 ```
 
 Your Qdrant instance from Week 1 is fine — we'll create a dedicated collection `user_memories`.
+
+**Required running services before starting the lab:**
+
+| Service | Endpoint | How to start | Verify |
+|---|---|---|---|
+| Qdrant | `localhost:6333` | `docker start qdrant` (or `docker run -d -p 6333:6333 --name qdrant qdrant/qdrant`) | `curl localhost:6333/readyz` returns `OK` |
+| oMLX (chat for extraction + response) | `localhost:8000` | Open the oMLX menu-bar app | `curl -H "Authorization: Bearer $OMLX_API_KEY" localhost:8000/v1/models` returns model list including `MODEL_HAIKU` + `MODEL_SONNET` |
+| BGE-M3 (embeddings) | in-process | Auto-loaded on first `import src.memory` (~10s first-time download + load) | Smoke test: `python -c "from src.memory import embed; print(len(embed('test')))"` returns `1024` |
+
+If `curl localhost:8000/v1/models` returns `Connection refused`, oMLX isn't running. If it returns `API key required`, you forgot the `Authorization` header — that's fine, the server is up. If you get `404 Model 'bge-m3' not found` after running the chat REPL, your `embed()` is still hitting oMLX — apply the in-process fix from Phase 2.1.
 
 ### 1.3 SQLite schema for semantic facts
 
@@ -305,6 +320,7 @@ from typing import Literal
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -314,6 +330,13 @@ SQLITE = os.getenv("SQLITE_PATH")
 MODEL  = os.getenv("MODEL_SONNET")
 HAIKU  = os.getenv("MODEL_HAIKU")
 COLLECTION = "user_memories"
+
+# In-process BGE-M3 dense embedder. oMLX does NOT serve embedding
+# models by default — only chat models. Loading BGE-M3 directly via
+# sentence-transformers avoids the second-server dependency and
+# matches the W2.7 PageVectorIndex / W2.5 GraphRAG patterns.
+# device="mps" uses Apple Silicon GPU via PyTorch MPS backend.
+_embedder = SentenceTransformer("BAAI/bge-m3", device="mps")
 
 # Bootstrap Qdrant collection (idempotent)
 if not qdrant.collection_exists(COLLECTION):
@@ -340,8 +363,10 @@ Skip trivia. Do not invent facts. If nothing memorable, return empty lists."""
 
 
 def embed(text: str) -> list[float]:
-    r = omlx.embeddings.create(model="bge-m3", input=text)
-    return r.data[0].embedding
+    # In-process BGE-M3 dense vector (1024-dim, L2-normalized).
+    # normalize_embeddings=True so cosine and dot product agree.
+    vec = _embedder.encode([text], normalize_embeddings=True)[0]
+    return vec.tolist()
 
 
 def extract_memories(user_msg: str, assistant_msg: str) -> dict:
@@ -841,6 +866,11 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 *Symptom:* After 20 turns, `recall()` returns 30+ semantic facts and 50+ episodic summaries. System prompt + retrieved facts + conversation now exceeds 4K tokens on a 4K model, context exhausted, model fails.
 *Root cause:* No cap on `recall()` results. Every fact ever stored is eligible for retrieval and injection. Memory growth is unbounded.
 *Fix:* Add `LIMIT k` to retrieval queries (e.g., `LIMIT 20` for facts). Implement TTL (facts older than 30 days get archived). Implement confidence-weighted eviction: each fact has a `confidence` score; lowest scores are archived when store hits cap. Summarise old facts: after N days, run an LLM over episodic history to emit "permanent takeaways" (semantic facts) and archive the raw episodes.
+
+**Entry 6 — `recall()` crashes with `404 Model 'bge-m3' not found` on first user message.**
+*Symptom:* Fresh-install agent, `python -m src.chat --user alice` starts, REPL prompts for input, first message crashes with `openai.NotFoundError: Error code: 404 - {'error': {'message': "Model 'bge-m3' not found. Available models: Gemma-4-..., Qwen3.6-..., gpt-oss-20b-..."}}`. Connection IS established (oMLX is running), but `embed()` calls `omlx.embeddings.create(model="bge-m3", ...)` and gets a 404.
+*Root cause:* oMLX (the Apple Silicon menu-bar inference server) ships with chat models registered by default — embedding models are NOT included. The lab's original `embed()` assumed oMLX would route `bge-m3` to an embedding endpoint; on a stock install, it doesn't. Connection succeeds (server up, auth OK) but the model name is unknown. Earlier symptom of the same root cause is `Connection refused` if oMLX itself isn't running — the layered failure mode hides which dependency is missing.
+*Fix:* Load BGE-M3 **in-process** via `sentence-transformers` with `device="mps"` on Apple Silicon. One extra GB resident memory, zero second-server dependency. Add `sentence-transformers` to the Phase 1 install line (`uv pip install ... sentence-transformers`). Rewrite `embed()` to use `_embedder.encode([text], normalize_embeddings=True)[0].tolist()`. **Discipline rule:** check what each "running" service ACTUALLY serves, not just whether the port is open. Phase 1 setup table now lists per-service smoke tests (e.g. `curl /v1/models` must return `bge-m3` in the list if you keep the original two-server design).
 
 ---
 
