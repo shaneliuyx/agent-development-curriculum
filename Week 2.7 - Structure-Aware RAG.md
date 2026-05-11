@@ -1708,35 +1708,54 @@ flowchart TB
 
 ### Phase 7 — Why Vector at the Cluster Layer (mixed-architecture commentary)
 
-Phase 4 explicitly framed vector vs tree as competing architectures and measured their head-to-head. Phase 7 reintroduces vectors. This subsection explains why that's not a contradiction — and where the mixed pattern fits.
+> **Phase 8 + 9 update (2026-05-09):** Originally authored at Phase 7 where vectors lived only at the cluster routing layer. Phase 8 then added a **chunk-level page-vector fallback** (BGE-M3 dense+sparse hybrid, `PageVectorIndex` at `shared/tree_index/page_vector_index.py`) wired into the agentic loop as the last-resort recovery path. The end-state Phase 9 architecture has vectors at TWO distinct layers, not one. The "Three reasons vectors return" section + the anti-patterns + the mixed-architecture table below have all been updated to reflect the post-Phase-9 form. The original Phase-7 text appears in commit history if you need it.
 
-**Three reasons vectors return at this layer:**
+Phase 4 explicitly framed vector vs tree as competing architectures and measured their head-to-head. Phase 7 reintroduces vectors at L2 (cluster routing). Phase 8 reintroduces them AGAIN at L3 (page-level fallback). This subsection explains why neither return is a contradiction — and where each mixed pattern fits.
+
+**The three layers of the Phase-9 final retrieval stack**:
+
+| Layer | What it is | Primary technique | Vector use? |
+|---|---|---|---|
+| **L1 — Leaf navigation** | Agent loop with `get_page_content(start, end)` tool | Structural (LLM reasoning over tree compact view) | No |
+| **L2 — Cluster routing (Phase 7)** | Pre-fetch the right cluster of leaves before the agent's first LLM call | Vector (BGE-M3 dense cosine over 8 centroids) | YES — vector accelerates routing |
+| **L3 — Chunk-level fallback (Phase 8)** | Last-resort recovery when low-quality detection fires after the agentic loop and forced-synthesis paths have failed | Vector (BGE-M3 dense+sparse hybrid + RRF fusion over 152 pages) | YES — vector catches what structural retrieval missed |
+
+**Three reasons vectors return at L2 (cluster routing):**
 
 1. **Vector at L2 is not vector at leaf level.** Phase 4's vector RAG was a vector-only system (chunk → embed → ANN search → top-K passages). Phase 7 uses vectors only at the CLUSTER ROUTING layer — to pick which subset of leaves to navigate. Leaves themselves are still navigated by the structural agentic loop. The two techniques live in different roles, not in competition for the same job.
 2. **Cluster routing is the right job for embeddings.** Embeddings excel at "find me the K most similar items in a small fixed set" — exactly cluster routing's job (8 centroids, single cosine call). Embeddings underperform at "find the precise answer in a 200-page document" — that's the leaf-navigation job, where structure matters more than similarity. Use the right tool per layer.
 3. **One LLM-call cheap.** Cluster routing replaces 2-3 agent-loop iterations (~30-60s) with one BGE-M3 cosine call (~50ms). The speed lever IS embeddings; insisting on pure-structural routing would leave it on the table.
 
+**Two reasons vectors return at L3 (chunk-level fallback) — added in Phase 8:**
+
+1. **Structural retrieval has known failure modes.** The variant generator paraphrases query terms ("Scorecard" → "performance metrics, KPI dashboard"), losing literal keywords that the structural index might have matched. Truncation caps may hide answer pages. The agent may exit the loop on a misroute it didn't detect. Each failure is rare per-query but the union is non-trivial — Phase 8 measured 2-3/16 queries hitting one. The chunk-level fallback catches all of them with one mechanism.
+2. **BGE-M3 dense+sparse hybrid is structurally different from dense-only ANN at L2.** Dense alone misses literal-keyword matches (BGE-M3 dense embedding of "Scorecard" doesn't match "performance metrics" cosine-closely). Sparse (BM25-like lexical) matches literal tokens directly. RRF fusion (k=60) combines both rankings without trusting either alone. This is a DIFFERENT vector technique than the dense-only cluster routing at L2 — the same underlying model (BGE-M3) used in different modes for different jobs.
+
 **When mixed architecture is the right choice:**
 
 | Corpus shape + question mix | Best architecture | Why |
 |---|---|---|
-| Long structured doc (10-K, contract, regulatory filing) with cross-section synthesis questions | **Mixed: vector at L2 + structural at L1** (Phase 7 pattern) | Structure IS the index; vector accelerates the routing decision before the agent loop |
+| Long structured doc (10-K, contract, regulatory filing) with cross-section synthesis + literal-term queries | **3-tier: structural at L1 + dense vector at L2 + dense+sparse hybrid at L3 fallback** (Phase 9 pattern) | Structure IS the index; dense vector accelerates routing; hybrid vector catches paraphrase-induced misses |
+| Long structured doc, cross-section synthesis only (no literal-term queries) | **2-tier: structural at L1 + dense vector at L2** (Phase 7 pattern) | L3 fallback is overhead if variant generator never paraphrases out the literal terms |
 | Short prose (essays, blog posts), questions paraphrase content | Vector only (Phase 4 baseline) | No useful structure; vector handles paraphrase well at the leaf level |
 | Multi-document corpus, questions cross documents | Graph + vector (W2.5 pattern) | Structure varies per doc; entity-graph normalizes across them |
 | Single-paragraph QA, questions extract one fact | Vector only with rerank | Sub-paragraph precision; tree-index overkill |
 
 **Anti-patterns to avoid:**
 
-- **DON'T put vector at the leaf level when structure already disambiguates.** If the document has a clean ToC + section titles, ANN over leaf chunks recreates the paraphrase-confusion / off-by-one-chunk problems the tree was designed to avoid. Phase 4's vector backend scored 0.75 on section-specific factoid because chunks crossed section boundaries — exactly the failure mode tree-index fixes.
+- **DON'T put vector at the leaf level as the PRIMARY retrieval mechanism when structure already disambiguates.** If the document has a clean ToC + section titles, ANN over leaf chunks as the FIRST retrieval pass recreates the paraphrase-confusion / off-by-one-chunk problems the tree was designed to avoid. Phase 4's vector backend scored 0.75 on section-specific factoid because chunks crossed section boundaries — exactly the failure mode tree-index fixes. Note: Phase 8's L3 fallback uses vector at page level but only AFTER structural retrieval has failed `_is_low_quality()` — it's the recovery layer, not the primary retrieval.
 - **DON'T cluster the leaves themselves to skip the agent loop.** Tempting to think "if a cluster has 5 leaves and the answer is in one of them, just embed the question and pick the closest leaf." That collapses to vector-RAG over the cluster — losing the structural reasoning. Tree-index's win is the agent's ability to fetch + observe + re-decide; clustering leaves at retrieval time removes that observation step.
 - **DON'T trust top-1 cluster pick when gap is below noise floor.** Phase 7's whole top-K-with-delta-band pattern exists because BGE-M3 cosine on cluster centroids has ~0.05 noise. Top-1 demands precision the embedding cannot reliably provide. Shipping cluster routing without measuring the noise floor on the actual corpus is the calibration anti-pattern.
+- **DON'T use dense-only at L3 fallback.** Phase 8 measured dense-only vs dense+sparse hybrid: dense-only missed literal-keyword Q9-class queries entirely (BGE-M3 doesn't know "Scorecard" is a literal term, not a paraphrase target). Hybrid + RRF k=60 fusion is the right L3 technique. Skipping sparse here defeats the whole point of having a fallback layer.
 - **DON'T use the same model for retriever loop and judge.** Phase 7 measured judge-swap divergence at |Δ|=0.141 (4/16 disagree ≥0.25). Swapping judges to save latency loses the ability to compare to ANY prior baseline. Speed up the retriever (MODEL_TREE) where calls are 50+ per eval; keep the judge model fixed forever.
-- **DON'T let the LLM decide which retrieval lane to use mid-loop.** Phase 7's cluster pre-fetch fires BEFORE the first LLM call, deterministically gated by `is_synthesis_question(query)`. Letting the model "decide whether to use vector or tree" mid-loop adds an LLM call and introduces a routing failure mode. Pre-decide based on a cheap regex; do not burn an iteration on routing-decision overhead.
+- **DON'T let the LLM decide which retrieval lane to use mid-loop.** Phase 7's cluster pre-fetch fires BEFORE the first LLM call, deterministically gated. Phase 8's L3 fallback fires AFTER the loop exits, deterministically gated by `_is_low_quality()`. Both routing decisions are made WITHOUT the LLM. Letting the model "decide whether to use vector or tree" mid-loop adds an LLM call and introduces a routing failure mode. Pre-decide based on a cheap signal; do not burn an iteration on routing-decision overhead.
 
 `★ Insight ─────────────────────────────────────`
-- **The right abstraction layer for mixing is the ROUTING layer, not the retrieval layer.** Vector at L2 (clusters) + structural at L1 (leaves) keeps each technique in its strongest role. Inverting (vector at L1 + structural at L2) would still work but with worse precision — vector loses leaf-boundary precision; structural loses cluster-routing speed.
-- **Cluster pre-fetch is a "router that doesn't burn an iteration".** Most agentic-RAG routers add an LLM call to decide which tool to use. Phase 7's router uses a regex (cheap) + cosine (cheap) — total ~50ms, no LLM call. The model sees the routing already done at iter 0.
-- **Mixed beats pure when the corpus + question mix is heterogeneous.** Berkshire 2023 has cross-section synthesis (suits cluster pre-fetch), section-specific factoid (suits structural navigation), citation-required (suits structural), out-of-document refusal (suits both). Any pure architecture loses ≥1 category. Mixed picks the right tool per query type.
+- **Vectors live at TWO distinct layers in the Phase-9 final form, each in a non-competing role.** L2 cluster routing (dense BGE-M3 cosine over centroids) is a SPEEDUP — vectors save 2-3 iterations of agent navigation. L3 chunk fallback (dense+sparse hybrid + RRF) is a SAFETY NET — vectors catch what structural retrieval missed. Neither replaces structural at L1; both complement it. The "Three reasons" section addresses L2; the "Two reasons" section addresses L3.
+- **The right abstraction layer for mixing is the ROUTING + RECOVERY layers, not the retrieval layer.** Structural at L1 (leaves) + vector at L2 (clusters) + vector at L3 (fallback) keeps each technique in its strongest role. Inverting any pair would lose precision OR speed OR recovery.
+- **Cluster pre-fetch is a "router that doesn't burn an iteration".** Most agentic-RAG routers add an LLM call to decide which tool to use. Phase 7's router uses cosine (cheap, ~50ms) — total no LLM call. The model sees the routing already done at iter 0.
+- **Chunk fallback is a "safety net that doesn't burn the happy path".** When structural + cluster routing produce a high-quality answer (~12-14 of 16 Q on Berkshire), `_is_low_quality()` returns false and the fallback never fires. Cost on the happy path is ZERO. Cost on the failure path is one BGE-M3 query + one synthesis LLM call. Asymmetric cost — pay only when needed.
+- **Mixed beats pure when the corpus + question mix is heterogeneous.** Berkshire 2023 has cross-section synthesis (suits L2 cluster pre-fetch), section-specific factoid (suits L1 structural navigation), literal-term factoid that may paraphrase out under variant generation (suits L3 hybrid fallback), citation-required (suits L1 structural), out-of-document refusal (suits L1 with early exit). Any pure architecture loses ≥1 category. The 3-tier mixed picks the right tool per query path.
 `─────────────────────────────────────────────────`
 
 ### Phase 7 Block 2 — Top-K Cluster Routing with Delta-Band Tiebreak (`shared/tree_index/summary_index.py`)
