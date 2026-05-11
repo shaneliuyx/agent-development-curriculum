@@ -2633,6 +2633,252 @@ flowchart TD
 
 ---
 
+## Evaluation Reference — GT-Judge Methodology
+
+This section is the pedagogical companion to Phase 8 Block 2 (where GT-judge was introduced in response to a concrete failure). Read this when you need to understand **why** answer-grounded judging is necessary, **what** "ground truth" means in this context, and **how** to author and run a GT-judge eval. The Phase 8 narrative tells the story; this section is the reference.
+
+### GT-Judge 1 — Why we need it (the entity-recall failure modes)
+
+Most public RAG benchmarks (and most "judge" implementations in starter labs) score candidate answers via **entity-recall** or **keyword overlap**: the eval-set author lists `expected_entities` per question; the candidate answer's score is the fraction of expected entities that appear in the answer text. This is fast, deterministic, cheap, and **fundamentally wrong for synthesis questions** in two opposite directions.
+
+**Failure mode 1 — False negatives on substantive synthesis (Q3 / Q12)**:
+
+Question: "What did Buffett describe as Berkshire's 'not-so-secret weapon'?"
+
+- `expected_entities` was authored as a bag spanning multiple sections of the Chairman's Letter: `["Coca-Cola", "American Express", "Apple", "fiscal conservatism", "shareholders", "Bertie", "patience", "long-term"]` — 8 entities drawn from across pages 5-17.
+- Candidate answer (substantively correct, 4 sentences): "Buffett describes Berkshire's not-so-secret weapon as its enduring base of long-term shareholders who treat Berkshire as a vehicle for compounding rather than trading [page 5]. He frames this against Wall Street's transactional pressure and credits patient ownership for enabling Berkshire's fiscal conservatism."
+- Entity-recall score: **0.25 (2/8)** — answer mentioned "shareholders" and "long-term" but missed "Coca-Cola", "American Express", "Apple", "fiscal conservatism", "Bertie", "patience".
+
+The candidate answer **correctly identifies** the not-so-secret weapon (the long-term shareholder base) and contextualizes it against Wall Street. Pass_criteria says "should capture the long-term shareholder framing". GT-judge: **PASS**. Entity-recall: 0.25 — fails any reasonable threshold.
+
+**Failure mode 2 — False positives on hallucinated answers (Q9)**:
+
+Question: "What was Berkshire's operating earnings figure for 2023 according to the **Scorecard**?"
+
+- `expected_entities` was authored as: `["operating earnings", "37", "Scorecard"]` — three entities from the canonical answer.
+- Candidate answer (HALLUCINATED, Phase-8 trace): "Berkshire's 2023 operating earnings were **$37.4 billion** as reported in the Chairman's Letter Scorecard [Chairman's Letter pages 6-7]."
+- Entity-recall score: **0.67 (2/3)** — answer mentions "operating earnings" and "37" and "Scorecard". Three out of three keywords appear. The score is partial only because "37" matched without "37.4 billion" being an exact substring.
+
+The candidate answer is **completely fabricated**. The model never fetched pages 12-13 (where the real Scorecard table lives); the fetched range stopped at page 10 due to the 8K char truncation bug (Phase 9 Block 1). The number "$37.4 billion" came from training memory; the citation "pages 6-7" is fake — the Scorecard isn't on those pages. **Entity-recall gave it 0.67 — partial credit for a hallucination.** Any production system that ships on entity-recall data is one false-positive away from confidently misleading users.
+
+**Why entity-recall is structurally broken for synthesis questions**:
+
+1. **Keyword overlap is necessary but not sufficient for substance.** A correct synthesis may use synonyms or paraphrases ("long-term shareholders" instead of "lifetime shareholders"). A hallucinated answer may include all the right keywords arranged into wrong claims.
+2. **Multi-section pass_criteria bias the entity bag toward longer answers.** Q3's expected_entities span 4 different sections of the Chairman's Letter. A correct, focused answer that addresses the question (the framing) without enumerating every related entity will score low.
+3. **No source-grounding check.** Entity-recall doesn't ask "is this answer actually backed by the source document?" — it only asks "does this answer contain these strings?". A model that has memorized BRK's 2023 financials can score high on entity-recall without ever consulting the PDF.
+4. **No format-strictness check.** Q9's hallucination cited "pages 6-7" — wrong location. Entity-recall doesn't parse citations against fetched ranges; it sees "37" and "Scorecard" co-occur and counts them.
+
+Adjacent methodologies — **embedding-similarity** (cosine between gt_answer and candidate), **ROUGE/BLEU** (n-gram overlap), **BERTScore** (contextual embedding match) — all share the same root flaw: they measure *surface similarity* without asking *did the candidate actually answer the question correctly under the criteria a human would apply*. They're useful as cheap sanity checks; they cannot replace a judgment-based pass/fail decision for evaluation that drives architectural choices.
+
+### GT-Judge 2 — The principle ("ground truth" + "pass criteria")
+
+GT-judge replaces the entity bag with a **two-part ground-truth specification** per question:
+
+1. **`gt_answer`** — the canonical answer extracted **directly from the source PDF**, written in the author's own words but verifiable against specific pages. Not what the model SHOULD output, but what the document actually SAYS. Length 1-3 sentences.
+2. **`pass_criteria`** — the rubric for what counts as a passing candidate answer. Written as natural-language predicates ("must mention at least 2 of: Coca-Cola, American Express, Apple, Occidental Petroleum, Japanese trading companies"; "must capture the long-term shareholder framing"; "should cite page 13 or the Scorecard section"). Encodes the author's judgment about what's load-bearing for the answer.
+
+This is fundamentally a **specification-by-example** pattern: instead of trying to formalize "is this answer correct?" as a function, you write down both the canonical answer AND the rubric, then ask an LLM judge to apply the rubric to the candidate. The author's judgment is what makes this work — pass_criteria is where the human says "this is what 'correct' MEANS for this question".
+
+`★ Insight ─────────────────────────────────────`
+- **`gt_answer` is the calibration reference; `pass_criteria` is the scoring rule.** Both are needed. Without `gt_answer`, the judge has to infer what's correct from the question alone — which collapses to "does the candidate sound plausible". Without `pass_criteria`, the judge has to guess which parts of `gt_answer` are load-bearing — different judges will weight different aspects.
+- **The author IS the evaluator.** GT-judge centralizes the judgment work into the eval-set authoring step. You pay it once when you write the question; you cash it back every time you run the eval. Entity-recall pretends to be objective by hiding the judgment in the entity bag, but that bag was still authored — just less transparently.
+- **`pass_criteria` is permission to be partial.** It explicitly says "must mention at least 2 of X, Y, Z" rather than "must mention all of X, Y, Z". The "at least 2" framing is the author's call about what counts as a substantive answer. This is the lever you tune to distinguish "the question is multi-aspect and any answer mentioning 2 of 4 holdings is solid" from "the question is single-aspect and the answer is wrong if it misses the one canonical entity".
+`─────────────────────────────────────────────────`
+
+### GT-Judge 3 — Implementation (`src/gt_judge.py` + `data/eval_ground_truth.json`)
+
+```mermaid
+flowchart LR
+    Q([Question]) --> RUN[Tree-v3 retriever<br/>scripts/run_one_variant.py]
+    Q --> GT_LOAD[Load eval_ground_truth.json<br/>question → 'gt_pages, gt_answer, pass_criteria']
+    RUN --> CAND[candidate_answer]
+    GT_LOAD --> JUDGE_IN
+
+    CAND --> JUDGE_IN["score_against_ground_truth<br/>question + gt_answer<br/>+ pass_criteria<br/>+ candidate_answer"]
+    JUDGE_IN --> LLM[Judge LLM<br/>MODEL_SONNET = Gemma-26B<br/>temp=0.0, max_tokens=300<br/>response_format=json_object]
+    LLM --> PARSE{Parse JSON<br/>{'passed': bool,<br/>'rationale': str}}
+    PARSE -->|"valid + 'passed' field"| OUT([passed, rationale])
+    PARSE -->|"LLM error / parse error /<br/>missing field"| FAIL([False, error_message])
+
+    style Q fill:#bdc3c7,color:#222
+    style RUN fill:#f5a623,color:#fff
+    style GT_LOAD fill:#9b59b6,color:#fff
+    style LLM fill:#4a90d9,color:#fff
+    style PARSE fill:#9b59b6,color:#fff
+    style OUT fill:#27ae60,color:#fff
+    style FAIL fill:#e74c3c,color:#fff
+```
+
+**Ground-truth file format** (`data/eval_ground_truth.json`, 16 entries for this lab):
+
+```json
+{
+  "q04_non_controlled_businesses": {
+    "q": "What did Buffett write about non-controlled businesses that leave Berkshire comfortable in 2023?",
+    "gt_pages": [10, 11, 12, 13, 14, 15, 16, 17],
+    "gt_answer": "Buffett describes long-duration partial-ownership positions in non-controlled businesses that leave Berkshire comfortable, primarily Coca-Cola and American Express (each accounting for 4-5% of Berkshire's market value). He emphasizes Berkshire's commitment to these businesses for the long term. Apple is also mentioned as a major equity holding. Occidental Petroleum (27.8% ownership) is highlighted, with admiration for CEO Vicki Hollub. The five Japanese trading houses (Itochu, Marubeni, Mitsubishi, Mitsui, Sumitomo, ~9% each) are also discussed in this section.",
+    "pass_criteria": "Must mention at least 2 of the named non-controlled positions: Coca-Cola, American Express, Apple, Occidental Petroleum, or the Japanese trading companies. Bonus credit for the 'long-term' framing, the 4-5% allocation figures, Vicki Hollub mention, or the 9% Japanese stake. Generic 'Berkshire owns stocks' fails."
+  }
+}
+```
+
+Three fields per entry:
+- **`gt_pages`** (page-number list): which PDF pages the answer is grounded in. Used to validate the judge's own work — if the model claims an answer, we know which pages to verify against. Also useful for citation-validity checks (Open Question 2).
+- **`gt_answer`** (1-3 sentences): the canonical answer in the author's words, extracted from the PDF.
+- **`pass_criteria`** (rubric prose): the load-bearing predicates the judge applies. Author's call on what counts as "captured the substance".
+
+**Judge implementation** (`src/gt_judge.py`, ~60 LoC):
+
+```python
+GT_JUDGE_SYSTEM = """You are an evaluation judge. You receive:
+  - A question about a document
+  - A ground-truth answer extracted directly from the document
+  - The pass criteria for what counts as a correct candidate answer
+  - A candidate answer to evaluate
+
+Decide whether the candidate answer PASSES the criteria. Be strict:
+the candidate must capture the substantive answer, not just mention
+related keywords.
+
+Output strict JSON only:
+  {"passed": true | false, "rationale": "<one-sentence explanation>"}
+
+Use the EXACT JSON schema above. No markdown, no commentary outside the JSON."""
+
+
+def score_against_ground_truth(*, client, model, question, gt_answer,
+                                pass_criteria, candidate_answer) -> tuple[bool, str]:
+    """Binary pass/fail judge. Conservative on errors: parse failures
+    and LLM exceptions return (False, error_message) so a broken judge
+    can never inflate a score.
+    """
+    user_msg = (
+        f"Question:\n{question}\n\n"
+        f"Ground-truth answer (from source document):\n{gt_answer}\n\n"
+        f"Pass criteria:\n{pass_criteria}\n\n"
+        f"Candidate answer:\n{candidate_answer}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=model, temperature=0.0, max_tokens=300,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": GT_JUDGE_SYSTEM},
+                      {"role": "user", "content": user_msg}],
+        )
+    except Exception as e:
+        return False, f"LLM error: {type(e).__name__}: {e}"
+
+    content = (resp.choices[0].message.content or "").strip()
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        return False, f"JSON parse error: {e}; raw={content[:120]!r}"
+
+    if not isinstance(parsed, dict) or "passed" not in parsed:
+        return False, "missing 'passed' field"
+    return bool(parsed["passed"]), str(parsed.get("rationale", ""))
+```
+
+**Walkthrough** — key design choices:
+
+- **`response_format={"type": "json_object"}`**: forces the judge LLM to return parseable JSON. Without this, the model emits "Yes, the candidate passes because..." prose that has to be regex-parsed unreliably. JSON-mode is the cheapest signal-quality lift in the whole pipeline.
+- **`temperature=0.0` + Gemma-26B as judge**: Gemma is the heavyweight model (Phase 7 2-model split). T=0.0 makes the judge deterministic for a given (question, candidate) pair across runs. Variance in the judge would silently corrupt cross-run comparisons.
+- **`max_tokens=300`**: tight cap. The judge only needs to output `{"passed": true, "rationale": "..."}` — 300 tokens is plenty for that and forces concise rationales.
+- **Conservative error handling**: any failure path (LLM exception, JSON parse error, missing `passed` field) returns `(False, error_message)`. Never silently passes a question due to judge malfunction. A bug in the judge can only depress the score, never inflate it.
+- **Judge model is a different family from retriever model**: retriever runs on `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` (Phase 7 hot path); judge runs on `gemma-4-26B-A4B-it-heretic-4bit`. Separating the families reduces the risk of "judge confabulates the same way the retriever did" — different pretraining biases give independent verdicts.
+
+**Wiring into the eval runner** (`scripts/run_one_variant.py`):
+
+```python
+gt_qs = load_ground_truth(_LAB_ROOT / "data/eval_ground_truth.json")
+
+for q_idx, (q, ty, exp) in enumerate(eval_set):
+    out = retriever.answer(q)
+    ans = out["answer"]
+
+    # PRIMARY: GT-judge (when ground truth is authored for this Q)
+    gt_pass: bool | None = None
+    gt_rationale = ""
+    if q in gt_qs:
+        gt_pass, gt_rationale = score_against_ground_truth(
+            client=omlx, model=os.getenv("MODEL_SONNET", ""),
+            question=q, gt_answer=gt_qs[q]["gt_answer"],
+            pass_criteria=gt_qs[q]["pass_criteria"],
+            candidate_answer=ans,
+        )
+
+    # LEGACY: entity-recall (kept as side-by-side column for methodology comparison)
+    judge, _ = score_llm_judge(q, ans, exp)
+    rows.append({"q": q, "gt_pass": gt_pass, "judge": judge, ...})
+
+# Aggregate
+agg_gt_pass_rate = sum(1 for r in rows if r["gt_pass"]) / gt_evaluated_count
+```
+
+The two metrics run side-by-side on every question. Live screen output:
+
+```
+[v2][section-specif] What were Berkshire's revenues  GT=PASS judge=1.00 sub=1.00 lat=22.3s iters=2
+[v2][cross-section ] What did Buffett describe as... GT=PASS judge=0.25 sub=0.25 lat=62.6s iters=3
+```
+
+The disagreement column is the value-add. Q3 above shows GT=PASS / entity-judge=0.25 — that's a +0.75 disagreement event, surfacing an entity-recall undercount in real time.
+
+### GT-Judge 4 — Validation workflow (calibration runs + disagreement tracking)
+
+Adopting a new judge is itself a methodology change that needs evidence. The Phase 8 introduction of GT-judge was validated through a two-step process:
+
+1. **Selective deployment first**: GT-judge wired into `compare_three_v3.py` ONLY for the 4 known-bad questions (Q3, Q9, Q11, Q12) where entity-recall had visibly mis-scored. This produced the first disagreement data — Q3 `entity=0.25 → GT=PASS`, Q9 `entity=0.67 → GT=FAIL`, Q11 `1.00 → PASS` (agreement), Q12 `0.50 → PASS`. The agreement on Q11 + the directional disagreement on Q3/Q9/Q12 confirmed the judge wasn't systematically biased in either direction.
+
+2. **Full-portfolio rollout**: GT-judge then wired as the PRIMARY metric for all 16 questions in `run_one_variant.py` (Phase 9 Block 4). Entity-recall was preserved as a legacy side-by-side column so disagreements remain visible per run.
+
+**Disagreement tracking — what to watch**:
+
+| Pattern | Reading | Action |
+|---|---|---|
+| GT=PASS + entity high (≥0.75) | Agreement on success | Good. Both metrics happy. |
+| GT=FAIL + entity low (≤0.25) | Agreement on failure | Good. Both metrics flag the bug. |
+| **GT=PASS + entity low** | Entity-recall **false negative** — substantively correct answer that used synonyms / focused on framing rather than enumerating | Trust GT-judge. Update entity bag IF the eval set will outlast this run (e.g. add synonyms) — but architectural decisions should anchor to GT-judge. |
+| **GT=FAIL + entity high** | Entity-recall **false positive** — hallucination or wrong-citation answer that happens to contain the keyword bag | This is the dangerous one. Trust GT-judge. Investigate WHY the keywords appeared without the substance (training-memory hallucination? fake citation?). Q9 was this case. |
+
+**Cross-run consistency check**: the Phase 9 progression shows the validation. Two consecutive 16-Q runs at GT-judge 0.938 and 1.000 (after fixes) while entity-recall went 0.865 → 0.818 in the opposite direction. Two metrics moving opposite ways on the SAME run is the smoking gun for entity-recall mismeasuring synthesis quality. If both had moved together, the rebrand would have been cosmetic; the opposite movement is the evidence.
+
+### GT-Judge 5 — Limitations + when NOT to use it
+
+GT-judge is not free. It carries trade-offs that you have to be honest about.
+
+| Limitation | Detail | Mitigation |
+|---|---|---|
+| **Authoring cost** | Every question needs hand-curated `gt_answer` + `pass_criteria`. ~5-10 minutes per question if the source is familiar; longer if you have to skim the source PDF first. For a 100-Q eval set that's 8-16 hours of work. | Author incrementally — start with 5-10 questions covering the categories you care about, add over time. Don't try to ground-truth a whole benchmark upfront. |
+| **Judge model dependency** | A different judge model gives different verdicts. Swapping Gemma-26B for GPT-4o would re-baseline every score. | Fix the judge model + temperature + prompt at the start of a project; treat it as part of the eval-set version. Annotate aggregate numbers with judge identity. |
+| **Cost per eval run** | 1 extra LLM call per question. For 16-Q eval that's 16 extra calls (~30s wall-time on Gemma-26B). For 1000-Q eval it adds non-trivial cost. | Use a smaller judge for triage runs, full judge for release runs. The Gemma-26B judge is overkill for clearly-passing factoid questions; a smaller model would suffice. |
+| **Multi-aspect rubric ambiguity** | `pass_criteria` can encode either "must mention at least 2 of [list]" or "must mention all of [list]" — these give different scores. Author has to pick. | Be explicit in the rubric ("at least N of [list]"). Avoid "etc." or "things like" — they push judgment back onto the LLM judge unpredictably. |
+| **Judge LLM can be wrong** | Especially on borderline cases. Q14 in the Phase 9 eval: candidate said "pages 99-147" when correct range is 99-141; judge accepted as "slightly extended" but pages 142-147 are Exhibits Index, not Notes — substantively wrong. | Spot-audit judge rationales periodically. If you see "slightly", "roughly", "close enough" patterns in the rationale, suspect tolerance-creep and tighten the rubric. |
+| **Not appropriate for production user-facing answers** | GT-judge requires the question to be in the eval set with pre-authored ground truth. It cannot score live user queries. | Use GT-judge for architectural decisions only. Production observability needs different signals (refusal rate, citation rate, latency, user feedback). |
+
+**When NOT to use GT-judge**:
+
+- **Pure factoid retrieval with deterministic right answers** ("What year did Berkshire IPO?"). Entity-recall or substring match is sufficient. GT-judge is over-engineered for this.
+- **Live production scoring**. GT-judge requires pre-authored ground truth per question; production sees novel queries.
+- **Benchmark comparison across labs that use different judges**. The judge model is part of the methodology — your GT-judge 0.95 isn't comparable to someone else's GT-judge 0.92 if they used a different model.
+- **Quick "did I break it" sanity checks during development**. Entity-recall is faster and good enough for catching obvious regressions. Reserve GT-judge for release-gate and architectural-decision runs.
+
+**Production parallel**: in real RAG systems, you typically run a **two-tier eval**:
+
+1. **Tier 1 (fast, continuous)** — automated metrics on every commit: retrieval recall@K, citation-presence rate, refusal rate, latency p50/p95. Cheap, deterministic, catches regressions.
+2. **Tier 2 (slow, gated)** — GT-judge or human eval on a fixed benchmark before each release. Expensive, judgment-bearing, catches what Tier 1 misses (substance correctness, hallucinations, format failures).
+
+The lab uses Tier 2 only because the corpus is small enough (1 PDF, 16 questions) to afford running GT-judge on every change. A real deployment with 1000s of documents and 100s of evals would need both tiers.
+
+`★ Insight ─────────────────────────────────────`
+- **GT-judge is a methodology, not a tool.** Swapping the entity-bag scorer for the GT-judge function is the 1-day code change; the actual investment is authoring 16 pieces of ground truth. The function is ~60 LoC. The eval set authoring is where the value lives.
+- **The biggest risk is `pass_criteria` drift.** As the author iterates on the eval set, "must mention X, Y, Z" gradually becomes "must mention at least 2 of X, Y, Z, W" becomes "should capture the framing of long-term ownership". Each loosening sounds reasonable in isolation but the eval set quietly grades on a curve. Snapshot pass_criteria at the start of a measurement campaign + check git diff before treating cross-run deltas as architecture evidence.
+- **GT-judge surfaces methodology bugs that entity-recall hides.** Q9's hallucination was always there — entity-recall just gave it 0.67 partial credit. The architecture wasn't broken; the eval was lying. Fixing the eval revealed the architectural bug (truncation cap), which was fixed in Phase 9. Without GT-judge, the Q9 hallucination ships forever.
+- **The two-metric side-by-side display is non-negotiable during migration.** Showing `GT=PASS judge=0.25 sub=0.25` lets the author see disagreement events live and decide whether the entity bag needs updating, whether the rubric is too loose, or whether the architecture actually changed. Hide one metric and you lose calibration evidence.
+`─────────────────────────────────────────────────`
+
+---
+
 ## Production Considerations — Storage, Concurrency, Observability
 
 > **Cross-ref:** the storage decision below is tree-index-specific (tree.json + PDF + page_provider). The cross-cutting generalization for any persistent-state decision (vector indexes, graph data, eval harnesses, agent memory, audit logs) lives at [[Engineering Decision Patterns#Pattern 13 — Storage-Scale Match (right backend for current scale, no premature scaling)]] — three-tier template + four data-shape mapping rules + three documented anti-patterns + 5-second sanity test. Read Pattern 13 first if you're making the storage decision for a non-tree-index artifact; come back here for the W2.7-specific shape.
