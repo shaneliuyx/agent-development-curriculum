@@ -358,30 +358,29 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** Multi-agent shared memory is a distributed-systems primitive in miniature. SQLite WAL + atomic-claim locks is the same pattern as Postgres advisory locks or DynamoDB conditional writes. Guild proves you don't need a Raft cluster or a service mesh to coordinate agents — embedded SQLite + careful schema design handles single-host parallel-agent workloads. When you DO need cross-host coordination, the pattern transfers to a real distributed lock service (Consul / etcd) without architectural rework — same primitive, different physical substrate.
 
-### Week 3.5.7 — Memory Eval Benchmark Lab (LongMemEval vs DIY) (half-week insert, ~4–6h)
-> Detailed runbook: [[Week 3.5.7 - Memory Eval Benchmark]] *(brief; runbook generated on demand)*
+### Week 3.5.8 — Two-Tier Memory Architecture (guild + EverCore) (half-week insert, ~6–8h)
+> Detailed runbook: [[Week 3.5.8 - Two-Tier Memory Architecture]] *(brief; chapter file written)*
 
-**Theory (1–2h).**
-- Read: [LongMemEval](https://github.com/xiaowu0162/LongMemEval) paper + dataset format (the canonical 500-turn-conversation memory benchmark). [LoCoMo](https://github.com/snap-research/locomo) for the other industry-standard benchmark. [EverOS evaluation README](https://github.com/EverMind-AI/EverOS/tree/main/methods/EverCore/evaluation) for how a production system structures its benchmark harness.
+The capstone of the W3.5 cluster. W3.5 built single-agent memory; W3.5.5 added multi-agent coordination via guild; W3.5.8 wires guild (operational tier) and EverCore (semantic tier) into a single production-shaped two-tier architecture with an explicit consolidation pipeline between them. Includes the LongMemEval benchmark from the retired W3.5.7 as Phase 5's measurement step.
+
+**Theory (1.5h).**
+- Read: the biological-memory analogy — hippocampus (fast-write, short-term, coordination) + neocortex (slow-write, durable, semantic) + memory consolidation during sleep. [Letta (formerly MemGPT) paper](https://arxiv.org/abs/2310.08560) for the canonical RAM↔archive two-tier in agent systems. [LongMemEval](https://github.com/xiaowu0162/LongMemEval) + [LoCoMo](https://github.com/snap-research/locomo) for industry-standard memory benchmarks. EverOS's `methods/EverCore/evaluation/` for production-grade benchmark harness shape.
 - Master:
-  - What LongMemEval measures (single-session-user / multi-session-user / temporal-reasoning / knowledge-update / abstention — 5 categories of long-conversation memory recall)
-  - Why DIY 15-Q recall benchmarks are non-comparable to LongMemEval (different conversation length, different judge methodology, different category mix)
-  - The two-tier eval discipline (fast DIY benchmark on every commit + slow industry benchmark before release)
-  - HuggingFace dataset publishing as the production discipline for benchmark results
+  - WHEN to use each tier (atomic-claim → guild; semantic recall → EverCore; never the reverse)
+  - The consolidation pipeline as the load-bearing pattern (when to consolidate, what to consolidate, idempotency + ordering)
+  - The cache-aside / Debezium-style data-movement analogy from data engineering
+  - Why two-tier beats single-tier on cross-session-AND-cross-agent questions
 
-**Lab (3–4h) — `lab-03.5.7-memory-eval-bench`.**
-1. Clone `EverMind-AI/EverOS`, follow `methods/EverCore/docs/installation/SETUP.md` to bring up the Docker stack (Postgres + EverCore service at `localhost:1995`). ~30 min one-time setup.
-2. Download the LongMemEval `oracle` subset (smallest tier) — ~50 questions, ~25K-token conversations.
-3. Write a thin Python client (`bench_client.py`) that hits BOTH:
-   - **Your W3.5 DIY system** (mem0+Qdrant+SQLite, via `remember_turn` + `recall`)
-   - **EverCore** via its HTTP API at `localhost:1995`
-4. Run the LongMemEval `oracle` subset against both systems. Capture per-category pass rate + mean latency + total tokens.
-5. Write `RESULTS.md` comparison matrix: DIY-W3.5 vs EverCore vs published EverCore score (LoCoMo 93.05%, LongMemEval 83%). Account for tier difference if you used `oracle` not full set.
-6. Publish results dataset to a private HuggingFace dataset (mirror EverOS's discipline). Optional but interview-quotable.
+**Lab (5–6.5h) — `lab-03.5.8-two-tier-memory`.**
+1. **Phase 1 — Bring up both services (~30min)**: guild via homebrew install + EverCore via docker compose. Verify both reachable with smoke-test scripts.
+2. **Phase 2 — Two-tier Python orchestrator (~2h)**: build `TieredMemory(guild_client, evercore_client)` wrapper with `claim_task() / complete_task(scroll) / query_context(query) / consolidate()` methods. guild handles claim+scroll; EverCore handles semantic query+imprint.
+3. **Phase 3 — Consolidation pipeline (~1.5h)**: batch job that pulls closed scrolls from guild, extracts task summaries, imprints them into EverCore as semantic memories. Idempotency via scroll_id deduplication; ordering via timestamp. Tests for both.
+4. **Phase 4 — Two-agent shared-knowledge demo (~1.5h)**: agent A completes a task in session 1 → consolidation runs → agent B starts session 2 with cross-session context retrieved from EverCore, then claims next quest in guild.
+5. **Phase 5 — Four-way benchmark (~1.5h)**: same 15-Q multi-agent recall, run against (a) no-memory baseline, (b) guild-only, (c) EverCore-only, (d) **two-tier**. Optional extension: run LongMemEval `oracle` subset for industry-standard scoring (carries the retired W3.5.7's purpose into this lab's Phase 5).
 
-**Exit criteria.** 90-second answer to "how do you benchmark a memory system properly?" — name the industry-standard benchmarks (LongMemEval + LoCoMo), distinguish them from DIY-recall ones, cite both your DIY system's score AND EverCore's score on the same subset, articulate the two-tier eval discipline (continuous DIY + release-gate industry-standard). Bonus: explain why HuggingFace-as-result-store is the right production primitive (versioned, reproducible, shareable).
+**Exit criteria.** 90-second answer to "how would you architect memory for a multi-agent system?" — name the two-tier pattern (operational + semantic), the biological analogy (hippocampus + neocortex + REM-sleep consolidation), the consolidation pipeline (REM-sleep-style batch transfer with idempotency + ordering). Cite the measured 4-way benchmark differential — two-tier should beat each single-tier by ≥10% on cross-session questions. Articulate WHY each system is wrong for the OTHER's job. Bonus: name Letta as the canonical production parallel.
 
-**Infra bridge.** Memory-system benchmarking is the same shape as data-quality dashboards in DE: continuous lightweight signals (your 15-Q for every commit, like a `dbt test`) + heavyweight gated runs before release (LongMemEval for major changes, like a `Great Expectations` suite run). Score-vs-baseline comparison is the gating discipline; the actual benchmark is the artifact you point at when interviewers ask "how did you measure?".
+**Infra bridge.** Two-tier memory is the cache-aside pattern applied to agent state. guild is Redis-tier (hot, sub-100ms, ephemeral). EverCore is Postgres-tier (cold, slower, durable, semantic-indexable). The consolidation pipeline is Debezium / Kafka Connect moving rows from transactional → analytical store — same primitive, different artifact. Pattern transfers directly to any agent system where short-term coordination and long-term institutional knowledge have different access patterns.
 
 ### Week 3.7 — Agentic RAG (half-week insert, ~6–8h)
 > Detailed runbook: [[Week 3.7 - Agentic RAG]]
@@ -1751,7 +1750,7 @@ Useful modifiers you can add to any generation request:
 | 2.7 | [[Week 2.7 - Structure-Aware RAG]] | PageIndex / tree-index RAG on Berkshire 2023 annual report (152 pages); 4-index architecture (LLM tree + K-means cluster + entity reverse-index + BGE-M3 hybrid page-vector fallback); agentic multi-iter loop with cluster pre-fetch + BUDGET EXHAUSTED 5-rule synthesis + chunk-level fallback; same-corpus three-way comparison vs vector + graph; per-Python-block bundle structure (mermaid → code → walkthrough → result → insight); GT-judge methodology (binary pass/fail against PDF-grounded `pass_criteria`) replaces entity-recall; Phase 9 ceiling = **16/16 = 1.000** (vector 0.500, graph 0.375 — graph DOES degenerate on single-document corpora under GT-judge; the May 7 "refuted" reading was an entity-recall artifact, see Phase 8 Block 1) |
 | 3.5 | [[Week 3.5 - Cross-Session Memory]] | mem0 + Qdrant + SQLite dual-store; recall/remember REPL; 3-session demo proving cross-session recall; 15-Q recall benchmark with contradiction-update + multi-fact composition tests; production-comparator section reading `mathomhaus/guild` after lab completion |
 | 3.5.5 | [[Week 3.5.5 - Multi-Agent Shared Memory]] | Install `mathomhaus/guild` (Go MCP server, single binary, embedded SQLite, BM25+dense+RRF retrieval); two parallel MCP clients (Claude Code + Cursor) sharing one substrate; atomic-claim scenario proving exactly-one-winner lock; 3-act cross-session handoff (A → B → C scroll chain); side-by-side W3.5-vs-guild comparison matrix; 15-Q multi-agent recall benchmark (same-agent + cross-agent + contradiction-during-parallel-work) |
-| 3.5.7 | [[Week 3.5.7 - Memory Eval Benchmark]] | Clone `EverMind-AI/EverOS` + docker-compose EverCore service at localhost:1995; run LongMemEval `oracle` subset (~50 Q) against BOTH W3.5 DIY system AND EverCore via HTTP API; comparison matrix vs published EverCore scores (LoCoMo 93.05% / LongMemEval 83%); two-tier eval discipline (DIY 15-Q continuous + industry standard gated); optional HuggingFace dataset publish for results |
+| 3.5.8 | [[Week 3.5.8 - Two-Tier Memory Architecture]] | Two-tier capstone of the W3.5 cluster. Phase 1 spin up guild + EverCore. Phase 2 build `TieredMemory` Python wrapper (claim_task / complete_task / query_context / consolidate). Phase 3 consolidation pipeline (closed scrolls → EverCore imprints, idempotent + ordered). Phase 4 two-agent shared-knowledge demo (A in session 1 → consolidate → B in session 2 has cross-session context). Phase 5 four-way benchmark (no-mem / guild-only / EverCore-only / two-tier) + optional LongMemEval `oracle` subset. Biological analogy (hippocampus + neocortex + REM-sleep consolidation); Letta as the canonical production parallel. |
 | 3.7 | [[Week 3.7 - Agentic RAG]] | Phase 1-4: LangChain official 5-node Agentic RAG notebook end-to-end + head-to-head vs Week 3 single-pass on 50-Q dev set + CRAG variant + decision tree (when help vs hurt). Phase 6: hand-rolled Self-RAG + CRAG baseline ported from `shaneliuyx/rag` to current stack (Qdrant + oMLX + `shared/rag_hybrid`). Phase 7: query decomposition with topological execution (DAG-based planning, IRCoT-style). Phase 8: FastMCP server wrapper exposing the lab as 3 tools (`rag_query`, `rag_status`, `rag_decompose`) consumable from Claude Desktop / Cursor — first MCP-server pattern in the curriculum |
 | 4 | [[Week 4 - ReAct From Scratch]] | (1) 150-line `react.py` with no framework; (2) 4 local tools (search, repl, read_file, write_file); (3) SQLite trace logging; (4) 15+ bad-case scenarios with a before/after diff per patch; (5) `RESULTS.md` with failure-mode table |
 | 5 | [[Week 5 - Pattern Zoo]] | 4 parallel implementations (ReAct, Plan-and-Solve, Reflexion, Orchestrator-Worker) on one task ("research + 1-page summary"); LLM-as-judge rubric scoring; cost/latency/quality 4-way comparison |
