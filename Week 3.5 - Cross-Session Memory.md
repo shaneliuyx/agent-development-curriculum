@@ -752,7 +752,11 @@ Target: 12 of 15 passing. Write the failing cases into the bad-case journal.
 
 ---
 
-## Production Comparator — `mathomhaus/guild` (read after completing the lab)
+## Production Comparators — read after completing the lab
+
+Two production-shaped systems worth studying after you've shipped the canonical lab. They solve overlapping problem spaces with different architectures; reading them gives a real comparator for your DIY mem0+Qdrant+SQLite design. **Read in order** — guild first (smaller surface, faster orientation), EverOS second (full research-grade stack).
+
+### Comparator 1 — `mathomhaus/guild`
 
 After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min reading [`mathomhaus/guild`](https://github.com/mathomhaus/guild) (Apache-2.0, Go, single binary, embedded SQLite) as a production-shaped reference for the same problem space. Guild is an MCP-protocol-native agent-memory server with hybrid (BM25 + dense embedding + RRF fusion k=60) retrieval and atomic-lock primitives for parallel-agent coordination. The mythos vocabulary (Gates / Guild / Quest / Scroll / Lore / Oath) maps onto familiar memory primitives, listed below.
 
@@ -787,6 +791,60 @@ After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min rea
 - **The mythos vocabulary is a real design choice, not just flavor.** "Lore" as semantic memory + "Oath" as procedural principle has the advantage of being meaningful to non-ML readers (product managers, designers). The disadvantage in interviews: requires translation back to ML terms. Use ML terms in interview answers; cite guild as the production parallel.
 - **The Go-vs-Python stack difference exposes a real production tradeoff**: guild's single binary + embedded SQLite is operationally cleaner than mem0 + Qdrant + SQLite (3 processes, 2 storage engines). The cost is harder to extend without Go knowledge. For lab work and rapid iteration, Python wins. For production deployment, single-binary Go is the safer ops shape. Both are valid — the choice is product-driven, not technical.
 - **Future W3.5.5 supplement (multi-agent shared memory) uses guild as the substrate.** Your single-agent lab is the prerequisite — finish here, then graduate to multi-agent coordination in W3.5.5 if your roadmap calls for it.
+`─────────────────────────────────────────────────`
+
+### Comparator 2 — `EverMind-AI/EverOS` (research-grade, published benchmark scores)
+
+[EverOS](https://github.com/EverMind-AI/EverOS) (Apache 2.0, Python 3.12, 4.6K stars as of May 2026, actively maintained) is a research-grade memory operating system for self-evolving agents. Where guild is "single-binary multi-agent coordination", EverOS is "full-stack memory architecture + benchmarks". Three components to study:
+
+| Part | What it is | Why it matters |
+|---|---|---|
+| **EverCore** | The reference memory architecture — biological-imprinting-inspired self-organizing LTM | LangGraph + Postgres + LangChain stack. Internal package name `memsys`, exposes HTTP API at `localhost:1995`. Backed by arXiv:2601.02163. |
+| **HyperMem** | Hypergraph memory architecture | Multi-entity relational memory primitive your DIY lab doesn't cover. Closer to W2.5 GraphRAG ontology than to W3.5 SCD-2. |
+| **EverMemBench + EvoAgentBench** | Open evaluation suites for memory quality + agent self-evolution | EverCore reports **LoCoMo 93.05% / LongMemEval 83.00%** — industry-standard numbers. Your DIY lab's 15-Q recall benchmark is non-comparable to these. |
+
+**Side-by-side mapping — your lab vs guild vs EverOS**:
+
+| Dimension | Your W3.5 lab | guild | EverOS / EverCore |
+|---|---|---|---|
+| Stack | mem0 + Qdrant + SQLite (Python) | Single Go binary + embedded SQLite | LangGraph + Postgres + LangChain (Python 3.12) |
+| Deployment | Python venv + Docker (Qdrant) | One binary | Docker compose stack (Postgres + services) |
+| Memory architecture | 4 types (working/episodic/semantic/procedural) | Quest/Scroll/Lore/Oath | EverCore (LTM-OS) + optional HyperMem (hypergraph) |
+| Multi-agent | No | YES (atomic claims) | Partial (server is single-host) |
+| Hypergraph memory | No | No | YES (HyperMem) |
+| Self-evolving agent loop | No | Partial | YES (core focus) |
+| Eval methodology | DIY 15-Q recall | DIY | **LoCoMo + LongMemEval** (industry standard) |
+| Pip-installable library | N/A (your own code) | N/A (Go binary) | NO — internal package `memsys`, install from source only |
+| Integration shape | Direct Python imports | HTTP API via MCP | HTTP API at `localhost:1995` |
+| Research backing | None | None | arXiv paper + HuggingFace org + Discord |
+
+**Why EverOS is NOT a drop-in Python library**:
+
+- The Python package inside `methods/EverCore/` is named `memsys`, NOT published to PyPI. You'd have to `git clone EverOS && cd methods/EverCore && uv sync && docker compose up -d`.
+- Requires Python 3.12 (your W3.5 lab uses 3.11). Separate venv needed.
+- Backed by LangGraph + LangChain + Postgres + scikit-learn + numpy — full stack, not a lightweight lib.
+- Server runs as a SEPARATE process at `localhost:1995`. Clients talk to it via HTTP API.
+
+**Correct integration shape — HTTP-API-as-comparator**: run EverCore as a docker-compose service alongside your DIY lab; point a thin Python client at its API; benchmark side-by-side against your DIY system on the SAME questions. This is the W3.5.7 supplemental lab — see curriculum overview.
+
+**What to read in EverOS source (in order)**:
+
+1. `methods/EverCore/README.md` — system-level overview
+2. `methods/EverCore/src/` — the `memsys` package: extraction, retrieval, evolution logic
+3. `methods/EverCore/evaluation/` — LongMemEval + LoCoMo runners. **This is the most portable artifact** — you can lift the eval harness pattern even if you don't run EverCore itself.
+4. `benchmarks/EverMemBench/` — the benchmark dataset + task definitions
+
+**Three production insights worth importing into your W3.5 BCJ**:
+
+- **Memory quality has industry-standard benchmarks**. Your DIY 15-Q is fine for correctness sanity; LoCoMo + LongMemEval are the published standards for "is my memory system competitive". The gap between "I built a memory system" and "I built a memory system that scores X on LongMemEval" is the senior-engineer signal in interviews.
+- **HuggingFace dataset publishing** ([EverMind-AI/everos_Eval_Results](https://huggingface.co/datasets/EverMind-AI/everos_Eval_Results)) is the production discipline. Eval results live as a versioned dataset, not a one-off notebook. Worth adopting for your own future work.
+- **Biological-imprinting framing** — the EverCore design metaphor — is non-obvious. Most memory systems frame as database-with-eviction; EverCore frames as imprinting + consolidation + reorganization. The vocabulary affects API design ("imprint" vs "store", "consolidate" vs "update"). Same shape as guild's mythos vocabulary — deliberate naming as a design lever.
+
+`★ Insight ─────────────────────────────────────`
+- **EverOS and guild are complementary, not competing**. guild's multi-agent atomic-claim primitive doesn't exist in EverOS (single-host scope); EverOS's hypergraph + research-grade benchmarks don't exist in guild. The W3.5 production-comparator slot legitimately holds BOTH.
+- **The 4.6K-star / arXiv-paper / HuggingFace-dataset combination signals "this is canonical reference material" for memory-of-agents work in 2026.** Interviewers at China-headquartered AI shops, academic labs, or memory-focused agent startups likely know it. For your portfolio, citing EverCore's LongMemEval 83% and saying "my DIY 15-Q hit 15/15 but doesn't measure the same surface; I'd need to run LongMemEval to compare" is the right calibration.
+- **The "Python lib vs HTTP service" distinction is a real product call**: when you control deployment, embedding the lib in-process is cheaper. When you have multiple consumer agents in different languages, HTTP service is the right abstraction. EverOS chose HTTP service because of the multi-language consumer use case (Browser Agent, iOS app, MCO orchestrator — all in their use-cases gallery use the API). Your lab is single-Python so in-process makes sense.
+- **The W3.5.7 supplemental lab** turns these references into measurable: clone EverOS, run docker compose, point a benchmark client at it, score the DIY lab AND EverCore on a LongMemEval subset, write the comparison matrix. ~4-6h end-to-end.
 `─────────────────────────────────────────────────`
 
 ---
