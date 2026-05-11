@@ -239,7 +239,18 @@ uv venv --python 3.11 && source .venv/bin/activate
 uv pip install mem0ai qdrant-client openai python-dotenv pytest sentence-transformers
 ```
 
-> **Why `sentence-transformers`**: oMLX (the menu-bar app on :8000) serves **chat** models only by default — embedding models are NOT registered. The lab originally called `omlx.embeddings.create(model="bge-m3", ...)` which fails with `404 Model 'bge-m3' not found` on a stock oMLX install. The fix is to load BGE-M3 **in-process** via `sentence-transformers` (~1 GB model + torch + MPS backend on Apple Silicon). Trade-off: one extra GB of resident memory; benefit: zero second-server dependency. See Phase 2.1 `embed()` for the in-process pattern.
+**Embedding model setup — recommended path (oMLX serves BGE-M3)**:
+
+oMLX supports embedding models including BGE-M3 (see [jundot/omlx README](https://github.com/jundot/omlx) — types supported: LLM, VLM, OCR, embedding, reranker). A fresh oMLX install ships chat models only — you need to add the embedding model explicitly. Two options:
+
+1. **Via oMLX admin dashboard** (easiest): open `http://localhost:8000/admin/chat`, find the model-download UI, search for `bge-m3`, download. Restart oMLX → `bge-m3-mlx-fp16` (or similar id) appears in `/v1/models`.
+2. **Via HuggingFace CLI manual placement**: `huggingface-cli download mlx-community/bge-m3-mlx-fp16 --local-dir ~/.omlx/models/bge-m3-mlx-fp16` → restart oMLX.
+
+Verify the model is registered: `curl -H "Authorization: Bearer $OMLX_API_KEY" http://localhost:8000/v1/models | grep -i bge`. Once the model id appears, `embed()` will use the oMLX-served endpoint (no Python-side model load, much lower resident memory per process).
+
+**Embedding fallback — in-process (`USE_LOCAL_EMBED=1`)**: if you can't / don't want to add the model to oMLX, set `USE_LOCAL_EMBED=1` in `.env`. The lab will load BGE-M3 in-process via `sentence-transformers` (~1 GB resident, MPS device on Apple Silicon). Slower at module import (10s first load); offline-capable.
+
+`sentence-transformers` stays in the dependency list so the fallback path always works even on a fresh oMLX install that hasn't been configured yet.
 
 ### 1.2 Environment
 
@@ -249,11 +260,11 @@ OMLX_BASE_URL=http://localhost:8000/v1
 OMLX_API_KEY=Shane@7162
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
+EMBED_MODEL=bge-m3-mlx-fp16    # oMLX-served embedding model id; see Phase 1.1
+USE_LOCAL_EMBED=0              # set to 1 to bypass oMLX + use in-process
+                               # sentence-transformers BGE-M3 fallback
 QDRANT_URL=http://localhost:6333
 SQLITE_PATH=data/memory.db
-# NOTE: no embedding-server URL — BGE-M3 runs in-process via sentence-transformers.
-# If you later switch to an embedding server (mlx-openai-server with bge-m3
-# on a different port), add EMBED_BASE_URL=... and edit embed() accordingly.
 ```
 
 Your Qdrant instance from Week 1 is fine — we'll create a dedicated collection `user_memories`.
@@ -320,7 +331,6 @@ from typing import Literal
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -329,14 +339,17 @@ qdrant = QdrantClient(url=os.getenv("QDRANT_URL"))
 SQLITE = os.getenv("SQLITE_PATH")
 MODEL  = os.getenv("MODEL_SONNET")
 HAIKU  = os.getenv("MODEL_HAIKU")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3-mlx-fp16")
 COLLECTION = "user_memories"
 
-# In-process BGE-M3 dense embedder. oMLX does NOT serve embedding
-# models by default — only chat models. Loading BGE-M3 directly via
-# sentence-transformers avoids the second-server dependency and
-# matches the W2.7 PageVectorIndex / W2.5 GraphRAG patterns.
-# device="mps" uses Apple Silicon GPU via PyTorch MPS backend.
-_embedder = SentenceTransformer("BAAI/bge-m3", device="mps")
+# Dual-path embedding: default oMLX-served BGE-M3 (low resident memory,
+# shared across processes); fallback in-process sentence-transformers
+# when USE_LOCAL_EMBED=1 (offline-capable, ~1 GB per process).
+_USE_LOCAL = os.getenv("USE_LOCAL_EMBED", "0") == "1"
+_local_embedder = None
+if _USE_LOCAL:
+    from sentence_transformers import SentenceTransformer
+    _local_embedder = SentenceTransformer("BAAI/bge-m3", device="mps")
 
 # Bootstrap Qdrant collection (idempotent)
 if not qdrant.collection_exists(COLLECTION):
@@ -363,10 +376,14 @@ Skip trivia. Do not invent facts. If nothing memorable, return empty lists."""
 
 
 def embed(text: str) -> list[float]:
-    # In-process BGE-M3 dense vector (1024-dim, L2-normalized).
-    # normalize_embeddings=True so cosine and dot product agree.
-    vec = _embedder.encode([text], normalize_embeddings=True)[0]
-    return vec.tolist()
+    """1024-dim L2-normalized BGE-M3 vector. Default path is oMLX-served
+    (low resident, shared across processes); fallback is in-process
+    sentence-transformers when USE_LOCAL_EMBED=1."""
+    if _local_embedder is not None:
+        vec = _local_embedder.encode([text], normalize_embeddings=True)[0]
+        return vec.tolist()
+    r = omlx.embeddings.create(model=EMBED_MODEL, input=text)
+    return r.data[0].embedding
 
 
 def extract_memories(user_msg: str, assistant_msg: str) -> dict:
@@ -869,8 +886,10 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 
 **Entry 6 — `recall()` crashes with `404 Model 'bge-m3' not found` on first user message.**
 *Symptom:* Fresh-install agent, `python -m src.chat --user alice` starts, REPL prompts for input, first message crashes with `openai.NotFoundError: Error code: 404 - {'error': {'message': "Model 'bge-m3' not found. Available models: Gemma-4-..., Qwen3.6-..., gpt-oss-20b-..."}}`. Connection IS established (oMLX is running), but `embed()` calls `omlx.embeddings.create(model="bge-m3", ...)` and gets a 404.
-*Root cause:* oMLX (the Apple Silicon menu-bar inference server) ships with chat models registered by default — embedding models are NOT included. The lab's original `embed()` assumed oMLX would route `bge-m3` to an embedding endpoint; on a stock install, it doesn't. Connection succeeds (server up, auth OK) but the model name is unknown. Earlier symptom of the same root cause is `Connection refused` if oMLX itself isn't running — the layered failure mode hides which dependency is missing.
-*Fix:* Load BGE-M3 **in-process** via `sentence-transformers` with `device="mps"` on Apple Silicon. One extra GB resident memory, zero second-server dependency. Add `sentence-transformers` to the Phase 1 install line (`uv pip install ... sentence-transformers`). Rewrite `embed()` to use `_embedder.encode([text], normalize_embeddings=True)[0].tolist()`. **Discipline rule:** check what each "running" service ACTUALLY serves, not just whether the port is open. Phase 1 setup table now lists per-service smoke tests (e.g. `curl /v1/models` must return `bge-m3` in the list if you keep the original two-server design).
+*Root cause:* oMLX *supports* embedding models (BERT, BGE-M3, ModernBERT — see [jundot/omlx README](https://github.com/jundot/omlx)) but ships with chat models only by default. The lab's original `embed()` assumed `bge-m3` would already be registered. Connection succeeds (server up, auth OK) but the model name is unknown until you explicitly add it. Earlier symptom of the same root cause is `Connection refused` if oMLX itself isn't running — the layered failure mode hides which dependency is missing.
+*Fix (recommended, oMLX-served):* Download an MLX-converted BGE-M3 into `~/.omlx/models/bge-m3-mlx-fp16/` (e.g. `huggingface-cli download mlx-community/bge-m3-mlx-fp16 --local-dir ~/.omlx/models/bge-m3-mlx-fp16` or via oMLX admin dashboard). Restart oMLX. Set `EMBED_MODEL=bge-m3-mlx-fp16` in `.env`. `embed()` then calls `omlx.embeddings.create(model=EMBED_MODEL, input=text)`. Verify with `curl -H "Authorization: Bearer $OMLX_API_KEY" http://localhost:8000/v1/models | grep bge` — model id must appear.
+*Fix (fallback, in-process):* Set `USE_LOCAL_EMBED=1` in `.env`. `embed()` then uses `sentence-transformers` BGE-M3 with `device="mps"`. One extra GB resident per process, zero second-server dependency, offline-capable. `sentence-transformers` stays in `requirements` so this path always works.
+*Discipline rule:* check what each "running" service ACTUALLY serves, not just whether the port is open. Phase 1 setup table now lists per-service smoke tests (e.g. `curl /v1/models` must return your embedding model id). Code stays dual-mode behind one env-var toggle so the lab works either way and ships a clean fallback for users who can't add the model to oMLX.
 
 ---
 
