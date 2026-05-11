@@ -2521,7 +2521,7 @@ flowchart TD
     LOOP -->|"LLM emits tool_call<br/>get_page_content(start, end)"| FETCH[page_provider<br/>slices PDF.pages[start-1:end]<br/>head-truncate at 25000 chars]
     FETCH -->|"observation: [page N]<br/>+ body text"| LOOP
 
-    LOOP -->|"LLM emits final answer<br/>with citation"| LQ{_is_low_quality?<br/>refusal phrase OR<br/>len<80 OR<br/>no [page N] citation}
+    LOOP -->|"LLM emits final answer<br/>with citation"| LQ{"_is_low_quality?<br/>refusal phrase OR<br/>len &lt; 80 OR<br/>no page-N citation"}
 
     LOOP -->|"iters == max_iterations<br/>+ no final answer set"| BUDGET[BUDGET EXHAUSTED prompt<br/>5 strict rules:<br/>1 verbatim-only<br/>2 cite-fetched-only<br/>3 partial > refuse<br/>4 refuse on no-answer<br/>5 prose format pressure<br/>max_tokens=800]
     BUDGET --> LQ
@@ -2696,8 +2696,8 @@ flowchart LR
 
     CAND --> JUDGE_IN["score_against_ground_truth<br/>question + gt_answer<br/>+ pass_criteria<br/>+ candidate_answer"]
     JUDGE_IN --> LLM[Judge LLM<br/>MODEL_SONNET = Gemma-26B<br/>temp=0.0, max_tokens=300<br/>response_format=json_object]
-    LLM --> PARSE{Parse JSON<br/>{'passed': bool,<br/>'rationale': str}}
-    PARSE -->|"valid + 'passed' field"| OUT([passed, rationale])
+    LLM --> PARSE{"Parse JSON response<br/>fields: passed bool<br/>+ rationale str"}
+    PARSE -->|"valid + passed field present"| OUT([passed, rationale])
     PARSE -->|"LLM error / parse error /<br/>missing field"| FAIL([False, error_message])
 
     style Q fill:#bdc3c7,color:#222
