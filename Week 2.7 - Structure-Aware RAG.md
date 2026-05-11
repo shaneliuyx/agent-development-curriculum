@@ -3307,6 +3307,176 @@ The lab's findings show tree-index winning every category on Berkshire 2023 — 
 
 The W2.5 Soundbite 3 routing pattern (Graph for relational, Vector for paraphrase, Tree for citation/refusal) is the production answer — not "pick one." A 5-line haiku-tier classifier router on each query costs <0.5s and saves 10s+ on misrouted questions. Tree-index in production is one lane behind a router, not the only lane.
 
+### Algorithm selection — choosing the retrieval backend per query
+
+Production RAG is router-shaped, not architecture-monolithic. The decision tree below maps query characteristics to backend choice. Run this as a haiku-tier classifier (gpt-oss-20B or equivalent, ~200-500ms per call); the misroute cost is bounded (wrong-lane returns a worse answer, not a fabricated one), so the gate can be loose.
+
+```mermaid
+flowchart TD
+    Q([Incoming query])
+    Q --> CLF{Haiku-tier query classifier<br/>features: length, entity-density,<br/>section-name presence,<br/>cross-section indicators,<br/>OOD signals}
+
+    CLF -->|"contains time-sensitive phrasing<br/>'today', 'current', 'now'"| OOD[Refuse with explanation<br/>'doc covers FY2023 only']
+    CLF -->|"single section named<br/>'Item 1C', 'Risk Factors'"| TREE_FAST[Tree-index<br/>cluster pre-fetch, low max_iter=2<br/>tight latency 25-40s]
+    CLF -->|"cross-section synthesis cue<br/>'compare', 'how does X differ<br/>from Y across sections'"| TREE_DEEP[Tree-index<br/>full agentic loop, max_iter=4<br/>quality 100% but 60-160s]
+    CLF -->|"multi-hop relational<br/>'who works with X who also...'"| GRAPH[GraphRAG<br/>entity extraction + 2-hop subgraph<br/>2-20s]
+    CLF -->|"paraphrase / similarity<br/>'find passages about'"| VECTOR[Vector + rerank<br/>BGE-M3 + cross-encoder<br/>1-3s]
+    CLF -->|"low confidence on classification"| FALLBACK[Default to Vector<br/>worst-case latency bound<br/>+ allow user to escalate]
+
+    style Q fill:#bdc3c7,color:#222
+    style CLF fill:#9b59b6,color:#fff
+    style OOD fill:#7f8c8d,color:#fff
+    style TREE_FAST fill:#f5a623,color:#fff
+    style TREE_DEEP fill:#f5a623,color:#fff
+    style GRAPH fill:#e67e22,color:#fff
+    style VECTOR fill:#4a90d9,color:#fff
+    style FALLBACK fill:#bdc3c7,color:#222
+```
+
+**Per-backend tuning knobs that move quality at known cost** (use this as a triage list when a backend underperforms in production):
+
+| Backend | Knob | Effect | Cost |
+|---|---|---|---|
+| Vector | `top_k` (retrieval), `rerank_k` (rerank cap), chunking strategy, reranker model | Higher `top_k` → better recall, more reranker calls (linear cost) | Linear in `top_k × rerank_cost_per_pair` |
+| Vector | Switch dense-only → dense+sparse hybrid (RRF k=60) | +5-15% recall on technical terms with rare tokens | ~2× embedding store size, sub-ms additional query time |
+| Graph | Hop depth, entity-extraction prompt, community-detection algorithm | Deeper hops = more candidate paths, more chance of finding bridges; risk of noisy paths | Each extra hop ≈ 2-5× context tokens at synthesis |
+| Tree-index | `max_iterations` (agent budget), `max_range_chars` (per-fetch cap), Rules 1-5 BUDGET prompt | More iters = more recovery from misroutes; bigger char cap = sees more body per fetch | Each iter ≈ 1 LLM call (15-30s); char cap raises per-iter token cost |
+| Tree-index | `δ=0.07` cluster routing band | Smaller δ = more decisive cluster picks; larger δ = more AMBIGUOUS-hint tiebreaks | No direct cost; affects 9B-GLM context handling |
+| Tree-index | Chunk-fallback `PageVectorIndex top_k`, neighbor expansion window | Larger window = more context per fallback; bigger window = wasteful when not needed | Linear in window × pages per query |
+| Tree-index | Switch retriever model (9B-GLM → 26B-Gemma) | Better instruction following + tiebreak handling | ~3× inference cost per LLM call |
+
+`★ Insight ─────────────────────────────────────`
+- **The router's misroute cost is asymmetric**: routing a cross-section question to vector returns a thin, low-confidence answer (the user can detect this and rephrase); routing a paraphrase question to tree pays 60s for an answer vector would have given in 1.4s. **Vector misroutes are cheap; tree misroutes are expensive.** Calibrate the classifier to be conservative about routing TO tree — when in doubt, default to vector.
+- **The "fast tree" vs "deep tree" split is a recent addition to production routing**: for queries that DO need tree but are clearly single-section, use `max_iterations=2` with cluster pre-fetch and skip the agentic synthesis. Cuts latency 60s → 25s on section-specific questions while preserving citation traceability. Phase 9's Q1/Q2/Q14 patterns are candidates.
+- **Backend tuning is BACKWARDS-COMPATIBLE under the eval gate**: any knob change can be A/B tested by running both old and new configs against the 16-Q eval set with `--reset-cache=hard` between. Only ship the new config if pass_rate ≥ baseline − tolerance. This is the production discipline that prevents Approach-B-style regressions.
+- **The classifier model is a hidden cost**: 200-500ms per query × millions of queries adds up. At Anthropic API prices, haiku-tier classification on 10M queries/day is ~$30K/month. Local MLX serving (gpt-oss-20B) makes this nearly free but adds operational complexity. The tradeoff is your normal "build vs buy" call.
+`─────────────────────────────────────────────────`
+
+### Performance / accuracy tradeoff — choosing the operating point
+
+Every production RAG deployment sits on a tradeoff curve: latency budget vs answer quality. Tree-v3 with full agentic loop hits 1.000 GT-judge on 60s mean; vector + rerank hits 0.500 GT-judge on 1.4s. Neither is "right" — they're different operating points on the same Pareto frontier.
+
+```mermaid
+flowchart LR
+    subgraph FRONTIER["The Pareto frontier we measured (Berkshire 2023, 16 Q)"]
+        direction LR
+        V[Vector + rerank<br/>1.4s / 0.500]
+        VH[Vector + hybrid + rerank<br/>2s / 0.55-0.60 estimated]
+        TF[Tree-index 'fast'<br/>max_iter=2 + cluster prefetch<br/>25s / 0.85 estimated]
+        TD[Tree-index 'deep'<br/>max_iter=4 + Phase 9 fixes<br/>60s / 1.000]
+        H[Human-in-loop<br/>180-300s / ~1.0]
+    end
+
+    V --> VH --> TF --> TD --> H
+
+    style V fill:#4a90d9,color:#fff
+    style VH fill:#4a90d9,color:#fff
+    style TF fill:#f5a623,color:#fff
+    style TD fill:#f5a623,color:#fff
+    style H fill:#27ae60,color:#fff
+```
+
+**Operating points by use case** — pick the one that matches your latency budget AND your tolerance for wrong answers:
+
+| Use case | Latency budget | Target quality | Best backend | Why |
+|---|---|---|---|---|
+| Real-time chat (consumer chatbot, support search) | < 3s | ≥ 0.5 | Vector + rerank | User abandons at 3s; partial answer + ability to rephrase is acceptable |
+| Internal knowledge tool (slack bot, dev docs lookup) | < 10s | ≥ 0.8 | Vector + rerank w/ hybrid OR Tree-fast | Users tolerate slight wait if answer quality is reliable |
+| Financial / legal analyst tooling | < 60s | ≥ 0.95 | Tree-deep agentic | Wrong answer is worse than slow answer; citation traceability is a hard requirement |
+| Regulatory submission / audit | < 5min | = 1.0 (no errors) | Tree-deep + human review gate | Cost of a wrong answer = compliance violation; latency irrelevant |
+| Async batch (overnight indexing of new docs) | hours OK | ≥ 0.95 | Tree-deep | No interactive user; optimize for quality + cost-per-correct-answer |
+
+`★ Insight ─────────────────────────────────────`
+- **The Pareto frontier has TWO distinct regions**: the steep section (vector → tree-fast) where you trade 20s for +0.35 quality, and the flat section (tree-fast → tree-deep) where you trade 35s for the last +0.15 quality. The steep section is where most production tuning happens; the flat section is where the cost-vs-quality math gets hard.
+- **Tree-fast (max_iter=2, cluster-prefetch only, no agentic loop) is a hypothesized operating point not yet measured in the lab.** It would be the right configuration for the "internal knowledge tool" use case. Worth a Phase 10 ablation study.
+- **Quality is HIGHLY skewed by question category**: vector gets 0.75 on factoid, 0.00 on cross-section synthesis; tree-deep gets 1.00 on both. Aggregate numbers hide this. **Always measure per-category** in production — your traffic mix determines effective quality, not the headline aggregate.
+- **The "Human-in-loop" point matters**: even tree-deep at 1.000 sits below a human-reviewed answer on hard questions. For regulatory or legal use cases, the LAYER above tree-deep is human review on the top-N% lowest-confidence outputs. Don't try to push tree-deep past 1.000; add the review layer.
+- **Operating-point choice is a PRODUCT decision, not a technical one**. Engineers should present the curve + per-use-case recommendations to the product team and let THEM pick the latency-vs-quality point. Tree-v3 has 4+ viable operating points; "ship the best one" is not the right framing.
+`─────────────────────────────────────────────────`
+
+### Eval set design — how to author a 16-Q (or 100-Q) eval set that drives architecture
+
+The lab uses 16 hand-curated questions split across 4 categories (4 each: section-specific factoid, cross-section synthesis, citation-required, out-of-document refusal). This section is the recipe for how that eval was built and how to scale it to a real production benchmark.
+
+**Why category coverage matters more than question count**:
+
+A 100-Q eval that's 80% paraphrase queries and 20% factoid won't tell you whether your tree-index recovers cross-section synthesis — it will look like vector is fine. The 16-Q lab eval beats a 100-Q paraphrase-heavy eval because each category has 4 questions probing a distinct failure mode. The categories are the load-bearing design choice; the question count is secondary.
+
+**Categories that should be in EVERY RAG eval set** (regardless of corpus):
+
+| Category | Probes | How to author | Pass criteria style |
+|---|---|---|---|
+| **Section-specific factoid** | Retrieval recall on questions with a canonical answer in one location | Pick 4-6 named entities or numeric figures from the corpus; phrase as "What is X?" or "What was Y in 2023?" | Must mention the specific entity/figure verbatim or as a recognizable numeric equivalent |
+| **Cross-section synthesis** | Whether the system can integrate evidence from 2+ distant sections | Pick a theme that appears in multiple sections (e.g. "Buffett's view on shareholders") and write a question requiring both | Must mention ≥ N of the supporting entities, framed as natural-language predicates |
+| **Citation-required** | Whether answers cite specific page numbers / section IDs and whether those citations are valid | Pick questions with a definitive "page X" or "Item Y" canonical answer | Must include the correct citation; tolerate slight page-range overshoot |
+| **Out-of-document refusal** | Whether the system refuses with explanation OR hallucinates | Ask about content the document doesn't have ("today's stock price", "competitor's revenue") | Must explicitly refuse + name the doc's actual scope; partial credit lost for hallucinated answers |
+
+**Authoring workflow per question** (~8-12 min per question if you have the source):
+
+1. Pick the question's topic with a target category in mind. "I need another cross-section synthesis question — what does Buffett say about X across sections?"
+2. Skim the source PDF for the canonical answer. Write `gt_answer` in 1-3 sentences in your own words but verifiable.
+3. Note `gt_pages` — the actual page numbers where the answer lives. This is the citation reference.
+4. Write `pass_criteria` as natural-language predicates. Be explicit about thresholds ("at least 2 of [list]"). Avoid vague qualifiers ("substantially correct").
+5. Validate by running the question through your current best system. If it PASSES with a clearly-wrong answer, your pass_criteria is too loose. If it FAILS with a clearly-correct answer, too strict. Iterate.
+6. Add to `eval_ground_truth.json` keyed by a stable q_id.
+
+**Anti-patterns to avoid**:
+
+- ❌ **Questions answerable from training data**: "What is Berkshire's primary business?" — the model knows this from pre-training, system isn't actually tested
+- ❌ **Yes/no questions**: "Did Berkshire mention Apple?" — binary outcomes degrade judge usefulness
+- ❌ **Questions with multiple valid answers**: "What's Berkshire's most important holding?" — depends on interpretation; pass_criteria becomes ambiguous
+- ❌ **Questions that test the corpus, not the system**: "How many pages is the report?" — counts and structural facts aren't retrieval problems
+- ❌ **Author bias toward easy categories**: if you only write factoid questions because they're easier to author, you'll miss the cross-section synthesis weakness
+
+**Scaling from 16 → 100 questions**:
+
+- Maintain category balance (25/25/25/25 not 80/10/5/5)
+- Add a 5th category for any corpus-specific failure mode you discover (e.g. "table-extraction" if your corpus has critical numeric tables; "footnote-resolution" if footnotes carry meaning)
+- Per-category, vary difficulty: include both easy "exact substring" questions and hard "synthesis with multiple gotchas" questions
+- For 100-Q sets, expect 16-20 hours of authoring time + 4-8 hours of judge-calibration validation
+
+`★ Insight ─────────────────────────────────────`
+- **The eval set IS the product spec for retrieval quality.** What you measure is what you optimize. If your eval has no cross-section questions, your team will ship a system that doesn't do cross-section. The category coverage decision is more architecturally consequential than any algorithm choice.
+- **Pass criteria authoring is the load-bearing skill.** Anyone can list expected entities; few can articulate "this counts as correct" in natural language with explicit thresholds. The pass_criteria for Q4 ("at least 2 of: Coca-Cola, American Express, Apple, Occidental, Japanese trading companies") encodes a real human judgment about what substantive coverage means; the entity bag does not.
+- **Validate by running the eval against KNOWN bad systems**: before trusting your eval, run it against a deliberately-broken retriever (e.g. returns random pages). If your eval doesn't drop to ~0 on that, your pass_criteria is too generous. Phase 9's Q9 hallucination scoring 0.67 on entity-recall was exactly this calibration failure.
+- **Eval-set drift is real and dangerous**: as the eval set is iterated (questions added, pass_criteria tweaked), the "1.000 ceiling today" can quietly become "0.95 ceiling on the v2 eval" without anyone noticing. Snapshot pass_criteria with the eval results; treat eval-set version as part of the measurement.
+- **The 16-Q lab eval is barely production-grade**: 16 questions × 4 categories = 4 samples per category. Statistical power is weak; any single question flip moves the per-category number by 0.25. For real production, 100 questions × 4 categories = 25 per category is the floor for stable measurement; 400 questions (100 per category) is the standard for release-gating retrieval changes.
+`─────────────────────────────────────────────────`
+
+### Cost model — LLM call budget per query class
+
+Tree-v3 looks deceptively expensive ("60s per query") until you compute the actual LLM call cost. Each query class consumes a different mix of LLM calls; aggregate cost is dominated by the cross-section synthesis category.
+
+**Per-query LLM call breakdown** (Berkshire 2023 corpus, Phase 9 final):
+
+| Query class | Cluster routing | Agent iters (LLM calls) | Forced synthesis | Chunk fallback | GT-judge | Total LLM calls | Total tokens (in+out) |
+|---|---|---|---|---|---|---|---|
+| OOD refusal (Q7/Q8/Q15/Q16) | 0 (BGE-M3 cosine, no LLM) | 1 | 0 | 0 | 1 | 2 | ~3K |
+| Section-specific factoid (Q1/Q2/Q10) | 0 | 2 | 0 | 0 | 1 | 3 | ~10-25K |
+| Citation-required (Q5/Q6/Q13/Q14) | 0 | 2 | 0 | 0 | 1 | 3 | ~8-15K |
+| Cross-section synthesis (Q3/Q4/Q11/Q12) | 0 | 3-4 | 0-1 | 0-1 | 1 | 4-6 | ~30-80K |
+| Section-specific factoid w/ truncation recovery (Q9) | 0 | 4 | 1 | 0 | 1 | 6 | ~50K |
+
+**Cost per 1000 queries** at production query mix (Berkshire-like corpus, 20% OOD / 30% factoid / 25% citation / 25% cross-section):
+
+| Cost driver | Per query | Per 1000 queries |
+|---|---|---|
+| LLM tokens (in + out) | ~25-30K avg | ~28M tokens |
+| LLM calls | ~4 avg | ~4000 calls |
+| BGE-M3 cosine + RRF | ~0.05s compute | ~50s total |
+| PDF page-fetch | ~0.01s × 2 fetches/query | ~20s total |
+| Cloud cost @ haiku-tier ($0.80/M in, $4/M out) | ~$0.06/query | ~$60/1000 queries |
+| Cloud cost @ sonnet-tier ($3/M in, $15/M out) | ~$0.22/query | ~$220/1000 queries |
+| Local MLX (electricity + amortized HW) | ~$0.001/query | ~$1/1000 queries |
+
+`★ Insight ─────────────────────────────────────`
+- **Cross-section synthesis dominates cost.** It's 25% of queries but ~60% of tokens. Production routing that sends synthesis to tree and everything else to vector is essential — running tree-deep on ALL queries triples cost for marginal quality gain.
+- **Local MLX is ~200× cheaper than cloud sonnet** for this workload — but only after amortizing the M-series Mac purchase + power + ops time. Crossover point is ~50K queries/day vs cloud; below that, cloud is cheaper end-to-end.
+- **The "extra LLM call for GT-judge" is a measurement cost, not a production cost.** GT-judge runs at eval time only, not on live queries. The cost model for production should exclude the GT-judge column unless you're running shadow-traffic evals continuously.
+- **Q9's recovery path costs 6 LLM calls** (4 main iters + 1 forced synthesis + 1 GT-judge) — 2× the average. The truncation fix (Phase 9 max_range_chars 25K) actually REDUCES cost on this query class because the model doesn't iterate looking for content that was already past the cap. **Quality fixes can be cost-positive too**, not just quality-positive.
+- **Caching strategy**: the BGE-M3 dense embeddings + sparse weights for all pages are computed ONCE at build time. A production system serving many queries against the same corpus pays zero embedding cost per query — the 5-min ingestion is amortized. This is the "cheap to build, expensive to query" inversion of vector RAG (vector is "expensive to build, cheap to query"). Tree-index inverts the cost shape — important for capacity planning.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Bad-Case Journal
