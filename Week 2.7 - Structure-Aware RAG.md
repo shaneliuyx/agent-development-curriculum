@@ -2586,6 +2586,72 @@ flowchart LR
 - **Entity index is intentionally lightweight.** It's a hint generator, not a retriever. Bad entity matches at worst inject a noisy hint; they never bypass the tree.
 `─────────────────────────────────────────────────`
 
+### Reference 2B — Code Locations (which file, which function, which line)
+
+Reference 2 named the four index *artifacts* (data files on disk). Reference 2B maps each artifact to its **code locations** — the Python file + line range where it is built, where its data structure is defined, where its query API is implemented, and where it is wired into the agent at runtime. Use this as a `git grep` cheat-sheet when reading or modifying the pipeline.
+
+**Repository layout** (paths relative to `~/code/agent-prep/`):
+
+```text
+shared/tree_index/                       # cross-lab shared library — data structures + query APIs
+  ├─ index.py                            # TreeIndex class
+  ├─ summary_index.py                    # SummaryIndex class (cluster index)
+  ├─ entity_index.py                     # EntityIndex class + extract_entities()
+  ├─ page_vector_index.py                # PageVectorIndex class (chunk fallback)
+  ├─ agentic.py                          # AgenticTreeRetriever class — the query-time loop
+  ├─ builder.py                          # split_large_nodes() helper for tree construction
+  └─ prompts.py                          # FACT_RICH_SUMMARIZE_SYSTEM + AGENTIC_SYSTEM_TEMPLATE_V2
+
+lab-02-7-pageindex/
+  ├─ src/build_tree.py                   # PDF parse → headings → tree.json BUILDER
+  ├─ src/build_summary_index.py          # tree.json → summary_index.json + page_vectors.npy BUILDERS
+  ├─ src/gt_judge.py                     # GT-judge implementation
+  ├─ scripts/run_one_variant.py          # eval runner — loads all 4 indexes + wires the retriever
+  ├─ scripts/reset_vmlx_cache.sh         # KV-cache reset hook
+  └─ data/                               # OUTPUT artifacts (the four indexes + source PDF + eval set)
+       ├─ brk-2023-ar.pdf
+       ├─ tree.json
+       ├─ summary_index.json
+       ├─ entity_index.json
+       ├─ page_vectors.npy
+       ├─ page_vectors.sparse.json
+       └─ eval_ground_truth.json
+```
+
+**Per-index code map**:
+
+| Layer | Build script (offline) | Data structure (runtime class) | Build entry point | Query API entry point | Runtime wiring (load + inject into retriever) |
+|---|---|---|---|---|---|
+| **Tree** | `lab-02-7-pageindex/src/build_tree.py` | `shared/tree_index/index.py:22` — `class TreeIndex` | `build_tree.py:main()` line 401. Pipeline: `extract_pages()` (line 49) → `detect_heading_candidates()` (line 58) → `build_tree()` (line 146, the LLM hierarchy builder) → `split_large_nodes()` (line 370) → `add_summaries_recursive()` (line 353, which calls `summarize_node()` line 313). Outputs `data/tree.json`. | `TreeIndex.__init__(tree)` line 29 loads `tree.json` into the runtime class. Method `compact_view()` produces the titles+page-range+summary view the agent reads. | `scripts/run_one_variant.py` — `tree = json.load(open(LAB / "data/tree.json"))` then `ti = TreeIndex(tree)`. Injected into `AgenticTreeRetriever(tree_index=ti, ...)`. |
+| **Cluster** | `lab-02-7-pageindex/src/build_summary_index.py` | `shared/tree_index/summary_index.py:22` — `class SummaryIndex` | `build_summary_index.py:main()` line 412. Pipeline: `extract_summary_nodes(tree)` (line 35, flattens tree into leaf-summary list) → `_embed_summaries()` (line 331, BGE-M3 dense embedding of each node summary) → `auto_k_silhouette()` (line 74) OR fixed k via `resolve_k()` (line 118) → `kmeans_cluster()` (line 57) → `summarize_cluster()` (line 268, generates tags + centroid summary per cluster) → `write_atomic()` (line 165). Outputs `data/summary_index.json`. | `SummaryIndex.find_clusters_for_query(query, threshold=0.5, top_k=2, delta=0.07)` line 134 — returns top-K candidates within δ-band of best match. Used by `AgenticTreeRetriever._find_cluster()` to inject `cluster_hint` into the agent's prompt. | `run_one_variant.py` — `si = SummaryIndex(LAB / "data/summary_index.json", LAB / "data/tree.json")` then `si.set_embedder(bge_encode_fn)`. Injected as `summary_index=si`. |
+| **Entity** | `lab-02-7-pageindex/src/build_tree.py` (built inline during tree construction; no separate script) | `shared/tree_index/entity_index.py:78` — `class EntityIndex` | `entity_index.py:59` — `extract_entities(text)` runs the regex-based capitalized-phrase scan. `EntityIndex.__init__()` line 89 builds the reverse index from the tree by walking nodes and accumulating `entity → [node_ids]`. No separate output file in this lab — entity index is rebuilt at process start from `tree.json` (lazy materialization). | `EntityIndex.lookup(entity)` returns `[node_ids]`. Used inside `AgenticTreeRetriever.answer()` to detect entities in the query and inject `entity_hint`. | `run_one_variant.py` — `ei = EntityIndex(ti, page_provider=raw_provider)`. Injected as `entity_index=ei`. |
+| **Page-vector** | `lab-02-7-pageindex/src/build_summary_index.py` (`build_page_vector_index()` is co-located with the cluster builder — same script, separate function) | `shared/tree_index/page_vector_index.py:41` — `class PageVectorIndex` | `build_summary_index.py:build_page_vector_index()` line 372. Calls `_bge_m3_hybrid_encoder()` line 344 which lazy-loads `FlagEmbedding.BGEM3FlagModel` and returns `{"dense": ..., "sparse": ...}` per page. `PageVectorIndex.save()` line 172 writes `.npy` + `.sparse.json` atomically. | `PageVectorIndex.search(query, top_k=3)` line 80 — dense kNN + sparse BM25-like + RRF fusion (k=60). Returns `[(page_num, fused_score)]`. Used by `AgenticTreeRetriever._chunk_level_fallback()` after low-quality detection fires. | `run_one_variant.py` — `pvi = PageVectorIndex.load(LAB / "data/page_vectors.npy", embedder=hybrid_fn)`. Injected as `page_vector_index=pvi`. |
+
+**Query-flow code map** (where each pipeline stage lives, in execution order):
+
+| Stage | File:line | What runs |
+|---|---|---|
+| **Entry point** | `shared/tree_index/agentic.py:313` (`class AgenticTreeRetriever`) → `.answer(query)` method | Top-level retriever; orchestrates all stages below. |
+| **Entity-hint resolution** | `agentic.py` near `_tree_view()` (line 292) + use of `self.entity_index.lookup(query_entities)` | Capitalized phrases in query → list of node_ids that mention them. |
+| **Cluster-hint resolution** | `agentic.py:_find_cluster()` method on `AgenticTreeRetriever` (calls `summary_index.find_clusters_for_query()` at `summary_index.py:134`) | BGE-M3 cosine + top-K δ-band → cluster_hint with tags + member_node_ids OR AMBIGUOUS hint. |
+| **System-prompt assembly** | `shared/tree_index/prompts.py` — `AGENTIC_SYSTEM_TEMPLATE_V2` | Builds the prompt with tree compact view + cluster_hint + entity_hint. |
+| **Main agent loop** | `agentic.py:693` (`for iteration in range(self.max_iterations):`) | Up to 4 iterations. Each iter: LLM call (max_tokens=1500) → optional tool_call → fetch via `page_provider(start, end)` → observation → repeat or exit. |
+| **Page-fetch tool** | `agentic.py` — the `page_provider` callable passed to `__init__` (in `run_one_variant.py`, `page_provider` is a closure that slices `PdfReader(...).pages[s-1:e]` and truncates at `max_range_chars=25000`) | Returns `[page N] body text` for the requested range. |
+| **BUDGET EXHAUSTED forced synthesis** | `agentic.py:820` (the 5-strict-rules prompt block) → `agentic.py:882` (the LLM call with max_tokens=800) | Triggered when `iteration == max_iterations` and no final answer set. Forces honest refusal or synthesis from observations only. |
+| **Low-quality detection** | `agentic.py:255` (`_is_low_quality(answer)` function) | Composite signal: refusal phrase OR len<80 OR no `[page N]` citation. |
+| **Chunk-level fallback** | `agentic.py:_chunk_level_fallback()` method (uses `PageVectorIndex.search()` + `_expand_with_neighbors()` line 211 + chunk-synthesis LLM call at `agentic.py:565` with max_tokens=1000) | Runs only when low-quality is true AND `page_vector_index` is wired. |
+| **Output assembly** | `agentic.py:899` (`return {"answer": ..., "iterations": ..., "tool_call_log": ..., "fallback_used": ...}`) | Structured dict returned to the eval harness. |
+| **GT-judge scoring** | `lab-02-7-pageindex/src/gt_judge.py` — `score_against_ground_truth()` function | Called per-Q from `scripts/run_one_variant.py` immediately after `retriever.answer()`. |
+| **Eval aggregation** | `scripts/run_one_variant.py` — last 30 lines of `main()` | Computes `agg_gt_pass_rate`, `per_cat_gt`, writes `results/ab_v2.json`. |
+
+**`★ Insight ─────────────────────────────────────`**
+- **The split between `shared/tree_index/` and `lab-02-7-pageindex/src/`**: shared library has the data-structure classes + the agentic retriever (reusable across labs); the lab repo has the build scripts (corpus-specific) + the eval runner + the GT-judge implementation (eval-set-specific). This is the seam — if you want to apply tree-index RAG to a different document corpus, you write new `build_*.py` scripts but reuse `shared/tree_index/` unchanged.
+- **Entity index has no on-disk artifact** in this lab — it's built lazily at process start from `tree.json`. Other labs may serialize it. The lazy choice was deliberate: entity index is tiny (~50 KB) and rebuild cost is sub-second, so disk storage is overhead for no win.
+- **`build_summary_index.py` builds TWO artifacts**: the cluster index AND the page-vector index. The page-vector function (`build_page_vector_index()` line 372) lives in the same script for convenience (shared BGE-M3 model load), but the two artifacts are independent — you can rebuild one without the other (see Reference 4 dependency rules).
+- **The eval runner is the ONLY place the four indexes meet**: `scripts/run_one_variant.py` loads each from its `.json` / `.npy` file and injects them into `AgenticTreeRetriever(...)` as constructor kwargs. The retriever itself doesn't know how indexes are built or where they're persisted — that decoupling is what lets the same retriever serve both the lab and a future production pipeline that reads indexes from a Postgres `jsonb` column or S3.
+- **`max_tokens` values are scattered across `agentic.py` lines 431, 565, 696, 882** (200 for entity lookup probe, 1000 for chunk-fallback synthesis, 1500 for main agent loop, 800 for BUDGET forced synthesis). Each is tuned for the call's purpose. If you bump one without considering the others, you'll get partial fixes (Phase 9 first attempt: only bumped BUDGET-path to 800, left main loop at 800 — Q4 still truncated. Phase 9 final: bumped main loop to 1500, Q4 PASSed.).
+`─────────────────────────────────────────────────`
+
 ### Reference 3 — Query Flow (end-to-end, Phase-9 final form)
 
 This is the full pipeline a query traverses, including all conditional branches. Reading this diagram top-to-bottom is the fastest way to understand the production system shape.
