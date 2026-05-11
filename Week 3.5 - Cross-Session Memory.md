@@ -710,6 +710,45 @@ Target: 12 of 15 passing. Write the failing cases into the bad-case journal.
 
 ---
 
+## Production Comparator — `mathomhaus/guild` (read after completing the lab)
+
+After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min reading [`mathomhaus/guild`](https://github.com/mathomhaus/guild) (Apache-2.0, Go, single binary, embedded SQLite) as a production-shaped reference for the same problem space. Guild is an MCP-protocol-native agent-memory server with hybrid (BM25 + dense embedding + RRF fusion k=60) retrieval and atomic-lock primitives for parallel-agent coordination. The mythos vocabulary (Gates / Guild / Quest / Scroll / Lore / Oath) maps onto familiar memory primitives, listed below.
+
+**Side-by-side mapping — your lab vs guild**:
+
+| Your W3.5 lab primitive | Guild equivalent | Notable difference |
+|---|---|---|
+| `remember_turn()` writes to dual store | `quest_complete()` writes a scroll into the archive | Guild treats each completion as a discrete record with cause/effect; your lab archives by turn |
+| `recall()` queries both stores | `guild_session_start()` returns oath + brief + top quest in ONE call | Single-shot context recovery vs multi-call assembly — production discipline |
+| 4 memory types (working / episodic / semantic / procedural) | Quest (procedural-as-task) / Scroll (episodic-as-handoff) / Lore (semantic-as-archive) / Oath (procedural-as-principle) | Different ontology, same underlying needs; vocabulary decouples from ML jargon |
+| SQLite for facts + Qdrant for vectors | Single SQLite with embedded ONNX encoder (`-tags=withembed`) for vectors | Guild's choice: one binary, zero infra. Tradeoff: harder to swap embedders |
+| Contradiction-update via archive flag | Versioned scrolls + lore supersedes via timestamp | Same SCD-2 pattern, different implementation |
+| Single-agent context | Atomic `quest_accept` locks for parallel agents | Guild adds multi-agent coordination — beyond this lab's scope |
+
+**Hybrid retrieval pattern parallels W2.7**: guild fuses BM25 + dense via RRF k=60 — the EXACT same stack as W2.7's `PageVectorIndex` (Phase 8 chunk-level fallback). When two unrelated local-first memory systems independently land on the same hybrid+RRF stack, that's evidence the pattern is the right shape for this problem class.
+
+**What to read in their source (in order)**:
+
+1. `internal/store/sqlite/` — schema design (scrolls, lore, quests, oaths). Compare to your lab's SQLite schema. Note the table-per-primitive split + the explicit `superseded_by` column for contradiction handling.
+2. `internal/retrieve/` — BM25 + vector + RRF fusion. Compare to W2.7's `PageVectorIndex.search()` for the same pattern in a different language.
+3. `internal/mcp/` — MCP-tool surface (the 15-ish tools agents call). Compare to your lab's `recall()` / `remember_turn()` shape. Note how guild collapses multi-step lifecycles into single tool calls.
+4. `cmd/guild/init.go` — the `guild init` guided-setup flow. Compare to your lab's manual setup. Production-quality DX is a load-bearing skill that lab work often skips.
+
+**Three production insights worth importing into your lab BCJ**:
+
+- **Single-shot session start vs multi-call recall**. Guild's `guild_session_start` returns oath + brief + top quest atomically. Your `recall()` is invoked turn-by-turn. The single-shot pattern minimizes prompt-construction churn — relevant for any production system that values determinism per session.
+- **Versioned scrolls vs in-place updates**. Guild never deletes; it timestamps + supersedes. Your contradiction-update test (`test_recall.py`) implements the same pattern; guild's source is the production-quality reference for the same SCD-2 discipline.
+- **MCP-protocol-native vs Python-library-native**. Your lab agent imports mem0 directly. Guild exposes memory as MCP tools, so ANY MCP client (Claude Code, Cursor, Codex) shares the same memory layer. The MCP wrapping pattern is the right shape when memory needs to span multiple agent frameworks — a topic W6.7 / W7 expands on.
+
+`★ Insight ─────────────────────────────────────`
+- **Reading guild AFTER the canonical lab is the right order.** The lab teaches WHY each memory primitive exists; guild teaches HOW production-grade systems compose them. Reading guild first would skip the why and turn into copy-paste-engineering.
+- **The mythos vocabulary is a real design choice, not just flavor.** "Lore" as semantic memory + "Oath" as procedural principle has the advantage of being meaningful to non-ML readers (product managers, designers). The disadvantage in interviews: requires translation back to ML terms. Use ML terms in interview answers; cite guild as the production parallel.
+- **The Go-vs-Python stack difference exposes a real production tradeoff**: guild's single binary + embedded SQLite is operationally cleaner than mem0 + Qdrant + SQLite (3 processes, 2 storage engines). The cost is harder to extend without Go knowledge. For lab work and rapid iteration, Python wins. For production deployment, single-binary Go is the safer ops shape. Both are valid — the choice is product-driven, not technical.
+- **Future W3.5.5 supplement (multi-agent shared memory) uses guild as the substrate.** Your single-agent lab is the prerequisite — finish here, then graduate to multi-agent coordination in W3.5.5 if your roadmap calls for it.
+`─────────────────────────────────────────────────`
+
+---
+
 ## RESULTS.md Template
 
 ```markdown
