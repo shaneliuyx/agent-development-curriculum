@@ -847,6 +847,48 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 
 ---
 
+## When to Add a Third Tier (HyperMem)
+
+This lab's two-tier architecture is operational + semantic. EverOS ships a THIRD memory architecture — [`HyperMem`](https://github.com/EverMind-AI/EverOS/tree/main/methods/HyperMem) — that handles **multi-entity relational** queries via a hypergraph backend. We don't use it in this lab because the demo's queries are about FACTS ("how do we deploy?"), not RELATIONSHIPS ("which engineers have worked together on which deploys?"). Adding HyperMem here would dilute the load-bearing two-tier lesson and push lab time past the 8h budget.
+
+**When HyperMem becomes the right third tier**:
+
+| Use case | Why HyperMem | What the hypergraph encodes |
+|---|---|---|
+| Multi-entity collaboration tracking | EverCore stores facts; HyperMem stores typed edges between actors | `(engineer) ─[worked-on]─ (system) ─[touched-by]─ (engineer)` |
+| Dependency-graph reasoning across projects | Hyperedges connect ≥3 nodes natively (regular graph DBs need pivot tables) | `(project A) ─[depends-on]─ (auth-refactor) ─[depends-on]─ (project B, C, D)` |
+| Multi-dimensional expert finder | Single hyperedge spans concept × person × experience | "Experts on Kubernetes ∧ cost-optimization ∧ Australian compliance" |
+| Incident root-cause traversal across many migrations | Multi-hop relational paths between deploy events | Trace incident → migration step → upstream change → original PR |
+
+**The three-tier shape**:
+
+```mermaid
+flowchart LR
+    A[Agents]
+    A -->|claim/scroll| L1[L1 Operational guild]
+    A -->|fact query| L2[L2 Semantic EverCore]
+    A -->|relational query| L3[L3 Relational HyperMem]
+    L1 -.->|scroll consolidation| L2
+    L2 -.->|entity-relation extraction| L3
+    style L1 fill:#4a90d9,color:#fff
+    style L2 fill:#27ae60,color:#fff
+    style L3 fill:#9b59b6,color:#fff
+```
+
+The arrows are the SAME shape as the two-tier: consolidation pipeline moves data from each tier into the next-slower one as the entities accumulate enough relational structure to be worth indexing. EverCore's semantic facts become HyperMem hyperedges when enough facts share entities to form a useful graph.
+
+**Concrete trigger to add HyperMem**: when ≥30% of your `query_context()` calls have a "tell me about X AND Y AND Z together" shape (multi-entity intersection), the semantic tier alone forces post-processing in Python. At that point a relational tier earns its operational cost.
+
+**Where it slots in the curriculum**: not as a W3.5.9 supplemental (would over-fragment the W3.5 cluster). Recommend reaching for HyperMem in **W11 System Design** as a "scaling architecture" topic, OR in a **W12 Capstone-A variant** where the corpus has explicit multi-entity structure (e.g. organizational knowledge graph).
+
+`★ Insight ─────────────────────────────────────`
+- **The two-tier → three-tier extension is a real production scaling pattern**, not just a research artifact. Most agent systems START at single-tier, GRADUATE to two-tier when cross-session knowledge transfer matters, and ADD relational only when entity-density crosses a threshold. Knowing all three stages — and the trigger for each — is the production-architect signal.
+- **Don't add HyperMem speculatively.** YAGNI applies harder to memory architecture than to most things. Each tier costs operational complexity (service + Docker + consolidation pipeline + benchmarks). Add only when measured query patterns demand it.
+- **Compare to W2.5 GraphRAG territory**: W2.5 builds entity-graph for RETRIEVAL over a document corpus. HyperMem builds entity-hypergraph for MEMORY over an agent's experience. Different surface area (corpus vs experience), same primitive (typed-edge graph). The distinction matters in interviews — don't conflate.
+`─────────────────────────────────────────────────`
+
+---
+
 ## References
 
 - **Letta (formerly MemGPT)** — Packer, C. et al. (2023). *MemGPT: Towards LLMs as Operating Systems.* arXiv:2310.08560. The canonical two-tier memory paper in the agent-systems literature; RAM↔archive separation is the engineering precedent for hippocampus↔neocortex.
