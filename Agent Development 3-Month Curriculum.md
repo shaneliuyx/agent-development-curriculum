@@ -522,6 +522,27 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** A skill is the unit of repeatable agent capability. Same shape as a versioned IaC module — write it once, version it, install it globally, share it across a team. Skill authoring is to prompt engineering what Terraform modules are to one-off scripts.
 
+### Week 6.8 — Agent Communication Protocol Survey (MCP / A2A / ANP) (half-week insert, ~3h)
+> Detailed runbook: [[Week 6.8 - Protocol Survey]] *(brief; reading-heavy, no major lab artifact)*
+
+**Theory (2h).**
+- Read: hello-agents Ch 10 [Agent Communication Protocols](https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter10/Chapter10-Agent-Communication-Protocols.md). Anthropic MCP spec (definitive). Google's A2A (Agent2Agent) protocol announcement + spec. ANP (Agent Network Protocol) — third entrant, focuses on decentralized agent discovery + identity.
+- Master:
+  - **MCP (Anthropic, Nov 2024)** — tool/resource/prompt primitives between a host (agent) and a server (capability provider). Stdio + HTTP+SSE transports. Now adopted by OpenAI + Google. Best for *single-agent connects to many capabilities*.
+  - **A2A (Google, Apr 2025)** — agent-to-agent collaboration protocol. Capability advertisement, task delegation, message passing between PEER agents. Best for *multi-agent task decomposition + cross-vendor agent collaboration*.
+  - **ANP (open spec, 2025)** — decentralized agent discovery + DID (decentralized identity)-based authentication. W3C-aligned. Best for *agent-to-agent communication across organizational boundaries without a central broker*.
+  - The three philosophies compared: MCP is "agent + tools" (server is dumb capability), A2A is "agent + agent" (both sides are smart, peer-to-peer), ANP is "agent in a network" (discovery + identity primitives, no central hub).
+  - Where they overlap, where they don't, and the migration story (W7 lab harness is MCP-native; A2A wraps MCP for inter-agent flows; ANP adds the discovery layer above both).
+
+**Lab (1h) — `lab-06.8-protocol-survey`.**
+1. Write a 1-page comparison ADR (`docs/PROTOCOL-SURVEY-ADR.md`) covering: (a) what each protocol solves, (b) which transport each uses, (c) authentication model, (d) interop story, (e) one concrete use case where each is the right pick.
+2. Annotate your W3.5.5 guild server: which of the three protocols does it implement (MCP), which would be needed if multiple guild instances coordinated across hosts (A2A or ANP).
+3. Optional: install one A2A reference implementation (Google's open-sourced reference exists as of 2026) and run a 2-agent handshake. ~30 min.
+
+**Exit criteria.** 90-second answer to "what's the difference between MCP, A2A, and ANP — and which would you pick for X?" — name the three primitives (agent↔tool / agent↔agent peer / agent↔agent decentralized), give one concrete use case per protocol, articulate the layering (ANP discovery above A2A communication above MCP capability). Bonus: explain why MCP won the single-agent-tool battle (open spec + Anthropic/OpenAI/Google all adopted) but A2A + ANP are still in play for multi-agent + cross-org cases.
+
+**Infra bridge.** The three protocols are agent-world analogues to service-mesh primitives: MCP ≈ service-to-database (capability access), A2A ≈ service-to-service mTLS (peer communication), ANP ≈ service discovery + identity (Consul + SPIFFE). The protocol landscape is going through the same consolidation cycle that service meshes went through in 2018-2020 — bet on the open spec with multi-vendor adoption, hedge with thin wrappers around the others.
+
 ---
 
 ## Phase 3 — Stability: Tools, Schema, Hallucination (Weeks 7–9)
@@ -1712,6 +1733,7 @@ Useful modifiers you can add to any generation request:
 | 6 | [[Week 6 - Claude Code Source Dive]] | Reading-only week. 8 subsystem study sheets filled in; one "Architecture Cheat Sheet" markdown that you can bring to interviews; 3 "what I would steal" design ideas |
 | 6.5 | [[Week 6.5 - Hermes Agent Hands-On]] | Hermes Agent running locally; same canonical task in 3 agents (Claude Code / Pi / Hermes); observe one skill creation + audit one learned skill; 3×3 comparison matrix (extensibility / auditability / cost) |
 | 6.7 | [[Week 6.7 - Authoring Agent Skills]] | Three production-quality skills authored end-to-end; SKILL.md + trigger pattern + verification step each; install globally + use for one week; description-field iteration log capturing trigger-tuning |
+| 6.8 | [[Week 6.8 - Protocol Survey]] | Reading-heavy half-week (~3h). hello-agents Ch 10 + Anthropic MCP + Google A2A + open-spec ANP. 1-page Protocol-Survey ADR comparing transport, auth, interop, use cases. Annotate W3.5.5 guild for which protocol it implements + what would be needed for cross-host coordination. Optional A2A reference-impl 2-agent handshake. Service-mesh-primitive infra-bridge framing |
 | 7 | [[Week 7 - Tool Harness]] | Generic `Tool`/`ToolHarness` classes; retry + timeout + budget + idempotency; 20-scenario bad-case suite; local (Qwen3.6) vs cloud (Claude Haiku) reliability comparison |
 | 7.5 | [[Week 7.5 - Computer Use and Browser Agents]] | Same task three ways (Playwright / browser-use / Claude Computer Use); 10-task suite with one CSS-rename ablation; safety wrapper (action allowlist + budget cap + screenshot diff alarm) |
 | 8 | [[Week 8 - Schema Reliability Bench]] | **The signature-question lab.** 5-way comparison (naive prompt / provider-native / Outlines+xgrammar / Instructor+retry / post-validation+repair) across 4 local models + GPT-4o-mini, 100 prompts; draws the 5-layer defense diagram |
