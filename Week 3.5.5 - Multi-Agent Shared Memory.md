@@ -457,17 +457,37 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
 
-class GuildClient:
-    """One Python process talking to guild via MCP stdio.
+import re
 
-    Method names mirror guild's actual MCP tool names verified via
-    `session.list_tools()` against the live `guild mcp serve` process.
-    The full 43-tool surface includes `quest_*` (post / accept / journal /
-    fulfill / scroll / list / brief / bounties / campfire / forfeit / ...)
-    and `lore_*` (inscribe / study / appraise / meld / reforge / seal / ...)
-    namespaces, plus three top-level helpers (`guild_session_start`,
-    `guild_set_project`, `guild_status`). This wrapper covers the five most-
-    used quest verbs + the session-start primitive; expand as needed.
+QUEST_ID_RE = re.compile(r"QUEST-\d+")
+
+
+class GuildClient:
+    """One Python MCP-stdio session against guild.
+
+    All method signatures aligned with guild's authoritative MCP input
+    schemas (probed live via session.list_tools()[i].inputSchema). The
+    server rejects extra args with 'unexpected additional properties'.
+
+    Two non-obvious facts about guild's MCP interface:
+
+    1. RESPONSES ARE TEXT-ONLY. Every MCP tool returns a `CallToolResult`
+       with `content=[{type:'text', text:'<human-readable string>'}]` and
+       `structuredContent=None`. There are no machine-parseable JSON fields.
+       Wrappers must regex-parse identifiers (QUEST-N) and keyword-match
+       status from the text. This is by design — guild's MCP surface is
+       optimized for LLM consumption, not for Python introspection. For
+       machine-parseable JSON output, use the CLI `--json` flag instead
+       of MCP.
+
+    2. AGENT IDENTITY IS SESSION-SCOPED, NOT CALL-SCOPED. The MCP schema
+       does NOT accept per-call agent identity (no `owner` on accept, no
+       `agent` on journal, no `agent_id` on session_start). One MCP
+       connection = one anonymous agent stream from the server's view.
+       The `agent_id` constructor arg below is a Python-side label for
+       logging + test isolation; for true multi-agent demos, spawn one
+       Python process per agent (each gets its own guild subprocess +
+       its own session). This is the production pattern anyway.
     """
 
     def __init__(
@@ -492,11 +512,27 @@ class GuildClient:
         await self._stack.enter_async_context(session)
         await session.initialize()
         self._session = session
+        # MANDATORY per guild's MCP contract — without this, subsequent
+        # calls fail with '[error] no active project set'.
+        await session.call_tool("guild_session_start", arguments={})
         return self
 
     async def __aexit__(self, *exc) -> None:
         await self._stack.aclose()
         self._session = None
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _text(result) -> str:
+        """Extract the text payload from an MCP CallToolResult."""
+        content = result.model_dump().get("content") or []
+        return content[0].get("text", "") if content else ""
+
+    @staticmethod
+    def _parse_quest_id(text: str) -> str:
+        m = QUEST_ID_RE.search(text)
+        return m.group(0) if m else ""
 
     # ── Quest operations ──────────────────────────────────────────────
 
@@ -505,81 +541,77 @@ class GuildClient:
         subject: str,
         spec: str | None = None,
         campaign: str | None = None,
+        priority: str | None = None,
     ) -> str:
-        """Create a new quest. guild assigns the QUEST_ID server-side.
-
-        Returns the assigned QUEST_ID (e.g. 'QUEST-1') — callers must
-        capture it; subsequent verbs (accept / journal / fulfill / scroll)
-        reference quests by this ID, not by a client-chosen slug.
-
-        `spec` is the WHY+HOW design rationale — guild atomically inscribes
-        it as a kind=decision lore entry and links it from the quest's
-        journal as 'acceptance: spec: LORE-N'.
-
-        `campaign` tags the quest for within-project grouping (see §1.2).
-        """
+        """Create a new quest. Returns the server-assigned QUEST_ID (e.g.
+        'QUEST-7'), parsed from the response text. `spec` atomically inscribes
+        a kind=decision lore entry. `campaign` tags for within-project
+        grouping. `priority` defaults to P2 server-side."""
         assert self._session is not None
         args: dict[str, Any] = {"subject": subject}
         if spec is not None:
             args["spec"] = spec
         if campaign is not None:
             args["campaign"] = campaign
+        if priority is not None:
+            args["priority"] = priority
         result = await self._session.call_tool("quest_post", arguments=args)
-        return result.model_dump().get("quest_id", "")
+        return self._parse_quest_id(self._text(result))
 
-    async def quest_accept(self, quest_id: str) -> dict[str, Any]:
-        """Atomically claim a quest. Returns claim status (winner gets
-        status=claimed; loser gets status=already_claimed). The atomic-claim
-        primitive that makes guild safe for multiple agents racing on the
-        same quest pool."""
+    async def quest_accept(self, quest_id: str) -> str:
+        """Atomically claim a quest. Returns the server's human-readable
+        response text. Winners contain wording like 'accepted' or 'claimed';
+        race losers contain 'already claimed' or similar. Callers use
+        substring match (e.g. `'accepted' in resp.lower()`) to check status —
+        no structured status field is returned over MCP."""
         assert self._session is not None
         result = await self._session.call_tool(
-            "quest_accept",
-            arguments={"quest_id": quest_id, "owner": self.agent_id},
+            "quest_accept", arguments={"quest_id": quest_id}
         )
-        return result.model_dump()
+        return self._text(result)
 
-    async def quest_journal(self, quest_id: str, text: str) -> None:
-        """Append a task-scoped journal note. This is the WRITE primitive
-        for in-flight quest annotations (also used for handoff text — the
-        original 'scroll' verb was renamed to align with the CLI vocabulary).
-        Notes are append-only; they die when the quest is fulfilled."""
+    async def quest_journal(self, quest_id: str, text: str) -> str:
+        """Append a task-scoped journal note. Returns response text."""
         assert self._session is not None
-        await self._session.call_tool(
+        result = await self._session.call_tool(
             "quest_journal",
-            arguments={
-                "quest_id": quest_id,
-                "text": text,
-                "agent": self.agent_id,
-            },
+            arguments={"quest_id": quest_id, "text": text},
         )
+        return self._text(result)
 
-    async def quest_fulfill(self, quest_id: str, report: str) -> None:
-        """Complete a quest. `report` is REQUIRED — must include commit hash,
-        files touched, and remaining issues per guild's discipline rule.
-        Fulfillment cascades unblock to dependent quests."""
+    async def quest_fulfill(self, quest_id: str, report: str) -> str:
+        """Complete a quest. `report` is REQUIRED by guild's schema.
+        Returns response text containing 'fulfilled QUEST-N'."""
         assert self._session is not None
-        await self._session.call_tool(
+        result = await self._session.call_tool(
             "quest_fulfill",
             arguments={"quest_id": quest_id, "report": report},
         )
+        return self._text(result)
 
-    async def quest_scroll(self, quest_id: str) -> dict[str, Any]:
-        """Read the full history of a quest (status + journal + timeline).
-        This is the READ primitive — use after fulfill to verify the trail,
-        or at session-start to pick up a quest someone else was working on."""
+    async def quest_scroll(self, quest_id: str) -> str:
+        """Read the full quest history as a human-readable text block
+        (status + journal + timeline). Callers grep the text for what they
+        need; there is no structured shape (per response-shape note in
+        class docstring)."""
         assert self._session is not None
         result = await self._session.call_tool(
             "quest_scroll", arguments={"quest_id": quest_id}
         )
-        return result.model_dump()
+        return self._text(result)
 
     async def quest_list(
         self,
         status: str | None = None,
         campaign: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """List quests with optional status / campaign filters."""
+    ) -> str:
+        """List quests with optional filters. Returns response text.
+
+        Valid `status` values (verified against MCP schema):
+        `next | in_progress | blocked | done` — NOT 'unclaimed'/'claimed'/
+        'fulfilled'. Use `next` for unclaimed quests, `in_progress` for
+        in-flight, `done` for fulfilled.
+        """
         assert self._session is not None
         args: dict[str, Any] = {}
         if status is not None:
@@ -587,20 +619,18 @@ class GuildClient:
         if campaign is not None:
             args["campaign"] = campaign
         result = await self._session.call_tool("quest_list", arguments=args)
-        return result.model_dump().get("quests", [])
+        return self._text(result)
 
     # ── Session orchestration ────────────────────────────────────────
 
-    async def session_start(self) -> dict[str, Any]:
-        """guild's single-shot context-recovery primitive. Returns oath +
-        last brief + top available quest in ONE call. An agent's FIRST guild
-        call after spawning is `session_start()`."""
+    async def session_start(self) -> str:
+        """Manually re-issue guild_session_start (already called once in
+        __aenter__). Returns oath + last brief + top bounty as text."""
         assert self._session is not None
         result = await self._session.call_tool(
-            "guild_session_start",
-            arguments={"agent_id": self.agent_id},
+            "guild_session_start", arguments={}
         )
-        return result.model_dump()
+        return self._text(result)
 ```
 
 **Walkthrough**:
@@ -623,33 +653,39 @@ from src.guild_client import GuildClient
 
 @pytest.mark.asyncio
 async def test_quest_lifecycle_round_trip() -> None:
-    """Verify the full post -> accept -> journal -> fulfill -> scroll cycle."""
+    """Verify the full post -> accept -> journal -> fulfill -> scroll cycle.
+    All assertions are substring-match against text responses — guild's MCP
+    surface returns human-readable text, not structured JSON (see class
+    docstring)."""
     async with GuildClient(agent_id="alice") as gc:
-        # 1. Post a quest. Capture the server-assigned QUEST_ID.
+        # 1. Post a quest. Capture the server-assigned QUEST_ID
+        #    (regex-extracted from the response text 'posted QUEST-N:').
         quest_id = await gc.quest_post(
             subject="smoke-test: round-trip the full quest lifecycle",
             spec="Verify Python wrapper covers post/accept/journal/fulfill/scroll.",
             campaign="lab-03-5-5",
         )
-        assert quest_id.startswith("QUEST-")
+        assert quest_id.startswith("QUEST-"), f"unexpected response: {quest_id!r}"
 
-        # 2. Atomically claim. Owner becomes "alice" (agent_id from __init__).
-        claim = await gc.quest_accept(quest_id)
-        assert claim.get("status") == "claimed"
+        # 2. Atomically claim. Response text contains 'accepted' on success.
+        accept_resp = await gc.quest_accept(quest_id)
+        assert "accept" in accept_resp.lower() or "claim" in accept_resp.lower(), \
+            f"unexpected accept response: {accept_resp!r}"
 
         # 3. Write an in-flight journal entry.
         await gc.quest_journal(quest_id, "smoke-test journal text")
 
-        # 4. Fulfill with the required report.
-        await gc.quest_fulfill(
+        # 4. Fulfill with the required report. Response contains 'fulfilled'.
+        fulfill_resp = await gc.quest_fulfill(
             quest_id,
             report="commit smoke-test-stub; files: tests/test_guild_client.py; no remaining issues",
         )
+        assert "fulfill" in fulfill_resp.lower()
 
         # 5. Read back the full history. Journal note must round-trip.
         scroll = await gc.quest_scroll(quest_id)
-        notes_text = str(scroll)  # crude but sufficient for smoke-test
-        assert "smoke-test journal text" in notes_text
+        assert "smoke-test journal text" in scroll, \
+            f"journal entry not in scroll: {scroll!r}"
 ```
 
 ```bash
@@ -684,7 +720,7 @@ Run as two terminal processes simultaneously:
 import asyncio
 import sys
 
-from src.guild_client import GuildClient
+from src.guild_client import GuildClient, QUEST_ID_RE
 
 
 async def attempt_claim(agent_id: str) -> None:
@@ -693,12 +729,19 @@ async def attempt_claim(agent_id: str) -> None:
     guild assigns QUEST_IDs server-side — we can't pre-decide a slug like
     'race-the-prize'. Instead both agents look up the race quest by its
     campaign tag; the first agent to run creates it, the second finds it.
+
+    Status semantics (per guild MCP schema): valid status filter values are
+    `next | in_progress | blocked | done` (NOT 'unclaimed'/'claimed'); use
+    `next` for unclaimed quests. quest_accept returns text — winners contain
+    'accept'/'claim', losers contain 'already' or similar — so the race
+    branch checks via substring match, not via a dict `.get("status")`.
     """
     async with GuildClient(agent_id=agent_id) as gc:
         # Find or create the race quest, tagged with the shared campaign.
-        unclaimed = await gc.quest_list(campaign="race-demo", status="unclaimed")
-        if unclaimed:
-            quest_id = unclaimed[0]["id"]
+        listing = await gc.quest_list(campaign="race-demo", status="next")
+        existing = QUEST_ID_RE.search(listing)
+        if existing:
+            quest_id = existing.group(0)
             print(f"[{agent_id}] found existing race quest: {quest_id}")
         else:
             quest_id = await gc.quest_post(
@@ -709,9 +752,14 @@ async def attempt_claim(agent_id: str) -> None:
 
         print(f"[{agent_id}] attempting claim on {quest_id}...")
         result = await gc.quest_accept(quest_id)
-        print(f"[{agent_id}] result: {result}")
+        print(f"[{agent_id}] result: {result[:120]}")
 
-        if result.get("status") == "claimed":
+        # Winner sees 'accept' or 'claim' in response text; loser sees
+        # 'already' or 'cannot' or similar. Substring-match because guild's
+        # MCP responses are human-readable text, not structured JSON.
+        result_low = result.lower()
+        if ("accept" in result_low or "claim" in result_low) \
+                and "already" not in result_low:
             print(f"[{agent_id}] WON the claim. Doing the work.")
             await gc.quest_journal(quest_id, f"completed by {agent_id}")
             await gc.quest_fulfill(
@@ -780,20 +828,26 @@ async def test_atomic_claim_exactly_one_winner() -> None:
             campaign="race-test",
         )
 
-    async def try_claim(agent_id: str) -> dict:
+    async def try_claim(agent_id: str) -> str:
         async with GuildClient(agent_id=agent_id) as gc:
             return await gc.quest_accept(quest_id)
 
     # Run two claims concurrently via asyncio.gather (same process,
-    # different GuildClient instances → different agent IDs)
+    # different GuildClient instances → different MCP sessions).
     results = await asyncio.gather(
         try_claim("agent_a"),
         try_claim("agent_b"),
     )
-    statuses = [r.get("status") for r in results]
-    # Exactly one 'claimed', exactly one anything-else
-    assert statuses.count("claimed") == 1, f"got {statuses}"
-    assert len(statuses) == 2, f"got {statuses}"
+
+    # guild's MCP returns text, not dicts. Classify each response:
+    # winners have 'accept'/'claim' (without 'already'); losers have
+    # 'already' or otherwise lack accept-language.
+    def is_winner(resp: str) -> bool:
+        low = resp.lower()
+        return ("accept" in low or "claim" in low) and "already" not in low
+
+    winners = sum(1 for r in results if is_winner(r))
+    assert winners == 1, f"expected exactly 1 winner, got {winners}; results={results}"
 ```
 
 ```bash
@@ -1110,8 +1164,9 @@ async def test_01_same_agent_quest_appears_in_listing() -> None:
     subj = unique_subject("01-list")
     async with GuildClient(agent_id="alice") as gc:
         quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
-        quests = await gc.quest_list(campaign="recall-bench")
-        assert any(q.get("id") == quest_id for q in quests)
+        listing = await gc.quest_list(campaign="recall-bench")
+        # guild's MCP returns text; substring-match the QUEST_ID.
+        assert quest_id in listing, f"{quest_id} not in listing: {listing!r}"
 
 
 @pytest.mark.asyncio
@@ -1122,7 +1177,7 @@ async def test_02_same_agent_journal_round_trip() -> None:
         await gc.quest_accept(quest_id)
         await gc.quest_journal(quest_id, "alice's notes on the test")
         scroll = await gc.quest_scroll(quest_id)
-        assert "alice's notes" in str(scroll)
+        assert "alice's notes" in scroll
 
 
 # (3 more same-agent tests omitted; same shape — list, fetch, completion-state, etc.)
@@ -1144,7 +1199,7 @@ async def test_06_agent_b_reads_agent_a_journal() -> None:
 
     async with GuildClient(agent_id="agent_b") as gc:
         scroll = await gc.quest_scroll(quest_id)
-        assert "agent_a's handoff note" in str(scroll)
+        assert "agent_a's handoff note" in scroll
 
 
 # (4 more cross-agent tests omitted)
@@ -1158,13 +1213,18 @@ async def test_11_parallel_claim_exactly_one_winner() -> None:
     async with GuildClient(agent_id="seed") as gc:
         quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
 
-    async def try_claim(agent_id: str) -> dict:
+    async def try_claim(agent_id: str) -> str:
         async with GuildClient(agent_id=agent_id) as gc:
             return await gc.quest_accept(quest_id)
 
     a, b = await asyncio.gather(try_claim("alice"), try_claim("bob"))
-    statuses = [a.get("status"), b.get("status")]
-    assert statuses.count("claimed") == 1
+    # Winner has 'accept'/'claim' (without 'already'); loser has 'already'.
+    def is_winner(resp: str) -> bool:
+        low = resp.lower()
+        return ("accept" in low or "claim" in low) and "already" not in low
+
+    winners = sum(1 for r in (a, b) if is_winner(r))
+    assert winners == 1, f"expected 1 winner, got {winners}; a={a!r} b={b!r}"
 
 
 # (4 more contradiction tests omitted)
