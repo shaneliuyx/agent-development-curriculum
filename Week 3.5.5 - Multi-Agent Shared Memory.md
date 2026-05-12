@@ -710,56 +710,63 @@ The whole point of multi-agent shared memory is that TWO agents can run simultan
 `src/atomic_claim_demo.py`:
 
 ```python
-"""Two parallel Python processes both attempt to claim the same quest.
+"""Two parallel Python processes race to claim the SAME quest.
 Exactly one should win; the other should receive a clear rejection.
 
-Run as two terminal processes simultaneously:
-  terminal 1: python -m src.atomic_claim_demo alice
-  terminal 2: python -m src.atomic_claim_demo bob
+This is a TWO-PHASE demo to avoid a timing footgun:
+
+  Phase 1 — seed:   create the race quest ONCE, capture its QUEST_ID.
+  Phase 2 — race:   spawn alice + bob simultaneously, both attempting
+                     to accept the SAME pre-existing QUEST_ID.
+
+Why not find-or-create-by-campaign? If alice creates+claims+fulfills before
+bob runs, bob's status='next' lookup returns empty -> bob creates a NEW quest
+and both agents report WON on DIFFERENT quests. The seed step makes the race
+quest authoritative for both racers.
+
+Usage:
+  # Phase 1 — seed (run once)
+  python -m src.atomic_claim_demo seed
+  # prints: QUEST-N
+
+  # Phase 2 — race (run both in parallel)
+  python -m src.atomic_claim_demo race QUEST-N alice &
+  python -m src.atomic_claim_demo race QUEST-N bob &
+  wait
 """
 import asyncio
 import sys
 
-from src.guild_client import GuildClient, QUEST_ID_RE
+from src.guild_client import GuildClient
 
 
-async def attempt_claim(agent_id: str) -> None:
-    """Find-or-create the race quest by campaign tag, then race to claim.
+async def seed() -> str:
+    """Create the race quest once. Prints + returns the assigned QUEST_ID."""
+    async with GuildClient(agent_id="seed") as gc:
+        quest_id = await gc.quest_post(
+            subject="race-the-prize: both agents want this",
+            campaign="race-demo",
+        )
+        print(quest_id)
+        return quest_id
 
-    guild assigns QUEST_IDs server-side — we can't pre-decide a slug like
-    'race-the-prize'. Instead both agents look up the race quest by its
-    campaign tag; the first agent to run creates it, the second finds it.
 
-    Status semantics (per guild MCP schema): valid status filter values are
-    `next | in_progress | blocked | done` (NOT 'unclaimed'/'claimed'); use
-    `next` for unclaimed quests. quest_accept returns text — winners contain
-    'accept'/'claim', losers contain 'already' or similar — so the race
-    branch checks via substring match, not via a dict `.get("status")`.
-    """
+async def race(quest_id: str, agent_id: str) -> None:
+    """One agent's race attempt. Reports WIN or LOSS by substring-matching
+    the response text (guild's MCP returns human-readable text, not
+    structured JSON — see GuildClient class docstring)."""
     async with GuildClient(agent_id=agent_id) as gc:
-        # Find or create the race quest, tagged with the shared campaign.
-        listing = await gc.quest_list(campaign="race-demo", status="next")
-        existing = QUEST_ID_RE.search(listing)
-        if existing:
-            quest_id = existing.group(0)
-            print(f"[{agent_id}] found existing race quest: {quest_id}")
-        else:
-            quest_id = await gc.quest_post(
-                subject="race-the-prize: both agents want this",
-                campaign="race-demo",
-            )
-            print(f"[{agent_id}] created race quest: {quest_id}")
-
         print(f"[{agent_id}] attempting claim on {quest_id}...")
         result = await gc.quest_accept(quest_id)
         print(f"[{agent_id}] result: {result[:120]}")
 
-        # Winner sees 'accept' or 'claim' in response text; loser sees
-        # 'already' or 'cannot' or similar. Substring-match because guild's
-        # MCP responses are human-readable text, not structured JSON.
+        # Winner sees 'accept' or 'claim' (without 'already') in response;
+        # loser sees 'already' or 'cannot'. Server-side atomic-claim
+        # guarantees exactly one winner across concurrent attempts.
         result_low = result.lower()
-        if ("accept" in result_low or "claim" in result_low) \
-                and "already" not in result_low:
+        won = (("accept" in result_low or "claim" in result_low)
+               and "already" not in result_low)
+        if won:
             print(f"[{agent_id}] WON the claim. Doing the work.")
             await gc.quest_journal(quest_id, f"completed by {agent_id}")
             await gc.quest_fulfill(
@@ -772,41 +779,60 @@ async def attempt_claim(agent_id: str) -> None:
 
 
 def main() -> None:
-    agent_id = sys.argv[1] if len(sys.argv) > 1 else "alice"
-    asyncio.run(attempt_claim(agent_id))
+    if len(sys.argv) < 2:
+        print("usage: python -m src.atomic_claim_demo {seed|race QUEST-N agent_id}")
+        sys.exit(2)
+    mode = sys.argv[1]
+    if mode == "seed":
+        asyncio.run(seed())
+    elif mode == "race" and len(sys.argv) >= 4:
+        asyncio.run(race(quest_id=sys.argv[2], agent_id=sys.argv[3]))
+    else:
+        print("usage: python -m src.atomic_claim_demo {seed|race QUEST-N agent_id}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
     main()
 ```
 
-**Run in two terminals simultaneously**:
+**Run the two-phase demo**:
 
 ```bash
-# Terminal 1
-python -m src.atomic_claim_demo alice &
+# Phase 1 — seed once. Captures the assigned QUEST_ID into a shell variable.
+QUEST_ID=$(python -m src.atomic_claim_demo seed)
+echo "seeded $QUEST_ID"
 
-# Terminal 2  (within 1 second)
-python -m src.atomic_claim_demo bob &
+# Phase 2 — race both agents on the SAME QUEST_ID. Spawn in parallel via &.
+python -m src.atomic_claim_demo race "$QUEST_ID" alice &
+python -m src.atomic_claim_demo race "$QUEST_ID" bob &
+wait
 ```
 
-**Expected output** (order may vary):
+**Expected output** (order between alice + bob may vary; quest-id digits depend on prior runs). Captured verbatim from a live 2026-05-12 run:
 
 ```
-[alice] attempting claim...
-[bob] attempting claim...
-[alice] result: {'status': 'claimed', ...}
-[bob] result: {'status': 'rejected', 'reason': 'already claimed by alice', ...}
-[alice] WON the claim. Doing the work.
+=== seeded: QUEST-13 ===
+[bob] attempting claim on QUEST-13...
+[bob] result: [error] ❌ already accepted: QUEST-13 is held by agent (status=in_progress)
 [bob] LOST the race. Will pick another quest.
+[alice] attempting claim on QUEST-13...
+[alice] result: ⚔️ accepted QUEST-13: race-the-prize: both agents want this
+  status=in_progress · priority=P2 · campaign=race-demo · ow…
+[alice] WON the claim. Doing the work.
 ```
 
-Verify state in guild:
+Key signal: **one** "WON" line, **one** "LOST" line — never two WONs. The losing agent's text contains `[error] ❌ already accepted` because guild's atomic-claim primitive serialized the two accepts and returned a deterministic rejection to the second one. Note that the losing response is surfaced with an `[error]` prefix — guild's MCP server treats race-loss as a tool-error (`isError: true` on the `CallToolResult`), not as a successful "you lost" response. The wrapper above ignores `isError` and substring-matches the text body, which is the right move for race semantics — race-loss is expected, not exceptional.
+
+Verify final state in guild:
 
 ```bash
-guild quest list --campaign race-demo
-# expect: QUEST-N  race-the-prize: both agents want this  fulfilled  (owner=alice)
+guild quest scroll QUEST-12  # substitute the QUEST_ID you actually seeded
+# expect: status=done, journal contains 'completed by alice' (or whichever
+# agent won), timeline shows post -> accept -> journal -> fulfill
 ```
+
+> **Why a two-phase seed/race split rather than find-or-create?** Earlier chapter revisions tried `find-by-campaign-or-create` so both terminals could be invoked with just an agent_id. If alice runs to completion before bob starts (sequential invocations, as actually happens when you type two `&` commands a few seconds apart), bob's `status='next'` lookup returns empty — alice's quest is already `done` — and bob creates a NEW quest. Both agents then report WON on DIFFERENT quests, which falsely contradicts the atomic-claim primitive. The seed-then-race split forces both racers onto the same authoritative QUEST_ID so the atomicity test is meaningful. (Sibling chapter BCJ Entry 5 records the original symptom — see below.)
 
 ### 3.2 Programmatic race test
 
