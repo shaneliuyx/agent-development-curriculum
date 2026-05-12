@@ -191,6 +191,45 @@ uv venv --python 3.11 && source .venv/bin/activate
 uv pip install mcp openai python-dotenv pytest pytest-asyncio
 ```
 
+**Project layout (canonical across all decimal-week labs in this curriculum):**
+
+```
+lab-03-5-5-guild/
+├── src/              # library code; importable as `from src.X import Y`
+│   ├── __init__.py   # makes src a package (empty file is fine)
+│   ├── guild_client.py
+│   └── ...
+├── tests/            # pytest test modules; import sibling `src` package
+│   ├── conftest.py   # sys.path bootstrap so `from src.X` works (see below)
+│   ├── test_guild_client.py
+│   └── ...
+├── data/             # input fixtures (small) — committable
+├── docs/             # lab notes + RESULTS.md
+├── pyproject.toml    # optional; declare pytest config here
+└── .venv/            # uv-managed Python env (gitignored)
+```
+
+**Required: `tests/conftest.py` for sys.path bootstrap.** Without this, `pytest tests/...` fails at collection with `ModuleNotFoundError: No module named 'src'` because pytest only puts the test file's own directory on `sys.path`, not the project root. Drop this one file into `tests/`:
+
+```python
+# tests/conftest.py
+"""Bootstrap so tests/ can import src/ as a sibling package."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+```
+
+This matches the W3.5 lab's pattern (`lab-03-5-memory/tests/conftest.py`) so the layout is portable across all decimal-week labs.
+
+> **Alternative (declarative, no conftest.py):** add `[tool.pytest.ini_options]\npythonpath = ["."]` to `pyproject.toml`. Pick this if you prefer config-over-code; pick `conftest.py` if you want one boilerplate file and zero project-config commitment. The curriculum's existing labs use `conftest.py` — match unless you have a reason not to.
+
+Touch `src/__init__.py` to make `src/` a proper Python package (empty file is fine; without it, `from src.X import Y` raises `ImportError` on Python 3.11+):
+
+```bash
+touch src/__init__.py
+```
+
 ### 1.2 Install guild
 
 ```bash
