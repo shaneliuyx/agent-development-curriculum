@@ -7,8 +7,8 @@ tags:
   - process
   - continuous-learning
   - curriculum-maintenance
-audience: Curriculum maintainer (Yuxin / future contributors). Companion to the curriculum overview; complements Appendix G (Continuous Learning System) with the *trend-monitoring* slice specifically — keeping the curriculum current with 2026+ technical trends without emergency rescue audits.
-stack: ~30 min / week skim cadence + quarterly triage; no tooling required beyond a markdown file (this one) and the six signal sources below.
+audience: "Curriculum maintainer (Yuxin / future contributors). Companion to the curriculum overview; complements Appendix G (Continuous Learning System) with the *trend-monitoring* slice specifically — keeping the curriculum current with 2026+ technical trends without emergency rescue audits."
+stack: "~30 min / week skim cadence + quarterly triage; no tooling required beyond a markdown file (this one) and the six signal sources below."
 ---
 
 # Trend-Monitoring Discipline

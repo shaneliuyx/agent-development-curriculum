@@ -14,8 +14,8 @@ tags:
   - gptcache
   - langsmith
   - opentelemetry
-audience: Cloud infrastructure engineer (3 yrs) transitioning to Agent / LLM Engineer roles; treating production-LLM-infra as the same shape as API-gateway + cache + FinOps work they've already shipped at scale.
-stack: MacBook Pro M5 Pro, 48 GB unified memory; oMLX on :8000 + vMLX on :8003 as local backends; Anthropic + OpenAI cloud APIs for cross-provider routing (cap: ~$3 across this chapter); LiteLLM as the gateway; Redis for cache backing; LangSmith free tier for cost-attribution metadata.
+audience: "Cloud infrastructure engineer (3 yrs) transitioning to Agent / LLM Engineer roles; treating production-LLM-infra as the same shape as API-gateway + cache + FinOps work they've already shipped at scale."
+stack: "MacBook Pro M5 Pro, 48 GB unified memory; oMLX on port 8000 + vMLX on port 8003 as local backends; Anthropic + OpenAI cloud APIs for cross-provider routing (cap ~$3 across this chapter); LiteLLM as the gateway; Redis for cache backing; LangSmith free tier for cost-attribution metadata."
 ---
 
 # Week 7.3 — Production LLM Infrastructure
