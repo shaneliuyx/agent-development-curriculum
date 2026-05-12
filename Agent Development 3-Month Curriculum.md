@@ -21,15 +21,31 @@ stack: Local-first MLX. oMLX serves Qwen3.6-35B-A3B-nvfp4 + gemma-4-26B-A4B-it-h
 
 ## How to Use This Guide
 
-**Time budget.** Plan ~12–15 hours per week: 4 hours theory/reading, 6–8 hours hands-on lab, 1–2 hours flashcards + mock answers. If you only have 8 hours, drop the flashcards and stretch each week to 1.5 weeks (≈ 18 weeks total) — do **not** drop the labs.
+**Time budget — read carefully, the math has shifted.** The original "12-week" framing predates the W2.5 / W2.7 / W3.5 cluster / W3.7 / W5.5 / W6.5 / W6.7 / W6.8 / W7.3 / W7.5 / W8.5 / W9.5 / W11.5 / W11.7 supplemental insertions. Today the curriculum has **12 main weeks + ~14 decimal supplements**. Plan accordingly:
+
+- **Core path** (12 main weeks, skip all decimals): ~150 hours over 12 weeks at 12–15 hrs/week.
+- **Full path** (all decimals included): ~200–240 hours over **14–18 calendar weeks** at 12–15 hrs/week. This is the bar the Outcome section below assumes.
+- **Compressed path** (8 hrs/week): same scope, stretch each week to 1.5×, total ~22–27 weeks. Drop flashcards if you must; **never drop the labs**.
+
+Per-week hours allocation:
+
+| Activity | Hours / week |
+|---|---|
+| Theory / reading | 3–4 |
+| Hands-on lab + `RESULTS.md` write-up | 6–8 |
+| Flashcards (15 min × 5 days) + mock answers | 1–2 |
+| Weekly infra-bridge writeup at end of `RESULTS.md` | ~30 min |
+| Trend-monitoring skim ([[Trend-Monitoring Discipline]]) | ~30 min |
+| **Total** | **~12–15 hrs/week** |
 
 **Discipline rules.**
-1. **No tutorial graveyard.** If you finish a week without a runnable artifact + measured number, you have not finished the week.
-2. **Every lab gets a `RESULTS.md`.** Numbers, screenshots, what broke, what you fixed. This becomes your portfolio narrative and your bad-case journal.
-3. **Speak the answers out loud.** Reading is recognition; speaking is recall. Interview signal lives in recall.
-4. **Local first, cloud only when you must.** The whole point of the local stack is to remove the "API-cost anxiety" tax that makes people skip experiments.
+1. **No tutorial graveyard.** If you finish a week without a runnable artifact + measured number, you have not finished the week. Re-do the lab. Reading without measuring is the failure mode this curriculum is designed to prevent.
+2. **Every lab gets a `RESULTS.md`.** Numbers, screenshots, what broke, what you fixed. Becomes your portfolio narrative + your bad-case journal source.
+3. **Speak the answers out loud.** Reading is recognition; speaking is recall. Interview signal lives in recall — record yourself at least 1× per week so you hear your own ums and dead air.
+4. **Local first, cloud with a hard cap.** The whole point of the local stack (oMLX / vMLX / sentence-transformers on Apple Silicon) is to remove the API-cost-anxiety tax that makes people skip experiments. Cloud APIs are scoped to Weeks 7–8 (frontier model comparisons), W7.3 (cross-provider routing — needs Anthropic + OpenAI keys), and W9.5 (optional cloud GPU for the SFT+GRPO run). Total cloud budget cap across the program: **~$13** (~$8 W7–8, ~$3 W7.3, ~$0–30 W9.5 optional). If you exceed $20, audit which lab is leaking — usually a missed `max_tokens` cap or a forgotten cache breakpoint.
+5. **Trend monitoring is a discipline, not an event.** Run the 30 min/week skim of the six signal sources in [[Trend-Monitoring Discipline]] from Week 1, not from Week 12. The Inbox + Audit History you build over the program is itself a portfolio artifact — it proves you maintain skills, not just acquire them once.
 
-**Output of the program.** By Week 12 you should have (this list reflects the 2026-05-12 curriculum scope after the W3.5 cluster + W7.3 + W9.5 + W11.5 + W11.7 expansions):
+**Output of the program.** By the end of the full path (12 main weeks + decimals you opt in to) you should have (this list reflects the 2026-05-12 curriculum scope after the W3.5 cluster + W7.3 + W9.5 + W11.5 + W11.7 expansions; cross-check at every phase boundary against the more detailed §"What You'll Be Able to Do — Outcome Bar" below):
 
 **Code + lab artifacts (~12 GitHub repos):**
 - **1 capstone repo** (W12) polished to portfolio bar — README reads like a tech-design doc (problem → constraints → architecture → eval → results → tradeoffs → what's next).
