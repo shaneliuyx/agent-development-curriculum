@@ -230,6 +230,33 @@ The sequence diagram choreographs a single agent turn: the agent reads existing 
 
 ## Phase 1 — Infrastructure Setup (~30 minutes)
 
+### 1.0 Guided setup (recommended after first checkout)
+
+After cloning the lab and installing dependencies (1.1 below), run the one-command guided setup:
+
+```bash
+.venv/bin/python -m src.lab_init
+```
+
+`src/lab_init.py` is the lab's `guild init` equivalent — a single Python script that auto-detects what's configured, prompts only for missing pieces, and is safe to re-run idempotently. It walks 5 steps:
+
+1. **Python environment** — verifies Python 3.11+ and venv-active
+2. **Qdrant** — checks `localhost:6333`; offers to `docker start qdrant` or `docker run` if missing
+3. **Embedding backend** — probes oMLX `/v1/models` for a `bge-*` model; falls back to interactive prompt for the `sentence-transformers` in-process path with `USE_LOCAL_EMBED=1`
+4. **.env** — writes the 8 required env-vars (OMLX_BASE_URL, OMLX_API_KEY, MODEL_SONNET, MODEL_HAIKU, QDRANT_URL, SQLITE_PATH, EMBED_MODEL, USE_LOCAL_EMBED) using detected values + interactive prompts for the rest
+5. **Verify** — initializes SQLite + smoke-tests `embed()` and `recall()`; prints next-step commands (3-session demo / chat REPL / 15-Q benchmark)
+
+Output mirrors `guild init`'s UX style: colored status (`✓` green, `▸` blue step headers, `⚠` yellow warnings, `✗` red failures), step-numbered progress, and a "Next:" footer. ~150 LOC, stdlib only (no extra dependencies beyond the lab's existing install).
+
+If `lab_init.py` succeeds, skip ahead to Phase 2. Sections 1.1-1.3 below are the manual fallback for users who want to do the setup by hand (e.g. for debugging, or to read what the script actually does).
+
+`★ Insight ─────────────────────────────────────`
+- **DX (Developer Experience) as a load-bearing skill**: a one-command setup that auto-detects state + prompts for missing pieces is the difference between a lab that gets cloned-and-abandoned (manual setup gauntlet) and a lab that ships portfolio-quality reproducibility. The script is ~3 hours of code; saves 30 minutes per new contributor.
+- **Modeled on `guild init`**: same primitives — detect-state-first, idempotent, ANSI-colored status lines, "Next:" footer. The pattern transfers across labs; consider porting to W3.5.5 (guild integration), W3.5.8 (two-tier composition), and any future supplemental lab.
+- **The 5-step structure mirrors a production install script**: dependency check → service health → backend detection → config write → smoke-test. Same shape as Kubernetes operator's reconciliation loop, Terraform's apply phase, or Docker compose's `up -d --wait`. Production discipline in miniature.
+- **Why stdlib-only**: zero new dependencies = the script works even when other things are broken. If lab_init can't import its way to standing up the lab, it can at least diagnose what's missing. The colored-status output uses raw ANSI codes instead of `rich` for the same reason.
+`─────────────────────────────────────────────────`
+
 ### 1.1 Lab scaffold
 
 ```bash
