@@ -917,37 +917,66 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 
 ## Bad-Case Journal
 
-**Entry 1 — Retrieval returns contradiction: "lives in Taipei" and "just moved to Tokyo" both rank high.**
-*Symptom:* User updates location across sessions. `recall()` returns both semantic facts, or both episodic memories. Model gets conflicting context and either refuses to answer or hallucinates a merge.
-*Root cause:* Semantic facts not deduplicated on key. Two live rows exist for the same user+key because contradiction detection failed (extraction said different things; `value` field mismatch passed UNIQUE constraint). Episodic memories from different sessions both match the query embedding.
-*Fix:* Semantic facts must enforce `UNIQUE(user_id, key, archived)` at schema level. On contradiction, query live facts by key and archive old before write. For episodic retrieval, set a relevance threshold (similarity > 0.7) so old irrelevant memories don't surface.
+All entries below are real bugs observed during this lab's implementation (2026-05-11 session). Hypothetical entries removed.
 
-**Entry 2 — Extraction returns structurally invalid JSON; pipeline crashes silently.**
-*Symptom:* `extract_memories()` calls `json.loads()`, which throws `JSONDecodeError` on some turns. Try-except silently returns empty dicts; facts aren't written; user has no idea memory didn't persist. Later queries fail silently.
-*Root cause:* Model sometimes returns markdown-wrapped JSON (```json ... ```) or raw text comments before JSON. Extraction prompt doesn't enforce strict JSON mode (or model doesn't support it).
-*Fix:* Force JSON mode in API call: `response_format={"type": "json_object"}` in OpenAI SDK. Add regex extraction as fallback: `re.search(r'\{.*\}', resp, re.DOTALL)` before `json.loads()`. Log extraction failures loudly; don't swallow errors.
+**Entry 1 — Layered embedding-backend failure: `Connection refused` → `404 Model 'bge-m3' not found`.**
+*Symptom:* Two distinct crashes in sequence as one was fixed. First run: `httpx.ConnectError: [Errno 61] Connection refused` on `embed()`. After starting oMLX: `openai.NotFoundError: Error code: 404 - {'error': {'message': "Model 'bge-m3' not found. Available models: Gemma-4-..., Qwen3.6-..., gpt-oss-20b-..."}}`.
+*Root cause:* Two layered dependencies, each masking the next when the prior was missing. (a) oMLX itself wasn't running — port 8000 was empty. (b) After oMLX started, it shipped with chat models only by default — embedding models supported (BERT / BGE-M3 / ModernBERT per [jundot/omlx README](https://github.com/jundot/omlx)) but not auto-registered.
+*Fix (recommended, oMLX-served):* Download MLX-converted BGE-M3 into `~/.omlx/models/bge-m3-mlx-fp16/` via `huggingface-cli download mlx-community/bge-m3-mlx-fp16 --local-dir ~/.omlx/models/bge-m3-mlx-fp16` or the oMLX admin dashboard. Restart oMLX. Set `EMBED_MODEL=bge-m3-mlx-fp16` in `.env`. Verify with `curl -H "Authorization: Bearer $OMLX_API_KEY" http://localhost:8000/v1/models | grep bge`.
+*Fix (fallback, in-process):* Set `USE_LOCAL_EMBED=1`. `embed()` uses `sentence-transformers` BGE-M3 with `device="mps"`. One extra GB resident per process, zero second-server dependency, offline-capable.
+*Discipline rule:* check what each "running" service ACTUALLY serves, not just whether the port is open. Phase 1 setup table now lists per-service smoke tests (Qdrant `/readyz`, oMLX `/v1/models | grep <embed-model-id>`, in-process embed import). Code ships dual-mode behind one env-var toggle so the lab works on a stock oMLX install AND on a configured one.
 
-**Entry 3 — Seed-entity matching fails; graph traversal finds zero edges.**
-*Symptom:* `recall()` successfully retrieves episodic memories ("user mentioned cycling"). But semantic facts retrieval returns empty because the embedding of "cycling" doesn't match the stored fact's embedding (e.g., fact stored as "hobby=cycling" during extraction, but query embedded just the word "cycling").
-*Root cause:* Extraction and retrieval use the same embedding model, but extraction embeds the full semantic fact string while retrieval embeds the isolated query term. Vocabulary mismatch.
-*Fix:* On write, embed both the full fact string and the key+value separately; store both embeddings. On retrieval, search both. Alternatively, normalise by always embedding in context: extract time writes `f"{key}={value}"` and retrieval embeds incoming query as `f"user fact: {query}"`.
+**Entry 2 — `extract_memories()` returns a top-level JSON array; downstream `mem.get("semantic")` crashes with `AttributeError: 'list' object has no attribute 'get'`.**
+*Symptom:* Single-turn after first successful `recall`. The extraction LLM (gpt-oss-20b at Haiku tier) emitted `[{"key": "location", "value": "Taipei"}, ...]` — a top-level array — instead of the requested `{"semantic": [...], "episodic": [...]}` object. Pipeline assumed dict; iterating `mem.get("semantic", [])` raised AttributeError on the list.
+*Root cause:* `response_format={"type": "json_object"}` is best-effort on local quantized models. gpt-oss-20b respects the schema ~95% of runs but emits other shapes (top-level array, top-level scalar, nested dict-of-dicts) ~5% of the time. Cloud models (Claude / GPT-4 family) enforce strictly; local models do not.
+*Fix:* Coerce-or-empty at the parsing boundary. `extract_memories()` now:
+  1. Tries `json.loads(raw)` — empty dict on `JSONDecodeError`
+  2. If parsed is a `list` of `{key, value}` dicts → treat as all-semantic
+  3. If parsed is a `list` of strings → treat as all-episodic
+  4. If parsed is anything else (scalar, None, malformed) → empty dict
+  5. If parsed is a dict but `semantic`/`episodic` fields have wrong types → empty for that field
+*Discipline rule:* `response_format=json_object` is a contract on cloud models, a hint on local models. Always coerce-or-empty at the parsing boundary; never trust the schema. Same pattern as W2.7's `_is_low_quality()` defensive check.
 
-**Entry 4 — Memory writes cause N+1 queries on user table lookups.**
-*Symptom:* `write_semantic_fact()` does a SELECT to check for live facts, then UPDATE/INSERT. In a multi-turn session, this repeated SELECT per turn causes 50 queries to SQLite. Latency compounds; agent response stalls.
-*Root cause:* No indexing; no connection pooling. Each write is a separate sqlite3.connect(), which is slow. SELECT-then-write pattern is atomic at app level but not DB level.
-*Fix:* Add `CREATE INDEX idx_user_facts_live ON user_facts(user_id, archived)` (already in schema). Use connection pool or keep one persistent connection per session. Or, use `INSERT OR REPLACE` with a trigger to handle contradictions atomically on the DB side.
+**Entry 3 — `sqlite3.OperationalError: database is locked` under 15-Q benchmark load.**
+*Symptom:* `pytest tests/test_recall.py` ran 12/15 passing; tests 12 / 13 / 15 failed with `database is locked` on the INSERT inside `write_semantic_fact`. Each failing test passed in isolation — failure was order-dependent.
+*Root cause:* Three stacked issues. (a) SQLite default journal mode is DELETE, which serializes ALL access — readers block writers and vice versa. Under test load (15 tests × 3 writes/test interleaved with LLM extraction calls taking 30-60s each), the default 5s connection timeout was insufficient. (b) `write_semantic_fact` had no `try/finally` around `conn.close()`; an exception mid-transaction leaked the connection and held the lock. (c) Some tests left transactions uncommitted when an LLM-extraction call raised.
+*Fix (three-part):*
+  1. Bump `sqlite3.connect(SQLITE, timeout=30)` at every connect site — gives writers a chance to acquire the lock under contention.
+  2. Enable WAL mode at module-import:
+     ```python
+     _init = sqlite3.connect(SQLITE, timeout=30)
+     _init.execute("PRAGMA journal_mode=WAL")
+     _init.execute("PRAGMA synchronous=NORMAL")
+     _init.close()
+     ```
+  3. Wrap `write_semantic_fact`'s body in `try/finally` so `conn.close()` always runs even on exception mid-transaction.
+*Discipline rule:* any SQLite-backed code path with concurrent access patterns MUST use WAL mode AND `try/finally` connection cleanup AND a connection timeout. The default-DELETE-mode + leak-on-exception combination produces this exact failure under load every time. Result after fix: 14/15 passing (test 12 still failing on a different bug — Entry 4).
 
-**Entry 5 — Memory injected into prompt exceeds context window.**
-*Symptom:* After 20 turns, `recall()` returns 30+ semantic facts and 50+ episodic summaries. System prompt + retrieved facts + conversation now exceeds 4K tokens on a 4K model, context exhausted, model fails.
-*Root cause:* No cap on `recall()` results. Every fact ever stored is eligible for retrieval and injection. Memory growth is unbounded.
-*Fix:* Add `LIMIT k` to retrieval queries (e.g., `LIMIT 20` for facts). Implement TTL (facts older than 30 days get archived). Implement confidence-weighted eviction: each fact has a `confidence` score; lowest scores are archived when store hits cap. Summarise old facts: after N days, run an LLM over episodic history to emit "permanent takeaways" (semantic facts) and archive the raw episodes.
+**Entry 4 — `sqlite3.IntegrityError: UNIQUE constraint failed: user_facts.user_id, user_facts.key, user_facts.archived` on the third contradiction-update.**
+*Symptom:* `test_12_multiple_contradictions_latest_wins` seeded location: Osaka → Tokyo → Kyoto. First update succeeded (Osaka.archived=0 → 1, Tokyo.archived=0 inserted). Second update on third call failed: trying to archive Tokyo (Tokyo.archived=0 → 1) while an archived Osaka.archived=1 row already existed for the same (user_id, key) → unique constraint violation.
+*Root cause:* Schema had `UNIQUE(user_id, key, archived)`. This enforced uniqueness across THE WHOLE TUPLE including the `archived` flag — meaning at most ONE archived row per (user_id, key). The intent had been "one live row + one history row", but real SCD-2 history requires UNBOUNDED archived rows (Osaka, Tokyo both archived as Kyoto becomes live).
+*Fix:* Remove the full `UNIQUE(user_id, key, archived)` constraint. Add a partial unique index on live rows only:
+```sql
+CREATE TABLE user_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    archived INTEGER DEFAULT 0,
+    ...
+    -- NO full UNIQUE constraint here
+);
+CREATE UNIQUE INDEX idx_live_unique
+    ON user_facts(user_id, key) WHERE archived = 0;
+```
+The partial index lets exactly one (user_id, key, archived=0) row exist while archived=1 rows accumulate without limit. SCD-2 history is now correctly unbounded.
+*Discipline rule:* `UNIQUE(a, b, flag)` is almost never what you want when `flag` is "is-this-the-current-version". Use a partial unique index with `WHERE flag = <current-value>` instead. After this fix: 15/15 passing.
 
-**Entry 6 — `recall()` crashes with `404 Model 'bge-m3' not found` on first user message.**
-*Symptom:* Fresh-install agent, `python -m src.chat --user alice` starts, REPL prompts for input, first message crashes with `openai.NotFoundError: Error code: 404 - {'error': {'message': "Model 'bge-m3' not found. Available models: Gemma-4-..., Qwen3.6-..., gpt-oss-20b-..."}}`. Connection IS established (oMLX is running), but `embed()` calls `omlx.embeddings.create(model="bge-m3", ...)` and gets a 404.
-*Root cause:* oMLX *supports* embedding models (BERT, BGE-M3, ModernBERT — see [jundot/omlx README](https://github.com/jundot/omlx)) but ships with chat models only by default. The lab's original `embed()` assumed `bge-m3` would already be registered. Connection succeeds (server up, auth OK) but the model name is unknown until you explicitly add it. Earlier symptom of the same root cause is `Connection refused` if oMLX itself isn't running — the layered failure mode hides which dependency is missing.
-*Fix (recommended, oMLX-served):* Download an MLX-converted BGE-M3 into `~/.omlx/models/bge-m3-mlx-fp16/` (e.g. `huggingface-cli download mlx-community/bge-m3-mlx-fp16 --local-dir ~/.omlx/models/bge-m3-mlx-fp16` or via oMLX admin dashboard). Restart oMLX. Set `EMBED_MODEL=bge-m3-mlx-fp16` in `.env`. `embed()` then calls `omlx.embeddings.create(model=EMBED_MODEL, input=text)`. Verify with `curl -H "Authorization: Bearer $OMLX_API_KEY" http://localhost:8000/v1/models | grep bge` — model id must appear.
-*Fix (fallback, in-process):* Set `USE_LOCAL_EMBED=1` in `.env`. `embed()` then uses `sentence-transformers` BGE-M3 with `device="mps"`. One extra GB resident per process, zero second-server dependency, offline-capable. `sentence-transformers` stays in `requirements` so this path always works.
-*Discipline rule:* check what each "running" service ACTUALLY serves, not just whether the port is open. Phase 1 setup table now lists per-service smoke tests (e.g. `curl /v1/models` must return your embedding model id). Code stays dual-mode behind one env-var toggle so the lab works either way and ships a clean fallback for users who can't add the model to oMLX.
+**Entry 5 — Test passes in isolation but fails in sequence (state leakage from prior tests).**
+*Symptom:* `test_15_archived_facts_not_returned` passed alone (`pytest tests/test_recall.py::test_15_...`). Failed when run as part of the full suite. Same error class as Entry 3 (`database is locked`) but discovered AFTER the WAL + try/finally fix; persisted because a different mechanism leaked state.
+*Root cause:* `write_semantic_fact`'s SELECT-then-INSERT pattern, when interleaved with LLM-extraction calls in the prior test, could leave a transaction open if the LLM call raised. Even with WAL + timeout=30 the next test's SQLite connection saw the stale open transaction and blocked. The pattern is "SELECT (autocommit) → if-row-is-None (Python) → INSERT (auto-begin transaction) → commit". An exception between INSERT and commit leaves the transaction open until connection close. Without `try/finally`, close could be skipped.
+*Fix:* Same `try/finally` from Entry 3 — guarantees `conn.close()` runs even when the transaction is mid-flight. Test-isolation discipline applied at the wrapper layer, not per-test.
+*Discipline rule:* test isolation in a stateful system requires CONNECTION-CLOSE guarantees, not just per-test fresh data. The W3.5 lab's per-test `uuid` user_ids are necessary but not sufficient — connection lifecycle must also be deterministic. Worth tightening even further: production memory systems should use `with conn:` context managers to enforce both commit-or-rollback AND close.
 
 ---
 
@@ -963,13 +992,37 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 
 ## References
 
-- **Packer et al. (2023).** *MemGPT: Towards LLMs as Operating Systems.* arXiv:2310.08560. OS-paging analogy for agent memory.
-- **mem0 (2024).** https://github.com/mem0ai/mem0. Open-source episodic + semantic memory with LLM contradiction detection.
-- **Wang et al. (2024).** *A-MEM.* arXiv:2502.12110. Dynamic memory structuring.
-- **Shinn et al. (2023).** *Reflexion.* arXiv:2303.11366. Memory-through-reflection.
-- **Madaan et al. (2023).** *Self-Refine.* arXiv:2303.17651. Single-session self-critique; contrast with cross-session.
-- **Qdrant docs** — collection creation, payload filtering, score thresholds.
-- **Slowly Changing Dimensions (SCD-2)** — Kimball Group. Archive-on-contradiction = SCD-2 by another name.
+### Foundational papers
+
+- **Packer et al. (2023).** *MemGPT (now Letta): Towards LLMs as Operating Systems.* [arXiv:2310.08560](https://arxiv.org/abs/2310.08560). OS-paging analogy for agent memory; the canonical two-tier (RAM ↔ archive) precedent that anchors the W3.5.8 capstone.
+- **Wang et al. (2024).** *A-MEM: Agentic Memory for LLM Agents.* [arXiv:2502.12110](https://arxiv.org/abs/2502.12110). Dynamic memory structuring with note-network-style organization.
+- **Shinn et al. (2023).** *Reflexion: Language Agents with Verbal Reinforcement Learning.* [arXiv:2303.11366](https://arxiv.org/abs/2303.11366). Memory-through-reflection; distinguish from cross-session memory.
+- **Madaan et al. (2023).** *Self-Refine: Iterative Refinement with Self-Feedback.* [arXiv:2303.17651](https://arxiv.org/abs/2303.17651). Single-session self-critique; contrast with cross-session.
+- **McClelland, McNaughton, O'Reilly (1995).** *Why there are complementary learning systems in the hippocampus and neocortex.* The neuroscience grounding for the two-tier memory architecture (referenced extensively in W3.5.8).
+
+### Production reference systems (used in W3.5 + W3.5.5 + W3.5.8)
+
+- **mem0 (2024).** https://github.com/mem0ai/mem0. Open-source episodic + semantic memory with LLM contradiction detection. Used in this lab as the dual-store wrapper.
+- **mathomhaus/guild.** https://github.com/mathomhaus/guild. Single-Go-binary multi-agent MCP coordinator with embedded SQLite + BM25/dense/RRF retrieval. Production-comparator (W3.5.5 chapter integrates this as the operational tier).
+- **EverMind-AI/EverOS / EverCore.** https://github.com/EverMind-AI/EverOS. Research-grade memory OS with biological-imprinting model + LongMemEval 83% / LoCoMo 93.05% published scores. Production-comparator (W3.5.8 chapter integrates EverCore as the semantic tier). [arXiv:2601.02163](https://arxiv.org/abs/2601.02163).
+
+### Industry-standard memory benchmarks
+
+- **LongMemEval.** https://github.com/xiaowu0162/LongMemEval. 500-turn-conversation memory recall benchmark; the canonical evaluation surface for cross-session memory systems. Used optionally in W3.5.8 Phase 5.3.
+- **LoCoMo (Maharana et al. 2024).** *Evaluating Very Long-Term Conversational Memory of LLM Agents.* [arXiv:2402.17753](https://arxiv.org/abs/2402.17753) + https://github.com/snap-research/locomo. Companion benchmark to LongMemEval.
+
+### Storage + retrieval primitives
+
+- **Qdrant docs.** https://qdrant.tech/documentation/. Collection creation, payload filtering, score thresholds. Used for the episodic tier in this lab.
+- **SQLite WAL mode.** https://sqlite.org/wal.html. Journal mode that allows readers concurrent with one writer; load-bearing for both this lab's contradiction-update path AND guild's atomic-claim primitive (see W3.5.5 deep-dive).
+- **BGE-M3 (Chen et al. 2024).** *BGE M3-Embedding: Multi-Lingual, Multi-Functional, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation.* [arXiv:2402.03216](https://arxiv.org/abs/2402.03216). The embedding model used for both dense (this lab) and dense+sparse hybrid (W2.7 / W2.5).
+- **`sentence-transformers`.** https://www.sbert.net. Python framework wrapping HuggingFace embedding models with MPS-device support on Apple Silicon; used as the in-process fallback path when oMLX doesn't serve embeddings (Bad-Case Entry 1).
+
+### Data-engineering parallels
+
+- **Slowly Changing Dimensions (SCD-2)** — Kimball Group. Archive-on-contradiction = SCD-2 by another name. The data-warehouse pattern that explains why memory contradiction updates work the way they do.
+- **Cache-aside pattern** — Microsoft Azure architecture docs. The cache-aside / lazy-load pattern is the engineering version of the two-tier memory architecture in W3.5.8.
+- **MCP (Model Context Protocol, Anthropic Nov 2024).** https://modelcontextprotocol.io. Standard protocol for agent-to-tool communication. Adopted by OpenAI + Google in 2025-2026. Used in W3.5.5 as the integration substrate for guild.
 
 ---
 
