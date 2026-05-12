@@ -39,6 +39,62 @@ stack: Local-first MLX. oMLX serves Qwen3.6-35B-A3B-nvfp4 + gemma-4-26B-A4B-it-h
 
 ---
 
+## What You'll Be Able to Do — Outcome Bar
+
+If you study this material day-by-day on a strict schedule (12–15 hrs/week × 12 weeks ≈ **150–180 hours total**) and complete every lab carefully — meaning you write the code yourself, capture measured numbers in each `RESULTS.md`, and speak each interview soundbite aloud before moving on — here is the concrete competency floor you reach. None of these claims are aspirational; each maps to a runnable artifact + a measured number you will own in your own repo.
+
+### After Phase 1 (Weeks 1–3.7, ~55 hours) — RAG Senior-Engineer Bar
+
+- You hold **empirically-measured numbers on five RAG backends** on your own corpus: vector hybrid (W1–2), GraphRAG (W2.5), tree-index PageIndex (W2.7 with the **16/16 = 1.000 GT-judge** result), RAG eval with RAGAS (W3), agentic 5-node graph (W3.7).
+- You can defend each backend's failure mode in interviews with cited deltas (HyDE = −0.007 on `answer_relevancy`; multi-query tied on faithfulness; tree-v3 = 1.000 vs vector 0.500 vs graph 0.375) — not abstract pros/cons.
+- Cross-session memory works end-to-end (W3.5): 15/15 recall benchmark + Phase 5 mem0 cross-check (10/14, four measured architectural differences).
+- **You hit a hireable bar for:** any RAG-leaning take-home, leading a RAG project, mentoring junior engineers on retrieval quality.
+
+### After Phase 2 (Weeks 4–6.7, ~50 hours) — Agent Architect Bar
+
+- You wrote a **ReAct loop from scratch in ~150 lines** (W4). You can name the three dominant failure modes (infinite loop / tool hallucination / scratchpad bloat) and cite the exact fix for each.
+- You read Claude Code's source end-to-end (W6) and authored three production-quality skills with measured trigger-tuning logs (W6.7).
+- You shipped multi-agent shared memory via the guild MCP integration (W3.5.5) — you understand atomic-claim vs blackboard vs message-queue coordination and can defend which fits which use case.
+- **You hit a hireable bar for:** designing an agent system from a one-line product spec; reading a competing framework's source and identifying where it cut corners.
+
+### After Phase 3 (Weeks 7–9.5, ~50 hours) — Production Reliability Bar
+
+- You ship a tool harness with a **20-scenario bad-case suite** (W7) covering retry, timeout, budget, idempotency, idle-watchdog, false-completion gate, and typed-error envelope routing.
+- You ship the production-LLM-infra stack (W7.3): LiteLLM gateway routing 3 providers + Anthropic/OpenAI prompt caching + GPTCache semantic cache + LangSmith cost-attribution + circuit-breaker fallback. You walk into interviews with a **measured cost-per-faithful-answer number** in your back pocket.
+- You ship the schema reliability bench (W8): 5-strategy × 5-model matrix on 100 prompts. **This is your signature question — it can move you up a level in a single answer.**
+- You ship faithfulness checker + abstention router (W9) and the pretrain → SFT → GRPO 4-row ablation table on GSM8K-mini (W9.5).
+- **You hit a hireable bar for:** Akshay 6-area rubric **all six areas covered with measured artifacts** — harness engineering + inference serving + structured output reliability + evals/observability + production infra + fine-tune-vs-in-context decision making. **This is the staff-track AI engineer signal.**
+
+### After Phase 4 (Weeks 10–12, ~25 hours) — Interview-Ready Senior Bar
+
+- You re-implemented your agent loop in **four frameworks** (LangGraph / LlamaIndex / OpenAI Agents SDK / DSPy) and ship a decision matrix on LOC + traceability + testability + cost (W10).
+- You whiteboarded **five system designs** out loud and self-recorded against a 7-point rubric (W11), including the infra-aware SRE agent as your interview-closer differentiator.
+- You shipped a 10-attack red-team suite + 3 defense layers with **kill-rate-per-layer table** (W11.5).
+- You ran a 4-hour timed take-home dress rehearsal (W11.7) with `git log` showing evals-first discipline visible to any reviewer.
+- You shipped 1 capstone repo + 30 mock-interview recordings + 10 tailored applications with one quoted measured number per cover letter.
+- **You hit a hireable bar for:** Senior AI / LLM / Agent / Applied AI Engineer roles, with a portfolio that reads like a tech-design doc rather than a tutorial collection.
+
+### What "competently" really means
+
+Most candidates with 2–3 years of generic ML work cannot pass the bar above. The reason is not intelligence — it is **discipline**. Specifically:
+
+- **Time discipline.** 12–15 hrs/week is the published minimum. Less than 10 hrs/week and the labs degrade into reading. More than 20 hrs/week and you burn out before the capstone. The schedule is not "do labs when motivated"; it is **same window every day**, even when the topic feels boring.
+- **Measurement discipline.** Every lab ends with a `RESULTS.md` containing numbers, screenshots, and what broke. No skipped labs. No "I'll come back to RAGAS later." A candidate who quotes "I ran the eval and it improved" without a delta is indistinguishable from a candidate who never ran it.
+- **Speaking discipline.** Every interview soundbite spoken aloud before being written down. Reading silently does not build the recall muscle that gets you offers. ~30 recorded mock answers by Week 12 — audio-only is fine, video is better.
+- **Honesty discipline.** When a measurement isn't possible on your hardware, you say so in the chapter. Faking a number is worse than skipping it — interviewers smell unmeasured claims in 90 seconds.
+
+The reader who maintains these four disciplines for 12 weeks ends with skills most "AI engineers" in 2026 do not actually have. The reader who skips half the labs and skims the chapters ends with the same vague understanding they walked in with. **There is no middle path** — this is a measurement-driven curriculum or it is nothing.
+
+### What this is NOT a path to
+
+- **Not "AI Researcher / Scientist" roles** — those want PhD-level fundamentals this curriculum doesn't drill (transformer internals, novel-paper authorship, deep PyTorch). W9.5 touches fine-tuning but as a *deployment* skill, not a *research* skill.
+- **Not "ML Platform Engineer at FAANG" cold** — those want distributed-systems-at-scale primitives (Kubernetes scheduler internals, Spark physical plans, Ray actor model) this curriculum treats only as analogies.
+- **IS** the bridge from cloud-infrastructure engineer (3+ yrs Terraform / observability / on-call / FinOps / distributed-systems-failure-modes) to applied-AI / agent-engineer roles. The infra fundamentals you already have **compose directly** with the new agent-engineering primitives. You are not starting from zero — you are translating known production discipline into a new model layer. That is the unfair advantage this curriculum is built to leverage.
+
+If you finish this curriculum on schedule with all artifacts, you walk into 2026 interviews able to answer **any of the 100 questions in Appendix A** with a measured number from your own lab. That is the bar. It is reachable. It takes the four disciplines above and 12 weeks.
+
+---
+
 ## Conceptual Framework — The Three Engineering Paradigms
 
 Understanding where this curriculum sits in the 2024–2026 arc of AI engineering prevents you from treating it as a collection of disconnected skills.
