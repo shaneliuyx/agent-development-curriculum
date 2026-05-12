@@ -879,7 +879,7 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 
 **Concrete trigger to add HyperMem**: when ≥30% of your `query_context()` calls have a "tell me about X AND Y AND Z together" shape (multi-entity intersection), the semantic tier alone forces post-processing in Python. At that point a relational tier earns its operational cost.
 
-**Where it slots in the curriculum**: not as a W3.5.9 supplemental (would over-fragment the W3.5 cluster). Recommend reaching for HyperMem in **W11 System Design** as a "scaling architecture" topic, OR in a **W12 Capstone-A variant** where the corpus has explicit multi-entity structure (e.g. organizational knowledge graph).
+**Where it slots in the curriculum**: **[[Week 3.5.9 - Memory Benchmarks and Hypergraph Three-Tier]]** integrates HyperMem as the L3 relational tier on top of this lab's two-tier architecture. W3.5.9 also runs the LongMemEval `oracle` subset across all five backends (no-mem / guild / EverCore / two-tier / three-tier), turning the trigger-condition discussion above into a measurement. Prerequisite: this chapter (W3.5.8) shipped end-to-end. The cluster's graduation arc is now W3.5 → W3.5.5 → W3.5.8 → W3.5.9, with measurement-driven scaling at the top.
 
 `★ Insight ─────────────────────────────────────`
 - **The two-tier → three-tier extension is a real production scaling pattern**, not just a research artifact. Most agent systems START at single-tier, GRADUATE to two-tier when cross-session knowledge transfer matters, and ADD relational only when entity-density crosses a threshold. Knowing all three stages — and the trigger for each — is the production-architect signal.
