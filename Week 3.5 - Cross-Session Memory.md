@@ -971,83 +971,47 @@ FAILED test_12_multiple_contradictions_latest_wins
 
 ### 5.5 Comparison Matrix + Diagnosis — Add to RESULTS.md
 
-```markdown
-## Phase 5 — mem0 cross-check
+Add the following block under a `## Phase 5 — mem0 cross-check` heading in your `RESULTS.md`:
 
 | Backend | LOC | 15-Q pass | Mean latency / turn | Setup | Where it wins |
 |---|---|---|---|---|---|
-| Hand-rolled (W3.5 lab) | ~150 in src/memory.py | **15/15** | ~3-4s | ~30 min from scratch | Explicit episodic/semantic split; SCD-2 contradiction archival; defensive parsing tuned for local-quantized models |
-| mem0 v2.0.2 wrapper | ~120 in src/memory_mem0.py | **10/14** (test_15 skipped, 4 architectural failures) | ~4-5s | ~15 min wrapper + Qdrant collection | Production-grade contradiction-detection prompt; single-API surface; multi-backend support |
+| Hand-rolled (W3.5 lab) | ~150 in `src/memory.py` | **15/15** | ~3-4s | ~30 min from scratch | Explicit episodic/semantic split; SCD-2 contradiction archival; defensive parsing tuned for local-quantized models |
+| mem0 v2.0.2 wrapper | ~120 in `src/memory_mem0.py` | **10/14** (test_15 skipped, 4 architectural failures) | ~4-5s | ~15 min wrapper + Qdrant collection | Production-grade contradiction-detection prompt; single-API surface; multi-backend support |
 
-### Three measured architectural differences (the actual artifact)
+#### Three measured architectural differences (the actual artifact)
 
-The 4 mem0 failures are NOT wrapper bugs. They're measured semantic
-differences from the hand-roll's contract — verified across two
-different LLM tiers (gpt-oss-20b + Gemma-26B):
+The 4 mem0 failures are NOT wrapper bugs. They're measured semantic differences from the hand-roll's contract — verified across two different LLM tiers (gpt-oss-20b + Gemma-26B):
 
-1. **Contradiction-update semantics (tests 05 + 12 fail)** — mem0 v2
-   does NOT archive old values when a new value contradicts. Multiple
-   location updates (Osaka → Tokyo → Kyoto) leave multiple "memories"
-   in mem0's store, not a single live row with archived history. The
-   hand-roll's SCD-2 + partial-unique-index produces a different
-   contract: at most one live (user_id, key) row, unbounded archived
-   history. Production tradeoff: mem0 preserves full mention history
-   without schema hacks; hand-roll enforces a single canonical
-   "current" value at the cost of needing the partial unique index
-   from W3.5 BCJ Entry 4.
+1. **Contradiction-update semantics (tests 05 + 12 fail).** mem0 v2 does NOT archive old values when a new value contradicts. Multiple location updates (Osaka → Tokyo → Kyoto) leave multiple "memories" in mem0's store, not a single live row with archived history. The hand-roll's SCD-2 + partial-unique-index produces a different contract: at most one live `(user_id, key)` row, unbounded archived history. Production tradeoff: mem0 preserves full mention history without schema hacks; hand-roll enforces a single canonical "current" value at the cost of needing the partial unique index from W3.5 BCJ Entry 4.
 
-2. **No episodic vs semantic split (tests 07 + 10 fail)** — mem0 v2
-   has no architectural distinction between episodic and semantic
-   memory. Everything is a flat 'memories' list. The wrapper's
-   score>0.5 heuristic classifies everything as semantic, so
-   relevant_episodes is always empty, breaking tests that assert on
-   episodic-specific surfaces. The hand-roll's dual-store (Qdrant
-   episodic + SQLite semantic) is the architectural choice mem0
-   collapses. Tradeoff: mem0's unified model is simpler to operate;
-   hand-roll's split makes the four-memory-types taxonomy explicit
-   at the storage layer.
+2. **No episodic vs semantic split (tests 07 + 10 fail).** mem0 v2 has no architectural distinction between episodic and semantic memory. Everything is a flat `memories` list. The wrapper's `score>0.5` heuristic classifies everything as semantic, so `relevant_episodes` is always empty, breaking tests that assert on episodic-specific surfaces. The hand-roll's dual-store (Qdrant episodic + SQLite semantic) is the architectural choice mem0 collapses. Tradeoff: mem0's unified model is simpler to operate; hand-roll's split makes the four-memory-types taxonomy explicit at the storage layer.
 
-3. **API churn (mem0 v2 broke v1 patterns)** — Memory() default to
-   cloud, search() filters dict, return-shape inconsistencies. The
-   wrapper carries three defensive patches that wouldn't exist in
-   a v1 mem0 client. Tradeoff: pinning a version buys stability
-   but locks out fixes; the hand-roll has no external API surface
-   to track.
+3. **API churn (mem0 v2 broke v1 patterns).** `Memory()` default to cloud, `search()` filters dict, return-shape inconsistencies. The wrapper carries three defensive patches that wouldn't exist in a v1 mem0 client. Tradeoff: pinning a version buys stability but locks out fixes; the hand-roll has no external API surface to track.
 
-### Hypothesis-test narrative (the interview-quotable artifact)
+#### Hypothesis-test narrative (the interview-quotable artifact)
 
 The model-swap experiment was the most senior-signal-producing step:
-  1. Observation — 10/14 pass with gpt-oss-20b, error logs mention
-     'NoneType has no attribute strip'
-  2. Hypothesis — failures are gpt-oss-20b-specific (Haiku quirk on
-     edge prompts)
-  3. Experiment — swap to Sonnet-tier Gemma-26B
-  4. Result — identical 10/14, same 4 tests failed → hypothesis
-     falsified
-  5. Updated conclusion — failures are mem0 design differences,
-     not model-quality issues
 
-Without the model-swap, the writeup would have been "mem0 is flaky
-on small local models" — true sometimes, but misleading and narrow.
-With the swap, the writeup is "mem0 v2 has different semantic
-contracts than my hand-roll on contradiction archival and episodic/
-semantic separation" — specific, actionable, defensible in any
-interview about empirical method.
+1. **Observation** — 10/14 pass with gpt-oss-20b, error logs mention `'NoneType' has no attribute 'strip'`
+2. **Hypothesis** — failures are gpt-oss-20b-specific (Haiku quirk on edge prompts)
+3. **Experiment** — swap to Sonnet-tier Gemma-26B
+4. **Result** — identical 10/14, same 4 tests failed → hypothesis falsified
+5. **Updated conclusion** — failures are mem0 design differences, not model-quality issues
 
-### What I'd port back into src.memory.py from mem0's source
+Without the model-swap, the writeup would have been "mem0 is flaky on small local models" — true sometimes, but misleading and narrow. With the swap, the writeup is "mem0 v2 has different semantic contracts than my hand-roll on contradiction archival and episodic/semantic separation" — specific, actionable, defensible in any interview about empirical method.
+
+#### What I'd port back into `src.memory.py` from mem0's source
 
 If productionizing the hand-roll:
-- mem0's contradiction-detection prompt structure (more sophisticated
-  than the lab's simple value-mismatch check)
+
+- mem0's contradiction-detection prompt structure (more sophisticated than the lab's simple value-mismatch check)
 - Retry-on-extraction-failure with exponential backoff
-- Multi-fact dedup before write (mem0 handles within a single add())
+- Multi-fact dedup before write (mem0 handles within a single `add()`)
 
 What I'd NOT port:
-- mem0's unified episodic+semantic model — the dual-store explicit
-  split serves the four-memory-types taxonomy better
-- mem0's contradiction-keep-history policy — SCD-2 archival is the
-  right pattern for "what is currently true about this user"
-```
+
+- mem0's unified episodic+semantic model — the dual-store explicit split serves the four-memory-types taxonomy better
+- mem0's contradiction-keep-history policy — SCD-2 archival is the right pattern for "what is currently true about this user"
 
 ### 5.6 Exit Criteria for Phase 5
 
