@@ -978,6 +978,15 @@ The partial index lets exactly one (user_id, key, archived=0) row exist while ar
 *Fix:* Same `try/finally` from Entry 3 — guarantees `conn.close()` runs even when the transaction is mid-flight. Test-isolation discipline applied at the wrapper layer, not per-test.
 *Discipline rule:* test isolation in a stateful system requires CONNECTION-CLOSE guarantees, not just per-test fresh data. The W3.5 lab's per-test `uuid` user_ids are necessary but not sufficient — connection lifecycle must also be deterministic. Worth tightening even further: production memory systems should use `with conn:` context managers to enforce both commit-or-rollback AND close.
 
+**Entry 6 — Episodic-recall threshold 0.35 is a precision-recall lever; `test_11` flakes on the noise floor.**
+*Symptom:* `test_11_episodic_does_not_surface_on_irrelevant_query` passes some runs and fails others with the SAME code + SAME seed. Run 1: 15/15. Run 2: 14/15 (test_11 failed). Run 3: 15/15. The flake is real — repeated runs disagree on whether the seeded episode about "Python list comprehensions" surfaces on an irrelevant query like "what's the weather like in Antarctica?".
+*Root cause:* The `recall()` filter `[h.payload["text"] for h in hits if h.score > 0.35]` uses a fixed similarity threshold. BGE-M3's cosine score on semantically-distant-but-not-orthogonal text pairs ("Python comprehensions" vs "Antarctica weather") sits at 0.36-0.40 — right on the noise floor. Compounding: the LLM extraction step paraphrases the seed text slightly differently each run (gpt-oss-20b at T=0.0 is *near*-deterministic, not exactly deterministic on local quantized weights), so the EMBEDDED text differs subtly between runs, pushing the score above or below 0.35 non-deterministically.
+*Fix (three valid paths, pick based on goal):*
+  1. **Bump threshold to 0.45.** Reduces this flake but risks breaking `test_10_episodic_surfaces_on_relevant_query` if the LangGraph→agent-frameworks pair scores in 0.35-0.45 range. Measure both before shipping.
+  2. **Make `test_11`'s irrelevant query genuinely orthogonal.** Swap "what's the weather in Antarctica?" for "what time is it now?" — less likely to score above any reasonable threshold against ANY seeded episode.
+  3. **Accept the flake as a precision-recall observation.** 14/15 is still well above the 12/15 exit criterion. The flake IS the lesson about similarity-threshold tuning.
+*Discipline rule:* in production memory systems with similarity thresholds, the threshold choice is a precision-recall lever, not a one-time number. Senior engineers MEASURE the corpus's noise-floor distribution before picking the threshold; junior engineers cargo-cult a value (0.35, 0.5, 0.7). This is the same pattern as W2.7's δ=0.07 cluster-routing tiebreak — same primitive (calibrated noise floor), different domain (cluster centroids vs episodic-memory pairs). The lab's 0.35 was a starter value; bump to 0.45 if your corpus warrants it, after measuring leader-vs-runner-up gap distribution.
+
 ---
 
 ## Interview Soundbites
