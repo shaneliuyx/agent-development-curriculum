@@ -2161,6 +2161,56 @@ The harness is an RPC client. Retry/backoff, timeout, budget cap, idempotency ke
 
 **Captured in curriculum at:** [[Week 7 - Tool Harness#Bad-Case Journal]]
 
+**Entry 2 — Tool process hangs silent; per-call wallclock + max-iter both green; loop never recovers.**
+*Symptom:* Subprocess tool (e.g., `python_repl` running a long compute or a streaming model returning empty-keepalive frames) emits no stdout for 5+ minutes. The 60s per-call wallclock has not fired because the subprocess is technically "alive" and the iteration counter has not incremented because the tool has not returned. Harness waits forever; user kills the process.
+*Root cause:* Wallclock timeout measures *call duration*; iteration cap measures *loop progress*; neither measures *liveness*. A tool that is alive but silent (model hang, infinite think, network stall with TCP keepalive) defeats both. Pattern lifted from `yzddp/harnesscode` — autonomous coding harness wrapping Claude Code, where idle-timeout watchdog is load-bearing because LLM-driven subprocesses regularly go silent without erroring.
+*Fix:* Add a background watchdog thread per tool dispatch: track `last_output_time`; if `now - last_output_time > IDLE_TIMEOUT` (default 300s for long tools, 60s for short), `SIGTERM` the process tree (not just the child — LLM-spawned subprocesses fork). Return structured error to model: `{"error_type": "idle_timeout", "elapsed_silent_seconds": 312, "suggestion": "tool appears stalled; consider smaller input or different approach"}`. This is **orthogonal to** wallclock + max-iter, not a replacement.
+
+**Tags:** #tool-calling #liveness #watchdog #subprocess #tool-harness #w7
+
+**Captured in curriculum at:** [[Week 7 - Tool Harness#Bad-Case Journal]]
+
+**Entry 3 — Agent claims `PROJECT COMPLETE` while test_report still says `fail`.**
+*Symptom:* Multi-step coding agent runs Coder → Tester → Fixer loop. After a few iterations, model emits a confident "all tests pass, project complete" message and the harness exits cleanly. Spot-check the test output: 2 of 14 tests still failing. LLM lied.
+*Root cause:* Harness trusted the agent's self-reported completion signal. No independent verification gate between "agent says done" and "loop exits." Pattern documented in `yzddp/harnesscode` orchestrator: false-completion detection re-reads the canonical `test_report.json` before honoring any exit signal. Generalizes to any agent loop where the agent self-reports terminal state.
+*Fix:* Add a verification gate between completion-claim and exit. Pseudocode:
+```python
+if agent_claims_done(msg):
+    actual = load_canonical_state()         # re-read test_report.json / tool_audit_log
+    if actual.has_unresolved_failures():
+        alert(f"false completion: {actual.failure_count} unresolved")
+        time.sleep(random.uniform(2, 8))    # jitter to avoid sync-thrash with other agents
+        iteration += 1
+        continue                            # do not exit; loop continues
+    else:
+        return success
+```
+The verification gate is **state-file-derived, not agent-derived** — that is the entire trick.
+
+**Tags:** #false-completion #verification-gate #self-report #tool-harness #w7
+
+**Captured in curriculum at:** [[Week 7 - Tool Harness#Bad-Case Journal]]
+
+**Entry 4 — Same `error-as-prompt` envelope routed every failure to the same recovery path; agent ran in circles.**
+*Symptom:* Tool fails three times in a row with three distinct underlying issues (a) wrong argument shape, (b) external service down, (c) feature genuinely not implemented in the tool. All three errors flow through the same generic `{"error": "tool failed: <message>"}` envelope. Model treats all three the same way: tweaks the argument shape on every retry. Two of three failures are unrecoverable that way.
+*Root cause:* Error-as-prompt without typed discrimination conflates failure modes. The model has no way to know which failure mode → which recovery action. Pattern lifted from `yzddp/harnesscode` test_report.json: every failure carries a `failure_type` discriminator (`code_bug | feature_not_implemented | compilation_error`) that routes to a different downstream agent (Fixer / Coder / Fixer). Same data, different recovery path.
+*Fix:* Upgrade the generic error envelope to a typed envelope with a discriminator + recovery-hint:
+```python
+@dataclass
+class ToolError:
+    error_type: Literal["arg_validation", "transient_infra", "feature_missing",
+                        "permission_denied", "idle_timeout", "rate_limit"]
+    message: str
+    retry_strategy: Literal["fix_args_and_retry", "backoff_and_retry",
+                            "escalate_to_human", "switch_tool", "abort"]
+    context: dict  # error_type-specific fields (status_code, expected_schema, etc)
+```
+Inject `retry_strategy` into the prompt as a structured hint, not free text. Measured benefit on the 20-scenario suite: scenarios 7 (transient infra) and 12 (feature missing) now resolve in 1 retry instead of 3-4 wasted argument-tweak loops.
+
+**Tags:** #typed-errors #error-routing #recovery-strategy #tool-harness #w7
+
+**Captured in curriculum at:** [[Week 7 - Tool Harness#Bad-Case Journal]]
+
 ---
 
 ## Lock-In: Anki Cards
@@ -2441,6 +2491,7 @@ if __name__ == "__main__":
 - **Anthropic (2024).** *Building Effective Agents — Tools.* Tool description quality, permission boundaries, contract vs governance.
 - **Gerred (2024).** *Claude Code Source Analysis — Tool Extensibility, Permissions.* Bk1 §§4.3-4.4, 4.7. Source-level walkthrough of `toolExecution.ts`, `useCanUseTool.tsx`.
 - **Braverman et al. (2025).** *PASTE: Speculative Tool Execution.* 30-50% p95 latency reduction at 2-3× compute cost.
+- **yzddp/harnesscode (2025-2026).** github.com/yzddp/harnesscode. Autonomous-coding meta-harness wrapping Claude Code / OpenCode via a 5-agent state-file pipeline (Orchestrator / Initializer / Coder / Tester / Fixer / Reviewer). Three patterns lifted into this chapter's BCJ (Entries 2-4): **idle-timeout watchdog** (liveness orthogonal to wallclock + max-iter), **false-completion verification gate** (re-read canonical state before honoring agent-claimed done), **typed-error envelope with routing discriminator** (`failure_type` → different recovery agent). Read for the state-file blackboard + priority decision-table pattern (parked in `Trend-Monitoring Discipline.md` Inbox as a candidate for a future multi-agent chapter).
 
 ---
 

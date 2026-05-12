@@ -109,7 +109,7 @@ Past quarterly triages get a dated summary entry under "Audit History" below.
 
 > Add entries below this line. Format: `**YYYY-MM-DD** — [Source] → [What] → [Why it matters] → [Candidate target chapter]`
 
-*(Inbox is empty as of 2026-05-12; first entries to be added starting 2026-05-18.)*
+**2026-05-12** — [yzddp/harnesscode audit] → **State-file blackboard + numbered priority decision table for multi-agent control flow** → Agents communicate via JSON state files on disk; an Orchestrator reads them and applies a fixed priority table (init missing → human-block → test-fail → review-fail → next-pending → tester → reviewer → done) to pick the next agent. Decouples role logic from control flow. Three other patterns from the same audit (idle watchdog / false-completion gate / typed-error envelope / structured human-handoff) were directly integrated into W7 + W7.3; this one is held over because it is **multi-agent architecture, not harness pattern** — wrong fit for W4 (single-agent), partial fit for W3.5.5 guild (which solves the same problem via SQLite atomic-claim instead of JSON blackboard). Candidate target: future supplemental on "Blackboard vs Atomic-Claim vs Message Queue for multi-agent coordination" — or absorb into W3.5.5 as a "Distinguish from" callout next time that chapter is touched. Watch quarter: 2026-Q3.
 
 ---
 
@@ -120,6 +120,15 @@ Past quarterly triages get a dated summary entry under "Audit History" below.
 ---
 
 ## Audit History
+
+### 2026-05-12 (later same day) — yzddp/harnesscode pattern audit
+
+**Trigger:** User-suggested cross-reference review of `github.com/yzddp/harnesscode` for transferable harness patterns.
+**Method:** Forked research agent fetched repo via WebFetch; skimmed README + 5-agent state-file pipeline (Orchestrator / Initializer / Coder / Tester / Fixer / Reviewer); scored 5 candidate patterns against existing W4 + W7 + W7.3 coverage; filtered patterns we already have.
+**Findings:** 5 transferable patterns surfaced. 4 directly integrated (3 into W7 BCJ Entries 2-4, 1 into W7.3 Production Considerations). 1 parked in Inbox (above) for future multi-agent chapter.
+**Actions taken:** W7 BCJ Entries 2-4 added (idle-timeout watchdog / false-completion verification gate / typed-error envelope with routing discriminator) + harnesscode reference. W7.3 Production Considerations addendum (structured human-handoff via missing_info pattern) + harnesscode reference. Trend-Monitoring Inbox entry for state-file blackboard pattern.
+**Time spent:** ~30 min audit (forked agent) + ~25 min integration.
+**Process learning:** A *single source* triage (one repo) is the right shape for the weekly skim — it took 55 min total. The 4-hour inaugural audit was an 11-source bulk triage. The two cadences (per-source weekly skim vs. bulk-list quarterly audit) need different time budgets; both belong in the discipline.
 
 ### 2026-05-12 — Inaugural 11-section audit
 
