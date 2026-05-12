@@ -90,12 +90,12 @@ This is the same primitive as Postgres advisory locks, DynamoDB conditional writ
 
 guild names its primitives Quest / Scroll / Oath / Lore instead of Task / Note / Principle / Knowledge. The vocabulary choice IS the design:
 
-| Mythos term | What it stores | Why this name |
-|---|---|---|
-| **Quest** | A unit of work an agent can claim and complete | Implies discreteness + ownership; "claim a quest" reads natural, "claim a task" reads bureaucratic |
-| **Scroll** | The handoff text saved after quest completion | Implies preservation + transmission ("leave a scroll for the next adventurer"); "save a note" doesn't convey the handoff semantics |
-| **Oath** | A project-level principle or constraint (e.g. "all deploys via Terraform") | Implies binding commitment, not just preference; agents BIND to oaths |
-| **Lore** | Accumulated semantic knowledge from past quests | Implies institutional memory passed down; "knowledge base" is dead corporate; "lore" makes future agents care |
+| Mythos term | What it stores                                                             | Why this name                                                                                                                      |
+| ----------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **Quest**   | A unit of work an agent can claim and complete                             | Implies discreteness + ownership; "claim a quest" reads natural, "claim a task" reads bureaucratic                                 |
+| **Scroll**  | The handoff text saved after quest completion                              | Implies preservation + transmission ("leave a scroll for the next adventurer"); "save a note" doesn't convey the handoff semantics |
+| **Oath**    | A project-level principle or constraint (e.g. "all deploys via Terraform") | Implies binding commitment, not just preference; agents BIND to oaths                                                              |
+| **Lore**    | Accumulated semantic knowledge from past quests                            | Implies institutional memory passed down; "knowledge base" is dead corporate; "lore" makes future agents care                      |
 
 The pedagogical value isn't the cuteness — it's that **non-ML readers (PMs, designers) understand the system without translation**. An agent engineer reading "agent claims quest, completes it, leaves a scroll for the next agent" gets the dataflow in one sentence. Compare to "agent acquires task lock, finishes work, writes handoff record" — same semantics, more friction.
 
@@ -211,25 +211,39 @@ This writes a `.guild/` directory in the lab folder containing the SQLite databa
 
 ### 1.3 First quest + scroll via CLI (sanity check)
 
-Before writing Python, verify guild works from the command line:
+Before writing Python, verify guild works from the command line. **Note on the CLI vocabulary**: guild's verb is `post` (not `create`), `fulfill` (not `complete`), and `--owner` (not `--agent`) for the claim flag. The quest description goes either in the SUBJECT positional argument or via `--spec` for design rationale; there is **no `--description` flag**. Quest history is read via `guild quest scroll QUEST_ID` (not a separate `scroll save / list` verb); the writable scratchpad is `guild quest journal QUEST_ID TEXT...`.
 
 ```bash
-guild quest create "deploy-prod-api" --description "Roll out the new API"
+# 1. Post a new quest. SUBJECT is positional + carries the human-readable
+#    summary; --spec attaches the WHY+HOW as an atomically-inscribed lore
+#    decision entry. guild assigns a sequential QUEST_ID (QUEST-1, QUEST-2, …).
+guild quest post "deploy-prod-api: Roll out the new API" \
+  --spec "Roll out new API to prod via canary 5% -> 50% -> 100%. WHY: ship feature X. Rollback if p99 > 800ms."
+
+# 2. List to confirm the QUEST_ID assigned by guild.
 guild quest list
-# expect: deploy-prod-api  unclaimed
+# expect: QUEST-1  deploy-prod-api: Roll out the new API  unclaimed
 
-guild quest accept "deploy-prod-api" --agent "alice"
+# 3. Atomic-claim via --owner. Reference by the assigned QUEST_ID, not the slug.
+guild quest accept QUEST-1 --owner alice
 guild quest list
-# expect: deploy-prod-api  claimed_by=alice
+# expect: QUEST-1  ...  claimed_by=alice
 
-guild scroll save "deploy-prod-api" --text "Deployed via Terraform IaC"
-guild quest complete "deploy-prod-api"
+# 4. Append an in-flight journal entry (task-scoped scratchpad).
+guild quest journal QUEST-1 "Deployed via Terraform IaC" --agent alice
 
-guild scroll list --closed
-# expect: 1 scroll for deploy-prod-api
+# 5. Fulfill the quest. --report is REQUIRED — must include commit hash,
+#    files touched, remaining issues. Fulfill cascades unblock to dependents.
+guild quest fulfill QUEST-1 \
+  --report "commit a1b2c3; files: deploy/prod.yaml; no remaining issues"
+
+# 6. Read the full quest history (status + journal + timeline).
+guild quest scroll QUEST-1
+# expect: status=fulfilled, journal contains the Terraform IaC note,
+#         timeline shows post -> accept -> journal -> fulfill
 ```
 
-If all four commands succeed, guild is correctly installed + initialized.
+If all six commands succeed, guild is correctly installed + initialized.
 
 ### 1.4 Smoke-test the MCP stdio interface
 
