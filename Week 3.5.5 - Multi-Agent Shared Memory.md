@@ -1028,25 +1028,40 @@ if __name__ == "__main__":
 
 **Cross-session lookup pattern (when acts run in separate Python invocations):**
 
-If you split the three acts across separate days / processes (the more realistic agent-handoff scenario), each later act starts by looking up the prior quests via `quest_list(campaign=CAMPAIGN, status="fulfilled")` and reading their `quest_scroll` rather than receiving QUEST_IDs through `main()`. The chapter ships the in-process version above for the smoke test; the cross-session version is the same code with a `quest_list` lookup at the top of each act.
+If you split the three acts across separate days / processes (the more realistic agent-handoff scenario), each later act starts by looking up the prior quests via `quest_list(campaign=CAMPAIGN, status="done")` and reading their `quest_scroll` rather than receiving QUEST_IDs through `main()`. The chapter ships the in-process version above for the smoke test; the cross-session version is the same code with a `quest_list` lookup at the top of each act.
 
-**Expected output**:
+**Run** (must use `python -m`, NOT `python src/three_act_handoff.py`):
+
+```bash
+cd <lab-root>                              # /Users/.../lab-03-5-5-guild
+.venv/bin/python -m src.three_act_handoff
+```
+
+> **Why `-m` is mandatory**: `python src/three_act_handoff.py` invokes the file as a *script* — Python sets `sys.path[0]` to the file's directory (`src/`), so `from src.guild_client import ...` fails with `ModuleNotFoundError: No module named 'src'`. `python -m src.three_act_handoff` invokes it as a *module* — `sys.path[0]` is the CWD, so `src/` is importable as a package. The same rule applies to `python -m src.atomic_claim_demo` and `python -m src.smoke_test`. Standard Python package-internal-script invocation pattern.
+
+**Expected output** (captured verbatim from a 2026-05-12 live run):
 
 ```
 >>> Act 1 — agent A designs the API spec
-  claim: {'status': 'claimed', ...}
-  scroll saved + quest completed
+  claim (QUEST-21): ⚔️ accepted QUEST-21: design-api-spec: design the new payments API
+  status=in_progress · priority=P2 · campaign=payments-api-3act · ...
+  journal logged + quest fulfilled (QUEST-21)
 
->>> Act 2 — agent B implements based on agent A's design scroll
-  read prior scroll: API spec finalized: REST + JSON, idempotency keys via...
-  claim: {'status': 'claimed', ...}
+>>> Act 2 — agent B implements based on agent A's design context
+  read design scroll: 📜 QUEST-21 [P2 · done]  design-api-spec: design the new payments API
+  owner: agent
+  ✓ spec: LORE-8...
+  claim (QUEST-22): ⚔️ accepted QUEST-22: implement-api: implement the payments API
+  status=in_progress · priority=P2 · campaign=payments-api-3act · ...
 
 >>> Act 3 — agent C writes tests, sees the WHOLE chain
-  read prior scroll [design-api-spec]: API spec finalized: REST + JSON,...
-  read prior scroll [implement-api]: Implemented POST /payments + GET /pay...
+  read prior scroll [QUEST-21]: 📜 QUEST-21 [P2 · done]  design-api-spec: design the new payments API
+  owner: ag...
+  read prior scroll [QUEST-22]: 📜 QUEST-22 [P2 · done]  implement-api: implement the payments API
+  owner: agent...
 ```
 
-The progressive scroll accumulation across three sessions IS the handoff demonstration. Save this transcript verbatim for the portfolio.
+Note three live-evidence signals from this transcript: (a) the `✓ spec: LORE-8` pointer in Act 2's scroll read — guild's auto-inscribed `kind=decision` lore entry from Act 1's `--spec=`, exactly as documented in §1.3.1; (b) `owner: agent` (NOT `agent_a` / `agent_b` / `agent_c`) — confirms the session-scoped-identity finding from BCJ Entry 5; (c) each act's scroll-read returns the FULL human-readable history block, not a structured response — confirms the text-only response shape from §2.1's class docstring. The progressive scroll accumulation across three sessions IS the handoff demonstration. Save this transcript verbatim for the portfolio.
 
 `★ Insight ─────────────────────────────────────`
 - **Cross-session-cross-agent handoff is the primitive most production systems get wrong.** Most teams just dump conversation history into a vector store and hope retrieval picks the right context. Scrolls are STRUCTURED handoff records keyed by quest_id — exact lookup, no embedding-similarity hit-or-miss.
