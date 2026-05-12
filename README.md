@@ -64,7 +64,7 @@ See [`Agent Development 3-Month Curriculum.md` → "The Six Areas an AI Engineer
 - **Vector DB**: Qdrant via OrbStack (Docker) on `:6333`.
 - **Memory infra (Weeks 3.5.5 / 3.5.8 / 3.5.9)**: `mathomhaus/guild` (Go MCP, single binary, embedded SQLite) for operational tier; EverMind-AI's EverCore (Python + Postgres via Docker compose, port 1995) for semantic tier; HyperMem (Docker compose, port 1996) for relational L3 tier. Benchmarked via LongMemEval `oracle` subset anchored to EverCore's published 83%.
 - **Observability**: Phoenix on `:6006`.
-- **Cloud spend cap**: ~$10 across 12 weeks. Used only when local can't substitute (mainly Week 7 frontier model benchmarks).
+- **Cloud spend cap**: **~$13 across the program** (W7–8 frontier-model comparisons ~$8 + W7.3 cross-provider gateway routing ~$3 + W9.5 optional cloud GPU $0–30). Diagnostic threshold $20 — exceed it, audit which lab is leaking. Used only when local can't substitute.
 
 Lab code: [`shaneliuyx/agent-prep`](https://github.com/shaneliuyx/agent-prep) — every chapter's lab phases are runnable artifacts there.
 

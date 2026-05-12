@@ -1286,62 +1286,119 @@ The 8 subsystems:
 
 ### Headline insight to memorize
 
-> Claude Code is ~512K LOC of TypeScript. **Only 1.6% is AI decision logic.** The other 98.4% is deterministic infrastructure: permission gates, context management, tool routing, recovery logic. **The hard problem in production agents is not the loop. It is everything around the loop.**
+> Claude Code is ~512K LOC of TypeScript (figure as of the March-2026 source-leak analyses cited above; 2.x releases have grown the codebase since but the *ratio* has held). **Only 1.6% is AI decision logic.** The other 98.4% is deterministic infrastructure: permission gates, context management, tool routing, recovery logic. **The hard problem in production agents is not the loop. It is everything around the loop.**
 
-That sentence wins interviews.
+That sentence wins interviews. Re-cite the percentage as a *ratio* rather than the absolute LOC — the ratio holds; the absolute number drifts with each release.
 
 ---
 
 ## Appendix D — Curated Reading List
 
+> **2026-05-12 audit note:** this list is the *cross-cutting* reading layer. Per-chapter References sections in each `Week N.md` are authoritative for that chapter's citations; this appendix is the curated subset that recurs across multiple chapters or is foundational for the program as a whole. After the 2026-05-12 trend-monitoring audit + harnesscode integration, this appendix now includes the production-LLM-infra + memory-system + hiring-rubric materials that were missing from the pre-W7.3-expansion version.
+
+### 2026 hiring-rubric primary sources (read first)
+- **Pachaar, Akshay (2026).** *The Six Areas an AI Engineer Must Master.* X thread / @akshay_pachaar. The 2026 de-facto hiring rubric. Curriculum maps onto all six (see §"The Six Areas an AI Engineer Must Master" above).
+- **teach_fireworks (2026).** *AI Engineer 11-Section Reading List.* X thread / @teach_fireworks. Source-material expansion of Akshay's framing. Triggered the W7.3 supplemental chapter.
+- **Fowler, Martin (2025).** *Harness of an LLM Application.* martinfowler.com. Canonical "agent = model + harness" naming. Required reading for W4/W7/W7.3.
+
 ### Papers (Friday reading)
-- ReAct (Yao et al. 2022)
-- Toolformer (Schick et al. 2023)
-- Reflexion (Shinn et al. 2023)
-- Plan-and-Solve (Wang et al. 2023)
-- Self-Refine (Madaan et al. 2023)
-- HyDE (Gao et al. 2022)
-- Self-RAG (Asai et al. 2023)
-- Constitutional AI (Anthropic, 2022)
-- SelfCheckGPT (Manakul et al. 2023)
-- Semantic Entropy (Farquhar et al., Nature 2024)
-- BGE-M3
-- Nomic Embed v2
-- XGrammar
-- SLOT (structuring LLM output)
-- "Lost in the Middle" (Liu et al. 2023)
-- Multi-Agent Collaboration Mechanisms: A Survey (2025)
+
+**Agent loop + tool use:**
+- ReAct (Yao et al. 2022). The base loop.
+- Toolformer (Schick et al. 2023). Why fine-tuned models emit tool calls inline.
+- Reflexion (Shinn et al. 2023). Episodic memory + self-critique.
+- Plan-and-Solve (Wang et al. 2023). Decompose-then-solve pattern.
+- Self-Refine (Madaan et al. 2023). Single-session self-critique.
+
+**RAG + retrieval:**
+- HyDE (Gao et al. 2022). Hypothetical document embeddings.
+- Self-RAG (Asai et al. 2023). Inline reflection tokens.
+- "Lost in the Middle" (Liu et al. 2023). Context-precision motivation.
+- BGE-M3 (Chen et al. 2024). Three-mode embedding model used throughout.
+- Nomic Embed v2.
+- RAPTOR (Sarthi et al. 2024). Tree-index RAG ancestor; cited in W2.7.
+
+**Faithfulness + evaluation:**
+- Constitutional AI (Anthropic, 2022).
+- SelfCheckGPT (Manakul et al. 2023). Inter-sample consistency.
+- Semantic Entropy (Farquhar et al., Nature 2024).
+- **MT-Bench / Chatbot Arena (Zheng et al. 2023, arXiv:2306.05685).** **The canonical LLM-judge bias paper** (position / verbosity / self-enhancement bias). Cross-cuts W2.7 GT-judge methodology, W3 RAGAS scoring, W3.5 mem0 cross-check scoring, W9 faithfulness.
+- RAGAS (Es et al. 2023, arXiv:2309.15217). Anchor for W3.
+
+**Structured output:**
+- XGrammar.
+- SLOT (Liu et al. 2024, arXiv:2505.04016).
+- Outlines / Willard & Louf (2023, arXiv:2307.09702).
+
+**Inference serving + production infra (added 2026-05-12):**
+- **PagedAttention / vLLM (Kwon et al. 2023, arXiv:2309.06180).** Why Apple Silicon unified-memory inference (oMLX/vMLX) behaves the way it does at long context.
+- **LMCache (2024-2025).** Prefill-decode disaggregation; the 2025 state-of-the-art for "the prompt is the cache" production patterns.
+- **QSPEC (2025, arXiv:2410.11305).** Speculative decoding + complementary quantization; the 2025 SOTA combining the two inference-optimization axes.
+- **GPTCache (Bang Fu 2023, arXiv:2311.04205).** Reference semantic-cache implementation; anchor for W7.3 Phase 3.
+
+**Memory + multi-agent (added 2026-05-12):**
+- MemGPT / Letta (Packer et al. 2023, arXiv:2310.08560). OS-paging analogy for agent memory; anchor for W3.5 + W3.5.8.
+- A-MEM (Wang et al. 2024, arXiv:2502.12110). Note-network-style memory organization.
+- LongMemEval (xiaowu0162 GitHub). 500-turn memory-recall benchmark.
+- LoCoMo (Maharana et al. 2024, arXiv:2402.17753). Companion to LongMemEval.
+- Multi-Agent Collaboration Mechanisms: A Survey (2025).
+
+**Fine-tuning + RL:**
+- DeepSeek-R1 paper (GRPO algorithm origin). Anchor for W9.5.
+- RLHF survey / InstructGPT (Ouyang et al. 2022).
+- DPO (Rafailov et al. 2023).
 
 ### Engineering essays
-- **Anthropic — Building effective agents** (Sept 2024 + 2026 updates) — your bible
-- **Anthropic — Contextual Retrieval** blog post
-- **Lilian Weng — LLM Powered Autonomous Agents**
-- **Simon Willison — anything tagged "agent"**
-- **Hamel Husain — Your AI product needs evals**
-- **Eugene Yan — Patterns for Building LLM-Based Systems & Products**
+- **Anthropic — Building effective agents** (Sept 2024 + 2026 updates) — your bible. Plus the 2025 Barry Zhang walkthrough talk.
+- **Anthropic — Contextual Retrieval** blog post.
+- **Anthropic — Prompt Caching with Claude** (docs). Cache-breakpoint semantics for W7.3.
+- **OpenAI — Optimizing LLM Accuracy: A Practical Guide** (platform.openai.com/docs). Decision matrix for prompt vs RAG vs fine-tuning. Anchor for W9 + W9.5.
+- **OpenAI — Prompt Caching** (docs). Implicit caching + `cached_tokens` telemetry.
+- **IBM — RAG vs Fine-tuning explainer** (ibm.com/think). Canonical 2024-2025 "two are non-substitutable" framing; anchor for W9.5.
+- **Google Cloud — Five Techniques to Optimize LLM Inference** (2024). Unified inference-optimization mental model.
+- **Lilian Weng — LLM Powered Autonomous Agents.** Outer-controller framing.
+- **Simon Willison — anything tagged "agent".**
+- **Hamel Husain — Creating a LLM-as-a-Judge That Drives Business Results** (hamel.dev). The practitioner blueprint for judge prompts that catch real defects. Cross-cuts every eval-bearing chapter (W2.7, W3, W3.5, W9).
+- **Hamel Husain — Your AI product needs evals.**
+- **Eugene Yan — Patterns for Building LLM-Based Systems & Products.**
 
-### Framework docs to skim
-- LangChain 1.0 announcement + LangGraph overview
-- LlamaIndex agentic docs
-- DSPy intro
-- OpenAI Agents SDK
-- Pydantic AI
-- Mastra (TS-first)
-- Outlines, Instructor, XGrammar, llguidance
+### Framework + production-infra docs to skim
+- LangChain 1.0 announcement + LangGraph overview.
+- LlamaIndex agentic docs.
+- DSPy intro.
+- OpenAI Agents SDK.
+- **Pydantic AI** (ai.pydantic.dev) — including 2025 `output_validators` for semantic post-validation.
+- Mastra (TS-first).
+- **Outlines, Instructor, Guardrails AI, XGrammar, llguidance** — five primary structured-output toolchains (W8).
+- **LiteLLM** (github.com/BerriAI/litellm) — gateway used in W7.3.
+- **Portkey AI** (portkey.ai) — managed-gateway alternative.
+- **TensorZero** (github.com/tensorzero/tensorzero) — Rust-based high-throughput AI gateway.
+- **OpenTelemetry GenAI Semantic Conventions** (opentelemetry.io/docs/specs/semconv/gen-ai) — vendor-neutral telemetry wire format.
+
+### Observability tools (W3 + W7.3 survey)
+- **Arize Phoenix** — OSS, OTel-native, used in this lab.
+- **LangSmith** — LangChain-native hosted; free tier 5k traces/month.
+- **W&B Weave** — eval-first, integrates with W&B Experiments.
+- **Braintrust** — eval-tournament-first; LLM-as-judge as primary workflow.
+- **Traceloop / OpenLLMetry** — pure OTel SDK.
 
 ### Claude Code architecture analyses (Week 6)
-- bits-bytes-nn (March 2026)
-- VILA-Lab GitHub
-- DEV.to architecture explainer
-- engineerscodex Substack
-- claudefa.st source-leak catalog
+- bits-bytes-nn (March 2026).
+- VILA-Lab GitHub.
+- DEV.to architecture explainer.
+- engineerscodex Substack.
+- claudefa.st source-leak catalog.
+- **yzddp/harnesscode** (github.com/yzddp/harnesscode). 5-agent state-file-driven autonomous-coding meta-harness wrapping Claude Code / OpenCode. Audited 2026-05-12; four patterns lifted into W7 BCJ + W7.3 Production Considerations (idle watchdog / false-completion gate / typed-error envelope / structured human-handoff).
 
 ### 2026 interview-question banks
-- DataCamp: Top 30 RAG Interview Questions (2026)
-- KalyanKS-NLP/RAG-Interview-Questions-and-Answers-Hub (GitHub)
-- Analytics Vidhya: 30 Agentic AI Interview Questions
-- The Interview Guys: Top 10 Context Engineer Interview Questions
-- amitshekhariitbhu/ai-engineering-interview-questions (GitHub)
+- DataCamp: Top 30 RAG Interview Questions (2026).
+- KalyanKS-NLP/RAG-Interview-Questions-and-Answers-Hub (GitHub).
+- Analytics Vidhya: 30 Agentic AI Interview Questions.
+- The Interview Guys: Top 10 Context Engineer Interview Questions.
+- amitshekhariitbhu/ai-engineering-interview-questions (GitHub).
+
+### Discipline + meta (added 2026-05-12)
+- **[[Trend-Monitoring Discipline]]** — the maintenance-discipline doc itself. Six signal sources + 30 min/week cadence + quarterly triage. Read once at Week 1 + use the Inbox throughout the program.
 
 ---
 
