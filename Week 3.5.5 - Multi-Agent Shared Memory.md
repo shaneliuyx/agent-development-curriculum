@@ -458,13 +458,26 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 
 class GuildClient:
-    """One Python process talking to guild via MCP stdio."""
+    """One Python process talking to guild via MCP stdio.
+
+    Method names mirror guild's actual MCP tool names verified via
+    `session.list_tools()` against the live `guild mcp serve` process.
+    The full 43-tool surface includes `quest_*` (post / accept / journal /
+    fulfill / scroll / list / brief / bounties / campfire / forfeit / ...)
+    and `lore_*` (inscribe / study / appraise / meld / reforge / seal / ...)
+    namespaces, plus three top-level helpers (`guild_session_start`,
+    `guild_set_project`, `guild_status`). This wrapper covers the five most-
+    used quest verbs + the session-start primitive; expand as needed.
+    """
 
     def __init__(
         self,
         agent_id: str,
         command: str = "guild",
-        args: tuple[str, ...] = ("serve", "--stdio"),
+        # CORRECT args = ("mcp", "serve"). guild has NO top-level 'serve' verb;
+        # the MCP server is launched via the 'mcp' subcommand. Wrong args
+        # produce 'Error: unknown command "serve"' and 'Connection closed'.
+        args: tuple[str, ...] = ("mcp", "serve"),
     ) -> None:
         self.agent_id = agent_id
         self._params = StdioServerParameters(command=command, args=list(args))
@@ -487,71 +500,101 @@ class GuildClient:
 
     # ── Quest operations ──────────────────────────────────────────────
 
+    async def quest_post(
+        self,
+        subject: str,
+        spec: str | None = None,
+        campaign: str | None = None,
+    ) -> str:
+        """Create a new quest. guild assigns the QUEST_ID server-side.
+
+        Returns the assigned QUEST_ID (e.g. 'QUEST-1') — callers must
+        capture it; subsequent verbs (accept / journal / fulfill / scroll)
+        reference quests by this ID, not by a client-chosen slug.
+
+        `spec` is the WHY+HOW design rationale — guild atomically inscribes
+        it as a kind=decision lore entry and links it from the quest's
+        journal as 'acceptance: spec: LORE-N'.
+
+        `campaign` tags the quest for within-project grouping (see §1.2).
+        """
+        assert self._session is not None
+        args: dict[str, Any] = {"subject": subject}
+        if spec is not None:
+            args["spec"] = spec
+        if campaign is not None:
+            args["campaign"] = campaign
+        result = await self._session.call_tool("quest_post", arguments=args)
+        return result.model_dump().get("quest_id", "")
+
     async def quest_accept(self, quest_id: str) -> dict[str, Any]:
-        """Attempt to atomically claim a quest. Returns claim status."""
+        """Atomically claim a quest. Returns claim status (winner gets
+        status=claimed; loser gets status=already_claimed). The atomic-claim
+        primitive that makes guild safe for multiple agents racing on the
+        same quest pool."""
         assert self._session is not None
         result = await self._session.call_tool(
             "quest_accept",
-            arguments={"quest_id": quest_id, "agent_id": self.agent_id},
+            arguments={"quest_id": quest_id, "owner": self.agent_id},
         )
         return result.model_dump()
 
-    async def quest_complete(self, quest_id: str) -> None:
+    async def quest_journal(self, quest_id: str, text: str) -> None:
+        """Append a task-scoped journal note. This is the WRITE primitive
+        for in-flight quest annotations (also used for handoff text — the
+        original 'scroll' verb was renamed to align with the CLI vocabulary).
+        Notes are append-only; they die when the quest is fulfilled."""
         assert self._session is not None
         await self._session.call_tool(
-            "quest_complete",
-            arguments={"quest_id": quest_id, "agent_id": self.agent_id},
-        )
-
-    async def quest_create(
-        self, quest_id: str, description: str = ""
-    ) -> None:
-        assert self._session is not None
-        await self._session.call_tool(
-            "quest_create",
-            arguments={"id": quest_id, "description": description},
-        )
-
-    async def quest_list(
-        self, status: str = "all"
-    ) -> list[dict[str, Any]]:
-        assert self._session is not None
-        result = await self._session.call_tool(
-            "quest_list", arguments={"status": status}
-        )
-        return result.model_dump().get("quests", [])
-
-    # ── Scroll operations (handoff text) ─────────────────────────────
-
-    async def scroll_save(self, quest_id: str, text: str) -> str:
-        assert self._session is not None
-        result = await self._session.call_tool(
-            "scroll_save",
+            "quest_journal",
             arguments={
                 "quest_id": quest_id,
                 "text": text,
-                "agent_id": self.agent_id,
+                "agent": self.agent_id,
             },
         )
-        return result.model_dump().get("scroll_id", "")
 
-    async def scroll_list(
-        self, quest_id: str | None = None
+    async def quest_fulfill(self, quest_id: str, report: str) -> None:
+        """Complete a quest. `report` is REQUIRED — must include commit hash,
+        files touched, and remaining issues per guild's discipline rule.
+        Fulfillment cascades unblock to dependent quests."""
+        assert self._session is not None
+        await self._session.call_tool(
+            "quest_fulfill",
+            arguments={"quest_id": quest_id, "report": report},
+        )
+
+    async def quest_scroll(self, quest_id: str) -> dict[str, Any]:
+        """Read the full history of a quest (status + journal + timeline).
+        This is the READ primitive — use after fulfill to verify the trail,
+        or at session-start to pick up a quest someone else was working on."""
+        assert self._session is not None
+        result = await self._session.call_tool(
+            "quest_scroll", arguments={"quest_id": quest_id}
+        )
+        return result.model_dump()
+
+    async def quest_list(
+        self,
+        status: str | None = None,
+        campaign: str | None = None,
     ) -> list[dict[str, Any]]:
+        """List quests with optional status / campaign filters."""
         assert self._session is not None
         args: dict[str, Any] = {}
-        if quest_id is not None:
-            args["quest_id"] = quest_id
-        result = await self._session.call_tool(
-            "scroll_list", arguments=args
-        )
-        return result.model_dump().get("scrolls", [])
+        if status is not None:
+            args["status"] = status
+        if campaign is not None:
+            args["campaign"] = campaign
+        result = await self._session.call_tool("quest_list", arguments=args)
+        return result.model_dump().get("quests", [])
 
     # ── Session orchestration ────────────────────────────────────────
 
     async def session_start(self) -> dict[str, Any]:
-        """guild's three-shot session start — returns oath + last scroll +
-        top quest. The 'single-shot context recovery' production pattern."""
+        """guild's single-shot context-recovery primitive. Returns oath +
+        last brief + top available quest in ONE call. An agent's FIRST guild
+        call after spawning is `session_start()`."""
         assert self._session is not None
         result = await self._session.call_tool(
             "guild_session_start",
@@ -563,9 +606,11 @@ class GuildClient:
 **Walkthrough**:
 
 - **One `GuildClient` per Python process**. The async-context-manager owns the guild subprocess lifetime; on exit, the subprocess is cleaned up. No leaked Go processes.
-- **`agent_id` is set at construction**, not per-call. This mirrors how real agents work: each agent process IS one identity. Per-call agent IDs would be a footgun.
-- **`session_start()` mirrors guild's single-shot context-recovery primitive**. In production usage, an agent's FIRST guild call after spawning is `session_start()`, which returns oath + last-handoff-scroll + top-available-quest in ONE call. This is the production-discipline pattern for minimizing startup chatter.
-- **Tools NOT wrapped** (intentional): oath CRUD, lore queries (covered in Phase 5 deep-dive), scroll_mark_consolidated (covered in W3.5.8). Keep the surface minimal; expand as needed.
+- **`agent_id` is set at construction**, not per-call. This mirrors how real agents work: each agent process IS one identity. Per-call agent IDs would be a footgun. Maps to the `owner` (in `quest_accept`) and `agent` (in `quest_journal`) MCP arguments.
+- **`quest_post` returns the server-assigned `QUEST_ID`** (e.g. `QUEST-1`) rather than accepting a client-chosen slug. This matches guild's authoritative-ID design — the server is the source of truth for IDs, and callers chain via the returned ID. Capture it: `quest_id = await gc.quest_post(...)`.
+- **`quest_fulfill` requires a `report` argument** (commit hash + files touched + remaining issues). guild's MCP server rejects fulfillment without a report — same discipline as the CLI's `--report` flag. Callers cannot accidentally close a quest without explaining what was done.
+- **`session_start()` mirrors guild's single-shot context-recovery primitive**. The "first guild call after agent spawn" pattern minimizes startup chatter — one round-trip returns everything the agent needs to know about project state.
+- **Tools NOT wrapped** (intentional): oath CRUD, lore queries (covered in Phase 5 deep-dive), `quest_brief` / `quest_campfire` / `quest_bounties` (covered in W3.5.8 production patterns). Keep the surface minimal; expand as needed.
 
 ### 2.2 Smoke test the client
 
@@ -578,14 +623,33 @@ from src.guild_client import GuildClient
 
 @pytest.mark.asyncio
 async def test_quest_lifecycle_round_trip() -> None:
+    """Verify the full post -> accept -> journal -> fulfill -> scroll cycle."""
     async with GuildClient(agent_id="alice") as gc:
-        await gc.quest_create("test-task-001", "trivial test")
-        claim = await gc.quest_accept("test-task-001")
+        # 1. Post a quest. Capture the server-assigned QUEST_ID.
+        quest_id = await gc.quest_post(
+            subject="smoke-test: round-trip the full quest lifecycle",
+            spec="Verify Python wrapper covers post/accept/journal/fulfill/scroll.",
+            campaign="lab-03-5-5",
+        )
+        assert quest_id.startswith("QUEST-")
+
+        # 2. Atomically claim. Owner becomes "alice" (agent_id from __init__).
+        claim = await gc.quest_accept(quest_id)
         assert claim.get("status") == "claimed"
-        await gc.scroll_save("test-task-001", "smoke-test scroll text")
-        await gc.quest_complete("test-task-001")
-        scrolls = await gc.scroll_list(quest_id="test-task-001")
-        assert any("smoke-test" in s.get("text", "") for s in scrolls)
+
+        # 3. Write an in-flight journal entry.
+        await gc.quest_journal(quest_id, "smoke-test journal text")
+
+        # 4. Fulfill with the required report.
+        await gc.quest_fulfill(
+            quest_id,
+            report="commit smoke-test-stub; files: tests/test_guild_client.py; no remaining issues",
+        )
+
+        # 5. Read back the full history. Journal note must round-trip.
+        scroll = await gc.quest_scroll(quest_id)
+        notes_text = str(scroll)  # crude but sufficient for smoke-test
+        assert "smoke-test journal text" in notes_text
 ```
 
 ```bash
@@ -594,6 +658,10 @@ pytest tests/test_guild_client.py -v
 ```
 
 **Result.** Client works end-to-end on a quest lifecycle. ~2h from blank file to passing test, including MCP-client onboarding (the `mcp` Python package is light but has a small learning curve).
+
+> **2026-05-12 vocabulary alignment note.** Earlier chapter revisions used `quest_create / quest_complete / scroll_save / scroll_list` as both method names AND MCP tool names. None of those tools exist on the current `guild mcp serve` server (verified via live `session.list_tools()` — 43 tools across `quest_* / lore_* / guild_*` namespaces; none of the four old names are present). The correct mapping: `quest_create → quest_post`, `quest_complete → quest_fulfill` (with required `report`), `scroll_save → quest_journal` (the writer), `scroll_list → quest_scroll` (read-only history for one QUEST_ID). The class above uses the correct names.
+>
+> **Deferred (next commit):** Phase 3 race-test, Phase 4 three-act demo, Phase 5 multi-agent tests, BCJ Entry 4, and the §3 interview soundbite still reference the old method names. A Phase 3–5 vocabulary sweep is on the maintenance queue.
 
 ---
 
