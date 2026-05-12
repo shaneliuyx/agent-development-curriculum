@@ -10,7 +10,7 @@ tags:
   - two-tier
   - guild
   - everos
-audience: cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$10 cloud spend cap across 12 weeks
+audience: "cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$13 cloud spend cap across the program (12 main weeks + decimal supplements; see curriculum overview §How to Use This Guide for the three time-paths)"
 stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000, guild via homebrew (Go binary), EverCore via Docker compose (Python 3.12 + Postgres + LangGraph), Qdrant via Docker
 ---
 
