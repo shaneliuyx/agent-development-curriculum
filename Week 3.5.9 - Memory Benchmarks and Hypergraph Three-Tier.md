@@ -11,7 +11,7 @@ tags:
   - longmemeval
   - locomo
   - three-tier
-audience: cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$10 cloud spend cap across 12 weeks
+audience: "cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$13 cloud spend cap across the program (12 main weeks + decimal supplements; see curriculum overview §How to Use This Guide for the three time-paths)"
 stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000, guild (Go binary), EverCore + HyperMem (Docker compose), Qdrant (Docker), Python 3.11
 prerequisites: W3.5.8 (Two-Tier Memory Architecture) shipped end-to-end with guild + EverCore composable + 4-way benchmark green
 ---

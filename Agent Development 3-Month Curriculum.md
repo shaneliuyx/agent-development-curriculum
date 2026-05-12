@@ -9,13 +9,13 @@ tags:
   - mlx
   - local-first
 audience: Cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles
-stack: Local-first MLX. oMLX serves Qwen3.6-35B-A3B-nvfp4 + gemma-4-26B-A4B-it-heretic-4bit + gpt-oss-20b-MXFP4-Q8. vMLX serves gemma-4-31B-uncensored-heretic-mlx-4bit. Cloud spend ≈ $8 across 12 weeks.
+stack: "Local-first MLX. oMLX serves Qwen3.6-35B-A3B-nvfp4 + gemma-4-26B-A4B-it-heretic-4bit + gpt-oss-20b-MXFP4-Q8. vMLX serves gemma-4-31B-uncensored-heretic-mlx-4bit. Cloud spend cap ≈ $13 across the program (W7-8 ~$8 + W7.3 ~$3 + W9.5 optional $0-30; $20 diagnostic threshold)."
 ---
 
 # Agent Development 3-Month Curriculum
 
-> A 12-week, project-driven study plan to convert a cloud infrastructure background into a hireable Agent / LLM Engineer profile.
-> All hands-on labs default to local MLX inference on Apple Silicon. Cloud API spend is capped at ~$10 across the entire program.
+> A 12-week (core path) / 14–18-week (full path with decimal supplements) project-driven study plan to convert a cloud infrastructure background into a hireable Agent / LLM Engineer profile. See §"How to Use This Guide" for the three time-paths (core / full / compressed) and §"What You'll Be Able to Do — Outcome Bar" for the competency floor at each phase boundary.
+> All hands-on labs default to local MLX inference on Apple Silicon. Cloud API spend is capped at **~$13 across the program** (W7–8 frontier comparisons ~$8 + W7.3 cross-provider gateway routing ~$3 + W9.5 optional cloud GPU $0–30; $20 diagnostic threshold).
 
 ---
 
