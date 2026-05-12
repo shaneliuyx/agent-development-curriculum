@@ -199,46 +199,63 @@ guild --version
 # Expect: guild 0.x.y
 ```
 
-Then initialize for this lab:
+Then initialize. **`guild init` has only three flags** (`--yes`, `--dry-run`, `--print-agents-md`); it does *not* accept `--project` or `--no-mcp-register`. Project name is auto-derived from the git repo root, and the MCP-registration step is a printed *hint* — nothing auto-registers, so there is nothing to skip:
 
 ```bash
-guild init --project lab-03-5-5 --no-mcp-register
-# --no-mcp-register: we want PYTHON clients in this lab,
-# not editor-MCP integration (that's a Phase 4 optional)
+cd /Users/yuxinliu/code/agent-prep    # the agent-prep monorepo root
+guild init --yes                       # accept defaults; registers project "agent-prep"
 ```
 
-This writes a `.guild/` directory in the lab folder containing the SQLite database + config.
+This writes the project's SQLite database + config to **`~/.guild/<project>/`** (not the lab folder — guild's state is centralized under `~/.guild/` so multiple checkouts see the same quest state). It also creates-or-merges `AGENTS.md` at the project root.
+
+**Per-lab isolation via the `-p` global flag.** Because the agent-prep monorepo holds many labs and the default project name is the repo's directory name (`agent-prep`), every `guild quest` command for THIS lab should scope to a lab-specific project name via the global `-p / --project` flag:
+
+```bash
+# Scope every quest verb to project "lab-03-5-5":
+guild quest -p lab-03-5-5 post "first-quest: smoke test the setup" --spec "..."
+guild quest -p lab-03-5-5 list
+guild quest -p lab-03-5-5 accept QUEST-1 --owner alice
+guild quest -p lab-03-5-5 journal QUEST-1 "note text" --agent alice
+guild quest -p lab-03-5-5 fulfill QUEST-1 --report "commit a1b2c3; files: ..."
+guild quest -p lab-03-5-5 scroll QUEST-1
+```
+
+`-p` is a **global flag on the `quest` subcommand group** (not on `init`). It overrides the CWD-derived project name and gives this lab its own isolated quest DB scope inside `~/.guild/lab-03-5-5/`. **If you forget `-p` mid-lab, quests will land in the `agent-prep`-scoped DB and mix with any future labs that share the monorepo** — make the `-p lab-03-5-5` part of muscle memory.
+
+> **Why not just `cd` into the lab subdir and let CWD detection handle scoping?** Because guild's project-name detection walks up to the git repo root, not the nearest `.guild/` directory. CWD inside a monorepo subdir still resolves to the repo-root project. `-p` is the only correct isolation primitive here.
 
 ### 1.3 First quest + scroll via CLI (sanity check)
 
 Before writing Python, verify guild works from the command line. **Note on the CLI vocabulary**: guild's verb is `post` (not `create`), `fulfill` (not `complete`), and `--owner` (not `--agent`) for the claim flag. The quest description goes either in the SUBJECT positional argument or via `--spec` for design rationale; there is **no `--description` flag**. Quest history is read via `guild quest scroll QUEST_ID` (not a separate `scroll save / list` verb); the writable scratchpad is `guild quest journal QUEST_ID TEXT...`.
 
+**Every command below carries `-p lab-03-5-5`** to scope this lab's quests to their own DB inside `~/.guild/lab-03-5-5/` (see §1.2 for why). Drop the flag and quests will land in the `agent-prep`-scoped DB and mix with any future labs.
+
 ```bash
 # 1. Post a new quest. SUBJECT is positional + carries the human-readable
 #    summary; --spec attaches the WHY+HOW as an atomically-inscribed lore
 #    decision entry. guild assigns a sequential QUEST_ID (QUEST-1, QUEST-2, …).
-guild quest post "deploy-prod-api: Roll out the new API" \
+guild quest -p lab-03-5-5 post "deploy-prod-api: Roll out the new API" \
   --spec "Roll out new API to prod via canary 5% -> 50% -> 100%. WHY: ship feature X. Rollback if p99 > 800ms."
 
 # 2. List to confirm the QUEST_ID assigned by guild.
-guild quest list
+guild quest -p lab-03-5-5 list
 # expect: QUEST-1  deploy-prod-api: Roll out the new API  unclaimed
 
 # 3. Atomic-claim via --owner. Reference by the assigned QUEST_ID, not the slug.
-guild quest accept QUEST-1 --owner alice
-guild quest list
+guild quest -p lab-03-5-5 accept QUEST-1 --owner alice
+guild quest -p lab-03-5-5 list
 # expect: QUEST-1  ...  claimed_by=alice
 
 # 4. Append an in-flight journal entry (task-scoped scratchpad).
-guild quest journal QUEST-1 "Deployed via Terraform IaC" --agent alice
+guild quest -p lab-03-5-5 journal QUEST-1 "Deployed via Terraform IaC" --agent alice
 
 # 5. Fulfill the quest. --report is REQUIRED — must include commit hash,
 #    files touched, remaining issues. Fulfill cascades unblock to dependents.
-guild quest fulfill QUEST-1 \
+guild quest -p lab-03-5-5 fulfill QUEST-1 \
   --report "commit a1b2c3; files: deploy/prod.yaml; no remaining issues"
 
 # 6. Read the full quest history (status + journal + timeline).
-guild quest scroll QUEST-1
+guild quest -p lab-03-5-5 scroll QUEST-1
 # expect: status=fulfilled, journal contains the Terraform IaC note,
 #         timeline shows post -> accept -> journal -> fulfill
 ```
