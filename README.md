@@ -13,9 +13,12 @@ Week 0  — Environment Setup
 Week 1  — Vector Retrieval Baseline
 Week 2  — Rerank and Context Compression
 Week 2.5 — GraphRAG on a Wikipedia Subset       ← v12.4m: 0.96 judge, 32/0/0 vs vector
-Week 2.7 — Structure-Aware RAG (PageIndex)      ← long-doc third lane
+Week 2.7 — Structure-Aware RAG (PageIndex)      ← 16/16 GT-judge vs Vector 0.500 / Graph 0.375
 Week 3  — RAG Evaluation                        ← RAGAS, HyDE, Phoenix
-Week 3.5 — Cross-Session Memory
+Week 3.5 — Cross-Session Memory                 ← 15/15 + Phase 5 mem0 cross-check (10/14)
+Week 3.5.5 — Multi-Agent Shared Memory          ← guild MCP integration + atomic-claim race
+Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + consolidation
+Week 3.5.9 — Memory Benchmarks + Hypergraph     ← LongMemEval 5-way + HyperMem L3 relational tier
 Week 3.7 — Agentic RAG                          ← canonical 5-node graph
 Week 4  — ReAct From Scratch
 Week 5  — Pattern Zoo                           ← ReAct vs PaS vs Reflexion
@@ -43,8 +46,9 @@ Week 12 — Capstone and Mocks
 ## Stack assumptions
 
 - **Hardware**: MacBook Pro M5 Pro, 48 GB unified memory (M-series Apple Silicon).
-- **Local-first inference**: oMLX serving Gemma-4-26B-heretic / Qwen3.6-35B-A3B / gpt-oss-20b on `:8000`.
+- **Local-first inference**: oMLX serving Gemma-4-26B-heretic / Qwen3.6-35B-A3B / gpt-oss-20b on `:8000`, plus `bge-m3-mlx-fp16` for embeddings.
 - **Vector DB**: Qdrant via OrbStack (Docker) on `:6333`.
+- **Memory infra (Weeks 3.5.5 / 3.5.8 / 3.5.9)**: `mathomhaus/guild` (Go MCP, single binary, embedded SQLite) for operational tier; EverMind-AI's EverCore (Python + Postgres via Docker compose, port 1995) for semantic tier; HyperMem (Docker compose, port 1996) for relational L3 tier. Benchmarked via LongMemEval `oracle` subset anchored to EverCore's published 83%.
 - **Observability**: Phoenix on `:6006`.
 - **Cloud spend cap**: ~$10 across 12 weeks. Used only when local can't substitute (mainly Week 7 frontier model benchmarks).
 
