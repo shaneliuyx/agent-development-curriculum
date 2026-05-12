@@ -594,6 +594,23 @@ The 64% cost reduction with zero quality loss is the punchline number for the ba
 
 **Budget governance.** Set a hard cap per virtual key at the gateway. The Phoenix BCJ pattern from W2.7 of "budget exhausted → final-answer prompt" maps directly: hard ceiling at the gateway level prevents one runaway agent from burning the team's monthly cloud spend in an hour.
 
+**Structured human-handoff as a terminal state (pattern lifted from yzddp/harnesscode, added 2026-05-12).** The circuit-breaker fallback in Phase 5 has three possible terminal states: (a) success on primary, (b) success on fallback, (c) all providers down → 503 to user. Production stacks need a fourth: **(d) escalate to a human reviewer with structured handoff context.** The pattern lifted from `harnesscode`'s `missing_info.json`:
+
+```python
+@dataclass
+class HumanHandoff:
+    handoff_type: Literal["all_providers_down", "budget_exhausted",
+                          "ambiguous_request", "policy_block", "low_confidence"]
+    blocks_features: list[str]              # which downstream features wait on this
+    context_for_human: dict                 # last query, last error, attempted providers
+    user_input_required: str                # specific question the human must answer
+    sla_seconds: int                        # how long until escalation re-routes
+```
+
+The gateway middleware emits a `HumanHandoff` event onto a structured queue (Redis stream / SQS / a database table) instead of returning a generic `5xx` to the caller. Downstream consumer (oncall dashboard / Slack bot / internal review tool) picks it up, surfaces it to a human, captures the `user_input_required` response, and the gateway resumes with the human-supplied input. The discipline rule: **never let "ask a human" be unstructured.** Free-text alerts to oncall do not roll up; structured handoff events do.
+
+This converts the binary "circuit open → degraded service" into a graded "circuit open → human-resumable workflow" terminal state, and it composes with the cost-attribution metadata from Phase 4 (`metadata.handoff_type` becomes a billable dimension, so the team sees which features generate the most human-review load).
+
 ---
 
 ## Bad-Case Journal
@@ -655,6 +672,7 @@ The 64% cost reduction with zero quality loss is the punchline number for the ba
 - **Kwon et al. (2023).** *Efficient Memory Management for LLM Serving with PagedAttention.* SOSP 2023. arXiv:2309.06180. Provider-side prompt caching primitives (paged KV-cache, automatic prefix caching) that make gateway-level prompt-cache discounts possible.
 - **LMCache project (2024–2025).** github.com/LMCache/LMCache. Prefill-decode disaggregation + cross-request KV reuse on top of vLLM; the next-generation primitive that production-LLM-infra teams are evaluating.
 - **Fowler, Martin (2025).** *Harness of an LLM Application.* martinfowler.com. The "agent = model + harness" framing the curriculum standardized on; W7.3 is the production-infra layer of the harness.
+- **yzddp/harnesscode (2025-2026).** github.com/yzddp/harnesscode. Source of the structured-human-handoff pattern added to Production Considerations (2026-05-12). The `missing_info.json` channel converts circuit-breaker terminal-state from "5xx degraded" into "human-resumable workflow with structured context." Also source of the three patterns added to W7's BCJ (Entries 2-4: idle watchdog / false-completion gate / typed-error envelope).
 
 ---
 
