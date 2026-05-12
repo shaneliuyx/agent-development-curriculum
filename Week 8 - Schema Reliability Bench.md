@@ -1749,6 +1749,8 @@ And one last thing: **keep the signature recording on your phone.** Listen to it
 - **lm-format-enforcer** — github.com/noamgat/lm-format-enforcer. Lightweight constrained decoding for HF Transformers + llama.cpp.
 - **Instructor (Jason Liu)** — github.com/jxnl/instructor. Canonical Pydantic wrapper for LLM structured output; error-as-context retry across providers.
 - **BAML (Boundary ML)** — github.com/BoundaryML/baml. Schema-first LLM function definition language; typed clients + co-evolving prompt + schema.
+- **Pydantic AI (Samuel Colvin, 2024–2025)** — ai.pydantic.dev. Pydantic-first agent framework with `output_validators` (2025) for post-generation semantic checks layered on top of structured-output enforcement; production-grade alternative to Instructor for Python services already standardized on Pydantic v2.
+- **Guardrails AI (guardrails-ai/guardrails)** — github.com/guardrails-ai/guardrails. Validator-pipeline framework (`PII`, `ToxicLanguage`, `ValidJSON`, custom rails) that wraps any LLM provider; fits the L3-L4 post-validation + repair layer in this lab's 5-strategy stack. Production deployments often pair Guardrails (semantic validators) with Outlines (structural decoding).
 - **Liu et al. (2024).** *SLOT: Sample-efficient Structured Output.* arXiv:2505.04016. Near-zero overhead for common JSON Schema constraints.
 
 ---

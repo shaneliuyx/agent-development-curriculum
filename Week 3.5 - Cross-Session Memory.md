@@ -1102,11 +1102,11 @@ After your hand-rolled dual-store lab is shipped (custom OpenAI-extraction + Qdr
 
 [EverOS](https://github.com/EverMind-AI/EverOS) (Apache 2.0, Python 3.12, 4.6K stars as of May 2026, actively maintained) is a research-grade memory operating system for self-evolving agents. Where guild is "single-binary multi-agent coordination", EverOS is "full-stack memory architecture + benchmarks". Three components to study:
 
-| Part | What it is | Why it matters |
-|---|---|---|
-| **EverCore** | The reference memory architecture — biological-imprinting-inspired self-organizing LTM | LangGraph + Postgres + LangChain stack. Internal package name `memsys`, exposes HTTP API at `localhost:1995`. Backed by arXiv:2601.02163. |
-| **HyperMem** | Hypergraph memory architecture | Multi-entity relational memory primitive your DIY lab doesn't cover. Closer to W2.5 GraphRAG ontology than to W3.5 SCD-2. |
-| **EverMemBench + EvoAgentBench** | Open evaluation suites for memory quality + agent self-evolution | EverCore reports **LoCoMo 93.05% / LongMemEval 83.00%** — industry-standard numbers. Your DIY lab's 15-Q recall benchmark is non-comparable to these. |
+| Part                             | What it is                                                                             | Why it matters                                                                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **EverCore**                     | The reference memory architecture — biological-imprinting-inspired self-organizing LTM | LangGraph + Postgres + LangChain stack. Internal package name `memsys`, exposes HTTP API at `localhost:1995`. Backed by arXiv:2601.02163.             |
+| **HyperMem**                     | Hypergraph memory architecture                                                         | Multi-entity relational memory primitive your DIY lab doesn't cover. Closer to W2.5 GraphRAG ontology than to W3.5 SCD-2.                             |
+| **EverMemBench + EvoAgentBench** | Open evaluation suites for memory quality + agent self-evolution                       | EverCore reports **LoCoMo 93.05% / LongMemEval 83.00%** — industry-standard numbers. Your DIY lab's 15-Q recall benchmark is non-comparable to these. |
 
 **Side-by-side mapping — your lab vs guild vs EverOS**:
 
@@ -1337,6 +1337,11 @@ The partial index lets exactly one (user_id, key, archived=0) row exist while ar
 - **Slowly Changing Dimensions (SCD-2)** — Kimball Group. Archive-on-contradiction = SCD-2 by another name. The data-warehouse pattern that explains why memory contradiction updates work the way they do.
 - **Cache-aside pattern** — Microsoft Azure architecture docs. The cache-aside / lazy-load pattern is the engineering version of the two-tier memory architecture in W3.5.8.
 - **MCP (Model Context Protocol, Anthropic Nov 2024).** https://modelcontextprotocol.io. Standard protocol for agent-to-tool communication. Adopted by OpenAI + Google in 2025-2026. Used in W3.5.5 as the integration substrate for guild.
+
+### Evaluation methodology (judge prompts + bias)
+
+- **Zheng et al. (2023).** *Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena.* NeurIPS 2023 D&B. arXiv:2306.05685. Position / verbosity / self-enhancement bias taxonomy that explains why the Phase 5 mem0 cross-check used a fixed reference-answer scoring rubric per question (the 10/14 vs 15/15 delta is not a judge artifact — it is real architectural difference, confirmed because the scoring is bias-suppressed).
+- **Husain, Hamel (2024).** *Creating a LLM-as-a-Judge That Drives Business Results.* hamel.dev. Practitioner playbook for judge prompts that find real defects — pairs directly with the 15-Q recall benchmark scoring loop and the mem0-port test_recall_mem0.py validator.
 
 ---
 

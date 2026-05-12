@@ -27,6 +27,7 @@ Week 6  — Claude Code Source Dive
 Week 6.5 — Hermes Agent Hands-On
 Week 6.7 — Authoring Agent Skills
 Week 7  — Tool Harness
+Week 7.3 — Production LLM Infrastructure          ← gateway + caching + cost attribution + fallback (Akshay 6-area #2+#5)
 Week 7.5 — Computer Use and Browser Agents
 Week 8  — Schema Reliability Bench
 Week 8.5 — Voice AI Agents
@@ -36,6 +37,19 @@ Week 11 — System Design
 Week 11.5 — Agent Security
 Week 12 — Capstone and Mocks
 ```
+
+## How this maps to the Akshay 6-area hiring rubric (2026)
+
+| Area | Where covered |
+|---|---|
+| 1. Harness engineering | W4, W5, W7 |
+| 2. Inference serving (KV cache, paged attention, spec decoding, quantization) | W0, W2.7 BCJ #23, W9.5 |
+| 3. Structured output reliability | W8 |
+| 4. Evals + observability | W3, W2.7, W3.5 |
+| 5. Production LLM infrastructure (gateway, caching, cost attribution, fallback) | W7.3 |
+| 6. Fine-tune vs in-context | W9, W9.5 |
+
+See [`Agent Development 3-Month Curriculum.md` → "The Six Areas an AI Engineer Must Master"](./Agent%20Development%203-Month%20Curriculum.md) for the mapping table. Trend-monitoring cadence (~30 min / week) keeping this current is documented in [`Trend-Monitoring Discipline.md`](./Trend-Monitoring%20Discipline.md).
 
 ## What this is NOT
 
