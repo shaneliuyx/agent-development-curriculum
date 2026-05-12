@@ -1,10 +1,10 @@
 ---
 title: "Week 3.5 — Cross-Session Memory"
 created: 2026-04-24
-updated: 2026-05-03
-tags: [agent, curriculum, week-3-5, memory, mem0, qdrant, runbook]
+updated: 2026-05-12
+tags: [agent, curriculum, week-3-5, memory, qdrant, sqlite, runbook]
 audience: "Cloud infrastructure engineer (3 yrs), building stateful agent systems"
-stack: "MacBook M5 Pro, mem0 (local via pip), Qdrant on Docker, SQLite, Python 3.11+"
+stack: "MacBook M5 Pro, custom Python extraction (oMLX + sentence-transformers), Qdrant on Docker, SQLite, Python 3.11+"
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03-5-memory"
 estimated_time: "5 hours over 1–2 days"
@@ -13,7 +13,7 @@ prerequisites: "Week 3 lab complete (RAG eval harness working) + Qdrant running 
 
 # Week 3.5 — Cross-Session Memory
 
-> Goal: build an agent that remembers a user's preferences across three or more separate conversations, using `mem0` (open-source memory layer) + Qdrant for vector-addressable facts + SQLite for structured user state. Exit with a working demo, a recall benchmark, and a crisp answer to the interview question "how do you give an agent long-term memory?"
+> Goal: build an agent that remembers a user's preferences across three or more separate conversations. The lab is INTENTIONALLY hand-rolled — custom OpenAI-compatible extraction (oMLX Haiku-tier) + Qdrant for vector-addressable episodic memories + SQLite for structured semantic facts. No `mem0`-style library wrapper; you write the lifecycle yourself so you understand the primitives. Exit with a working demo, a 15-question recall benchmark, and a crisp answer to "how do you give an agent long-term memory?". The `mem0` library is cited as production prior-art in the References — read it AFTER finishing the lab to compare your hand-rolled design against the library's choices.
 
 This is a **half-week insert** between Week 3 and Week 4. It adds ~5 hours to Phase 1 and closes a real portfolio gap: before this lab, every agent you've built is session-local. Cross-session memory is the product feature behind ChatGPT's "memories," Claude Projects' context, and most 2026 consumer-agent products. It's also the thing interviewers will probe once you've explained RAG cleanly — "RAG gives your agent knowledge; what gives it a relationship?"
 
@@ -30,12 +30,12 @@ This is production critical. ChatGPT's "memories" feature, Claude Projects' cont
 ## Exit Criteria
 
 - [ ] `docker-compose.yml` running Qdrant (reusing your Week 1 instance is fine)
-- [ ] `src/memory.py` — memory writer + reader backed by mem0 + Qdrant + SQLite
+- [ ] `src/memory.py` — hand-rolled memory writer + reader: custom OpenAI-compatible extraction (oMLX Haiku-tier) + Qdrant episodic store + SQLite semantic-fact store
 - [ ] `src/chat.py` — a REPL agent that reads memory at turn-start and writes memory at turn-end
 - [ ] `src/demo_three_sessions.py` — scripted demo proving cross-session recall across three separate conversations
 - [ ] `tests/test_recall.py` — 15-question recall benchmark, ≥ 12/15 passing
 - [ ] `RESULTS.md` with the demo transcript + recall-benchmark table + memory-type taxonomy table
-- [ ] You can answer in 90 seconds: "What are the four types of agent memory, and which does mem0 give you?"
+- [ ] You can answer in 90 seconds: "What are the four types of agent memory, and which two does an episodic + semantic dual-store give you?"
 
 ---
 
@@ -52,9 +52,9 @@ The taxonomy interviewers expect you to know — adapted from cognitive science 
 | **Semantic / Entity** | "The user lives in Taipei. The user is vegan." | Permanent, fact-indexed | Vector store + structured DB |
 | **Procedural** | Learned skills — "for this user, prefer terse replies" | Permanent, pattern-indexed | System prompt augmentation or fine-tune |
 
-`mem0` primarily implements **episodic + semantic** memory. Working memory is still the conversation buffer. Procedural memory is almost always out-of-scope for off-the-shelf tools — you roll your own or fine-tune.
+This lab's hand-rolled design covers **episodic + semantic** memory. Working memory is still the conversation buffer (managed by the LLM caller's message list). Procedural memory is out-of-scope for hand-rolled memory systems — you roll it into the system prompt or fine-tune the model. Production libraries like `mem0` (referenced in §References) collapse episodic + semantic into one API; this lab keeps them in separate stores (Qdrant for episodic, SQLite for semantic) so the dual-store rationale is visible.
 
-> **Interview soundbite:** "Four types — working, episodic, semantic, procedural. mem0 gives you episodic and semantic out of the box. Working is the conversation buffer; procedural usually needs fine-tuning or prompt augmentation. The mistake candidates make is conflating all four under 'long-term memory' — interviewers want you to name the type and pick the right storage."
+> **Interview soundbite:** "Four types — working, episodic, semantic, procedural. A dual-store memory system covers episodic and semantic — vector DB for free-form events, relational for structured facts. Working memory is the conversation buffer; procedural usually needs fine-tuning or prompt augmentation. The mistake candidates make is conflating all four under 'long-term memory' — interviewers want you to name the type and pick the right storage."
 
 ### Concept 2 — The Memory Lifecycle: Extract → Store → Retrieve → Inject
 
@@ -81,7 +81,7 @@ Memory without forgetting is a landfill. Three forgetting strategies:
 2. **Confidence-weighted eviction.** Each fact has a confidence score; lowest-confidence facts are evicted when the memory store hits a cap.
 3. **Contradiction-triggered update.** When a new fact contradicts an existing one, the old fact is archived (not deleted — archived for audit), and the new one takes precedence.
 
-mem0 implements (3) natively via LLM-based contradiction detection. (1) and (2) you add yourself. Production systems usually run all three.
+This lab implements (3) natively — `write_semantic_fact()` archives the old row before inserting the new value when an LLM-extracted fact contradicts a stored one. (1) and (2) are out-of-scope for the lab but trivial to add (TTL = cron sweep over `updated_at`; eviction = ORDER BY `confidence` ASC LIMIT N before write). Production libraries like `mem0` ship all three; production systems usually run all three.
 
 > **Interview soundbite:** "Memory without forgetting is a landfill. I use three strategies — TTL for stale facts, confidence-weighted eviction under a cap, and LLM-based contradiction detection for updates. The archive-don't-delete rule is non-negotiable for audit."
 
@@ -236,7 +236,7 @@ The sequence diagram choreographs a single agent turn: the agent reads existing 
 mkdir -p ~/code/agent-prep/lab-03-5-memory/{src,data,results,tests}
 cd ~/code/agent-prep/lab-03-5-memory
 uv venv --python 3.11 && source .venv/bin/activate
-uv pip install mem0ai qdrant-client openai python-dotenv pytest sentence-transformers
+uv pip install qdrant-client openai python-dotenv pytest sentence-transformers
 ```
 
 **Embedding model setup — recommended path (oMLX serves BGE-M3)**:
@@ -754,11 +754,11 @@ Target: 12 of 15 passing. Write the failing cases into the bad-case journal.
 
 ## Production Comparators — read after completing the lab
 
-Two production-shaped systems worth studying after you've shipped the canonical lab. They solve overlapping problem spaces with different architectures; reading them gives a real comparator for your DIY mem0+Qdrant+SQLite design. **Read in order** — guild first (smaller surface, faster orientation), EverOS second (full research-grade stack).
+Two production-shaped systems worth studying after you've shipped the canonical lab. They solve overlapping problem spaces with different architectures; reading them gives a real comparator for your DIY hand-rolled-extraction + Qdrant + SQLite design. **Read in order** — guild first (smaller surface, faster orientation), EverOS second (full research-grade stack). The `mem0` library — production Python library that ships the same dual-store pattern this lab hand-rolls — is cited as additional prior-art in the References; skim its source if you want to compare your code against the library's choices.
 
 ### Comparator 1 — `mathomhaus/guild`
 
-After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min reading [`mathomhaus/guild`](https://github.com/mathomhaus/guild) (Apache-2.0, Go, single binary, embedded SQLite) as a production-shaped reference for the same problem space. Guild is an MCP-protocol-native agent-memory server with hybrid (BM25 + dense embedding + RRF fusion k=60) retrieval and atomic-lock primitives for parallel-agent coordination. The mythos vocabulary (Gates / Guild / Quest / Scroll / Lore / Oath) maps onto familiar memory primitives, listed below.
+After your hand-rolled dual-store lab is shipped (custom OpenAI-extraction + Qdrant + SQLite, no library wrapper), spend 30-60 min reading [`mathomhaus/guild`](https://github.com/mathomhaus/guild) (Apache-2.0, Go, single binary, embedded SQLite) as a production-shaped reference for the same problem space. Guild is an MCP-protocol-native agent-memory server with hybrid (BM25 + dense embedding + RRF fusion k=60) retrieval and atomic-lock primitives for parallel-agent coordination. The mythos vocabulary (Gates / Guild / Quest / Scroll / Lore / Oath) maps onto familiar memory primitives, listed below.
 
 **Side-by-side mapping — your lab vs guild**:
 
@@ -784,12 +784,12 @@ After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min rea
 
 - **Single-shot session start vs multi-call recall**. Guild's `guild_session_start` returns oath + brief + top quest atomically. Your `recall()` is invoked turn-by-turn. The single-shot pattern minimizes prompt-construction churn — relevant for any production system that values determinism per session.
 - **Versioned scrolls vs in-place updates**. Guild never deletes; it timestamps + supersedes. Your contradiction-update test (`test_recall.py`) implements the same pattern; guild's source is the production-quality reference for the same SCD-2 discipline.
-- **MCP-protocol-native vs Python-library-native**. Your lab agent imports mem0 directly. Guild exposes memory as MCP tools, so ANY MCP client (Claude Code, Cursor, Codex) shares the same memory layer. The MCP wrapping pattern is the right shape when memory needs to span multiple agent frameworks — a topic W6.7 / W7 expands on.
+- **MCP-protocol-native vs in-process-library-native**. Your lab agent imports a hand-rolled `src.memory` module directly — single-process, Python-only, no protocol boundary. Guild exposes memory as MCP tools, so ANY MCP client (Claude Code, Cursor, Codex) shares the same memory layer regardless of language. The MCP wrapping pattern is the right shape when memory needs to span multiple agent frameworks — a topic W3.5.5 / W6.7 / W7 expand on.
 
 `★ Insight ─────────────────────────────────────`
 - **Reading guild AFTER the canonical lab is the right order.** The lab teaches WHY each memory primitive exists; guild teaches HOW production-grade systems compose them. Reading guild first would skip the why and turn into copy-paste-engineering.
 - **The mythos vocabulary is a real design choice, not just flavor.** "Lore" as semantic memory + "Oath" as procedural principle has the advantage of being meaningful to non-ML readers (product managers, designers). The disadvantage in interviews: requires translation back to ML terms. Use ML terms in interview answers; cite guild as the production parallel.
-- **The Go-vs-Python stack difference exposes a real production tradeoff**: guild's single binary + embedded SQLite is operationally cleaner than mem0 + Qdrant + SQLite (3 processes, 2 storage engines). The cost is harder to extend without Go knowledge. For lab work and rapid iteration, Python wins. For production deployment, single-binary Go is the safer ops shape. Both are valid — the choice is product-driven, not technical.
+- **The Go-vs-Python stack difference exposes a real production tradeoff**: guild's single binary + embedded SQLite is operationally cleaner than your lab's stack (Python + oMLX HTTP + Qdrant Docker container + SQLite file — 3 services, 2 storage engines). The cost is harder to extend without Go knowledge. For lab work and rapid iteration, Python wins. For production deployment, single-binary Go is the safer ops shape. Both are valid — the choice is product-driven, not technical.
 - **Future W3.5.5 supplement (multi-agent shared memory) uses guild as the substrate.** Your single-agent lab is the prerequisite — finish here, then graduate to multi-agent coordination in W3.5.5 if your roadmap calls for it.
 `─────────────────────────────────────────────────`
 
@@ -807,7 +807,7 @@ After your dual-store mem0 + Qdrant + SQLite lab is shipped, spend 30-60 min rea
 
 | Dimension | Your W3.5 lab | guild | EverOS / EverCore |
 |---|---|---|---|
-| Stack | mem0 + Qdrant + SQLite (Python) | Single Go binary + embedded SQLite | LangGraph + Postgres + LangChain (Python 3.12) |
+| Stack | Hand-rolled Python: oMLX-extraction + Qdrant + SQLite | Single Go binary + embedded SQLite | LangGraph + Postgres + LangChain (Python 3.12) |
 | Deployment | Python venv + Docker (Qdrant) | One binary | Docker compose stack (Postgres + services) |
 | Memory architecture | 4 types (working/episodic/semantic/procedural) | Quest/Scroll/Lore/Oath | EverCore (LTM-OS) + optional HyperMem (hypergraph) |
 | Multi-agent | No | YES (atomic claims) | Partial (server is single-host) |
@@ -882,7 +882,7 @@ User memory is a slowly-changing dimension (SCD-2). Every contradiction update c
 
 ### 5 Anki Cards
 1. Q: Four types of agent memory? — A: Working, episodic, semantic, procedural.
-2. Q: Which two types does mem0 primarily implement? — A: Episodic + semantic.
+2. Q: Which two memory types does the standard dual-store pattern (vector + relational) cover? — A: Episodic (vector) + semantic (relational). Working memory is the conversation buffer; procedural memory is fine-tune or prompt augmentation.
 3. Q: Four stages of the memory lifecycle? — A: Extract → store → retrieve → inject.
 4. Q: Why not store every turn verbatim? — A: Transcripts crowd the prompt and contradictions accumulate; extraction compresses hundreds of turns into dozens of facts.
 5. Q: Three forgetting strategies? — A: TTL, confidence-weighted eviction, contradiction-triggered update (archive, don't delete).
@@ -1011,7 +1011,7 @@ The partial index lets exactly one (user_id, key, archived=0) row exist while ar
 
 ### Production reference systems (used in W3.5 + W3.5.5 + W3.5.8)
 
-- **mem0 (2024).** https://github.com/mem0ai/mem0. Open-source episodic + semantic memory with LLM contradiction detection. Used in this lab as the dual-store wrapper.
+- **mem0 (2024).** https://github.com/mem0ai/mem0. Open-source Python library for episodic + semantic memory with LLM contradiction detection. NOT used in this lab — cited as production prior-art. The lab hand-rolls the dual-store pattern (custom OpenAI-compatible extraction + Qdrant + SQLite) so the underlying primitives stay visible. Skim mem0's source after finishing the lab to compare design choices.
 - **mathomhaus/guild.** https://github.com/mathomhaus/guild. Single-Go-binary multi-agent MCP coordinator with embedded SQLite + BM25/dense/RRF retrieval. Production-comparator (W3.5.5 chapter integrates this as the operational tier).
 - **EverMind-AI/EverOS / EverCore.** https://github.com/EverMind-AI/EverOS. Research-grade memory OS with biological-imprinting model + LongMemEval 83% / LoCoMo 93.05% published scores. Production-comparator (W3.5.8 chapter integrates EverCore as the semantic tier). [arXiv:2601.02163](https://arxiv.org/abs/2601.02163).
 
