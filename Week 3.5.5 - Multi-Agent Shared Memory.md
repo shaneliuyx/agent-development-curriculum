@@ -169,7 +169,7 @@ sequenceDiagram
   G-->>B: already claimed by agent_a status rejected
 
   A->>A: does the work
-  A->>G: quest_complete + save scroll
+  A->>G: quest_journal + quest_fulfill
   B->>G: list available quests
   G-->>B: returns DIFFERENT available quest
   B->>G: quest_accept other-task
@@ -661,7 +661,7 @@ pytest tests/test_guild_client.py -v
 
 > **2026-05-12 vocabulary alignment note.** Earlier chapter revisions used `quest_create / quest_complete / scroll_save / scroll_list` as both method names AND MCP tool names. None of those tools exist on the current `guild mcp serve` server (verified via live `session.list_tools()` — 43 tools across `quest_* / lore_* / guild_*` namespaces; none of the four old names are present). The correct mapping: `quest_create → quest_post`, `quest_complete → quest_fulfill` (with required `report`), `scroll_save → quest_journal` (the writer), `scroll_list → quest_scroll` (read-only history for one QUEST_ID). The class above uses the correct names.
 >
-> **Deferred (next commit):** Phase 3 race-test, Phase 4 three-act demo, Phase 5 multi-agent tests, BCJ Entry 4, and the §3 interview soundbite still reference the old method names. A Phase 3–5 vocabulary sweep is on the maintenance queue.
+> **Sweep complete (2026-05-12):** Phase 3 race-test, Phase 4 three-act demo, Phase 5 multi-agent tests, BCJ Entry 4, the §3 interview soundbite, and the §3 mermaid sequence diagram have all been rewritten to use the correct vocabulary. Two intentional explanatory references to the old verb names remain (the drift-warning callout in §1.4 and this vocabulary alignment note) — those are *documentation of the rename history*, not usage.
 
 ---
 
@@ -688,22 +688,37 @@ from src.guild_client import GuildClient
 
 
 async def attempt_claim(agent_id: str) -> None:
-    quest_id = "race-the-prize"
-    async with GuildClient(agent_id=agent_id) as gc:
-        # Ensure the quest exists (idempotent — fine if other agent created it)
-        try:
-            await gc.quest_create(quest_id, "Quest both agents want")
-        except Exception:                                       # noqa: BLE001
-            pass  # already exists
+    """Find-or-create the race quest by campaign tag, then race to claim.
 
-        print(f"[{agent_id}] attempting claim...")
+    guild assigns QUEST_IDs server-side — we can't pre-decide a slug like
+    'race-the-prize'. Instead both agents look up the race quest by its
+    campaign tag; the first agent to run creates it, the second finds it.
+    """
+    async with GuildClient(agent_id=agent_id) as gc:
+        # Find or create the race quest, tagged with the shared campaign.
+        unclaimed = await gc.quest_list(campaign="race-demo", status="unclaimed")
+        if unclaimed:
+            quest_id = unclaimed[0]["id"]
+            print(f"[{agent_id}] found existing race quest: {quest_id}")
+        else:
+            quest_id = await gc.quest_post(
+                subject="race-the-prize: both agents want this",
+                campaign="race-demo",
+            )
+            print(f"[{agent_id}] created race quest: {quest_id}")
+
+        print(f"[{agent_id}] attempting claim on {quest_id}...")
         result = await gc.quest_accept(quest_id)
         print(f"[{agent_id}] result: {result}")
 
         if result.get("status") == "claimed":
             print(f"[{agent_id}] WON the claim. Doing the work.")
-            await gc.scroll_save(quest_id, f"completed by {agent_id}")
-            await gc.quest_complete(quest_id)
+            await gc.quest_journal(quest_id, f"completed by {agent_id}")
+            await gc.quest_fulfill(
+                quest_id,
+                report=f"commit demo-{agent_id}; files: src/atomic_claim_demo.py; "
+                       f"agent {agent_id} won the race",
+            )
         else:
             print(f"[{agent_id}] LOST the race. Will pick another quest.")
 
@@ -741,8 +756,8 @@ python -m src.atomic_claim_demo bob &
 Verify state in guild:
 
 ```bash
-guild quest list
-# expect: race-the-prize  completed by alice
+guild quest list --campaign race-demo
+# expect: QUEST-N  race-the-prize: both agents want this  fulfilled  (owner=alice)
 ```
 
 ### 3.2 Programmatic race test
@@ -758,13 +773,16 @@ from src.guild_client import GuildClient
 
 @pytest.mark.asyncio
 async def test_atomic_claim_exactly_one_winner() -> None:
-    # Setup: a fresh quest, no claim
+    # Setup: a fresh quest. guild assigns the QUEST_ID; capture + share it.
     async with GuildClient(agent_id="seed") as gc:
-        await gc.quest_create("race-test-001", "atomic claim test")
+        quest_id = await gc.quest_post(
+            subject="atomic-claim test: only one winner",
+            campaign="race-test",
+        )
 
     async def try_claim(agent_id: str) -> dict:
         async with GuildClient(agent_id=agent_id) as gc:
-            return await gc.quest_accept("race-test-001")
+            return await gc.quest_accept(quest_id)
 
     # Run two claims concurrently via asyncio.gather (same process,
     # different GuildClient instances → different agent IDs)
@@ -775,9 +793,7 @@ async def test_atomic_claim_exactly_one_winner() -> None:
     statuses = [r.get("status") for r in results]
     # Exactly one 'claimed', exactly one anything-else
     assert statuses.count("claimed") == 1, f"got {statuses}"
-    assert statuses.count("claimed") + statuses.count("rejected") == 2, (
-        f"got {statuses}"
-    )
+    assert len(statuses) == 2, f"got {statuses}"
 ```
 
 ```bash
@@ -802,107 +818,137 @@ Demonstrates the scroll-handoff primitive: agent A finishes a quest, leaves a sc
 `src/three_act_handoff.py`:
 
 ```python
-"""Three-act multi-agent handoff via guild scrolls.
+"""Three-act multi-agent handoff via guild quest+journal+scroll.
 
-Act 1 — agent A claims & completes 'design-api-spec', leaves a scroll
-        explaining the design decisions
+Act 1 — agent A posts + claims + completes 'design-api-spec', leaves a
+        journal entry explaining the design decisions
 Act 2 — agent B starts 'implement-api'. Before working, reads agent A's
-        design-api-spec scroll. Implements. Saves an implementation scroll.
+        design-api-spec scroll for context. Implements. Logs an
+        implementation journal entry.
 Act 3 — agent C starts 'write-api-tests'. Reads BOTH prior scrolls.
-        Writes tests. Saves test-coverage scroll.
+        Writes tests. Logs a test-coverage journal entry.
+
+QUEST_IDs are assigned by guild — each act captures the assigned ID and
+passes it to the next act. The main() driver chains them together.
 
 Each act is a separate function so you can run them across separate
-"sessions" (separate Python invocations, simulating different days).
+"sessions" (separate Python invocations, simulating different days) —
+in that case, look up the prior QUEST_IDs by campaign tag at act-start
+rather than passing them through main(). Both patterns shown below.
 """
 import asyncio
 
 from src.guild_client import GuildClient
 
+CAMPAIGN = "payments-api-3act"
 
-async def act_one_design(quest_id: str = "design-api-spec") -> None:
+
+async def act_one_design() -> str:
+    """Post + claim + fulfill the design quest. Returns the QUEST_ID."""
     print(">>> Act 1 — agent A designs the API spec")
     async with GuildClient(agent_id="agent_a") as gc:
-        try:
-            await gc.quest_create(quest_id, "Design the new payments API")
-        except Exception:                                       # noqa: BLE001
-            pass
+        quest_id = await gc.quest_post(
+            subject="design-api-spec: design the new payments API",
+            spec="Define REST endpoints, auth model, retry semantics, "
+                 "idempotency strategy. Output: API spec markdown.",
+            campaign=CAMPAIGN,
+        )
         claim = await gc.quest_accept(quest_id)
-        print(f"  claim: {claim}")
-        scroll = (
+        print(f"  claim ({quest_id}): {claim}")
+
+        handoff_note = (
             "API spec finalized: REST + JSON, idempotency keys via "
             "Idempotency-Key header, exponential-backoff retry. "
             "Authentication via JWT, 30-minute expiry. Use POST /payments "
             "for creation, GET /payments/{id} for retrieval."
         )
-        await gc.scroll_save(quest_id, scroll)
-        await gc.quest_complete(quest_id)
-        print(f"  scroll saved + quest completed")
+        await gc.quest_journal(quest_id, handoff_note)
+        await gc.quest_fulfill(
+            quest_id,
+            report="commit design-001; files: docs/api-spec.md; "
+                   "no remaining issues",
+        )
+        print(f"  journal logged + quest fulfilled ({quest_id})")
+    return quest_id
 
 
-async def act_two_implement(
-    design_quest: str = "design-api-spec",
-    impl_quest: str = "implement-api",
-) -> None:
-    print(">>> Act 2 — agent B implements based on agent A's design scroll")
+async def act_two_implement(design_quest_id: str) -> str:
+    """Read design context, post+claim+fulfill the impl quest, return ID."""
+    print(">>> Act 2 — agent B implements based on agent A's design context")
     async with GuildClient(agent_id="agent_b") as gc:
-        # Read prior scroll for context BEFORE claiming
-        prior_scrolls = await gc.scroll_list(quest_id=design_quest)
-        for s in prior_scrolls:
-            print(f"  read prior scroll: {s.get('text', '')[:100]}...")
+        # Read the design quest's full history (status + journal + timeline).
+        # quest_scroll returns a dict; the journal entries live inside it.
+        prior = await gc.quest_scroll(design_quest_id)
+        prior_text = str(prior)
+        print(f"  read design scroll: {prior_text[:100]}...")
 
-        try:
-            await gc.quest_create(impl_quest, "Implement the payments API")
-        except Exception:                                       # noqa: BLE001
-            pass
-        claim = await gc.quest_accept(impl_quest)
-        print(f"  claim: {claim}")
-        scroll = (
+        quest_id = await gc.quest_post(
+            subject="implement-api: implement the payments API",
+            spec=f"Implement per design spec captured in {design_quest_id}. "
+                 "Use FastAPI + Pydantic. Add tests stubs.",
+            campaign=CAMPAIGN,
+        )
+        claim = await gc.quest_accept(quest_id)
+        print(f"  claim ({quest_id}): {claim}")
+
+        handoff_note = (
             "Implemented POST /payments + GET /payments/{id} per spec. "
             "Used FastAPI + Pydantic for validation. Idempotency-Key "
             "stored in Redis with 24h TTL. JWT validation in middleware. "
             "Unit-test stubs in tests/test_payments.py — not yet exhaustive."
         )
-        await gc.scroll_save(impl_quest, scroll)
-        await gc.quest_complete(impl_quest)
+        await gc.quest_journal(quest_id, handoff_note)
+        await gc.quest_fulfill(
+            quest_id,
+            report="commit impl-001; files: src/api/payments.py, "
+                   "src/middleware/jwt.py, tests/test_payments.py; "
+                   "remaining: exhaustive happy-path tests in Act 3",
+        )
+    return quest_id
 
 
-async def act_three_test(
-    design_quest: str = "design-api-spec",
-    impl_quest: str = "implement-api",
-    test_quest: str = "write-api-tests",
-) -> None:
+async def act_three_test(design_quest_id: str, impl_quest_id: str) -> str:
+    """Read both prior scrolls; post+claim+fulfill the test quest."""
     print(">>> Act 3 — agent C writes tests, sees the WHOLE chain")
     async with GuildClient(agent_id="agent_c") as gc:
-        for q in (design_quest, impl_quest):
-            scrolls = await gc.scroll_list(quest_id=q)
-            for s in scrolls:
-                print(f"  read prior scroll [{q}]: {s.get('text', '')[:80]}...")
+        for q in (design_quest_id, impl_quest_id):
+            scroll = await gc.quest_scroll(q)
+            print(f"  read prior scroll [{q}]: {str(scroll)[:80]}...")
 
-        try:
-            await gc.quest_create(test_quest, "Write API tests")
-        except Exception:                                       # noqa: BLE001
-            pass
-        await gc.quest_accept(test_quest)
-        scroll = (
+        quest_id = await gc.quest_post(
+            subject="write-api-tests: exhaustive payments-API test suite",
+            campaign=CAMPAIGN,
+        )
+        await gc.quest_accept(quest_id)
+        handoff_note = (
             "Wrote integration tests covering happy-path + idempotency-key "
             "replay + JWT-expiry + retry-on-503. Coverage 85% on the new "
             "code. Edge case TODO: clock skew on JWT validation."
         )
-        await gc.scroll_save(test_quest, scroll)
-        await gc.quest_complete(test_quest)
+        await gc.quest_journal(quest_id, handoff_note)
+        await gc.quest_fulfill(
+            quest_id,
+            report="commit test-001; files: tests/test_payments_integration.py; "
+                   "coverage 85%; remaining: clock-skew edge case",
+        )
+    return quest_id
 
 
 async def main() -> None:
-    await act_one_design()
+    design_id = await act_one_design()
     print()
-    await act_two_implement()
+    impl_id = await act_two_implement(design_id)
     print()
-    await act_three_test()
+    await act_three_test(design_id, impl_id)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+**Cross-session lookup pattern (when acts run in separate Python invocations):**
+
+If you split the three acts across separate days / processes (the more realistic agent-handoff scenario), each later act starts by looking up the prior quests via `quest_list(campaign=CAMPAIGN, status="fulfilled")` and reading their `quest_scroll` rather than receiving QUEST_IDs through `main()`. The chapter ships the in-process version above for the smoke test; the cross-session version is the same code with a `quest_list` lookup at the top of each act.
 
 **Expected output**:
 
@@ -1050,7 +1096,10 @@ import pytest
 from src.guild_client import GuildClient
 
 
-def make_quest_id(prefix: str) -> str:
+def unique_subject(prefix: str) -> str:
+    """Generate a unique subject string per test run. QUEST_IDs are
+    assigned by guild server-side, but unique SUBJECTS keep test fixtures
+    isolated from each other when reading-back via quest_list filters."""
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
@@ -1058,22 +1107,22 @@ def make_quest_id(prefix: str) -> str:
 
 @pytest.mark.asyncio
 async def test_01_same_agent_quest_appears_in_listing() -> None:
-    quest = make_quest_id("01-list")
+    subj = unique_subject("01-list")
     async with GuildClient(agent_id="alice") as gc:
-        await gc.quest_create(quest, "test")
-        quests = await gc.quest_list()
-        assert any(q.get("id") == quest for q in quests)
+        quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
+        quests = await gc.quest_list(campaign="recall-bench")
+        assert any(q.get("id") == quest_id for q in quests)
 
 
 @pytest.mark.asyncio
-async def test_02_same_agent_scroll_round_trip() -> None:
-    quest = make_quest_id("02-scroll")
+async def test_02_same_agent_journal_round_trip() -> None:
+    subj = unique_subject("02-journal")
     async with GuildClient(agent_id="alice") as gc:
-        await gc.quest_create(quest, "test")
-        await gc.quest_accept(quest)
-        await gc.scroll_save(quest, "alice's notes on the test")
-        scrolls = await gc.scroll_list(quest_id=quest)
-        assert any("alice's notes" in s.get("text", "") for s in scrolls)
+        quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
+        await gc.quest_accept(quest_id)
+        await gc.quest_journal(quest_id, "alice's notes on the test")
+        scroll = await gc.quest_scroll(quest_id)
+        assert "alice's notes" in str(scroll)
 
 
 # (3 more same-agent tests omitted; same shape — list, fetch, completion-state, etc.)
@@ -1082,17 +1131,20 @@ async def test_02_same_agent_scroll_round_trip() -> None:
 # ── Cross-agent handoff (5 tests) ────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_06_agent_b_reads_agent_a_scroll() -> None:
-    quest = make_quest_id("06-handoff")
+async def test_06_agent_b_reads_agent_a_journal() -> None:
+    subj = unique_subject("06-handoff")
     async with GuildClient(agent_id="agent_a") as gc:
-        await gc.quest_create(quest, "test")
-        await gc.quest_accept(quest)
-        await gc.scroll_save(quest, "agent_a's scroll")
-        await gc.quest_complete(quest)
+        quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
+        await gc.quest_accept(quest_id)
+        await gc.quest_journal(quest_id, "agent_a's handoff note")
+        await gc.quest_fulfill(
+            quest_id,
+            report="commit handoff-stub; files: tests/test_06.py; complete",
+        )
 
     async with GuildClient(agent_id="agent_b") as gc:
-        scrolls = await gc.scroll_list(quest_id=quest)
-        assert any("agent_a's scroll" in s.get("text", "") for s in scrolls)
+        scroll = await gc.quest_scroll(quest_id)
+        assert "agent_a's handoff note" in str(scroll)
 
 
 # (4 more cross-agent tests omitted)
@@ -1102,13 +1154,13 @@ async def test_06_agent_b_reads_agent_a_scroll() -> None:
 
 @pytest.mark.asyncio
 async def test_11_parallel_claim_exactly_one_winner() -> None:
-    quest = make_quest_id("11-race")
+    subj = unique_subject("11-race")
     async with GuildClient(agent_id="seed") as gc:
-        await gc.quest_create(quest, "race")
+        quest_id = await gc.quest_post(subject=subj, campaign="recall-bench")
 
     async def try_claim(agent_id: str) -> dict:
         async with GuildClient(agent_id=agent_id) as gc:
-            return await gc.quest_accept(quest)
+            return await gc.quest_accept(quest_id)
 
     a, b = await asyncio.gather(try_claim("alice"), try_claim("bob"))
     statuses = [a.get("status"), b.get("status")]
@@ -1200,8 +1252,8 @@ Aggregate: 14/15 = 0.93
 *Root cause:* guild's quest_accept allows RE-ACCEPTING a completed quest by default (treats it as a reopen). The lab's mental model expected "completed = terminal state, no re-accept".
 *Fix:* Either (a) include `--no-reopen` flag if guild's CLI supports it (check `guild quest accept --help`), or (b) in the Python wrapper, check quest status BEFORE calling accept; raise an exception if already completed. Document the chosen semantics in `guild_client.py` docstrings.
 
-**Entry 4 — Scrolls accumulate forever; `scroll_list` returns thousands.**
-*Symptom:* After running the three-act demo 50 times during development, `scroll_list` returns ~150 scrolls and the test asserting "agent A's scroll appears" is slow + the matching scroll is one of many duplicates.
+**Entry 4 — Journal entries accumulate forever; `quest_scroll` returns a bloated history.**
+*Symptom:* After running the three-act demo 50 times during development, `quest_scroll(QUEST-N)` returns a history with ~150 journal entries spanning all prior runs, and the test asserting "agent A's handoff note appears" is slow + the matching entry is one of many duplicates because every dev iteration left its trail.
 *Root cause:* The lab's test setup doesn't clean up. Each test run creates new scrolls but never deletes. Over time, SQLite gets dense.
 *Fix:* Add a `pytest` fixture that resets state at session start:
 
@@ -1230,7 +1282,7 @@ Or use unique `quest_id` per test via `uuid.uuid4()` (the lab's `make_quest_id` 
 
 **Soundbite 2 — "Why MCP for memory? Couldn't you just expose an HTTP API?"**
 
-"MCP is the standard 2026 protocol for agent-to-tool communication — Anthropic, OpenAI, and Google all support it. The pragmatic reason to use MCP is that guild's state becomes accessible to EVERY MCP-aware harness simultaneously: Claude Code in one terminal, Cursor in another, my Python client in a third. All three see the same quests and scrolls. With a custom HTTP API I'd have to write a separate adapter for each consumer — and that's exactly what MCP was designed to eliminate. The deeper architectural reason: tool-calling is the canonical agent-substrate interface. Phrasing memory as 'tools' (`quest_accept`, `scroll_save`) means agents reason about memory operations the same way they reason about file I/O or shell commands. Lower cognitive load for the LLM, fewer special-cased code paths for the engineer."
+"MCP is the standard 2026 protocol for agent-to-tool communication — Anthropic, OpenAI, and Google all support it. The pragmatic reason to use MCP is that guild's state becomes accessible to EVERY MCP-aware harness simultaneously: Claude Code in one terminal, Cursor in another, my Python client in a third. All three see the same quests and journal entries. With a custom HTTP API I'd have to write a separate adapter for each consumer — and that's exactly what MCP was designed to eliminate. The deeper architectural reason: tool-calling is the canonical agent-substrate interface. Phrasing memory as 'tools' (`quest_accept`, `quest_journal`, `quest_fulfill`) means agents reason about memory operations the same way they reason about file I/O or shell commands. Lower cognitive load for the LLM, fewer special-cased code paths for the engineer."
 
 **Soundbite 3 — "What did reading guild's source teach you?"**
 
