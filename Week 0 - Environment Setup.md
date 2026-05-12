@@ -890,6 +890,11 @@ Your Anki deck, bad-case journal, and lab `RESULTS.md` files are git-tracked —
 - **oMLX (omlx.app)** — macOS inference server wrapping mlx-lm with OpenAI-compatible HTTP.
 - **vMLX (vmlx.app)** — companion app for second isolated MLX inference process.
 - **uv package manager** — https://docs.astral.sh/uv/ — Python environment manager used throughout.
+- **Kwon et al. (2023).** *Efficient Memory Management for Large Language Model Serving with PagedAttention.* SOSP 2023. arXiv:2309.06180. The vLLM paper — paged KV-cache + automatic prefix caching that oMLX/vMLX echo in their MLX-native form. Read to understand *why* Apple Silicon unified-memory inference behaves the way it does at long context.
+- **LMCache project (2024–2025)** — github.com/LMCache/LMCache. Prefill-decode disaggregation + cross-request KV reuse on top of vLLM; the 2025 state-of-the-art for "the prompt is the cache" production patterns. Relevant for W2.7 long-context tree-walk loops where the cluster-summary prefill dominates per-iteration cost.
+- **QSPEC (2025).** *QSPEC: Speculative Decoding with Complementary Quantization Schemes.* arXiv:2410.11305. Combines speculative decoding (low-bit draft model proposes, high-bit target model verifies) with quantization, achieving net 2-3× throughput gains over either technique alone. The 2025 SOTA for combining the two inference-optimization axes; explains why Qwen3.6-35B-A3B-nvfp4 + draft-mode configurations are appearing in production stacks.
+- **Google Cloud (2024).** *Five Techniques to Optimize LLM Inference.* cloud.google.com/blog. The unified framing — continuous batching + paged attention + quantization + speculative decoding + smart routing — useful as the 1-page mental model when deciding where to add capacity in a production inference stack.
+- **Pachaar, Akshay (2026).** *The Six Areas an AI Engineer Must Master.* X / @akshay_pachaar thread. The 2026 hiring-rubric framing: (1) harness engineering, (2) inference serving, (3) structured output reliability, (4) evals + observability, (5) production infra (gateway/caching/cost), (6) fine-tune vs in-context decision-making. This curriculum maps onto all six — see Phase 1 phase-goal + W7.3 + W9.5 for explicit coverage.
 
 ---
 

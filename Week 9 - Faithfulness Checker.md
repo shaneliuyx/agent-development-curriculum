@@ -1666,6 +1666,8 @@ Week 10 shifts from evaluating LLM outputs to comparing the frameworks that orch
 - **Mishra et al. (2021).** *Natural Instructions.* arXiv:2104.08773. Background on NLI task framing.
 - **Lakera AI (2026).** *LLM Hallucinations Guide.* lakera.ai. 2026 consensus on abstention-first safety.
 - **Anthropic (2024).** *Faithfulness Evaluation Cookbook.* docs.anthropic.com. Decompose-then-verify pipeline.
+- **OpenAI (2024).** *Optimizing LLM Accuracy — A Practical Guide.* platform.openai.com/docs. Decision matrix for prompt engineering vs RAG vs fine-tuning vs all-three; "stop chasing zero hallucinations" framing that anchors the abstention-first stance in this chapter. Anchor reference for W9.5 fine-tuning vs in-context boundary.
+- **Husain, Hamel (2024).** *Creating a LLM-as-a-Judge That Drives Business Results.* hamel.dev. The canonical practitioner blog on writing judge prompts that catch real defects (not just rephrased rubrics). MT-Bench bias types (position, verbosity, self-enhancement) operationalized into a development workflow — directly applies to the Phase 6 30-Q test set scoring.
 
 ---
 

@@ -2668,6 +2668,8 @@ zation for large results: `summarize_text(result)` for read_file if file is larg
 - **Weng, Lilian (2023).** *LLM Powered Autonomous Agents.* lilianweng.github.io. Outer-controller framing + memory taxonomy.
 - **Anthropic (2024).** *Building effective agents.* Production vocabulary: augmented LLM vs agent.
 - **Wei et al. (2022).** *Chain-of-Thought Prompting.* arXiv:2201.11903. The baseline ReAct surpasses.
+- **Fowler, Martin (2025).** *Harness of an LLM Application.* martinfowler.com. Canonical naming for "agent = model + harness" — the harness is the iteration loop, tool registry, scratchpad management, budget enforcement, and observability surrounding the LLM call. Required reading; the 2026 senior-engineer hiring rubric assumes this vocabulary.
+- **Zhang, Barry / Anthropic (2025).** *Building Effective Agents (walkthrough talk).* Production framing of the harness/agent split — when to use a workflow (DAG) vs an agent (loop). Companion to Anthropic's "Building effective agents" essay.
 
 ---
 

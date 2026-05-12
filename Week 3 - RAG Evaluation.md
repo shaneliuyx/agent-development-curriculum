@@ -1873,6 +1873,9 @@ Parallelizing LLM-backed checks (faithfulness, relevance) recovers ~30% of the l
 - **Cormack, Clarke & Buettcher (2009).** *Reciprocal Rank Fusion.* SIGIR 2009. RRF k=60.
 - **Zheng et al. (2023).** *MT-Bench / Chatbot Arena.* arXiv:2306.05685. LLM-judge calibration; metric differences below 0.03 = noise on 50-question sets.
 - **LangChain EnsembleRetriever docs** — production RRF with k=60.
+- **Husain, Hamel (2024).** *Creating a LLM-as-a-Judge That Drives Business Results.* hamel.dev. Practitioner blueprint for judge prompts that actually catch defects — error-analysis-first, rubric-second. Directly applicable to Phase 3 RAGAS judge tuning when the default `answer_relevancy` prompt produces noisy 0.65↔0.89 deltas.
+- **OpenTelemetry Semantic Conventions for GenAI (2025)** — opentelemetry.io/docs/specs/semconv/gen-ai. Vendor-neutral span schema (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, etc.) that Phoenix, LangSmith, W&B Weave, Braintrust, and Traceloop all consume. Picking OTel as the wire format means you can swap UIs without re-instrumenting code.
+- **Observability tool survey (2026):** *Arize Phoenix* (open-source, used in this lab) vs *LangSmith* (LangChain-native, hosted, free tier 5k traces/mo) vs *Weights & Biases Weave* (eval-first, integrates with W&B Experiments) vs *Braintrust* (eval-tournament-first; built around LLM-as-judge as a primary workflow) vs *Traceloop* (OpenLLMetry — pure OTel SDK). Pick by primary workflow: tracing-first → Phoenix; eval-first → Braintrust; team-already-on-W&B → Weave; framework-coupled → LangSmith.
 
 ---
 

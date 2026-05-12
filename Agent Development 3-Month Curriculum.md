@@ -87,6 +87,23 @@ A common false dichotomy is "bash vs MCP." The real question is token budget:
 
 The production pattern is **CLI-first, MCP-wrapper**: implement tools as CLI commands first (fast, testable, low overhead), then expose them via MCP transport when cross-model portability or the MCP ecosystem matters. The two are complementary, not competing. Linux Foundation backing for MCP (2026) makes the protocol durable; the optimization question is how you load and scope schemas, not whether to use the protocol.
 
+### The Six Areas an AI Engineer Must Master (2026 hiring rubric)
+
+Akshay Pachaar's *6 Areas* list ([@akshay_pachaar, 2026](https://x.com/akshay_pachaar)) has become the de-facto hiring rubric for "AI / LLM / Agent Engineer" roles in 2026. The teach_fireworks 11-section reading list ([@teach_fireworks, 2026](https://x.com/teach_fireworks)) is the curated source-material expansion. This curriculum maps onto all six — explicit coverage below.
+
+| # | Area | Where covered | Anchor artifact |
+|---|---|---|---|
+| 1 | **Harness engineering** (loop, tool registry, budget, scratchpad) | W4 (ReAct from scratch), W5 (pattern zoo), W7 (Tool harness) | W4 BCJ: 3 infinite-loop / hallucination / scratchpad-bloat failure modes |
+| 2 | **Inference serving** (KV cache, paged attention, spec decoding, quantization) | W0 (oMLX/vMLX MLX-native stack), W2.7 BCJ #23 (long-context budget), W9.5 (quantization for fine-tuning) | W0 4-model fleet at fp16/fp8/nvfp4; references: vLLM PagedAttention + LMCache + QSPEC |
+| 3 | **Structured output reliability** (FSM-guided decoding, schema-first, post-validation) | W8 (5-strategy schema bench) | W8 lab: L1–L5 defense matrix on 100 prompts, 4 local + 1 cloud model |
+| 4 | **Evals + observability** (LLM-as-judge bias, RAGAS, Phoenix, OpenTelemetry GenAI) | W3 (RAG eval), W2.7 (GT-judge methodology), W3.5 (recall benchmark) | W2.7 Tree-v3 = 1.000 GT-judge / 16-Q; W3 four-metric RAGAS deltas |
+| 5 | **Production LLM infrastructure** (gateway, prompt + semantic caching, cost attribution, provider fallback) | W7.3 (Production LLM Infrastructure — supplemental, 6 lab phases) | W7.3 lab: LiteLLM gateway routing 3 providers, cache-hit rate, cost-per-feature attribution, circuit-breaker fallback |
+| 6 | **Fine-tune vs in-context decision-making** (prompt → RAG → FT decision matrix) | W9 (faithfulness + abstention), W9.5 (Agentic RL Fine-Tuning — SFT + GRPO) | W9.5 4-row ablation: pretrain / SFT / GRPO / SFT+GRPO on GSM8K-mini; OpenAI Optimizing LLM Accuracy decision matrix referenced |
+
+The 2026 reality: a candidate who covers areas 1+3+4 looks like a 2024 LLM engineer. A candidate who covers 1+2+3+4+5+6 looks like a 2026 staff-track AI engineer. The W7.3 supplemental is the bridge — it converts areas 2/5 from theory citations into measured lab artifacts.
+
+See [[Trend-Monitoring Discipline]] for the ongoing-cadence companion (how to keep this rubric current without doing another emergency audit in 6 months).
+
 ---
 
 ## Local-First Stack Setup (Week 0 — Do Before Week 1)
@@ -636,6 +653,27 @@ The measurement + scaling cap of the W3.5 cluster. Prerequisite: W3.5.8 (two-tie
 
 **Infra bridge.** CUA is RPA with an LLM as the recognizer. Same governance shape as RPA: every action is an audit-log event, every credential is a least-privilege principal, every page change is a regression candidate.
 
+### Week 7.3 — Production LLM Infrastructure (supplemental, ~6–8h)
+> Detailed runbook: [[Week 7.3 - Production LLM Infrastructure]]
+
+**Why this week exists (added 2026-05-12).** The teach_fireworks 11-section reading list audit (12 May 2026) surfaced three gap areas in the curriculum: (a) prompt + semantic caching (sections 2–3), (b) per-feature cost attribution (section 7), (c) provider routing + fallback (section 10). All three share one toolchain — LiteLLM / Portkey / GPTCache / LangSmith metadata / OpenTelemetry GenAI semantic conventions — and all three are 2026 hiring-rubric area #5 (Akshay Pachaar). W7.3 fills the gap as a single 6-phase lab.
+
+**Theory (1–2h).**
+- Read: Akshay Pachaar 6-area X thread, teach_fireworks 11-section AI Engineer reading list, LiteLLM docs (gateway pattern), Portkey blog (semantic vs prompt caching tradeoffs), GPTCache paper, OpenTelemetry GenAI semantic conventions (2025), Anthropic cache-breakpoint docs, OpenAI cached_tokens telemetry.
+- Master: gateway pattern (one endpoint, many backends), prompt cache (exact-match deterministic discount, controlled by provider) vs semantic cache (embedding-similarity hit, controlled by you, precision tradeoff), cost attribution model (tag per call → roll up by feature/tenant/user), provider-fallback chain + circuit-breaker, AI gateway as 2026 analogue of 2018 API gateway.
+
+**Lab (5–6h) — `lab-07-3-prod-infra`.**
+1. **Gateway** — stand up LiteLLM routing Claude + GPT + local oMLX through one endpoint with one API surface.
+2. **Prompt cache** — enable Anthropic + OpenAI prompt caching; measure cache-hit rate + token cost reduction on a 50-prompt repeat-load.
+3. **Semantic cache** — add GPTCache layer; measure semantic-hit rate + precision tradeoff (false-hit rate on ambiguous queries).
+4. **Cost attribution** — add LangSmith metadata tags (feature_name + user_id) on every gateway call; aggregate cost-per-feature.
+5. **Provider fallback** — configure circuit-breaker (3 fails in 30s → open); test by killing primary provider mid-flight; verify failover latency.
+6. **End-to-end test** — re-run W3's RAG eval through the gateway; report cost-per-correct-answer with caching ON vs OFF.
+
+**Exit criteria.** Crisp 90-second answer to "how do you manage cost and reliability at the LLM API layer in production?" — name the four primitives (gateway / dual-tier cache / cost attribution / fallback chain), cite measured cache-hit rate + cost-per-correct-answer delta, name one tradeoff (semantic cache precision floor).
+
+**Infra bridge.** AI gateway is API gateway (Kong / Envoy / AWS API Gateway) with three additional concerns: token-cost accounting, cache-key derivation from prompt semantics, model-specific rate-limit handling. Cost attribution is the same FinOps primitive you'd apply to a multi-tenant SaaS — tag every cost-bearing call with the same dimensions your billing system uses.
+
 ### Week 8 — The Schema Reliability Playbook (Your Signature Question)
 > Detailed runbook: [[Week 8 - Schema Reliability Bench]]
 
@@ -707,7 +745,7 @@ Final deliverable: a comparison table + the **canonical "5-layer defense" diagra
 > Detailed runbook: [[Week 9.5 - Agentic RL Fine-Tuning]] *(brief; runbook generated on demand)*
 
 **Theory (3h).**
-- Read: hello-agents Ch 11 [Agentic-RL](https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter11/Chapter11-Agentic-RL.md) (the canonical SFT→GRPO walkthrough). DeepSeek-R1 paper (GRPO algorithm origin). RLHF survey (Ouyang et al. 2022 — InstructGPT). DPO paper (Rafailov et al. 2023 — preference learning without RL). Anthropic's Constitutional AI paper for the RLAIF variant.
+- Read: hello-agents Ch 11 [Agentic-RL](https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter11/Chapter11-Agentic-RL.md) (the canonical SFT→GRPO walkthrough). DeepSeek-R1 paper (GRPO algorithm origin). RLHF survey (Ouyang et al. 2022 — InstructGPT). DPO paper (Rafailov et al. 2023 — preference learning without RL). Anthropic's Constitutional AI paper for the RLAIF variant. **OpenAI's *Optimizing LLM Accuracy — A Practical Guide* (platform.openai.com/docs)** — the decision matrix for prompt engineering vs RAG vs fine-tuning vs all-three; required reading before this lab to anchor *why* you would fine-tune at all when RAG covers most of the surface. **IBM's *RAG vs Fine-tuning* explainer** (ibm.com/think) — the canonical 2024–2025 framing that the two are non-substitutable: RAG fixes *knowledge gap*, fine-tuning fixes *behavior gap*, prompt engineering fixes *clarity gap*. Read both before deciding what to optimize.
 - Master:
   - The two-stage LLM training pipeline (pretrain → post-train) and what post-train accomplishes (instruction-following + alignment + multi-step reasoning)
   - SFT vs RLHF vs DPO vs GRPO — what each optimizes, where each breaks
@@ -837,6 +875,14 @@ For each, spend ~2 hours: 30 min thinking, 60 min talking through architecture a
 ### Weekly — Infra bridge
 - 1 paragraph at the end of each week's lab `RESULTS.md` mapping the week's topic back to cloud-infrastructure concepts.
 - These become the "but here's my unfair advantage" line in your phone-screen self-introduction.
+
+### Weekly — Trend monitoring (~30 min / week)
+- Skim the 6-source signal feed (Akshay Pachaar + teach_fireworks on X for hiring-rubric drift; arxiv-sanity LLM-serving + agent filter for new papers; LiteLLM + Portkey + LangSmith changelogs for gateway-primitive evolution; Anthropic + OpenAI developer blogs for provider feature drops; Hamel Husain + Shreya Shankar + Eugene Yan + Harrison Chase for practitioner tools 2–4 weeks before mainstream; HuggingFace daily papers + Papers With Code for benchmark releases).
+- Add one flagged item per week to `Trend-Monitoring Discipline.md` Inbox section. Quarterly: triage Inbox → integrate into chapters as references / new lab phases.
+- **Full process + signal-source rationale: [[Trend-Monitoring Discipline]].**
+
+### Continuous — Production Infrastructure track (Weeks 0 → 12)
+- Areas 2 + 5 of Akshay's 6-area rubric (inference serving + production LLM infra) are not bounded to one chapter — they thread through. Anchor weeks: **W0** (inference stack mental model), **W2.7 BCJ #23** (long-context KV-cache budget), **W3** (observability tooling survey), **W7.3** (gateway + caching + cost attribution + fallback lab), **W9.5** (quantization for fine-tuning). At each anchor, the chapter cites the canonical paper (PagedAttention / LMCache / QSPEC / OpenTelemetry GenAI conventions / GPTCache) so the reader builds a continuous narrative rather than discovering production-infra concerns at week 7.
 
 ---
 
@@ -1781,6 +1827,7 @@ Useful modifiers you can add to any generation request:
 | 6.7 | [[Week 6.7 - Authoring Agent Skills]] | Three production-quality skills authored end-to-end; SKILL.md + trigger pattern + verification step each; install globally + use for one week; description-field iteration log capturing trigger-tuning |
 | 6.8 | [[Week 6.8 - Protocol Survey]] | Reading-heavy half-week (~3h). hello-agents Ch 10 + Anthropic MCP + Google A2A + open-spec ANP. 1-page Protocol-Survey ADR comparing transport, auth, interop, use cases. Annotate W3.5.5 guild for which protocol it implements + what would be needed for cross-host coordination. Optional A2A reference-impl 2-agent handshake. Service-mesh-primitive infra-bridge framing |
 | 7 | [[Week 7 - Tool Harness]] | Generic `Tool`/`ToolHarness` classes; retry + timeout + budget + idempotency; 20-scenario bad-case suite; local (Qwen3.6) vs cloud (Claude Haiku) reliability comparison |
+| 7.3 | [[Week 7.3 - Production LLM Infrastructure]] | LiteLLM gateway routing Claude + GPT + local oMLX through one endpoint; Anthropic + OpenAI prompt caching with measured cache-hit rate; GPTCache semantic layer with precision tradeoff; LangSmith metadata for cost-per-feature attribution; circuit-breaker provider fallback with mid-flight kill test; end-to-end re-run of W3 RAG eval through gateway with cost-per-correct-answer delta cached-vs-uncached. Fills Akshay 6-area rubric areas 2+5 (inference + production infra). |
 | 7.5 | [[Week 7.5 - Computer Use and Browser Agents]] | Same task three ways (Playwright / browser-use / Claude Computer Use); 10-task suite with one CSS-rename ablation; safety wrapper (action allowlist + budget cap + screenshot diff alarm) |
 | 8 | [[Week 8 - Schema Reliability Bench]] | **The signature-question lab.** 5-way comparison (naive prompt / provider-native / Outlines+xgrammar / Instructor+retry / post-validation+repair) across 4 local models + GPT-4o-mini, 100 prompts; draws the 5-layer defense diagram |
 | 8.5 | [[Week 8.5 - Voice AI Agents]] | Local cascaded pipeline (faster-whisper + Claude + ElevenLabs/Coqui); 20-turn latency measurement; OpenAI Realtime API head-to-head; barge-in handling implemented |
