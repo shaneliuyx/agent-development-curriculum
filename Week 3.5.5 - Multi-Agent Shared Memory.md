@@ -345,6 +345,8 @@ guild lore list
 
 ### 1.4 Smoke-test the MCP stdio interface
 
+> **CLI-vocabulary reminder applies here too**: guild's MCP server is launched via the **`mcp serve`** subcommand (two args), not `serve --stdio` (which would be a top-level `serve` verb guild does not have). Running with the wrong args produces `Error: unknown command "serve" for "guild"` followed by `mcp.shared.exceptions.McpError: Connection closed`. Use `args=["mcp", "serve"]` exactly.
+
 `src/smoke_test.py`:
 
 ```python
@@ -355,7 +357,10 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 
 async def main() -> None:
-    params = StdioServerParameters(command="guild", args=["serve", "--stdio"])
+    # Correct args: ['mcp', 'serve'] — guild has no top-level 'serve' verb.
+    # Wrong args produce: Error: unknown command "serve" for "guild"
+    #                     mcp.shared.exceptions.McpError: Connection closed
+    params = StdioServerParameters(command="guild", args=["mcp", "serve"])
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -373,10 +378,19 @@ Run:
 
 ```bash
 python -m src.smoke_test
-# expect a list of ~15 tools including:
-#   quest_accept, quest_complete, scroll_save, scroll_list,
-#   oath_read, lore_query, ...
+# Expect a list of tools mirroring the CLI verb surfaces. The exact set varies
+# by guild version; the categories you should see are:
+#   quest_*    — post / list / accept / journal / fulfill / scroll / campaign
+#   lore_*     — inscribe / list / study / appraise / reforge / seal / meld / dossier
+#   oath_*     — list / inscribe (project principles)
+#   session_*  — guild_session_start (bootstraps an agent's view of the project)
+#
+# If you don't see ~15+ tools across these four namespaces, recheck the args
+# (must be ["mcp", "serve"]) and that `guild init` ran successfully against
+# this repo's git root.
 ```
+
+> **Drift warning for chapter readers cross-checking via `guild mcp serve --help`**: the MCP server help is minimal (no flags). Tool names exposed over MCP can rename across guild releases as the CLI vocabulary evolves (e.g., `quest_complete` was renamed to `quest_fulfill` to match the CLI `fulfill` verb). Trust the live `list_tools()` output above over any hardcoded list in older chapter revisions.
 
 **Result.** Both CLI and MCP-Python interfaces work. ~45 min including homebrew install (~5-10 min on first run) + initialization + smoke-tests.
 
