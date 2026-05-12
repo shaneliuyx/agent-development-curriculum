@@ -29,13 +29,36 @@ stack: Local-first MLX. oMLX serves Qwen3.6-35B-A3B-nvfp4 + gemma-4-26B-A4B-it-h
 3. **Speak the answers out loud.** Reading is recognition; speaking is recall. Interview signal lives in recall.
 4. **Local first, cloud only when you must.** The whole point of the local stack is to remove the "API-cost anxiety" tax that makes people skip experiments.
 
-**Output of the program.** By Week 12 you should have:
-- 1 portfolio repo on GitHub (the capstone)
-- 3 smaller "lab" repos linked from it
-- ~300 Anki cards
-- ~30 recorded mock-interview answers (audio is fine)
-- A bad-case journal (single markdown, ~1,500 words) that becomes your behavioral-question fuel
-- A 1-pager "system design cheat sheet" for whiteboard rounds
+**Output of the program.** By Week 12 you should have (this list reflects the 2026-05-12 curriculum scope after the W3.5 cluster + W7.3 + W9.5 + W11.5 + W11.7 expansions):
+
+**Code + lab artifacts (~12 GitHub repos):**
+- **1 capstone repo** (W12) polished to portfolio bar — README reads like a tech-design doc (problem → constraints → architecture → eval → results → tradeoffs → what's next).
+- **~12 lab repos** linked from the capstone, one per substantive week — see the runbook table for the full list. Each has its own `RESULTS.md` with measured numbers, not screenshots of someone else's tutorial.
+
+**Cross-cutting measured artifacts (the interview-quotable numbers):**
+- **5-RAG comparison table** on your own corpus — vector hybrid (W1–2) / GraphRAG (W2.5) / tree-index PageIndex (W2.7, **16/16 GT-judge**) / RAGAS evals (W3) / agentic 5-node graph (W3.7).
+- **Cross-session memory benchmark** — 15/15 recall + Phase 5 mem0 cross-check 10/14 (W3.5), three-tier memory benchmark anchored to EverCore's published 83% (W3.5.9).
+- **Schema reliability matrix** — 5-strategy × 5-model on 100 prompts (W8). The signature-question artifact.
+- **Cost-per-faithful-answer table** — gateway-warm vs cold, measured on the W3 eval (W7.3). Expected delta $0.0063 → $0.0023 at 0.97 faithfulness.
+- **Pretrain / SFT / GRPO 4-row ablation table** on GSM8K-mini (W9.5).
+- **10-attack red-team suite** with kill-rate-per-layer table (W11.5).
+- **Take-home dress rehearsal** scored against the 30/30/25/15 rubric with evals-first `git log` (W11.7).
+- **3-framework decision matrix** — LangGraph / LlamaIndex / OpenAI Agents SDK head-to-head on LOC + traceability + testability + cost (W10).
+- **5 system-design whiteboard recordings** with 7-point self-critique rubric (W11).
+
+**Interview-prep artifacts:**
+- **~300 Anki flashcards** built from the weekly readings (Daily 15-min track).
+- **~30 recorded mock-interview answers** (audio is fine; video is stronger). One per Appendix A question category.
+- **Global Bad-Case Journal** (`Bad-Case Journal.md`) — 30+ entries from all chapters, indexed by tag. This is your behavioral-question fuel.
+- **Engineering Decision Patterns library** (`Engineering Decision Patterns.md`) — design-decision shortcuts indexed by pattern, not by week.
+- **1-page system design cheat sheet** for whiteboard rounds.
+- **10 tailored applications** submitted by end of W12, each with one quoted measured number from a specific lab in the cover note.
+
+**Process artifacts (the maintenance discipline):**
+- **Akshay 6-area coverage map** — explicit table proving you cover all six hiring-rubric areas (harness / inference serving / structured output / evals+obs / production infra / fine-tune-vs-in-context). See the §"The Six Areas an AI Engineer Must Master" section below.
+- **Trend-Monitoring Discipline log** ([[Trend-Monitoring Discipline]]) — Inbox + Audit History demonstrating ongoing curriculum-currency discipline. Recruiters reading your portfolio see that you maintain skills, not just acquired them once.
+
+The full list above is **the artifact bar**, not the chapter scope — chapters are the *path*; this list is the *destination*. Cross-check your portfolio against this list at the end of every phase. If a phase ends without its bullets above, you are not done with that phase regardless of which week you are calendar-on.
 
 ---
 
