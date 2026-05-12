@@ -752,6 +752,164 @@ Target: 12 of 15 passing. Write the failing cases into the bad-case journal.
 
 ---
 
+## Phase 5 (Optional) — mem0 Cross-Check (~1–2 hours)
+
+Optional side exercise. Skip if you're short on time — main lab is complete after Phase 4. Adopt if you want hands-on experience with the canonical production memory library, OR want a fourth column on the W3.5.7-style benchmark comparison.
+
+The premise: you hand-rolled the dual-store memory pattern in ~150 LOC across Phase 2. `mem0` ships the same pattern as a Python library in ~10 lines of consumer code. This phase ports your 15-Q benchmark to mem0, compares pass rates + latency + tokens, and writes a comparison row in `RESULTS.md`. The cross-check validates your hand-rolled lifecycle is correct AND surfaces production-quality tweaks (contradiction-detection prompt, async extraction queue, TTL sweep) that mem0 includes but you skipped.
+
+### 5.1 Install mem0
+
+```bash
+uv pip install mem0ai
+# Verify
+python -c "from mem0 import Memory; m = Memory(); print('mem0 ready')"
+```
+
+`mem0` reads `OPENAI_API_KEY` + `OPENAI_API_BASE` from env, so the same oMLX endpoint your lab uses for extraction works for mem0 too. Set:
+
+```bash
+# .env additions for mem0
+OPENAI_API_KEY=$OMLX_API_KEY
+OPENAI_API_BASE=$OMLX_BASE_URL
+# mem0 defaults to gpt-4o-mini; override to your local Haiku-tier:
+MEM0_LLM_MODEL=gpt-oss-20b-MXFP4-Q8
+```
+
+### 5.2 Thin mem0 wrapper matching the lab's API
+
+`src/memory_mem0.py` — same `remember_turn` + `recall` surface as the lab's hand-rolled `src/memory.py`, but backed by mem0:
+
+```python
+"""mem0-backed memory shim — same API as src.memory, different backend.
+Used in Phase 5's cross-check to compare hand-rolled vs library on
+the same 15-Q benchmark."""
+import os
+from typing import Any
+
+from mem0 import Memory
+from dotenv import load_dotenv
+
+load_dotenv()
+_mem = Memory()  # uses OPENAI_API_BASE + OPENAI_API_KEY from env
+
+
+def remember_turn(
+    user_id: str, session_id: str, user_msg: str, assistant_msg: str
+) -> dict[str, Any]:
+    """Wrap mem0's add() to match the hand-rolled signature."""
+    messages = [
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": assistant_msg},
+    ]
+    result = _mem.add(messages=messages, user_id=user_id)
+    return {"semantic": result.get("results", []), "episodic_count": 0}
+
+
+def recall(user_id: str, query: str, k: int = 5) -> dict[str, Any]:
+    """Wrap mem0's search() to match the hand-rolled signature."""
+    r = _mem.search(query=query, user_id=user_id, limit=k)
+    memories = r.get("results", [])
+    # mem0 collapses episodic + semantic into one list; split heuristically
+    # so the lab's downstream code (which expects semantic_facts +
+    # relevant_episodes) still works
+    return {
+        "semantic_facts": [
+            {"key": m.get("metadata", {}).get("category", "unknown"),
+             "value": m.get("memory", "")}
+            for m in memories
+            if m.get("score", 0) > 0.5  # high-confidence = semantic
+        ],
+        "relevant_episodes": [
+            m.get("memory", "")
+            for m in memories
+            if m.get("score", 0) <= 0.5  # lower-confidence = episodic
+        ],
+    }
+
+
+def format_memory_block(memory: dict[str, Any]) -> str:
+    """Same shape as src.memory.format_memory_block — keeps Phase 3 demo
+    swappable."""
+    if not memory.get("semantic_facts") and not memory.get("relevant_episodes"):
+        return ""
+    lines = ["Known facts about this user:"]
+    for f in memory["semantic_facts"]:
+        lines.append(f"- {f['key']}: {f['value']}")
+    if memory["relevant_episodes"]:
+        lines.append("\nRelevant past interactions:")
+        for e in memory["relevant_episodes"]:
+            lines.append(f"- {e}")
+    return "\n".join(lines)
+```
+
+### 5.3 Port the 15-Q benchmark
+
+Copy `tests/test_recall.py` → `tests/test_recall_mem0.py`. Change ONE line at the top of the file:
+
+```python
+# was:
+from src.memory import SQLITE, format_memory_block, recall, remember_turn
+# now:
+from src.memory_mem0 import format_memory_block, recall, remember_turn
+# (SQLITE is hand-rolled-only; tests using it directly need adaptation OR skipping)
+```
+
+Update test_15 (the one that does a direct SQLite insert) to skip when running against mem0:
+
+```python
+import os
+
+@pytest.mark.skipif(
+    os.getenv("MEMORY_BACKEND") == "mem0",
+    reason="test_15 inserts directly into SQLite; mem0 uses its own backend"
+)
+def test_15_archived_facts_not_returned() -> None:
+    # ... existing code ...
+```
+
+Run:
+
+```bash
+MEMORY_BACKEND=mem0 .venv/bin/python -m pytest tests/test_recall_mem0.py -v
+```
+
+Expect 10-13/14 passing (test_15 skipped, plus 1-2 likely flakes on threshold-tuning since mem0's internal similarity threshold differs from your 0.35).
+
+### 5.4 Comparison matrix
+
+Add to `RESULTS.md`:
+
+```markdown
+## Phase 5 — mem0 cross-check
+
+| Backend | LOC (src/memory*.py) | 15-Q pass | Mean latency per turn | Total tokens per turn | Setup time |
+|---|---|---|---|---|---|
+| Hand-rolled (W3.5 lab) | ~150 | 15/15 | ~3-4s | ~600-800 | ~30 min |
+| mem0 (this phase) | ~80 (wrapper + skip) | _measured_ | _measured_ | _measured_ | +15 min (install + env) |
+
+Observations from reading mem0's source vs my hand-roll:
+- [3 specific things mem0 does that I didn't — e.g. async extraction queue, retry on extraction failure, multi-fact dedup]
+- [What I'd port back into src.memory.py if I were productionizing]
+```
+
+### 5.5 Exit criteria for Phase 5
+
+- [ ] `src/memory_mem0.py` (~80 LOC wrapper) returns same signatures as `src/memory.py`
+- [ ] `tests/test_recall_mem0.py` runs end-to-end (10-13/14 expected, test_15 skipped)
+- [ ] `RESULTS.md` comparison matrix populated with measured numbers
+- [ ] 3-bullet "what mem0 does that I didn't" observation in `RESULTS.md`
+- [ ] 90-second answer to "what would you change about your hand-rolled memory after reading mem0's source?" — name 3 specific tweaks with reasons
+
+`★ Insight ─────────────────────────────────────`
+- **The comparison row is the load-bearing artifact, not the wrapper code.** Anyone can write 80 LOC of mem0 calls; few candidates can articulate "mem0 does X that I didn't because Y" with measured evidence. Spend most of Phase 5's time on the source read + observation note, not on perfecting the test pass rate.
+- **Expected outcome: mem0 wins on a few metrics, your hand-roll wins on a few, neither dominates.** mem0 likely scores higher on contradiction-update (more sophisticated detection prompt) but loses on latency (extra LLM calls per add). Your hand-roll likely matches semantic-recall precision because both use BGE-M3-class embeddings and similar thresholds. THE INTERESTING SIGNAL is WHERE each wins and WHY.
+- **DO NOT replace `src/memory.py` with `src/memory_mem0.py` for the main lab.** Keep both. Phase 3's demo + Phase 4's benchmark stay anchored to your hand-roll. Phase 5 is a side path, not a replacement. The pedagogical arc requires you to OWN your implementation as the baseline; mem0 is the reference, not the substitute.
+- **The "what mem0 does that I didn't" bullets are interview gold**: each bullet is a senior-engineer claim — "I built X, then read the canonical library's source, identified three production tweaks worth porting back, defended my choice to keep them out of the lab scope". This is exactly the depth signal hiring managers reward.
+`─────────────────────────────────────────────────`
+
+---
+
 ## Production Comparators — read after completing the lab
 
 Two production-shaped systems worth studying after you've shipped the canonical lab. They solve overlapping problem spaces with different architectures; reading them gives a real comparator for your DIY hand-rolled-extraction + Qdrant + SQLite design. **Read in order** — guild first (smaller surface, faster orientation), EverOS second (full research-grade stack). The `mem0` library — production Python library that ships the same dual-store pattern this lab hand-rolls — is cited as additional prior-art in the References; skim its source if you want to compare your code against the library's choices.
