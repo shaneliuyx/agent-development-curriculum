@@ -514,6 +514,19 @@ The measurement + scaling cap of the W3.5 cluster. Prerequisite: W3.5.8 (two-tie
 
 **Infra bridge.** Three-tier memory is the layered-cache architecture from databases applied to agent state: L1 in-memory cache (guild) → L2 application cache (EverCore) → L3 indexed durable storage (HyperMem). The graduation trigger (multi-entity-intersection query rate) is the same shape as the database-engineer decision "when do I add a materialized view"? — both are measurement-driven structural additions, not speculative. Industry-standard benchmarking is the integration-test discipline of memory systems: continuous internal-eval (W3.5's 15-Q) + gated industry-benchmark (LongMemEval / LoCoMo for major releases) — mirrors `dbt test` + `Great Expectations` two-tier eval cadence.
 
+### Week 3.5.95 — Self-Observability Memory (half-week insert, ~5–6h)
+> Detailed runbook: [[Week 3.5.95 - Self-Observability Memory]] *(SPEC v0 — phases scoped, code TBD)*
+
+The W3.5 memory cluster (W3.5 / W3.5.5 / W3.5.8 / W3.5.9) is all WORLD-facing — stores facts about the domain. PAI v7.6's contribution is the missing SELF-facing axis: OBSERVABILITY (every tool call + hook firing + satisfaction signal — the agent's own behavioral log) + LEARNING (meta-patterns the agent extracted ABOUT ITSELF, not about the world). The pedagogical thesis: "Memory that's about the agent itself is a separate concern. Observability tables aren't logs — they're memory. Reading from them at decision time is how an agent gets metacognition cheaply."
+
+**Theory (1h).** PAI v7.6 Memory architecture; Reflexion (arXiv:2303.11366) as the canonical self-reflection prior art; metacognition literature (Flavell 1979 foundational framing).
+
+**Lab (4–5h, SPEC).** 5 phases: (1) OBSERVABILITY SQLite schema (extends W4 `obs.py`); (2) tool-call instrumentation hooks into W4 ReAct loop; (3) LEARNING extractor — periodic LLM job summarises OBSERVABILITY rows into self-pattern facts; (4) metacognitive recall — pre-decision query against LEARNING + OBSERVABILITY; (5) measurement — does the recall change behaviour on a 15-task paired-trial probe set.
+
+**Exit criteria.** Agent retrieves a relevant LEARNING fact at decision time and the recall provably changes the decision (paired-trial gate). 90-second answer: "self-facing vs world-facing memory + Reflexion+observability-as-memory framing + measured paired-trial differential."
+
+**Infra bridge.** OBSERVABILITY scales to OpenTelemetry → ClickHouse in production with the same "memory-not-log" discipline. The append-only structure + cron-extractor pattern is identical to streaming-analytics aggregation jobs (Flink / kSQL) feeding downstream feature stores.
+
 ### Week 3.7 — Agentic RAG (half-week insert, ~6–8h)
 > Detailed runbook: [[Week 3.7 - Agentic RAG]]
 
@@ -580,6 +593,32 @@ The measurement + scaling cap of the W3.5 cluster. Prerequisite: W3.5.8 (two-tie
 
 **Infra bridge.** A ReAct loop is a Kubernetes reconciliation loop. The mitigations (idempotency keys, retry budgets, dead-letter queues, circuit breakers) are exactly the patterns you already use.
 
+### Week 4.5 — Model Routing and Effort Tiering (half-week insert, ~6h)
+> Detailed runbook: [[Week 4.5 - Model Routing and Effort Tiering]] *(SPEC v0 — phases scoped, code TBD)*
+
+W4 built one ReAct loop calling one opus-tier model — every task pays the same 35B-parameter latency cost. Production agent systems (Claude.ai, ChatGPT, Cursor) pass requests through a routing layer that picks the smallest model competent for the request. PAI v6.3.0's mode classifier + agenticSeek's two-stage `AgentRouter` (Adaptive + BART-MNLI voted) are the convergent pattern. Cross-repo finding: 2/4 surveyed repos converge on local-classifier-before-tool-dispatch.
+
+**Theory (1.5h).** Routing-layer thesis; tier vs mode as orthogonal axes; closed-list classification (not free-text reasoning); calibration curves over accuracy; cost-latency Pareto front as the real metric. RouteLLM (arXiv:2406.18665), FrugalGPT (arXiv:2305.05176), RouterBench, Mixture-of-Experts (Shazeer 2017).
+
+**Lab (4.5h, SPEC) — `lab-04.5-routing`.** Extends the W4 vMLX fleet with a Qwen-1.5B classifier on `:8005`. 5 phases: (1) fleet scaffold; (2) hand-labelled 60-prompt probe set (tier × mode); (3) classifier + tier_dispatch (single-classifier accuracy target ≥85%); (4) second classifier + vote with disagreement logging; (5) four-way cost-latency benchmark: opus-always vs classifier-routed vs classifier+vote vs random-baseline.
+
+**Exit criteria.** 90-second answer to "how would you design a routing layer for an LLM agent system?" — name the tier × mode axes + vote-for-safety pattern + the cost-latency Pareto plot. Cite measured 4-way bench numbers from Phase 5.
+
+**Infra bridge.** Routing is the API-gateway pattern applied to LLM serving — pick the right downstream based on cheap features of the request. Maps directly to Envoy / Istio request-classification, AWS Lambda function-routing, and the "policy layer" in any production ML system.
+
+### Week 4.6 — Durable Agent Runtime + Process Topologies (half-week insert, ~6h)
+> Detailed runbook: [[Week 4.6 - Durable Agent Runtime and Process Topologies]] *(SPEC v0 — phases scoped, code TBD)*
+
+W4's ReAct loop runs as one Python script and dies when the process dies. AutoGPT walked away from classic-AutoGPT's self-prompting infinite loop and built AutoGPT Platform's executor + scheduler + cluster_lock + cost_tracking + simulator — a durable runtime around the LLM loop. PraisonAI independently converges on four process topologies (sequential / parallel / hierarchical / workflow) as the right API on top of such a runtime. Pedagogical thesis: "Agents need execution state separate from the LLM loop. Triggers, not self-prompts."
+
+**Theory (1.5h).** Graph-as-program runtime; event sourcing; worker-pool vs always-on loop; process topology as first-class API; triggers (cron / webhook / manual) as auth boundaries. AutoGPT classic→Platform postmortem; Temporal.io durable-workflow thesis; Cadence Workflow (Uber).
+
+**Lab (4.5h, SPEC, 200–300 LOC hard cap) — `lab-04.6-durable-runtime`.** 5 phases: (1) SQLite graph store + persistence; (2) asyncio worker pool consuming queued nodes; (3) file-based distributed lock (`fcntl.flock`, POSIX); (4) per-node cost meter (token + wall-clock) + observability table with hardcoded public per-token rate card (Claude Sonnet 4.6 / Haiku 4.5 / Opus 4.5) for cloud-equivalent reporting; (5) trigger-based scheduler (cron + webhook + manual) + 4-topology benchmark.
+
+**Exit criteria.** 90-second answer: "agents need execution state separate from the LLM loop + 5 load-bearing primitives (graph store, worker pool, cluster lock, cost meter, trigger scheduler) + classic-AutoGPT self-prompting is the canonical anti-pattern + trigger surface = auth boundary."
+
+**Infra bridge.** This IS the agent-runtime version of the durable-workflow pattern (Temporal, Cadence, Airflow). The cost-meter is the agent-runtime version of CloudWatch billing dimensions. The trigger surface is the API-gateway auth boundary applied to agent invocations. Production agents at scale need exactly these five primitives.
+
 ### Week 5 — Beyond ReAct: Plan-and-Solve, Reflexion, Multi-Agent
 > Detailed runbook: [[Week 5 - Pattern Zoo]]
 
@@ -615,6 +654,19 @@ The measurement + scaling cap of the W3.5 cluster. Prerequisite: W3.5.8 (two-tie
 **Exit criteria.** Cold answer to "how would you handle an agent that keeps making the same mistake?" — name the loop, cite a paper, name one failure mode.
 
 **Infra bridge.** Reflexion's episodic memory is a post-mortem corpus. Production SRE runbooks and Reflexion's experience replay are the same primitive: write down what failed, retrieve when something similar happens, prevent the regression.
+
+### Week 5.6 — ISA-Driven Metacognition (half-week insert, ~6h)
+> Detailed runbook: [[Week 5.6 - ISA-Driven Metacognition]] *(SPEC v0 — phases scoped, code TBD)*
+
+W5.5 covers "agent knows when it's confused" via confidence thresholds. But confidence-threshold termination is still a model-judging-itself loop — Reflexion has shown the model will happily declare done on a half-finished task. PAI v5.0.0 ships a better primitive: the **Ideal State Artifact** (ISA), a 12-section structured document that serves SIMULTANEOUSLY as task spec AND test harness. Criteria decompose into ISCs (Ideal State Criteria) — discrete, mechanically-verifiable pass/fail items. The agent's main loop becomes "for each unsatisfied ISC, make progress; verify; mark done; repeat" — TDD for agent tasks.
+
+**Theory (1.5h).** Spec-as-test invariant; ISC vs goal vs criterion; mechanical-verification preference over LLM-as-judge; ISA reconciliation when user moves goal mid-run; the difference between "done" and "satisfied". PAI v5.0.0 ISA skill; Reflexion §6 on judge bias; Kent Beck TDD literature; Anthropic "Building Effective Agents" blog.
+
+**Lab (4.5h, SPEC) — `lab-05.6-isa`.** 5 phases: (1) ISA YAML schema + Pydantic v2 model (free JSON schema export benefits scaffolder LLM system prompt); (2) ISA scaffolding from user prompt via haiku-tier LLM (Qwen3.5-9B on `:8004`); (3) ISC verification dispatcher (mechanical checks > test runs > structured-output > LLM-judge fallback with `{verdict: pass|fail, reason: str}`); (4) hill-climbing loop wrapping W4 ReAct (re-evaluate ISCs after each action); (5) reconciliation (synchronous; user feedback mid-run updates ISA + re-plans).
+
+**Exit criteria.** Agent terminates on ISC pass, NOT on confidence-threshold guess. 90-second answer: "termination criteria must be falsifiable + ISA = TDD for agent tasks + mechanical-verification preference over LLM-judge + reconciliation handles goal updates synchronously."
+
+**Infra bridge.** ISA is the agent-runtime version of acceptance-test-driven development. ISCs are the agent-runtime version of CI smoke tests + integration tests + canary checks — same pattern, different artifact. Every production deploy gate has an ISC equivalent.
 
 ### Week 6 — Claude Code Source Dive
 > Detailed runbook: [[Week 6 - Claude Code Source Dive]]
@@ -660,6 +712,19 @@ The measurement + scaling cap of the W3.5 cluster. Prerequisite: W3.5.8 (two-tie
 **Exit criteria.** 60-second answer to "what is Hermes Agent's skill-creation loop, and what is its biggest production risk?" grounded in your own observation, not theory.
 
 **Infra bridge.** Hermes' learned-skill cache is a build artifact — generated, persisted, versioned. Auditing a learned skill before promoting it = code review of an autogenerated migration. Same governance pattern, new surface.
+
+### Week 6.6 — MCP Schema Bridge (half-week insert, ~6h)
+> Detailed runbook: [[Week 6.6 - MCP Schema Bridge]] *(SPEC v0 — phases scoped, code TBD)*
+
+W3.5.5 consumed MCP via `GuildClient` — reader has seen the client side. W6.6 teaches the SERVER side: how a Python function becomes an MCP tool deterministically. Cross-repo finding: 3/3 sampled producer-side MCP impls converge on "introspect type hints + docstring; emit JSON Schema; decorator-as-registration" (PraisonAI `function_to_mcp_schema` ~100 LOC; AutoGPT Pydantic block I/O with `AsyncGenerator` streaming; agenticSeek `parse_agent_tasks`). Pedagogical thesis: "The boundary between an LLM and a tool is a schema, not a natural-language description."
+
+**Theory (1.5h).** Schema-as-contract; type-hint introspection (`typing.get_type_hints` + `Optional` / `Union` / `Generic` mapping rules); streaming via `AsyncGenerator` + content-type protocol; schema versioning + backward-compatibility discipline. Anthropic MCP spec; JSON Schema Draft 2020-12; FastMCP (`jlowin/fastmcp`); Pydantic 2.x `TypeAdapter` fast path.
+
+**Lab (4.5h, SPEC) — `lab-06.6-mcp-bridge`.** 5 phases: (1) `python_type_to_json_schema` helper (port PraisonAI's ~100 LOC); (2) `@mcp_tool` decorator — type hints → input_schema, docstring → description, return type → output_schema; (3) MCP stdio server exposing 5 example tools (calculator, file-search, currency-converter, geo-distance, async-counter for streaming); (4) consumer test — local Hermes on `:8004` dispatches each tool; (5) streaming-output extension — AutoGPT-style `AsyncGenerator[BlockOutputEntry]` for a long-running tool.
+
+**Exit criteria.** A Python function with 5 typed parameters becomes a valid MCP tool with zero hand-written schema. 90-second answer: "type-hint introspection > free-text descriptions + `@mcp_tool` decorator + streaming as `AsyncGenerator` + schema evolution discipline."
+
+**Infra bridge.** Type-hint → JSON Schema is the agent-runtime version of OpenAPI generation from Pydantic / dataclass models. MCP is the agent-system version of gRPC + protobuf — strongly-typed contract between two processes, language-agnostic wire format.
 
 ### Week 6.7 — Authoring Agent Skills (Anthropic Pattern) (half-week insert, ~5h)
 > Detailed runbook: [[Week 6.7 - Authoring Agent Skills]]

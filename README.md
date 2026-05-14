@@ -17,14 +17,19 @@ Week 2.7 — Structure-Aware RAG (PageIndex)      ← 16/16 GT-judge vs Vector 0
 Week 3  — RAG Evaluation                        ← RAGAS, HyDE, Phoenix
 Week 3.5 — Cross-Session Memory                 ← 15/15 + Phase 5 mem0 cross-check (10/14)
 Week 3.5.5 — Multi-Agent Shared Memory          ← guild MCP integration + atomic-claim race
-Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + consolidation
+Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + consolidation + Phase 7 Qdrant stretch
 Week 3.5.9 — Memory Benchmarks + Hypergraph     ← LongMemEval 5-way + HyperMem L3 relational tier
+Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes (SPEC, v0)
 Week 3.7 — Agentic RAG                          ← canonical 5-node graph
 Week 4  — ReAct From Scratch
+Week 4.5 — Model Routing and Effort Tiering     ← local Qwen-1.5B classifier + cost-latency Pareto front (SPEC, v0)
+Week 4.6 — Durable Agent Runtime + Topologies   ← AutoGPT executor/scheduler/lock kernel + PraisonAI 4-mode process (SPEC, v0)
 Week 5  — Pattern Zoo                           ← ReAct vs PaS vs Reflexion
 Week 5.5 — Metacognition
+Week 5.6 — ISA-Driven Metacognition             ← PAI v5.0 Ideal-State Artifact as falsifiable termination contract (SPEC, v0)
 Week 6  — Claude Code Source Dive
 Week 6.5 — Hermes Agent Hands-On
+Week 6.6 — MCP Schema Bridge                    ← type-hint → JSON Schema producer + AsyncGenerator streaming (SPEC, v0)
 Week 6.7 — Authoring Agent Skills
 Week 7  — Tool Harness
 Week 7.3 — Production LLM Infrastructure          ← gateway + caching + cost attribution + fallback (Akshay 6-area #2+#5)
@@ -75,12 +80,12 @@ Every chapter follows the same 10-section template, defined in [`CLAUDE.md`](./C
 1. Why This Week Matters (~150 words — production motivation + interview signal)
 2. Theory Primer (~1000 words — papers cited, real numbers)
 3. Mechanism / Architecture Diagram (mermaid, every node labeled)
-4. Lab Phases (numbered, time-budgeted, with runnable Python)
-5. Code Walkthroughs (block-by-block per script, ★ Insight callouts, runtime tables)
-6. Bad-Case Journal (3-5 entries: symptom / root cause / fix)
+4. Lab Phases (numbered, time-budgeted, with per-Python-block bundle: Architecture mermaid → Code → Walkthrough → Result → ★ Insight)
+5. *(deprecated — walkthroughs live inline next to their code per §4 per-block-bundle rule as of 2026-05-07)*
+6. Bad-Case Journal (3-5 entries: symptom / root cause / fix; mark `(observed YYYY-MM-DD)` for entries from real lab runs, `(pre-scoped)` for theory-derived predictions pending validation)
 7. Interview Soundbites (2-3 entries, ~70 words each, anchored to measurements)
 8. References (peer-reviewed papers + production blogs)
-9. Cross-References (Builds on / Distinguish from / Connects to / Foreshadows)
+9. Cross-References (Builds on / Distinguish from / Connects to / Foreshadows — bidirectional invariant)
 10. Frontmatter (YAML — title, created, updated, tags, audience, stack)
 
 `Week 2 - Rerank and Context Compression.md` is the canonical reference; new chapters should match it structurally.
