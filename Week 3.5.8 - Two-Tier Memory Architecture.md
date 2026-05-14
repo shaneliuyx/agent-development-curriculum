@@ -198,6 +198,17 @@ brew install mathomhaus/tap/guild
 guild --version
 ```
 
+**Known issue (macOS Sequoia+):** if `guild --version` exits with code 137 (SIGKILL) and prints nothing, the cask binary is ad-hoc signed and Gatekeeper kills it on first launch. Fix:
+
+```bash
+REAL=$(readlink $(which guild))                  # /opt/homebrew/Caskroom/guild/<ver>/guild
+xattr -c "$REAL"                                 # strip all quarantine xattrs
+codesign --force --deep -s - "$REAL"             # re-apply ad-hoc signature locally
+guild --version                                  # should now print version line
+```
+
+Symptom check before fix: `spctl -a -vv "$REAL"` → `rejected`. After fix: binary runs normally; macOS trusts the locally-applied ad-hoc sig.
+
 Then initialize guild for this lab:
 
 ```bash
@@ -218,12 +229,65 @@ cd EverOS/methods/EverCore
 # Copy env template and fill in OPENAI_API_KEY (or point at oMLX-compatible endpoint)
 cp env.template .env
 # edit .env: set OPENAI_API_KEY + OPENAI_API_BASE if using oMLX
-
-docker compose up -d
-# Wait ~30s for Postgres + EverCore to be ready
-curl http://localhost:1995/health
-# Should return {"status": "ok"}
 ```
+
+**Important:** upstream `docker-compose.yaml` ships **data services only** (Mongo, Elasticsearch, Milvus, Redis). The EverCore app itself is **not** in compose — it runs locally via `uv`. The `docker compose up -d` + `curl localhost:1995/health` sequence from the upstream README does not work as written.
+
+#### Start data services
+
+```bash
+docker compose up -d
+# Wait ~30s for containers to become healthy
+docker ps --format '{{.Names}}\t{{.Status}}' | grep memsys
+# expect 6 containers: memsys-{mongodb,elasticsearch,milvus-etcd,milvus-minio,milvus-standalone,redis}
+```
+
+If `memsys-milvus-etcd` shows `(unhealthy)`, that's a known upstream healthcheck/command port mismatch (cosmetic — see [Known issue: etcd healthcheck](#known-issue-etcd-healthcheck) below). Milvus connects to etcd internally on `:2479` and works regardless.
+
+#### Start EverCore app (port 1995)
+
+```bash
+uv sync                       # first run only, ~30s
+uv run web                    # foreground; Ctrl-C to stop
+# port override: uv run web --port 1995 --host 0.0.0.0
+#                MEMSYS_PORT=1995 uv run web
+```
+
+Entrypoint `web` is defined in `pyproject.toml` → `[project.scripts]` → `src.run:main` (uvicorn server). Default `0.0.0.0:1995`.
+
+Verify in another terminal:
+
+```bash
+curl http://localhost:1995/health
+# {"status": "ok"}
+```
+
+#### Known issue: etcd healthcheck
+
+Upstream `methods/EverCore/docker-compose.yaml` has a port mismatch on `milvus-etcd`:
+
+- `command:` listens on **2479** (`-listen-client-urls http://0.0.0.0:2479`)
+- `healthcheck:` queries default **2379** → always fails → Docker reports `(unhealthy)`
+
+Verify etcd itself is fine without restart:
+
+```bash
+docker exec memsys-milvus-etcd etcdctl --endpoints=http://127.0.0.1:2479 endpoint health
+# http://127.0.0.1:2479 is healthy: successfully committed proposal: took = ~1ms
+curl -sf http://localhost:9091/healthz   # Milvus → OK
+```
+
+Optional cosmetic patch — edit the `milvus-etcd` healthcheck in `docker-compose.yaml`:
+
+```yaml
+healthcheck:
+  test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2479", "endpoint", "health"]
+  interval: 30s
+  timeout: 20s
+  retries: 3
+```
+
+Then `docker compose up -d` to apply.
 
 ### 1.4 Smoke-test both services
 
@@ -658,6 +722,97 @@ async def test_consolidation_skips_low_value_scrolls():
 - **Real-world consolidation latency**: each scroll = 1 Haiku-tier LLM call (~1-3s on oMLX gpt-oss-20b) + 1 EverCore imprint call (~100-300ms). At 50 scrolls/batch, expect ~60-120s per batch run. Acceptable for periodic cron; would block hot-path if synchronous.
 `─────────────────────────────────────────────────`
 
+#### How to Run
+
+These tests are **integration tests** — no mocks. They hit the real guild MCP server, the real EverCore HTTP service, and a real local LLM endpoint. Confirm all three are up before running.
+
+**One-time setup** (extends the W3.5.5 lab scaffold):
+
+```bash
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+uv add --dev pytest pytest-asyncio
+
+mkdir -p tests
+touch tests/__init__.py
+```
+
+`tests/conftest.py` — `sys.path` bootstrap so `from src.consolidation import consolidate` resolves (same pattern as W3.5.5 §1.1):
+
+```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+```
+
+`pyproject.toml` — register asyncio mode so `@pytest.mark.asyncio` is no longer required per-test:
+
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+**Live-service prereqs** (verify each before pytest):
+
+```bash
+# 1. guild MCP server reachable
+guild --version
+guild init --yes  # once per lab directory
+
+# 2. EverCore data services + app (see §1.3 etcd note)
+docker ps --format '{{.Names}}\t{{.Status}}' | grep memsys   # 6 containers up
+curl -sf http://localhost:1995/health   # → {"status": "ok"}
+# If 1995 not responding: `cd EverOS/methods/EverCore && uv run web` in another terminal.
+
+# 3. Local oMLX LLM reachable for summarize_scroll()
+export OMLX_BASE_URL=http://localhost:8000/v1
+export OMLX_API_KEY=local
+export MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
+curl -sf $OMLX_BASE_URL/models | head -5
+```
+
+**Run:**
+
+```bash
+# All three tests (~75s wall, dominated by LLM summarization)
+uv run pytest tests/test_consolidation.py -v
+
+# Single test
+uv run pytest tests/test_consolidation.py::test_consolidation_idempotent_on_second_run -v
+
+# With live LLM round-trip logs
+uv run pytest tests/test_consolidation.py -v -s
+```
+
+**Expected output:**
+
+```
+tests/test_consolidation.py::test_consolidation_imprints_completed_scrolls PASSED  [25s]
+tests/test_consolidation.py::test_consolidation_idempotent_on_second_run    PASSED  [40s]
+tests/test_consolidation.py::test_consolidation_skips_low_value_scrolls     PASSED  [12s]
+========================== 3 passed in ~77s ==========================
+```
+
+**Cleanup between runs.** Each run posts new quests AND writes to the local `.guild_consolidation_state.sqlite` dedup table (§3.1). Stale dedup state breaks the idempotency test — it will report `first.scrolls_imprinted == 0` on a fresh run because the table thinks last run's QUEST-IDs are already done:
+
+```bash
+rm -f .guild_consolidation_state.sqlite
+```
+
+Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is forge-once); the `--campaign test-w358-consolidation` tag isolates this test's posts from your other work but does not bulk-delete them. Live with the residue or scope a throwaway `guild init` in a temp directory for hermetic runs.
+
+**Common failure modes:**
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `ModuleNotFoundError: No module named 'src'` | Missing `tests/conftest.py` or running `python tests/...` | Add the conftest sys.path bootstrap; always invoke via `uv run pytest`, never bare `python` |
+| `httpx.ConnectError: ... :1995` | EverCore data services up but app not running | `cd EverOS/methods/EverCore && uv run web` in another terminal (per §1.3) |
+| `mcp.errors.McpError: ... no active project` | guild not initialized in lab dir | `guild init --yes` from the lab root |
+| `test_consolidation_idempotent_on_second_run` reports `first.scrolls_imprinted == 0` on a clean run | Stale `.guild_consolidation_state.sqlite` from a prior run | `rm -f .guild_consolidation_state.sqlite` and retry |
+| `openai.APIConnectionError` during `summarize_scroll` | `OMLX_BASE_URL` not exported / oMLX server down | `curl $OMLX_BASE_URL/models` to verify; restart oMLX |
+| `test_consolidation_skips_low_value_scrolls` fails — `scrolls_skipped == 0` | LLM summarizer emitted a fact instead of `SKIP` | Lower temperature, tighten SKIP examples in §3.1 `SUMMARIZE_PROMPT`, or swap the low-value test scroll for a more obviously-noise one — summarizer judgment is the gate, and gate quality is summarizer-quality-dependent |
+
 ### 3.3 Quality-Score Promotion Gate (~30 min mini-lab)
 
 The §3.1 consolidator imprints EVERY scroll the summarizer doesn't explicitly mark `SKIP`. That's a binary filter — pass/fail on a single LLM judgement. PraisonAI's memory subsystem (`src/praisonai-agents/praisonaiagents/memory/memory.py`) uses a finer-grained primitive: a **quality_score** in `[0.0, 1.0]` attached to each candidate memory, with a configurable **promotion threshold** between short-term (episodic) and long-term (durable) tiers. Only entries `score >= threshold` promote. That gives the operator a tunable precision/recall dial on what enters durable memory, instead of a single SKIP rule baked into the prompt.
@@ -1062,11 +1217,6 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 *Symptom:* Naive implementation calls `await consolidate()` inside `complete_task()`. Each quest fulfillment adds ~10-30s latency (LLM summarization + EverCore imprint). Multi-agent throughput collapses.
 *Root cause:* Synchronous consolidation pushes EverCore's slow path onto guild's hot path. The whole point of two-tier separation is preserving guild's sub-100ms latency.
 *Fix:* Consolidation MUST be async / batched / cron-scheduled. Never on the hot path. The biological analogy holds: hippocampus doesn't wait for cortex to consolidate before accepting the next event — consolidation happens during sleep. **Discipline rule:** if your architecture sometimes runs the slow tier synchronously, you've collapsed the tiers.
-
-**Entry 6 — Quality-score threshold tuned to test data, fails on production distribution shift.**
-*Symptom:* §3.3 promotion gate set to `threshold=0.5` on a 20-scroll probe (balanced 10 high-value / 10 low-value) shows ~84% precision / ~78% recall. Two weeks into production with a customer-support agent, the LTM has bloated 3x expected and `query_context()` precision has dropped — gate is now passing ~90% of incoming scrolls.
-*Root cause:* The probe set scrolls were curated to span the score range. Real customer-support traffic is heavily skewed toward verbose, specific-sounding-but-low-novelty scrolls (every ticket mentions a numeric order ID + product name → high `specificity_score`). The threshold was tuned for a distribution that doesn't exist in production. Classic train/test distribution shift, applied to a memory gate.
-*Fix:* Two-layer remediation. (a) Re-tune threshold on a rolling production sample (last 200 scrolls, label-via-LLM-judge), not on the curated probe. (b) Add a histogram of `quality_score` to the consolidation dashboard so distribution shift is observable BEFORE LTM bloat shows up in recall metrics. Production rule: any tunable threshold needs a live distribution monitor — a static cutoff against a fixed probe lies about its own calibration the moment traffic shape changes.
 
 ---
 
