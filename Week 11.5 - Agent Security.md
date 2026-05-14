@@ -616,11 +616,6 @@ if __name__ == "__main__":
 
 **Entry 4 — Claude Computer Use Beta, 2024.** Researchers demonstrated that a screenshot of a webpage containing terminal-command-like text could cause the agent to execute that command if it was performing web research. The agent read the OCR'd text as instruction. Anthropic added explicit prompting to treat visual content as untrusted. Broader lesson: any modality the model reads is an injection surface.
 
-**Entry 5 — ContainmentGuard config wrong, agent silently runs without enforcement.**
-*Symptom:* The agent appears to behave correctly — file ops succeed, no exceptions surface in logs. Operator believes containment zones are enforced because the `containment_zones.py` module is imported at startup. Post-incident audit shows the agent successfully read `~/.ssh/id_rsa` and POSTed it via `make_http_request` two weeks ago; no `ContainmentViolation` was ever raised.
-*Root cause:* The `ZONES` dict was loaded from a YAML config that was missing the `secrets` key (typo: `secret:` instead of `secrets:`). `_zone_for_path("~/.ssh/id_rsa")` returned `None` (unzoned), so the `check()` Rule-1 branch never fired. The guard fell open. There was no boot-time validation, so the misconfiguration was invisible until forensics.
-*Fix:* Add `ContainmentGuard.validate_config()` as a fail-stop call at process startup — before any tool is registered, before the durable runtime accepts triggers. Validation asserts (a) `ZONES` is non-empty, (b) `secrets` key is present, (c) every prefix is absolute or `~`-anchored. Any failure raises `RuntimeError` and the process exits non-zero, so the supervisor will not mark the agent healthy. Pair with a synthetic smoke test on boot: attempt a `~/.ssh/id_rsa` read with `active_zone="work"`; require the call to raise `ContainmentViolation`. If it does not raise, the guard is broken — refuse to start.
-
 ---
 
 ## Interview Soundbites
