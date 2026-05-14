@@ -1,7 +1,7 @@
 ---
 title: Week 8.5 - Voice AI Agents
 created: 2026-04-30
-updated: 2026-04-30
+updated: 2026-05-14
 tags:
   - agent
   - voice
@@ -365,6 +365,197 @@ During TTS playback, the input stream still needs to accept frames for barge-in 
 
 ---
 
+## Phase 6 — Voice as a Lazy-Degradable Layer (~1 hour)
+
+**Goal:** Decouple voice (STT/TTS) from the agent core. Voice becomes a feature flag, not an architectural change. The same agent loop must work in all four input/output modes — text/text, voice/text, text/voice, voice/voice — without code changes, with optional dependencies (Whisper, Piper) staying optional until first use.
+
+### 6.1 Motivation — the canonical failure mode
+
+The voice-agent pattern most beginners get wrong: import STT and TTS at the top of the agent module, instantiate them in `__init__`, and call them unconditionally in the loop. Three things break the day you ship: (a) the agent fails to start on machines without a microphone or audio driver (ImportError on `pyaudio`), (b) startup latency includes 2–4s of Whisper model load even when the user passes text in, (c) toggling voice off is a code change, not a config change. The fix is mechanical: lazy-initialize STT/TTS on first access, treat them as independent feature flags, derive the wake-word from the agent's own identity rather than hardcoding "Alexa"/"Jarvis"/etc. The agent core stays voice-agnostic; voice becomes a degradable layer wrapped around it. Cross-repo reference: `agenticSeek/sources/interaction.py` ships this exact shape.
+
+### 6.2 Architecture diagram
+
+```mermaid
+flowchart TD
+    UserText[User text input] -->|always available| Core
+    UserMic[User microphone] -. lazy STT .-> STT[Whisper / Piper STT]
+    STT -. transcript .-> WakeCheck{Wake-word match?<br/>derived from agent_name}
+    WakeCheck -. yes .-> Core
+    WakeCheck -. no .-> Drop[discard utterance]
+    AgentName[agent_name: 'Friday'] -->|find_ai_name| WakeWord[wake-word: 'friday']
+    WakeWord -. configures .-> WakeCheck
+    Core[Agent core ReAct loop<br/>voice-agnostic] -->|response text| OutText[Text output<br/>always available]
+    Core -. lazy TTS .-> TTS[Piper / ElevenLabs TTS]
+    TTS -. audio stream .-> Speaker[Speaker output]
+    StTFlag[stt_enabled flag] -. gates .-> STT
+    TtsFlag[tts_enabled flag] -. gates .-> TTS
+
+    classDef lazy stroke-dasharray: 5 5,fill:#fef3c7,stroke:#d97706
+    classDef core fill:#dbeafe,stroke:#2563eb
+    class STT,TTS,UserMic,Speaker,WakeCheck,WakeWord lazy
+    class Core,UserText,OutText core
+```
+
+Dashed edges and amber nodes are the optional/lazy path. Solid edges and blue nodes are the always-available text path. The agent core has zero references to audio modules.
+
+### 6.3 Code
+
+**Code:**
+
+```python
+# interaction.py — voice as lazy-degradable layer
+from __future__ import annotations
+import re
+from typing import Optional
+
+# NOTE: No top-level imports of pyaudio, whisper, piper, elevenlabs.
+# Those happen inside _stt and _tts properties on first access.
+
+def find_ai_name(agent_name: str) -> str:
+    """Derive wake-word from agent identity.
+
+    Examples:
+        find_ai_name("Friday Assistant")  -> "friday"
+        find_ai_name("Claude_Code")       -> "claude"
+        find_ai_name("J.A.R.V.I.S.")      -> "jarvis"
+
+    Strategy: lowercase, strip non-alpha, take first whitespace-delimited token.
+    Falls back to "assistant" if extraction yields empty string.
+    """
+    cleaned = re.sub(r"[^a-zA-Z\s]", "", agent_name).strip().lower()
+    first = cleaned.split()[0] if cleaned else ""
+    return first or "assistant"
+
+
+class Interaction:
+    """Voice-degradable wrapper around a text-only agent core.
+
+    STT and TTS are independent feature flags. Both, either, or neither
+    can be enabled. The agent core (self.agent) is invoked identically
+    in all four mode combinations.
+    """
+
+    def __init__(
+        self,
+        agent,
+        agent_name: str,
+        stt_enabled: bool = False,
+        tts_enabled: bool = False,
+        languages: Optional[list[str]] = None,
+    ) -> None:
+        self.agent = agent  # voice-agnostic ReAct core
+        self.agent_name = agent_name
+        self.wake_word = find_ai_name(agent_name)
+        self.stt_enabled = stt_enabled
+        self.tts_enabled = tts_enabled
+        self.language = (languages or ["en"])[0]
+        # Lazy holders — NOT instantiated yet. Saves ~2-4s startup
+        # when voice flags are off; keeps pyaudio/whisper optional deps.
+        self._stt_instance = None
+        self._tts_instance = None
+
+    @property
+    def _stt(self):
+        """Lazy-init STT. Raises only when actually used."""
+        if self._stt_instance is None:
+            try:
+                from faster_whisper import WhisperModel  # local import
+                self._stt_instance = WhisperModel(
+                    "base", device="cpu", compute_type="int8"
+                )
+            except ImportError as e:
+                raise RuntimeError(
+                    f"STT requested but faster-whisper not installed: {e}. "
+                    f"Run: pip install faster-whisper"
+                ) from e
+        return self._stt_instance
+
+    @property
+    def _tts(self):
+        """Lazy-init TTS. Raises only when actually used."""
+        if self._tts_instance is None:
+            try:
+                import piper  # local import; swap for elevenlabs in prod
+                self._tts_instance = piper.PiperVoice.load(
+                    f"voices/{self.language}.onnx"
+                )
+            except (ImportError, FileNotFoundError) as e:
+                raise RuntimeError(f"TTS requested but unavailable: {e}") from e
+        return self._tts_instance
+
+    def _hear(self) -> str:
+        """Capture audio, transcribe, return text only if wake-word present."""
+        audio_bytes = self._capture_audio()  # uses pyaudio internally
+        segments, _ = self._stt.transcribe(audio_bytes, language=self.language)
+        transcript = " ".join(s.text for s in segments).strip().lower()
+        if self.wake_word not in transcript:
+            return ""  # not addressed to this agent — drop
+        # strip wake-word from the actual prompt
+        return transcript.replace(self.wake_word, "", 1).strip()
+
+    def _speak(self, text: str) -> None:
+        """Synthesize text to speaker."""
+        audio = self._tts.synthesize(text)
+        self._play(audio)  # uses pyaudio internally
+
+    def listen_then_respond(self, text: Optional[str] = None) -> str:
+        """Handle all four input/output mode combinations uniformly.
+
+        text=None + stt_enabled=True  → voice input
+        text=str                       → text input (overrides STT)
+        tts_enabled=True               → also speaks the response
+        tts_enabled=False              → text-only response (always returned)
+        """
+        # Input branch: text arg wins; else STT if enabled; else error.
+        if text is not None:
+            user_input = text
+        elif self.stt_enabled:
+            user_input = self._hear()
+            if not user_input:
+                return ""  # no wake-word match, stay silent
+        else:
+            raise ValueError("No text provided and STT disabled")
+        # Core invocation — identical in all modes
+        response = self.agent.run(user_input)
+        # Output branch: text always returned; TTS additive if enabled.
+        if self.tts_enabled:
+            self._speak(response)
+        return response
+
+    def _capture_audio(self) -> bytes: ...  # impl elided
+    def _play(self, audio) -> None: ...     # impl elided
+```
+
+**Walkthrough:**
+
+- **Block 1 — `find_ai_name`.** Wake-word is data, not a constant. Hardcoding "alexa" couples your agent to a specific brand; deriving from `agent_name` means the same `Interaction` class works for a "Friday" assistant, a "Jarvis" agent, or a customer-named bot, without code changes. The regex strips punctuation so `"J.A.R.V.I.S."` collapses to `"jarvis"`. The `or "assistant"` fallback prevents empty-string footguns when someone passes an agent_name of pure punctuation.
+
+- **Block 2 — `__init__` does NOT instantiate STT/TTS.** This is the load-bearing design choice. If the constructor eagerly imported `pyaudio` and loaded Whisper, a machine without an audio driver would crash at agent construction time — even for a text-only run. By deferring to property accessors, the agent constructs in milliseconds and only pays the Whisper-load cost (2–4s) the first time `_stt` is touched.
+
+- **Block 3 — `_stt` / `_tts` properties.** The lazy pattern wraps both the import and the heavyweight initialization. The `try/except ImportError` produces a clear actionable error ("run: pip install faster-whisper") instead of a stack trace burying the user. This is the difference between "voice is optional" and "voice is required-pretending-to-be-optional".
+
+- **Block 4 — `listen_then_respond` mode matrix.** The function handles all four combinations with a clean two-branch structure: input branch (text arg ⊳ STT ⊳ error), output branch (text always ⊳ TTS additive). The agent's `run()` is called identically in all four modes — the core has no knowledge that voice exists. Note `return ""` on wake-word miss: the agent stays silent rather than processing utterances not addressed to it, which is the correct behavior in shared/multi-agent environments.
+
+**Result:**
+
+| Mode | Startup time | First-response latency | Notes |
+|---|---|---|---|
+| text in / text out (both flags off) | ~5ms | LLM latency only | No audio deps loaded |
+| text in / voice out | ~5ms | LLM + 2.1s first call (TTS load) | TTS load amortized after call 1 |
+| voice in / text out | ~5ms | LLM + 3.4s first call (Whisper load) | Whisper load amortized after call 1 |
+| voice in / voice out | ~5ms | LLM + 5.5s first call | Both deps load lazily on first use |
+
+~estimated — measure against `lab-8.5-voice/RESULTS.md` after first run. Key invariant: startup is constant regardless of voice flags. Optional deps stay optional.
+
+**★ Insight ─────────────────────────────────────**
+- **Voice is a feature flag, not an architectural change.** The agent core's `run(text) -> text` signature never changes. Voice is a *wrapper* around that core, not a *mode* of it. This is what makes the four-mode matrix testable as four config combinations rather than four code paths.
+- **Cross-repo data point — `agenticSeek/sources/interaction.py` ships this exact pattern** (lazy STT/TTS, wake-word from `find_ai_name(casual_agent.name)`, language from `languages[0]`). The opposite pattern is **recommended-against** by Daniel Miessler's PAI repo, which couples to paid ElevenLabs API for TTS at the agent-loop level — your agent stops working the day your ElevenLabs key expires. agenticSeek's local-Piper/local-Whisper default is the open-source-compatible baseline; treat third-party TTS as a swappable backend behind the lazy property, never a hard dependency.
+- **Wake-word as identity:** deriving from `agent_name` means renaming the agent automatically updates the wake-word. No second source of truth, no drift between "what the agent is called in logs" and "what the user says to address it". This is the same DRY principle as deriving config from environment rather than duplicating it.
+
+`─────────────────────────────────────────────────`
+
+---
+
 ## Lab Extension — Compare to OpenAI Realtime API
 
 | Metric | Cascaded (GPU + ElevenLabs) | OpenAI Realtime |
@@ -389,6 +580,11 @@ Realtime ~2.5× faster at p50, 3× more expensive. Consumer products: cost premi
 **Entry 3 — Interruption detection lags 800ms.** Barge-in detection used 800ms VAD silence threshold (conservative to avoid mid-sentence false positives). Users had to speak for nearly a second before TTS cancelled — felt broken. Reducing barge-in VAD threshold to 200ms (separate from end-of-utterance threshold) eliminated the lag. **Two thresholds for two different problems.**
 
 **Entry 4 — End-to-end model leaks pronoun context from audio metadata.** During testing OpenAI Realtime API, model began referring to user with pronouns matching voice acoustics (pitch, formants) rather than stated preference. End-to-end model infers demographic info from acoustics. Cascaded pipelines produce text transcripts with no acoustic metadata — LLM has no signal. Concrete privacy advantage for cascaded inspectability.
+
+**Entry 5 — Voice driver missing in production env crashes agent at import time.**
+*Symptom:* Agent that worked locally crashes on the production container at startup with `ImportError: PortAudio library not found` or `OSError: [Errno -9996] Invalid input device`. The container has no audio driver because it doesn't need one — the deployment is text-only (Slack, web chat). The agent never even gets to the part where it would skip voice.
+*Root cause:* Eager top-level imports of `pyaudio` (or eager construction of Whisper/TTS objects in `Interaction.__init__`) couple the agent's *startup* to the *availability* of voice dependencies. The voice flag check happens after `__init__` returns — too late.
+*Fix:* Lazy-init pattern from Phase 6.3. Move `import pyaudio` and `WhisperModel(...)` inside `@property` accessors (`_stt`, `_tts`) that only fire on first use. The text-only deployment never touches those properties, so missing audio drivers stay invisible. Validate in CI by running the agent in a container with `PYAUDIO_AVAILABLE=0` and confirming startup succeeds. Cross-ref: §4 Phase 6 lazy-degradable layer pattern.
 
 ---
 
@@ -433,7 +629,7 @@ Realtime ~2.5× faster at p50, 3× more expensive. Consumer products: cost premi
 
 ## Cross-References
 
-**Builds on: W4 ReAct.** Voice agent is a ReAct agent with audio I/O. Core loop (observe → think → act) identical to text ReAct. Added complexity: audio I/O layer + real-time latency constraints.
+**Builds on: [[Week 4 - ReAct From Scratch]].** Voice agent is a ReAct agent with audio I/O. Core loop (observe → think → act) identical to text ReAct. Added complexity: audio I/O layer + real-time latency constraints. **The lazy-degradable layer pattern from §4 Phase 6 makes this explicit:** the agent core's `run(text) -> text` signature is unchanged from W4; STT/TTS are wrappers, not modifications. The same ReAct core runs unchanged in all four input/output mode combinations — voice does not earn its way into the agent's internals.
 
 **Connects to: W11 System Design.** Voice is one deployment shape. W11 covers production architecture; voice adds the constraint that each inference path must complete in under 500ms.
 

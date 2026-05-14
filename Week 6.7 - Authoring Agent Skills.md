@@ -1,7 +1,7 @@
 ---
 title: Week 6.7 - Authoring Agent Skills (Anthropic Pattern)
 created: 2026-04-30
-updated: 2026-04-30
+updated: 2026-05-14
 tags:
   - agent
   - skills
@@ -292,6 +292,141 @@ This skill has `allowed-tools: [Bash]` only. Credentials read from env vars — 
 
 ---
 
+### Mini-Lab — Packaging a Skill via Python `entry_points` (~1.5 hours)
+
+**Motivation.** A SKILL.md in `~/.claude/skills/` is fine for one author on one machine. The moment a skill has Python helpers, gets installed across a team, or needs versioned upgrade semantics, the markdown-folder model breaks: there is no dependency graph, no install command, no way to roll back. Production agent frameworks (PraisonAI, AutoGPT) graduate from "folder of files" to "pip-installable package that self-registers via Python's `entry_points` mechanism." One `pip install my-skill` does both: lands the code on disk AND advertises the skill to the runtime registry. The registry boots, discovers every installed entry_point, caches them in SQLite, and optionally rewrites each description through an LLM to lift retrieval recall. This mini-lab teaches the leap from "function = tool" to "package = skill."
+
+**Architecture.**
+
+```mermaid
+flowchart TD
+  Dev[Developer: pyproject.toml<br/>declares entry_points] --> Pip[pip install my-skill-pkg]
+  Pip --> Site[site-packages/<br/>entry_points.txt written]
+  Site --> Boot[SkillRegistry boot]
+  Boot --> Scan["importlib.metadata.entry_points<br/>(group='my_agent.tools')"]
+  Scan --> Load[Import each entry_point<br/>instantiate BaseTool]
+  Load --> Cache[(SQLite cache:<br/>id, name, schema, desc)]
+  Cache --> LLM["LLM rewrite description<br/>(optional retrieval lift)"]
+  LLM --> Opt[(optimizedDescription<br/>back on row)]
+  Opt --> Query[Query-time retrieval<br/>top-k by embedding]
+  Query --> Invoke[Agent invokes tool]
+```
+
+**Code.**
+
+```python
+# ─── pyproject.toml (declarative skill registration) ────────────────
+# [project]
+# name = "my-skill-weather"
+# version = "0.1.0"
+#
+# [project.entry-points."my_agent.tools"]
+# weather_lookup = "my_skill_weather.tool:WeatherTool"
+# ────────────────────────────────────────────────────────────────────
+
+# my_skill_weather/tool.py
+class WeatherTool:
+    name = "weather_lookup"
+    description = "Returns current weather for a city."
+    input_schema = {"city": "string"}
+
+    def __call__(self, city: str) -> dict:
+        return {"city": city, "temp_c": 18, "cond": "cloudy"}
+
+
+# registry.py — runtime discovery + cache + LLM rewrite
+import sqlite3, json, hashlib
+from importlib.metadata import entry_points
+from threading import RLock
+
+GROUP = "my_agent.tools"
+DB = "skills_cache.db"
+
+
+class SkillRegistry:
+    def __init__(self, llm_rewriter=None):
+        self._lock = RLock()
+        self._tools: dict[str, object] = {}
+        self._llm = llm_rewriter  # callable(desc) -> str, optional
+        self._db = sqlite3.connect(DB, check_same_thread=False)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS tools (
+              id TEXT PRIMARY KEY, name TEXT, schema TEXT,
+              description TEXT, optimizedDescription TEXT, hash TEXT
+            )""")
+
+    def boot(self) -> int:
+        with self._lock:
+            for ep in entry_points(group=GROUP):
+                try:
+                    cls = ep.load()
+                except Exception as e:
+                    # ── BCJ Entry 5: never bare-except this ──
+                    raise RuntimeError(
+                        f"entry_point {ep.name} failed to import: {e}"
+                    ) from e
+                inst = cls()
+                self._tools[inst.name] = inst
+                self._upsert(inst)
+            return len(self._tools)
+
+    def _upsert(self, t):
+        sig = hashlib.sha256(
+            (t.name + t.description + json.dumps(t.input_schema)).encode()
+        ).hexdigest()
+        row = self._db.execute(
+            "SELECT hash FROM tools WHERE id=?", (t.name,)
+        ).fetchone()
+        if row and row[0] == sig:
+            return  # warm-start: nothing changed
+        opt = self._llm(t.description) if self._llm else t.description
+        self._db.execute(
+            "INSERT OR REPLACE INTO tools VALUES (?,?,?,?,?,?)",
+            (t.name, t.name, json.dumps(t.input_schema),
+             t.description, opt, sig))
+        self._db.commit()
+
+    def list_tools(self) -> list[str]:
+        return list(self._tools)
+
+    def call(self, name: str, **kw):
+        return self._tools[name](**kw)
+
+
+# test_registry.py
+def test_boot_and_call():
+    r = SkillRegistry()
+    assert r.boot() >= 1
+    assert "weather_lookup" in r.list_tools()
+    out = r.call("weather_lookup", city="Seattle")
+    assert out["temp_c"] == 18
+```
+
+**Walkthrough.**
+
+- **Block 1 — `pyproject.toml` entry_points declaration.** Why `entry_points` over a hand-maintained import list in `registry.py`? Decoupling. With entry_points, the registry has zero knowledge of which skills exist on disk — it just asks the Python interpreter "who advertised themselves under group `my_agent.tools`?" New skills land via `pip install`, not by editing a central import file. PraisonAI uses exactly this pattern under group `praisonaiagents.tools`.
+- **Block 2 — `SkillRegistry.boot()` with `RLock`.** Why thread-safe? Agent runtimes hot-reload skills under concurrent inference traffic; a non-reentrant lock would deadlock when `_upsert` recursively touches the same lock. The `RLock` is the same primitive PraisonAI's `ToolRegistry` uses.
+- **Block 3 — SQLite cache with content hash.** Cold-start scans every entry_point and imports every module — expensive on a fleet of 100+ skills. Warm-start checks the row hash: if a skill's `(name, description, schema)` tuple is unchanged, skip the LLM rewrite. AutoGPT's `initialize_blocks()` upserts into an `AgentBlock` table for the same reason.
+- **Block 4 — `optimizedDescription` via LLM rewrite.** This is the retrieval-quality lift mechanism. The author writes a description for humans; the LLM rewrites it as embedding-optimized prose dense in trigger phrases. AutoGPT stores both columns and indexes on the optimized one. The raw description stays for audit and rollback.
+- **Block 5 — Bare-except trap (BCJ §6 Entry 5).** `ep.load()` can fail for installed-but-broken packages (missing transitive dep, syntax error in tool module). Swallowing the exception leaves the registry silently incomplete — agent retrieval misses the tool at query time with no error trail. Always re-raise with context.
+
+**Result.** _(measurement plan, to be filled after run)_
+
+| Metric | Raw description | LLM-optimized | Δ |
+| --- | --- | --- | --- |
+| Recall@5 on 20-query probe set | ~estimated 0.65 | ~estimated 0.85 | +0.20 |
+| Cold-start boot (10 entry_points) | ~estimated 480 ms | — | — |
+| Warm-start boot (cache hit) | ~estimated 12 ms | — | — |
+| LLM rewrite cost per skill | — | ~estimated $0.0004 | one-time |
+
+`★ Insight ─────────────────────────────────────`
+- Two independent production codebases (PraisonAI, AutoGPT) converged on the same shape: **runtime discovery + SQLite cache + LLM-optimized description**. Convergence across unrelated stacks is the strongest signal that the pattern is load-bearing, not stylistic.
+- The pedagogical leap is from "function = tool" to "package = skill." A package has a version, a dependency graph, a changelog, and an install/uninstall contract. A loose function in a folder has none of these. Production agent platforms ship the package; hobby projects ship the function.
+- `optimizedDescription` is dual-column on purpose: the author retains write-control over the human-readable line (for audit and provenance), while the system owns the embedding-time line. Never overwrite the source-of-truth description in place.
+`─────────────────────────────────────────────────`
+
+---
+
 ## Skill Distribution and Versioning
 
 ### Install locations
@@ -327,6 +462,29 @@ A knowledge-base skill embedded its full document corpus directly in SKILL.md as
 **Entry 4: `allowed-tools` not enforced.**
 Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `Read`, `Write`, and git commands anyway. `allowed-tools` is a strong hint to the model, not runtime-enforced. For genuine sandboxing, configure session-level permissions.
 
+**Entry 5 — Entry-points discovered but failed-import propagates silently.**
+*Symptom:* Registry boot reports "12 tools loaded" but agent retrieval consistently misses one specific skill; users complain "/weather doesn't work anymore" after a dependency bump; no error in logs.
+*Root cause:* `entry_points(group=...).load()` raised `ImportError` (a transitive dep was uninstalled), and the boot loop swallowed the exception inside a bare `except:` block. The entry_point was advertised in `pyproject.toml`, indexed by Python's metadata, but never instantiated — so it never landed in the SQLite cache and never showed up in retrieval. No stack trace because bare-except ate it.
+*Fix:* Never bare-except around `ep.load()`. Catch the specific exception class, log with `ep.name` and `ep.value`, and re-raise with context — or, if soft-degradation is the policy, write a `tools_failed` row to the cache so the operator can grep for it.
+
+```python
+# WRONG
+try:
+    cls = ep.load()
+except:  # bare except — eats ImportError, AttributeError, everything
+    continue
+
+# RIGHT
+try:
+    cls = ep.load()
+except (ImportError, AttributeError) as e:
+    log.error("entry_point %s failed: %s", ep.name, e)
+    self._db.execute(
+        "INSERT OR REPLACE INTO tools_failed VALUES (?, ?, ?)",
+        (ep.name, ep.value, str(e)))
+    raise RuntimeError(f"skill registry boot incomplete: {ep.name}") from e
+```
+
 ---
 
 ## Interview Soundbites
@@ -358,3 +516,5 @@ Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `
 **Sets up: W11 System Design.** The skill-as-unit-of-capability pattern scales to service architecture. A skill with `allowed-tools` is a microservice with an API contract.
 
 **Distinguish from: W7 Tool Harness.** Tools are callable functions with JSON schemas. Skills are loaded prompts. A skill can invoke tools; a tool cannot invoke a skill. Most production agents need both layers.
+
+**Builds on: [[Week 6.6 - MCP Schema Bridge]].** W6.6 covers per-tool schema as the atomic primitive — JSON-schema validation, input/output contracts, the smallest unit of agent capability. This chapter composes over that primitive: a packaged Skill bundles one or more schema-defined tools, declares them via `entry_points`, and registers the whole bundle as a versioned, pip-installable unit. Schema is the cell; Skill package is the organ.

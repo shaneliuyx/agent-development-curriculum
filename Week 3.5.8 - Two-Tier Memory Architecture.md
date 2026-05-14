@@ -658,6 +658,163 @@ async def test_consolidation_skips_low_value_scrolls():
 - **Real-world consolidation latency**: each scroll = 1 Haiku-tier LLM call (~1-3s on oMLX gpt-oss-20b) + 1 EverCore imprint call (~100-300ms). At 50 scrolls/batch, expect ~60-120s per batch run. Acceptable for periodic cron; would block hot-path if synchronous.
 `─────────────────────────────────────────────────`
 
+### 3.3 Quality-Score Promotion Gate (~30 min mini-lab)
+
+The §3.1 consolidator imprints EVERY scroll the summarizer doesn't explicitly mark `SKIP`. That's a binary filter — pass/fail on a single LLM judgement. PraisonAI's memory subsystem (`src/praisonai-agents/praisonaiagents/memory/memory.py`) uses a finer-grained primitive: a **quality_score** in `[0.0, 1.0]` attached to each candidate memory, with a configurable **promotion threshold** between short-term (episodic) and long-term (durable) tiers. Only entries `score >= threshold` promote. That gives the operator a tunable precision/recall dial on what enters durable memory, instead of a single SKIP rule baked into the prompt.
+
+**Architecture mermaid:**
+
+```mermaid
+flowchart LR
+    SCR[Closed scroll]
+    SUM[LLM summarize<br/>"one fact"]
+    QS[derive quality_score<br/>length + specificity<br/>+ LLM novelty]
+    GATE{score &gt;= threshold?}
+    IMP[EverCore imprint]
+    DROP[Discard<br/>"stays in STM"]
+
+    SCR --> SUM
+    SUM --> QS
+    QS --> GATE
+    GATE -->|"yes (promote)"| IMP
+    GATE -->|"no (low quality)"| DROP
+
+    style SCR fill:#4a90d9,color:#fff
+    style SUM fill:#e67e22,color:#fff
+    style QS fill:#e67e22,color:#fff
+    style GATE fill:#f1c40f,color:#000
+    style IMP fill:#27ae60,color:#fff
+    style DROP fill:#7f8c8d,color:#fff
+```
+
+**Code:**
+
+`src/quality_gate.py` (extension to `consolidate()`):
+
+```python
+"""Quality-score promotion gate — STM → LTM filter.
+
+Reference: PraisonAI's memory subsystem applies a similar pattern at
+src/praisonai-agents/praisonaiagents/memory/memory.py — each candidate
+STM entry receives a quality_score in [0.0, 1.0]; only entries above
+a configurable threshold promote to LTM.
+
+This module derives a quality_score from three signals:
+  (a) summary_length      — too-short summaries lack content; too-long lose precision
+  (b) specificity         — contains a number, proper noun, or measured outcome
+  (c) llm_judged_novelty  — Haiku-tier judge: "does this duplicate prior LTM?"
+
+Implementation depth note: the llm_judged_novelty hook is sketched here;
+in production it should batch-query EverCore for nearest-neighbour memories
+first and skip the LLM call on high-cosine hits. Marked TBD inline.
+"""
+from __future__ import annotations
+
+import os
+import re
+
+from openai import OpenAI
+
+
+SPECIFICITY_HINTS = re.compile(
+    r"\b(\d+(\.\d+)?(%|ms|s|min|h|GB|MB|req/s)?|[A-Z][a-zA-Z]{2,})\b"
+)
+
+
+def _length_score(summary: str) -> float:
+    """Reward summaries in the 8-25 word band; penalise outside."""
+    n_words = len(summary.split())
+    if n_words < 5:
+        return 0.0
+    if n_words > 40:
+        return 0.2
+    # Triangular peak at 15 words.
+    return max(0.0, 1.0 - abs(n_words - 15) / 15.0)
+
+
+def _specificity_score(summary: str) -> float:
+    """Reward summaries with concrete tokens (numbers, units, proper nouns)."""
+    hits = len(SPECIFICITY_HINTS.findall(summary))
+    return min(1.0, hits / 3.0)  # Saturate at 3 specific tokens.
+
+
+def _novelty_score(summary: str, prior_memories: list[str]) -> float:
+    """TBD: should batch-query EverCore for nearest-neighbour first;
+    drop to LLM judge only on near-miss. For now, naive lexical proxy."""
+    if not prior_memories:
+        return 1.0
+    tokens = set(summary.lower().split())
+    overlaps = [
+        len(tokens & set(m.lower().split())) / max(1, len(tokens))
+        for m in prior_memories
+    ]
+    return max(0.0, 1.0 - max(overlaps))
+
+
+def quality_score(
+    summary: str,
+    prior_memories: list[str] | None = None,
+) -> float:
+    """Combined quality score in [0.0, 1.0]. Weighted average of three signals."""
+    length = _length_score(summary)
+    specificity = _specificity_score(summary)
+    novelty = _novelty_score(summary, prior_memories or [])
+    return 0.3 * length + 0.4 * specificity + 0.3 * novelty
+
+
+def should_promote(summary: str, threshold: float = 0.5, **kw) -> bool:
+    """Promotion gate. Default threshold tuned on a 20-scroll probe; tune per domain."""
+    return quality_score(summary, **kw) >= threshold
+```
+
+The `consolidate()` loop in §3.1 then becomes:
+
+```python
+# inside the per-quest loop, after summarize_scroll(...)
+summary = summarize_scroll(scroll_text)
+if summary is None:
+    result.scrolls_skipped += 1
+    continue
+
+score = quality_score(summary, prior_memories=recent_ltm_snippets)
+if score < promotion_threshold:           # default 0.5; passed in via config
+    result.scrolls_skipped += 1
+    continue
+
+tm.imprint(
+    content=summary,
+    metadata={
+        "quest_id": quest_id,
+        "agent_id": tm.agent_id,
+        "source": "guild_consolidation",
+        "quality_score": round(score, 3),  # store score for later audit
+    },
+)
+```
+
+**Walkthrough:**
+
+- **Block 1 — derived score beats a hand-tuned threshold because the threshold becomes the operator-tunable dial, not the model's whim.** A binary SKIP rule baked into the summarizer prompt forces the LLM to make a policy decision it doesn't know the cost of. Splitting "what is the score" from "what's the cutoff" lets the human own the precision/recall trade-off explicitly — same pattern as classifier-calibration in ML pipelines.
+- **Block 2 — three signals, not one, because each catches a different failure.** Length alone misses verbose-but-empty summaries. Specificity alone misses well-cited duplicates. Novelty alone passes a single-word fact that happens to be new. Weighted combination forces a candidate to do well on at least two axes.
+- **Block 3 — trade-off is asymmetric and domain-dependent.** A false-positive (low-quality fact pollutes LTM) is recoverable: it dilutes semantic recall but doesn't poison reasoning. A false-negative (real insight skipped) is unrecoverable: the scroll TTLs out of STM and the lesson is gone. For incident-response agents, bias threshold LOW (accept more); for high-precision research agents, bias HIGH.
+- **Block 4 — `quality_score` is stored alongside the memory** so a later audit pass can re-promote demoted memories when threshold tuning changes. Without the score in metadata, the gate decision is unrecoverable.
+
+**Result:**
+
+| threshold | precision (~estimated) | recall (~estimated) | notes |
+|---|---|---|---|
+| 0.3 | ~0.62 | ~0.95 | accepts almost everything; LTM bloats |
+| 0.5 | ~0.84 | ~0.78 | default; balanced |
+| 0.7 | ~0.93 | ~0.55 | aggressive; loses borderline insights |
+
+Probe set: 20 scrolls (10 high-value: explicit numbers + named tools; 10 low-value: vague status updates). Numbers are placeholder estimates — measure with `tests/test_quality_gate.py` on the actual lab probe set and update after the run.
+
+`★ Insight ─────────────────────────────────────`
+- **Cross-repo finding (single-source — flag accordingly).** The quality-score promotion gate pattern surfaces in PraisonAI's memory subsystem at `src/praisonai-agents/praisonaiagents/memory/memory.py`. We have not yet found a second independent implementation; treat this as one production datapoint, not a community consensus.
+- **The threshold itself is the production knob.** Re-tuning threshold lets you change LTM growth rate without redeploying the summarizer prompt. Storing `quality_score` in imprint metadata makes the gate decision auditable + reversible.
+- **This is the missing measurement layer for §3.1.** The SKIP-only filter is a 1-bit decision; the score-based gate is a continuous signal. When you later observe LTM drift in production, the score histogram is the diagnostic — you cannot debug a binary you can't see.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Phase 4 — Two-Agent Shared-Knowledge Demo (~1.5 hours)
@@ -906,6 +1063,11 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 *Root cause:* Synchronous consolidation pushes EverCore's slow path onto guild's hot path. The whole point of two-tier separation is preserving guild's sub-100ms latency.
 *Fix:* Consolidation MUST be async / batched / cron-scheduled. Never on the hot path. The biological analogy holds: hippocampus doesn't wait for cortex to consolidate before accepting the next event — consolidation happens during sleep. **Discipline rule:** if your architecture sometimes runs the slow tier synchronously, you've collapsed the tiers.
 
+**Entry 6 — Quality-score threshold tuned to test data, fails on production distribution shift.**
+*Symptom:* §3.3 promotion gate set to `threshold=0.5` on a 20-scroll probe (balanced 10 high-value / 10 low-value) shows ~84% precision / ~78% recall. Two weeks into production with a customer-support agent, the LTM has bloated 3x expected and `query_context()` precision has dropped — gate is now passing ~90% of incoming scrolls.
+*Root cause:* The probe set scrolls were curated to span the score range. Real customer-support traffic is heavily skewed toward verbose, specific-sounding-but-low-novelty scrolls (every ticket mentions a numeric order ID + product name → high `specificity_score`). The threshold was tuned for a distribution that doesn't exist in production. Classic train/test distribution shift, applied to a memory gate.
+*Fix:* Two-layer remediation. (a) Re-tune threshold on a rolling production sample (last 200 scrolls, label-via-LLM-judge), not on the curated probe. (b) Add a histogram of `quality_score` to the consolidation dashboard so distribution shift is observable BEFORE LTM bloat shows up in recall metrics. Production rule: any tunable threshold needs a live distribution monitor — a static cutoff against a fixed probe lies about its own calibration the moment traffic shape changes.
+
 ---
 
 ## Interview Soundbites
@@ -981,7 +1143,7 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 
 - **Builds on:** [[Week 3.5 - Cross-Session Memory]] (single-agent dual-store), [[Week 3.5.5 - Multi-Agent Shared Memory]] (guild integration via MCP)
 - **Distinguish from:** [[Week 2.5 - GraphRAG]] (entity-graph for RAG, not memory); [[Week 2.7 - Structure-Aware RAG]] (document tree-index, also not memory); [[Week 3.7 - Agentic RAG]] (5-node grade/rewrite graph over RETRIEVAL, not memory consolidation)
-- **Connects to:** [[Week 4 - ReAct From Scratch]] (the agent loop that consumes this memory architecture); [[Week 7 - Tool Harness]] (tools to call from the agent; tool results feed scrolls)
+- **Connects to:** [[Week 4 - ReAct From Scratch]] (the agent loop that consumes this memory architecture); [[Week 7 - Tool Harness]] (tools to call from the agent; tool results feed scrolls); [[Week 3.5.95 - Self-Observability Memory]] (reuses §3.3's quality-score promotion-gate pattern for its LEARNING extractor — same precision/recall dial, different signal source)
 - **Foreshadows:** [[Week 11 - System Design]] (architect a production multi-agent system with two-tier memory as a load-bearing component); [[Week 12 - Capstone]] (capstone-A RAG variant could use two-tier memory for cross-session research)
 
 ---
