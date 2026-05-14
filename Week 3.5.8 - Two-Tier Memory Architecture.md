@@ -743,6 +743,45 @@ touch tests/__init__.py
 
 `uv init` flags: `--no-readme` skips the auto-created README.md; `--no-workspace` opts out of workspace-member registration; `--python 3.12` pins the version to match W3.5.5 + EverCore. Without `pyproject.toml`, `uv add` errors with `No pyproject.toml found in current directory or any parent directory`.
 
+**Runtime deps** (the lab's source modules import these; `uv init` does NOT introspect existing source to derive them):
+
+```bash
+uv add openai httpx "mcp[cli]" pydantic
+```
+
+Why each:
+- `openai` — `src/consolidation.py` `summarize_scroll()` LLM call against the OMLX endpoint
+- `httpx` — `src/tiered_memory.py` EverCore HTTP client on `:1995`
+- `mcp[cli]` — `src/guild_client.py` MCP stdio client (vendored from W3.5.5 lab)
+- `pydantic` — typed data classes referenced via the MCP wrapper
+
+**EverCore `.env` — point at local oMLX, not openrouter/grok.** Upstream `env.template` defaults the LLM provider to `openrouter` with a placeholder grok-4-fast key. The chapter's local-first contract requires routing EverCore's internal memcell-extraction LLM at the local oMLX server instead:
+
+```bash
+cd ~/code/EverOS/methods/EverCore
+cp .env .env.bak.$(date +%s)  # backup before edit
+
+# Apply with sed (or hand-edit equivalent lines):
+sed -i.tmp \
+  -e 's|^LLM_PROVIDER=openrouter|LLM_PROVIDER=openai|' \
+  -e 's|^LLM_MODEL=x-ai/grok-4-fast|LLM_MODEL=gpt-oss-20b-MXFP4-Q8|' \
+  -e 's|^LLM_API_KEY=sk-or-v1-xxxx|LLM_API_KEY='"$OMLX_API_KEY"'|' \
+  -e 's|^LLM_BASE_URL=https://openrouter.ai/api/v1|LLM_BASE_URL=http://127.0.0.1:8000/v1|' \
+  -e 's|^LLM_MAX_TOKENS=32768|LLM_MAX_TOKENS=8192|' \
+  -e 's|^OPENAI_API_KEY=sk-xxxx|OPENAI_API_KEY='"$OMLX_API_KEY"'|' \
+  -e 's|^OPENAI_BASE_URL=https://api.openai.com/v1|OPENAI_BASE_URL=http://127.0.0.1:8000/v1|' \
+  .env && rm -f .env.tmp
+```
+
+Both `LLM_*` AND `OPENAI_*` need patching: EverCore's `openai` provider class reads `OPENAI_API_KEY` + `OPENAI_BASE_URL` (the bare names) regardless of what `LLM_PROVIDER=` says. The `LLM_*` block is the policy declaration; the provider-specific block is what the HTTP client actually uses.
+
+**Restart EverCore after .env changes** — config is loaded at app startup, not per-request:
+
+```bash
+# In the terminal running `uv run web`, Ctrl-C then:
+uv run web
+```
+
 `tests/conftest.py` — `sys.path` bootstrap so `from src.consolidation import consolidate` resolves (same pattern as W3.5.5 §1.1):
 
 ```python
@@ -1201,30 +1240,62 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 
 ## Bad-Case Journal
 
-**Entry 1 — Consolidation pipeline runs while guild is mid-write; reads inconsistent quest state.**
+*Provenance.* Entries 1–5 are **pre-scoped** at chapter-authoring time — failure modes predicted from theory; not yet confirmed against this lab's runs. Entries 6–11 are **observed** in the 2026-05-14 first-execution session against live guild + EverCore + local oMLX. Per the curriculum's real-data discipline, only the observed entries are load-bearing for interview soundbites; pre-scoped entries are intellectual scaffolding pending validation.
+
+**Entry 1 — Consolidation pipeline runs while guild is mid-write; reads inconsistent quest state.** *(pre-scoped)*
 *Symptom:* Race between `consolidate()`'s `quest_list(status='done')` query and a concurrent `quest_fulfill` from a live agent. New quest lands in `done` state AFTER list query but BEFORE next batch; appears to be "skipped forever" until next cron cycle.
 *Root cause:* No serialization between batch consolidation and live agent writes. Acceptable for cron-style (next run picks up the missed quest because the dedup table doesn't yet have its QUEST-ID) but produces measurement noise during benchmarking.
 *Fix:* Either (a) run consolidation in dedicated maintenance window (production pattern), or (b) snapshot guild's SQLite during list — too aggressive for hot path. The benchmark workaround is to call `consolidate()` AFTER all writes complete, not interleaved. Production rule: consolidation is eventual-consistency-tolerant by design; don't fight it.
 
-**Entry 2 — EverCore Postgres connection pool exhausted under benchmark load.**
+**Entry 2 — EverCore Postgres connection pool exhausted under benchmark load.** *(pre-scoped)*
 *Symptom:* Phase 5 benchmark runs 15 probes × 3 query_context calls = 45 EverCore HTTP requests in 30 seconds; EverCore returns 503 mid-bench.
 *Root cause:* EverCore's docker-compose Postgres ships with default `max_connections=100` and EverCore's internal pool spawns one connection per concurrent request. Lab's parallel queries hit pool ceiling.
 *Fix:* Throttle benchmark to serial (already sufficient for 15-Q load); for production, bump Postgres `max_connections` to 300 and EverCore pool to 50. Long-term, EverCore should pool connections more aggressively — known issue in their tracker.
 
-**Entry 3 — Summarizer LLM outputs verbose multi-paragraph "summaries"; EverCore stores them as long memories.**
+**Entry 3 — Summarizer LLM outputs verbose multi-paragraph "summaries"; EverCore stores them as long memories.** *(pre-scoped)*
 *Symptom:* `query_context(query="how do we deploy?")` returns one memory that is a 400-token paragraph instead of a one-sentence fact. Semantic search precision drops because long memories dominate cosine similarity.
 *Root cause:* Phase 3 SUMMARIZE_PROMPT asks for "one sentence" but gpt-oss-20b under temperature=0.0 sometimes elaborates. No max_tokens enforcement.
 *Fix:* Tighten prompt with explicit "MAXIMUM 25 words" + add `max_tokens=80` in the LLM call. Add post-processing: if summary > 200 chars, re-summarize. Production rule: summarization is a contract, not a hint; enforce length at both prompt + token-budget + post-processing layers.
 
-**Entry 4 — Idempotency check fires but EverCore returns wrong scroll_id format; duplicate imprints land.**
+**Entry 4 — Idempotency check fires but EverCore returns wrong scroll_id format; duplicate imprints land.** *(pre-scoped)*
 *Symptom:* After 5 batch runs of the same scroll, EverCore has 5 copies of the semantic fact. `query_context` returns all 5; semantic-recall pass rate stays high but storage bloats linearly.
 *Root cause:* `query_context(query=f"scroll_id:{scroll['id']}", k=1)` is a SEMANTIC query, not a metadata-filter query. Semantic search over "scroll_id:abc123" might return false negatives — short-string queries don't embed well in BGE-M3.
 *Fix:* Use EverCore's metadata-filter API (if available) instead of semantic query for idempotency check. If not available, maintain a local SQLite table of imprinted scroll_ids — cheap and exact. Production rule: idempotency checks need EXACT matching, not approximate semantic similarity.
 
-**Entry 5 — Two-tier latency spikes when consolidation runs synchronously after every quest_fulfill (anti-pattern).**
+**Entry 5 — Two-tier latency spikes when consolidation runs synchronously after every quest_fulfill (anti-pattern).** *(pre-scoped)*
 *Symptom:* Naive implementation calls `await consolidate()` inside `complete_task()`. Each quest fulfillment adds ~10-30s latency (LLM summarization + EverCore imprint). Multi-agent throughput collapses.
 *Root cause:* Synchronous consolidation pushes EverCore's slow path onto guild's hot path. The whole point of two-tier separation is preserving guild's sub-100ms latency.
 *Fix:* Consolidation MUST be async / batched / cron-scheduled. Never on the hot path. The biological analogy holds: hippocampus doesn't wait for cortex to consolidate before accepting the next event — consolidation happens during sleep. **Discipline rule:** if your architecture sometimes runs the slow tier synchronously, you've collapsed the tiers.
+
+**Entry 6 — `uv add` fails with "No pyproject.toml found".** *(observed 2026-05-14)*
+*Symptom:* `uv add --dev pytest pytest-asyncio` → `error: No pyproject.toml found in current directory or any parent directory`. Reader assumes lab scaffold inherits uv config from W3.5.5; it does not.
+*Root cause:* W3.5.5 lab predates uv adoption (pip + requirements.txt era). The W3.5.8 lab directory needs its own `pyproject.toml` before any `uv add` works. `uv init` does this, but `uv add` does not auto-init.
+*Fix:* Prepend a one-time bootstrap step before any `uv add`: `test -f pyproject.toml || uv init --no-readme --no-workspace --python 3.12`. The `test -f` guard makes it idempotent — re-running is safe. Patched into chapter §3.2.1 setup block.
+
+**Entry 7 — `ModuleNotFoundError: No module named 'openai'` after `uv init` + `uv add --dev pytest`.** *(observed 2026-05-14)*
+*Symptom:* Tests collected by pytest but fail at import: `from openai import OpenAI` in `src/consolidation.py` raises `ModuleNotFoundError`. The `uv` virtualenv has pytest but none of the lab's actual runtime imports.
+*Root cause:* `uv init` creates an empty project skeleton and `uv add --dev` only installs DEV dependencies. It does not introspect existing source files for runtime imports. The W3.5.5-era `requirements.txt` was never ported, so the dep list was lost.
+*Fix:* Explicit `uv add openai httpx "mcp[cli]" pydantic` before running tests. General rule: when scaffolding `uv` onto a lab that predates it, manually list the runtime imports as a one-time bootstrap; `uv` does not derive them.
+
+**Entry 8 — Reasoning-model `summarize_scroll` returns `None` for legitimate scrolls; `finish_reason=length`.** *(observed 2026-05-14)*
+*Symptom:* All 3 tests' scrolls land in `scrolls_skipped`, none in `scrolls_imprinted`, `errors=[]`. Direct repro on the input "deployed via terraform; ran apply; got 200; verified VPC peering" returns `message.content=None` with `finish_reason="length"` — but the response carries a non-empty `reasoning_content` field that contains the correct answer.
+*Root cause:* `gpt-oss-20b-MXFP4-Q8` is a REASONING model. It emits chain-of-thought into `reasoning_content` FIRST, then the final answer into `content`. With `max_tokens=80` (tuned for non-reasoning models per pre-scoped Entry 3), the CoT consumes the entire budget; the final `content` is never emitted; finish_reason becomes `length`. Caller reads `content` as empty, normalizes to `None`, skips.
+*Fix:* Bump `max_tokens` to 400 in `summarize_scroll()`. The 25-word output cap stays enforced by the SUMMARIZE_PROMPT, not by the token ceiling. General rule: for reasoning models, `max_tokens` must budget for CoT + answer; for non-reasoning models, the prompt-driven output cap is enough on its own. Sniff the model class first.
+
+**Entry 9 — EverCore HTTP `POST /memory/imprint` returns 404.** *(observed 2026-05-14)*
+*Symptom:* After bumping the summarizer budget, `consolidate()` errors fill with `httpx.HTTPStatusError: Client error '404 Not Found' for url 'http://localhost:1995/memory/imprint'`. Chapter §2.1 wrapper uses `/memory/imprint` and `/memory/query`; EverCore's actual OpenAPI catalog does not expose these paths.
+*Root cause:* The wrapper was written against a hypothetical API surface. Real EverCore endpoints (per `GET /openapi.json`): `POST /api/v1/memories` (personal add) takes `{user_id, session_id?, messages: [{role, timestamp, content}]}`; `POST /api/v1/memories/search` takes `{query, filters: {user_id}, top_k}` and returns `{data: {episodes: [...], profiles: [...]}}`. Conversation-shaped, not arbitrary key-value imprint.
+*Fix:* Rewrite `TieredMemory.imprint()` to POST `/api/v1/memories` with an assistant-role MessageItem containing the consolidated fact as content + unix-ms timestamp + the QUEST-ID as session_id. Rewrite `TieredMemory.query_context()` to POST `/api/v1/memories/search` with `filters={"user_id": self.agent_id}` and parse `data.episodes`. General rule: probe `/openapi.json` (or equivalent) FIRST when wrapping a third-party HTTP service; never hand-write client paths against assumed contracts.
+
+**Entry 10 — EverCore returns HTTP 500 "Failed to store memory"; upstream LLM is unauthenticated.** *(observed 2026-05-14)*
+*Symptom:* Imprint requests reach EverCore (no more 404), but every call now returns `500 Internal Server Error` with body `{"code":"HTTP_ERROR","message":"Failed to store memory, please try again later"}`. EverCore log shows: `[OpenAI-x-ai/grok-4-fast] HTTP 401: Missing Authentication header` → `LLMError: ... (all 1 keys exhausted)`.
+*Root cause:* EverCore's `mem_memorize` flow calls an upstream LLM for memcell boundary-detection BEFORE storing. Upstream env.template defaults to `LLM_PROVIDER=openrouter, LLM_MODEL=x-ai/grok-4-fast` with placeholder key `sk-or-v1-xxxx` — a paid-service config that violates this curriculum's local-first contract AND fails immediately without a real key. Subtler: even after setting `LLM_PROVIDER=openai`, the openai-provider class reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` (NOT `LLM_API_KEY` / `LLM_BASE_URL`). Both blocks must be patched.
+*Fix:* Patch EverCore's `.env` to point at local oMLX (chapter §3.2.1 ships the exact `sed` script). Both `LLM_*` (policy declaration) and `OPENAI_*` (what the http client actually reads) need updating. Restart EverCore (`Ctrl-C` + `uv run web`) for config to load. General rule: when a third-party service has BOTH a policy-layer env block AND a provider-specific block, patch both; the policy block alone does not get read by the executing provider class.
+
+**Entry 11 — Idempotency test fails on second invocation; QUEST-IDs sort alphabetically, seed quest never enters batch.** *(observed 2026-05-14)*
+*Symptom:* After fixing 6–10, 2/3 tests pass but `test_consolidation_idempotent_on_second_run` fails: `scrolls_seen=10, scrolls_imprinted=0, scrolls_skipped=3, errors=[]`. 10 scrolls reach the batch but the test's freshly-seeded quest contributes none of them.
+*Root cause:* Two interacting bugs. (1) `consolidate()` sorts QUEST-IDs alphabetically via `sorted(set(QUEST_ID_RE.findall(...)))`. With residue accumulation, `QUEST-1, QUEST-10, QUEST-11, ..., QUEST-2, QUEST-20, ...` orders the OLDEST quests first — fresh seed quests (e.g. `QUEST-60+`) never enter the `max_batch=10` window. (2) All 3 tests shared `CAMPAIGN = "test-w358-consolidation"`. Guild's quests are append-only; debug-run residue accumulates under the same campaign tag. Test 1 imprints 7 residue scrolls; test 2 sees them in dedup; its own seed is excluded by the alpha sort.
+*Fix:* (a) Numerical sort in `consolidate()`: `sorted(quest_ids, key=lambda q: int(q.split('-', 1)[1]))[:max_batch]`. Production-correct — process oldest-by-creation-order first, never strand high-N quests behind alpha-low ones. (b) Per-test unique campaign: `_fresh_campaign() -> f"test-w358-{uuid.uuid4().hex[:8]}"`. Each test isolates its own quest space. General rule: when wrapping append-only IDs that embed integers, sort by the integer, not the string; when writing tests against append-only stores, scope each test to its own tag/namespace.
 
 ---
 
