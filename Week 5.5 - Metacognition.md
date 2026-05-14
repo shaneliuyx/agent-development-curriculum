@@ -1,7 +1,7 @@
 ---
 title: Week 5.5 - Metacognition (Reflexion + Self-Critique)
 created: 2026-04-30
-updated: 2026-04-30
+updated: 2026-05-14
 tags:
   - agent
   - metacognition
@@ -21,6 +21,8 @@ In production, agents fail silently. A ReAct loop that hit a dead end last Tuesd
 This week sits between the Pattern Zoo (W5) and the Claude Code Source Dive (W6) for a reason: before you read how Anthropic built a production agent, you need to understand the self-correction primitives that make production agents reliable. Reflexion (Shinn et al., 2023) gave the field a clean formalism for the idea. Self-Refine (Madaan et al., 2023) extended it to open-ended generation. Self-Consistency (Wang et al., 2023) showed that sampling diversity plus majority vote is often cheaper than a critic.
 
 In interviews, this topic surfaces as: "How would you handle an agent that keeps making the same mistake?" The correct answer is not "add more prompt instructions." The correct answer involves episodic memory, a verifier signal, and a reflection pass. If you can describe that loop, cite a paper, and name one failure mode, you are in the top quartile of candidates.
+
+[[Week 5.6 - ISA-Driven Metacognition|Week 5.6]] develops one specific termination-criterion variant of the verifier-signal primitive in depth — the **Ideal State Artifact** (ISA), a structured, mechanically-verifiable test harness that replaces "I think I'm done" with "all N ISCs pass". The confidence-threshold gate this chapter introduces is the cheap early-warn signal; ISA in W5.6 is the falsifiable terminator. Read W5.5 for the metacognition toolbox; read W5.6 when the toolbox needs a stricter stop condition.
 
 ---
 

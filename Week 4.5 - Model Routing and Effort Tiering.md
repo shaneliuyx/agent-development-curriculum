@@ -218,7 +218,7 @@ Must include at least one production blog post or canonical implementation repo.
 ## Resolved design decisions (locked 2026-05-14)
 
 1. **Scope:** ✅ 5 phases ~6 hours (matches W3.5.8 budget).
-2. **Classifier port `:8005`:** ✅ accepted as default. **TODO during Phase 1 implementation:** grep W3.x chapters for any pre-existing service binding to `:8005` and reassign if collision found.
+2. **Classifier port `:8005`:** ✅ accepted as default. Verified 2026-05-14: no pre-existing chapter binds `:8005`. Port is free for the classifier tier.
 3. **Probe set:** ✅ hand-label 60 prompts (forces domain articulation). Public benches (RouterBench, RouteLLM) cited in §2.3 as comparative reading only.
 4. **Vote concurrency:** ✅ `asyncio.gather()` parallel. Both classifiers are 1.5B-class — no contention concern.
 5. **PAI propose-then-verify pattern:** ✅ slot in W5.5, not W4.5 (self-state classification, not prompt classification).

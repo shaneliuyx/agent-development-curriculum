@@ -228,7 +228,7 @@ Must include at least one production blog post or canonical implementation repo.
 
 ## Resolved design decisions (locked 2026-05-14)
 
-1. **Scope vs W5.5 overlap:** ✅ ship as 5-phase chapter. **TODO during R2 expansion:** side-by-side re-read of W5.5 §1 + W5.6 §1 to confirm "demote W5.5 terminator to early-warn signal" framing reads cleanly and W5.5 does not feel obsolete.
+1. **Scope vs W5.5 overlap:** ✅ ship as 5-phase chapter. Verified 2026-05-14: side-by-side re-read of W5.5 §1 + W5.6 §1 confirms W5.5 retains the broader metacognition toolbox (Reflexion / Self-Refine / Self-Consistency + confidence calibration); W5.6 narrows to one termination-primitive variant (ISA). No obsolescence — clean hand-off. Forward link added to W5.5 §1.
 2. **ISA model layer:** ✅ Pydantic v2 (free JSON schema export benefits scaffolder LLM system prompt).
 3. **Scaffolder model:** ✅ haiku-tier (Qwen3.5-9B :8004). Re-evaluate after Phase 2 if ISC recall <80%.
 4. **LLM-judge fallback rubric:** ✅ structured `{verdict: pass|fail, reason: str}`. Free-text rubrics correlate with judge bias per Reflexion §6.
