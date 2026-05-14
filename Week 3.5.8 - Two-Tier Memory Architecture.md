@@ -868,12 +868,12 @@ The §3.1 consolidator imprints EVERY scroll the summarizer doesn't explicitly m
 
 ```mermaid
 flowchart LR
-    SCR[Closed scroll]
-    SUM[LLM summarize<br/>"one fact"]
-    QS[derive quality_score<br/>length + specificity<br/>+ LLM novelty]
-    GATE{score &gt;= threshold?}
-    IMP[EverCore imprint]
-    DROP[Discard<br/>"stays in STM"]
+    SCR["Closed scroll"]
+    SUM["LLM summarize<br/>one fact"]
+    QS["derive quality_score<br/>length + specificity<br/>+ novelty"]
+    GATE{"score >= threshold?"}
+    IMP["EverCore imprint"]
+    DROP["Discard<br/>stays in STM"]
 
     SCR --> SUM
     SUM --> QS
@@ -891,115 +891,195 @@ flowchart LR
 
 **Code:**
 
-`src/quality_gate.py` (extension to `consolidate()`):
+`src/quality_gate.py`:
 
 ```python
 """Quality-score promotion gate — STM → LTM filter.
 
-Reference: PraisonAI's memory subsystem applies a similar pattern at
+Reference: PraisonAI's memory subsystem uses a similar pattern at
 src/praisonai-agents/praisonaiagents/memory/memory.py — each candidate
 STM entry receives a quality_score in [0.0, 1.0]; only entries above
 a configurable threshold promote to LTM.
 
-This module derives a quality_score from three signals:
-  (a) summary_length      — too-short summaries lack content; too-long lose precision
-  (b) specificity         — contains a number, proper noun, or measured outcome
-  (c) llm_judged_novelty  — Haiku-tier judge: "does this duplicate prior LTM?"
+Three signals combined:
+  (a) length      — reward summaries in the 8-25 word band
+  (b) specificity — concrete tokens (numbers, units, proper nouns)
+  (c) novelty     — 1.0 - max(similarity to existing memories) via EverCore search
 
-Implementation depth note: the llm_judged_novelty hook is sketched here;
-in production it should batch-query EverCore for nearest-neighbour memories
-first and skip the LLM call on high-cosine hits. Marked TBD inline.
+The novelty signal calls EverCore's /api/v1/memories/search; on any error
+(connection failure, empty store, search timeout) it defaults to 1.0 so
+the consolidation pipeline degrades gracefully instead of stalling.
 """
 from __future__ import annotations
 
-import os
 import re
+from typing import TYPE_CHECKING
 
-from openai import OpenAI
+if TYPE_CHECKING:
+    from src.tiered_memory import TieredMemory
 
 
 SPECIFICITY_HINTS = re.compile(
     r"\b(\d+(\.\d+)?(%|ms|s|min|h|GB|MB|req/s)?|[A-Z][a-zA-Z]{2,})\b"
 )
 
+DEFAULT_WEIGHTS = {"length": 0.3, "specificity": 0.4, "novelty": 0.3}
+DEFAULT_THRESHOLD = 0.5
+
 
 def _length_score(summary: str) -> float:
-    """Reward summaries in the 8-25 word band; penalise outside."""
+    """Reward summaries in the 8-25 word band; penalise outside.
+
+    Triangular peak at 15 words. Below 5 → 0.0 (no content). Above 40
+    → 0.2 (clamped, not zeroed; long facts can still be useful if specific).
+    """
     n_words = len(summary.split())
     if n_words < 5:
         return 0.0
     if n_words > 40:
         return 0.2
-    # Triangular peak at 15 words.
     return max(0.0, 1.0 - abs(n_words - 15) / 15.0)
 
 
 def _specificity_score(summary: str) -> float:
-    """Reward summaries with concrete tokens (numbers, units, proper nouns)."""
+    """Concrete tokens (numbers, units, proper nouns). Saturates at 3 hits."""
     hits = len(SPECIFICITY_HINTS.findall(summary))
-    return min(1.0, hits / 3.0)  # Saturate at 3 specific tokens.
+    return min(1.0, hits / 3.0)
 
 
-def _novelty_score(summary: str, prior_memories: list[str]) -> float:
-    """TBD: should batch-query EverCore for nearest-neighbour first;
-    drop to LLM judge only on near-miss. For now, naive lexical proxy."""
-    if not prior_memories:
+def _novelty_score(
+    summary: str,
+    tm: "TieredMemory | None",
+    top_k: int = 5,
+) -> float:
+    """Novelty = 1.0 - max(similarity) over top-k nearest existing memories.
+
+    EverCore's hybrid search returns each episode with a `score` in [0.0, 1.0].
+    High score = high similarity = low novelty. On any search failure
+    (connection refused, empty store, timeout, schema drift) we default to 1.0
+    so the consolidation pipeline keeps running. Production rule: a novelty
+    signal that crashes the pipeline is worse than one that occasionally
+    over-promotes.
+    """
+    if tm is None:
         return 1.0
-    tokens = set(summary.lower().split())
-    overlaps = [
-        len(tokens & set(m.lower().split())) / max(1, len(tokens))
-        for m in prior_memories
-    ]
-    return max(0.0, 1.0 - max(overlaps))
+    try:
+        matches = tm.query_context(query=summary, k=top_k)
+    except Exception:                                              # noqa: BLE001
+        return 1.0
+    if not matches:
+        return 1.0
+    scores = [float(m.get("score") or 0.0) for m in matches]
+    return max(0.0, 1.0 - max(scores))
 
 
 def quality_score(
     summary: str,
-    prior_memories: list[str] | None = None,
+    tm: "TieredMemory | None" = None,
+    weights: dict[str, float] | None = None,
 ) -> float:
-    """Combined quality score in [0.0, 1.0]. Weighted average of three signals."""
+    """Combined quality score in [0.0, 1.0]. Weighted average of three signals.
+
+    Pass `tm` to enable the EverCore-backed novelty signal; omit (or pass None)
+    for unit-testable offline scoring (novelty defaults to 1.0).
+    """
+    w = {**DEFAULT_WEIGHTS, **(weights or {})}
     length = _length_score(summary)
     specificity = _specificity_score(summary)
-    novelty = _novelty_score(summary, prior_memories or [])
-    return 0.3 * length + 0.4 * specificity + 0.3 * novelty
+    novelty = _novelty_score(summary, tm)
+    return w["length"] * length + w["specificity"] * specificity + w["novelty"] * novelty
 
 
-def should_promote(summary: str, threshold: float = 0.5, **kw) -> bool:
-    """Promotion gate. Default threshold tuned on a 20-scroll probe; tune per domain."""
-    return quality_score(summary, **kw) >= threshold
+def should_promote(
+    summary: str,
+    threshold: float = DEFAULT_THRESHOLD,
+    tm: "TieredMemory | None" = None,
+    weights: dict[str, float] | None = None,
+) -> bool:
+    """Promotion gate. Default threshold tuned on the 20-scroll probe.
+
+    Domain biases:
+      - incident-response agents → threshold LOW (false-negative loses lessons)
+      - high-precision research agents → threshold HIGH (false-positive pollutes LTM)
+    """
+    return quality_score(summary, tm=tm, weights=weights) >= threshold
 ```
 
-The `consolidate()` loop in §3.1 then becomes:
+The `consolidate()` integration in §3.1 adds an optional `promotion_threshold` kwarg and a `scrolls_demoted` counter. Diff against the §3.1 source:
 
 ```python
-# inside the per-quest loop, after summarize_scroll(...)
-summary = summarize_scroll(scroll_text)
-if summary is None:
-    result.scrolls_skipped += 1
-    continue
+@dataclass
+class ConsolidationResult:
+    scrolls_seen: int
+    scrolls_imprinted: int
+    scrolls_skipped: int
+    errors: list[str]
+    # NEW — kept separate from scrolls_skipped so operators can distinguish
+    # summarizer-SKIP from quality-gate-DEMOTE in metrics.
+    scrolls_demoted: int = 0
 
-score = quality_score(summary, prior_memories=recent_ltm_snippets)
-if score < promotion_threshold:           # default 0.5; passed in via config
-    result.scrolls_skipped += 1
-    continue
 
-tm.imprint(
-    content=summary,
-    metadata={
-        "quest_id": quest_id,
-        "agent_id": tm.agent_id,
-        "source": "guild_consolidation",
-        "quality_score": round(score, 3),  # store score for later audit
-    },
-)
+async def consolidate(
+    tm: TieredMemory,
+    max_batch: int = 50,
+    campaign: str | None = None,
+    promotion_threshold: float | None = None,  # NEW — None = gate disabled
+) -> ConsolidationResult:
+    from src.quality_gate import quality_score   # local import avoids circular ref
+    # ... (list closed quests, load dedup state, build result, etc.) ...
+
+    for quest_id in quest_ids:
+        if quest_id in imprinted_before:
+            continue
+        try:
+            scroll_text = await tm.get_scroll(quest_id)
+            summary = summarize_scroll(scroll_text)
+            if summary is None:
+                result.scrolls_skipped += 1
+                continue
+
+            # §3.3 quality-gate check before imprint (active iff threshold set).
+            score: float | None = None
+            if promotion_threshold is not None:
+                score = quality_score(summary, tm=tm)
+                if score < promotion_threshold:
+                    result.scrolls_demoted += 1
+                    continue
+
+            metadata: dict[str, object] = {
+                "quest_id": quest_id,
+                "agent_id": tm.agent_id,
+                "source": "guild_consolidation",
+            }
+            if score is not None:
+                metadata["quality_score"] = round(score, 3)
+
+            tm.imprint(content=summary, metadata=metadata)
+            dedup.execute(
+                "INSERT OR IGNORE INTO imprinted (quest_id) VALUES (?)",
+                (quest_id,),
+            )
+            dedup.commit()
+            result.scrolls_imprinted += 1
+        except Exception as e:                                       # noqa: BLE001
+            result.errors.append(f"{quest_id}: {type(e).__name__}: {e}")
+```
+
+`tests/test_quality_gate.py` — 9 offline unit tests covering length peak, specificity saturation, threshold dial, weight override. Run alongside the §3.2 integration tests:
+
+```bash
+uv run pytest tests/ -v
+# expect: 12 passed in ~30s (3 integration + 9 unit)
 ```
 
 **Walkthrough:**
 
 - **Block 1 — derived score beats a hand-tuned threshold because the threshold becomes the operator-tunable dial, not the model's whim.** A binary SKIP rule baked into the summarizer prompt forces the LLM to make a policy decision it doesn't know the cost of. Splitting "what is the score" from "what's the cutoff" lets the human own the precision/recall trade-off explicitly — same pattern as classifier-calibration in ML pipelines.
 - **Block 2 — three signals, not one, because each catches a different failure.** Length alone misses verbose-but-empty summaries. Specificity alone misses well-cited duplicates. Novelty alone passes a single-word fact that happens to be new. Weighted combination forces a candidate to do well on at least two axes.
-- **Block 3 — trade-off is asymmetric and domain-dependent.** A false-positive (low-quality fact pollutes LTM) is recoverable: it dilutes semantic recall but doesn't poison reasoning. A false-negative (real insight skipped) is unrecoverable: the scroll TTLs out of STM and the lesson is gone. For incident-response agents, bias threshold LOW (accept more); for high-precision research agents, bias HIGH.
-- **Block 4 — `quality_score` is stored alongside the memory** so a later audit pass can re-promote demoted memories when threshold tuning changes. Without the score in metadata, the gate decision is unrecoverable.
+- **Block 3 — novelty backed by real semantic similarity, not lexical proxy.** Earlier drafts used token-overlap against a `prior_memories: list[str]` parameter; that doesn't catch paraphrased duplicates ("API uses Terraform" vs "we deploy via Terraform IaC"). The lab version delegates novelty to EverCore's hybrid search — same retrieval primitive that powers `query_context` — and reads back the `score` field on each match. `1.0 - max(score)` lands in `[0.0, 1.0]`. The try/except → 1.0 fallback is load-bearing: if the novelty backend is down, the pipeline degrades to "accept as novel" rather than stalling the consolidation cron.
+- **Block 4 — trade-off is asymmetric and domain-dependent.** False-positive (low-quality fact pollutes LTM) is recoverable: dilutes semantic recall but doesn't poison reasoning. False-negative (real insight skipped) is unrecoverable: the scroll TTLs out of STM and the lesson is gone. For incident-response agents, bias threshold LOW; for high-precision research agents, bias HIGH.
+- **Block 5 — `quality_score` stored in imprint metadata** so an audit pass can re-promote demoted memories when threshold tuning changes. Without the score in metadata, the gate decision is unrecoverable.
+- **Block 6 — `scrolls_demoted` is a separate counter from `scrolls_skipped`.** `skipped` means "summarizer said SKIP" (no reusable knowledge); `demoted` means "passed summarizer but below quality threshold". Metrics dashboards need both — they're different signals about pipeline health.
 
 **Result:**
 
@@ -1010,6 +1090,8 @@ tm.imprint(
 | 0.7 | ~0.93 | ~0.55 | aggressive; loses borderline insights |
 
 Probe set: 20 scrolls (10 high-value: explicit numbers + named tools; 10 low-value: vague status updates). Numbers are placeholder estimates — measure with `tests/test_quality_gate.py` on the actual lab probe set and update after the run.
+
+**Lab status (2026-05-14):** `quality_gate.py` + integration + 9 offline unit tests committed at `lab-03-5-8-two-tier@d0fb042`. 12/12 tests pass (3 integration + 9 unit, 30.05s wall). Gate is opt-in via `promotion_threshold=` kwarg; legacy `consolidate()` behavior (no gate) preserved when kwarg omitted.
 
 `★ Insight ─────────────────────────────────────`
 - **Cross-repo finding (single-source — flag accordingly).** The quality-score promotion gate pattern surfaces in PraisonAI's memory subsystem at `src/praisonai-agents/praisonaiagents/memory/memory.py`. We have not yet found a second independent implementation; treat this as one production datapoint, not a community consensus.
