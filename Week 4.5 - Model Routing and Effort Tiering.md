@@ -215,13 +215,13 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## Reviewer-pass questions (DELETE BEFORE COMMIT TO MAIN)
+## Resolved design decisions (locked 2026-05-14)
 
-1. **Scope:** is 5 phases (~6 hours of lab work) the right size? Comparable to W3.5.8 (~6 hours total). Default: yes.
-2. **Classifier-tier port choice (`:8005`):** does it conflict with anything in W3.x? Quick check needed.
-3. **Probe-set labelled by hand (60 rows):** is hand-labelling worth the ~45 min, or do we want a paper-derived public set? Decision: hand-label, because it forces domain-articulation. Public sets (RouterBench, RouteLLM) come into §2.3 references as comparative reading.
-4. **Should vote run in parallel via `asyncio.gather()` or serial?** Default: parallel (cheap, both classifiers are 1.5B-class). Note in §3 walkthrough.
-5. **Anti-pattern callout placement:** PAI's "skill self-activation propose-then-verify" is a metacognitive variant of routing — should it live in W4.5 or W5.5? Default: W5.5, since it's the "agent classifies its own state" variant rather than "classify the prompt".
+1. **Scope:** ✅ 5 phases ~6 hours (matches W3.5.8 budget).
+2. **Classifier port `:8005`:** ✅ accepted as default. **TODO during Phase 1 implementation:** grep W3.x chapters for any pre-existing service binding to `:8005` and reassign if collision found.
+3. **Probe set:** ✅ hand-label 60 prompts (forces domain articulation). Public benches (RouterBench, RouteLLM) cited in §2.3 as comparative reading only.
+4. **Vote concurrency:** ✅ `asyncio.gather()` parallel. Both classifiers are 1.5B-class — no contention concern.
+5. **PAI propose-then-verify pattern:** ✅ slot in W5.5, not W4.5 (self-state classification, not prompt classification).
 
 ---
 

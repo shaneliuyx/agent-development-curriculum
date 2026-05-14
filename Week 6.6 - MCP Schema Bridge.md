@@ -216,13 +216,13 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## Reviewer-pass questions (DELETE BEFORE COMMIT TO MAIN)
+## Resolved design decisions (locked 2026-05-14)
 
-1. **Scope:** is 5 phases (~6 hours of lab work) the right size? Comparable to W4.5 (~6 hours), W3.5.8 (~6 hours). Default: yes.
-2. **Pydantic `TypeAdapter` as fast path:** include in Phase 1 as an alternative impl (and benchmark the perf delta), or defer to a §2 aside? Default: aside in §2 + a single one-liner in `src/schema_bridge.py` that demonstrates the equivalence; full benchmark in `RESULTS.md` only.
-3. **Streaming-output complexity (Phase 5):** worth a full ~1-hour phase, or fold into Phase 3 as a 15-min stretch goal? Default: keep as Phase 5 because the AutoGPT `BlockOutputEntry` pattern is independently load-bearing for W11 production-deployment discussion; readers who skip W11 can stop at Phase 4.
-4. **Consumer test model choice:** Hermes on `:8004` haiku-tier (W4 fleet) or a cheap cloud Claude Haiku call for stronger structured-output discipline? Default: local Hermes (local-first discipline rule from CLAUDE.md); add an aside on what changes if the consumer is Claude.
-5. **5 example tools (Phase 3):** are these the right 5? `code_runner` overlaps with W7 Tool Harness; consider swapping for a more distinctive one. Decision deferred to round-2 review against the W7 spec.
+1. **Scope:** ✅ 5 phases ~6 hours (matches W4.5 / W3.5.8 budget).
+2. **`pydantic.TypeAdapter` fast path:** ✅ §2 aside + 1-line equivalence demo in `src/schema_bridge.py`. Full perf benchmark in `RESULTS.md`.
+3. **Streaming-output (Phase 5):** ✅ keep as full Phase 5. AutoGPT `BlockOutputEntry` pattern load-bearing for W11 production discussion; readers who skip W11 can stop at Phase 4.
+4. **Consumer test model:** ✅ local Hermes `:8004` haiku-tier (local-first CLAUDE.md rule). Aside on what changes for Claude consumer.
+5. **5 example tools:** **TODO during R2 review:** swap `code_runner` (W7 Tool Harness overlap) for a more distinctive tool. Current candidates: calendar event lookup, currency converter, geo-distance, dice-roll. Pin before Phase 3 implementation.
 
 ---
 
