@@ -730,11 +730,18 @@ These tests are **integration tests** — no mocks. They hit the real guild MCP 
 
 ```bash
 cd ~/code/agent-prep/lab-03-5-8-two-tier
+
+# Bootstrap pyproject.toml if it doesn't exist (W3.5.5 lab predates uv).
+# Skip if `pyproject.toml` is already present.
+test -f pyproject.toml || uv init --no-readme --no-workspace --python 3.12
+
 uv add --dev pytest pytest-asyncio
 
 mkdir -p tests
 touch tests/__init__.py
 ```
+
+`uv init` flags: `--no-readme` skips the auto-created README.md; `--no-workspace` opts out of workspace-member registration; `--python 3.12` pins the version to match W3.5.5 + EverCore. Without `pyproject.toml`, `uv add` errors with `No pyproject.toml found in current directory or any parent directory`.
 
 `tests/conftest.py` — `sys.path` bootstrap so `from src.consolidation import consolidate` resolves (same pattern as W3.5.5 §1.1):
 
@@ -806,6 +813,7 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
+| `error: No pyproject.toml found in current directory or any parent directory` | Lab dir was bootstrapped with pip + requirements.txt (W3.5.5 era), never converted to `uv` | `uv init --no-readme --no-workspace --python 3.12` first, then `uv add --dev pytest pytest-asyncio` |
 | `ModuleNotFoundError: No module named 'src'` | Missing `tests/conftest.py` or running `python tests/...` | Add the conftest sys.path bootstrap; always invoke via `uv run pytest`, never bare `python` |
 | `httpx.ConnectError: ... :1995` | EverCore data services up but app not running | `cd EverOS/methods/EverCore && uv run web` in another terminal (per §1.3) |
 | `mcp.errors.McpError: ... no active project` | guild not initialized in lab dir | `guild init --yes` from the lab root |
