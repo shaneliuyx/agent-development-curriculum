@@ -581,11 +581,6 @@ Realtime ~2.5× faster at p50, 3× more expensive. Consumer products: cost premi
 
 **Entry 4 — End-to-end model leaks pronoun context from audio metadata.** During testing OpenAI Realtime API, model began referring to user with pronouns matching voice acoustics (pitch, formants) rather than stated preference. End-to-end model infers demographic info from acoustics. Cascaded pipelines produce text transcripts with no acoustic metadata — LLM has no signal. Concrete privacy advantage for cascaded inspectability.
 
-**Entry 5 — Voice driver missing in production env crashes agent at import time.**
-*Symptom:* Agent that worked locally crashes on the production container at startup with `ImportError: PortAudio library not found` or `OSError: [Errno -9996] Invalid input device`. The container has no audio driver because it doesn't need one — the deployment is text-only (Slack, web chat). The agent never even gets to the part where it would skip voice.
-*Root cause:* Eager top-level imports of `pyaudio` (or eager construction of Whisper/TTS objects in `Interaction.__init__`) couple the agent's *startup* to the *availability* of voice dependencies. The voice flag check happens after `__init__` returns — too late.
-*Fix:* Lazy-init pattern from Phase 6.3. Move `import pyaudio` and `WhisperModel(...)` inside `@property` accessors (`_stt`, `_tts`) that only fire on first use. The text-only deployment never touches those properties, so missing audio drivers stay invisible. Validate in CI by running the agent in a container with `PYAUDIO_AVAILABLE=0` and confirming startup succeeds. Cross-ref: §4 Phase 6 lazy-degradable layer pattern.
-
 ---
 
 ## Production Considerations

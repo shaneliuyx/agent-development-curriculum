@@ -462,29 +462,6 @@ A knowledge-base skill embedded its full document corpus directly in SKILL.md as
 **Entry 4: `allowed-tools` not enforced.**
 Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `Read`, `Write`, and git commands anyway. `allowed-tools` is a strong hint to the model, not runtime-enforced. For genuine sandboxing, configure session-level permissions.
 
-**Entry 5 — Entry-points discovered but failed-import propagates silently.**
-*Symptom:* Registry boot reports "12 tools loaded" but agent retrieval consistently misses one specific skill; users complain "/weather doesn't work anymore" after a dependency bump; no error in logs.
-*Root cause:* `entry_points(group=...).load()` raised `ImportError` (a transitive dep was uninstalled), and the boot loop swallowed the exception inside a bare `except:` block. The entry_point was advertised in `pyproject.toml`, indexed by Python's metadata, but never instantiated — so it never landed in the SQLite cache and never showed up in retrieval. No stack trace because bare-except ate it.
-*Fix:* Never bare-except around `ep.load()`. Catch the specific exception class, log with `ep.name` and `ep.value`, and re-raise with context — or, if soft-degradation is the policy, write a `tools_failed` row to the cache so the operator can grep for it.
-
-```python
-# WRONG
-try:
-    cls = ep.load()
-except:  # bare except — eats ImportError, AttributeError, everything
-    continue
-
-# RIGHT
-try:
-    cls = ep.load()
-except (ImportError, AttributeError) as e:
-    log.error("entry_point %s failed: %s", ep.name, e)
-    self._db.execute(
-        "INSERT OR REPLACE INTO tools_failed VALUES (?, ?, ?)",
-        (ep.name, ep.value, str(e)))
-    raise RuntimeError(f"skill registry boot incomplete: {ep.name}") from e
-```
-
 ---
 
 ## Interview Soundbites

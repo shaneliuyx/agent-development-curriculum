@@ -677,7 +677,7 @@ if __name__ == "__main__":
 
 - **Block 4 — Pin-name discipline.** Why validate pin names against a declared set rather than letting any string through? Because magic strings drift. The model is emitting structured calls expecting specific output channels — if a block yields `"progress"` once and `"progres"` once due to a typo, the consumer's `if pin == "progress"` branch silently drops half the events. Validating against `declared_pins` at yield time turns this from a Heisenbug into a `ValueError` at the source.
 
-- **Block 5 — Backpressure.** The async generator pauses at each `yield` until the consumer's `async for` body completes one iteration. If the consumer is slow (e.g., writes each progress event to a remote logger that takes 50ms), the producer is *blocked at the yield site* for that 50ms — backpressure is automatic. This is correct for memory safety but can cause counter-intuitive latency: a "streaming" tool may not stream at all if the consumer is the bottleneck. See BCJ Entry 2 below for the production failure mode.
+- **Block 5 — Backpressure.** The async generator pauses at each `yield` until the consumer's `async for` body completes one iteration. If the consumer is slow (e.g., writes each progress event to a remote logger that takes 50ms), the producer is *blocked at the yield site* for that 50ms — backpressure is automatic. This is correct for memory safety but can cause counter-intuitive latency: a "streaming" tool may not stream at all if the consumer is the bottleneck. **Measure consumer body latency** — if it exceeds producer per-yield work, decouple via `asyncio.Queue` or batch progress events.
 
 **Result:** _(measured on M5 Pro, asyncio default event loop, 2026-05-14 run)_
 
@@ -707,15 +707,6 @@ The streaming variant pays ~1.3ms per yield in overhead vs the single-call varia
 *Fix:* Implement namespace separation: learned skills go to `skills.learned.*`, curated to `skills.curated.*`. Or implement explicit versioning: each skill has a timestamp; loader always picks newest. When a conflict is detected, explicitly choose: prefer curated (human-audited) or learned (domain-specific)? Make the choice explicit in config, not implicit in file order.
 
 **Tags:** #skill-versioning #conflict-resolution #learned-agents #hermes #w6.5
-
-**Captured in curriculum at:** [[Week 6.5 - Hermes Agent Hands-On#Bad-Case Journal]]
-
-**Entry 2 — Streaming consumer hangs on slow producer; backpressure stalls the entire agent loop.**
-*Symptom:* A typed-block tool declared as `AsyncGenerator[tuple[str, Any], None]` is supposed to stream progress events to the UI. In production, the UI shows nothing for 8s then dumps all 100 progress events at once, then the result. Wall time is fine (~135ms expected) but the agent loop's `await next(producer)` is *blocked* waiting for the consumer between yields. Subsequent tool invocations queue up behind it; the agent feels frozen.
-*Root cause:* `AsyncGenerator` provides automatic backpressure — the producer pauses at each `yield` until the consumer's `async for` body finishes one iteration. The consumer was writing each progress event synchronously to a remote log endpoint (~80ms per write). 100 events × 80ms = 8s of stall, all attributed to the producer in the latency budget. The "streaming" tool wasn't streaming because the consumer was the bottleneck.
-*Fix:* Decouple consumer-side I/O from the iteration loop. Use `asyncio.Queue` between `async for` and the slow sink: the iteration body does a non-blocking `queue.put_nowait((pin, value))` and a separate background task drains the queue to the remote sink. Alternatively, batch progress events (`yield "progress_batch", [0,1,2,...,9]` every 10 ticks) to amortize per-yield overhead. Always measure consumer body latency — if it exceeds producer's per-yield work, you have inverted backpressure and the streaming contract is a lie.
-
-**Tags:** #async-generator #backpressure #typed-blocks #streaming-pins #w6.5
 
 **Captured in curriculum at:** [[Week 6.5 - Hermes Agent Hands-On#Bad-Case Journal]]
 
