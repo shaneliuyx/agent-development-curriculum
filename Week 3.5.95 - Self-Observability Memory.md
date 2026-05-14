@@ -208,13 +208,13 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## Reviewer-pass questions (DELETE BEFORE COMMIT TO MAIN)
+## Resolved design decisions (locked 2026-05-14)
 
-1. **Numbering choice — W3.5.95 vs W3.6?** W3.5.95 sits inside the memory cluster (3.5, 3.5.8, 3.5.9) and signals "elective supplement deep inside the memory thread"; W3.6 would imply a new primary thread. Default: keep W3.5.95 because pedagogically it IS a memory variant (self-facing vs world-facing), not a new topic. Risk: decimal-cascade visual clutter in the vault TOC.
-2. **Single-source convergence risk.** This chapter is sourced from one repo (PAI) where W4.5 was sourced from a 4-repo cross-repo convergence. Should we hold the chapter until at least one second source (Reflexion impl, Voyager skill-library repo, or another self-observability agent) is folded in to avoid PAI-specific accident? Default: ship as v0 spec, add second source before lab-execution round.
-3. **Table-size cap policy.** Default to 90-day retention with rollup-summary for older windows, or to a hard row-cap (e.g., 100K rows)? 90-day retention is more PAI-idiomatic; hard cap is more deterministic for a teaching lab. Lean: 90-day + rollup, document hard-cap as alternative.
-4. **PII-scrubbing default.** Default ON (safer, slightly distorts the data) or OFF with opt-in (truer to raw OBSERVABILITY, leak risk on shared repos)? Lean: ON by default, document the opt-out for power users. See BCJ Entry 5.
-5. **LEARNING summarizer model — same as agent or separate smaller model?** Using the agent's opus-tier model gives high-quality summaries but bakes the agent's biases into its self-knowledge (echo-chamber risk). Using a separate haiku-tier model breaks the feedback loop at some summary-quality cost. Lean: separate haiku-tier on `:8004`. This is the §2.2 concept-5 + Phase 3 pedagogical-note tension; surface it explicitly in the chapter prose.
+1. **Numbering:** ✅ W3.5.95 (memory-cluster variant, not new thread).
+2. **Single-source PAI risk:** ✅ ship as v0 spec. **TODO before lab-execution round:** fold in second source (Reflexion arXiv:2303.11366 implementation or Voyager skill-library impl) to validate the OBSERVABILITY+LEARNING split isn't PAI-specific accident.
+3. **Retention policy:** ✅ 90-day window + rollup-summary for older data. Hard 100K-row cap documented as alternative.
+4. **PII-scrubbing:** ✅ default ON. Opt-out documented for power users; see BCJ Entry 5.
+5. **LEARNING summarizer model:** ✅ separate haiku-tier on `:8004` (breaks echo-chamber feedback loop at modest summary-quality cost). Surface tension in §2.2 + Phase 3 walkthrough.
 
 ---
 

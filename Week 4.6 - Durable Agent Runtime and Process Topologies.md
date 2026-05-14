@@ -253,13 +253,13 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## Reviewer-pass questions (DELETE BEFORE COMMIT TO MAIN)
+## Resolved design decisions (locked 2026-05-14)
 
-1. **Scope:** is 5 phases (~6 hours of lab work) the right size for a runtime chapter? The temptation is to balloon — this is the chapter where one could spend 20 hours and still not be done. Default: 6 hours, 200–300 LOC target, hard cap on Redis/multi-host work (deferred to W11.5 / W12). Confirm or push back.
-2. **Lock primitive default:** `fcntl.flock` is POSIX-only (no Windows fallback). Acceptable given the curriculum's macOS-target assumption? Default: yes, with a one-line note. Alternative: SQLite `BEGIN EXCLUSIVE` (cross-platform but coarser). Confirm.
-3. **Topology coverage:** PraisonAI ships 4 (sequential / parallel / hierarchical / workflow). Do we implement all 4, or implement 2–3 + explain the other 1–2 conceptually? Default: implement all 4 (each is ~30–50 LOC once the runtime exists); the bench is the empirical anchor.
-4. **Scheduler scope:** cron + webhook + manual trigger is the spec. Should we add an "event trigger" (e.g., file-watcher, message-queue consumer) for completeness, or is that W11.5 / W12 territory? Default: defer event triggers; cron + webhook + manual is sufficient to prove the no-self-prompt thesis.
-5. **Cost-meter rate card:** do we hardcode public per-token rates (cloud-equivalent) in the rate-card dict, or measure local-MLX wall-clock only and skip $-equivalent? Default: hardcode public rates (Claude Sonnet 4.6 / Haiku 4.5 / Opus 4.5) so the chapter speaks the language of production cost dashboards; readers can override.
+1. **Scope:** ✅ 5 phases / 6 hours / 200–300 LOC hard cap. Redis + multi-host deferred to W11.5 / W12.
+2. **Lock primitive:** ✅ `fcntl.flock` (POSIX). One-line note re: macOS-target assumption + SQLite `BEGIN EXCLUSIVE` as cross-platform alternative.
+3. **Topology coverage:** ✅ implement all 4 PraisonAI modes (each ~30–50 LOC once runtime exists); benchmark is the empirical anchor.
+4. **Scheduler scope:** ✅ cron + webhook + manual trigger. Event triggers (file-watcher, MQ) deferred to W11.5 / W12.
+5. **Cost meter:** ✅ hardcode public per-token rates (Claude Sonnet 4.6 / Haiku 4.5 / Opus 4.5) as cloud-equivalent baseline. Readers override for their stack.
 
 ---
 

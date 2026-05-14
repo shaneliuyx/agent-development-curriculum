@@ -226,13 +226,13 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## Reviewer-pass questions (DELETE BEFORE COMMIT TO MAIN)
+## Resolved design decisions (locked 2026-05-14)
 
-1. **Scope:** is 5 phases (~6 hours) the right size given W5.5 is already in the curriculum? The risk is overlap; the mitigation is that W5.5 demotes its terminator to "early-warn signal" inside W5.6's loop — verify this framing reads cleanly and doesn't make W5.5 feel obsolete.
-2. **Pydantic v2 vs dataclasses for `ISA`:** Pydantic gives JSON schema export for free (useful when the scaffolder LLM needs the schema in its system prompt), but adds a dependency. Decision needed before Phase 1.
-3. **Should the scaffolder be haiku-tier (Qwen3.5-9B) or sonnet-tier (Gemma-4-26B)?** Default: haiku — structured-output extraction is well within 9B capability and we want the latency low because scaffolding happens once per task. Re-evaluate after Phase 2 measurement if ISC recall is below 80%.
-4. **LLM-as-judge fallback rubric:** should the rubric be free-text or structured (yes/no with reason)? Default: structured (`{verdict: pass | fail, reason: str}`); free-text rubrics correlate with judge bias per Reflexion §6.
-5. **Reconciliation: synchronous vs async?** Default: synchronous (block the loop turn until reconciliation finishes); async introduces the Entry-3 race condition. Note in §3 walkthrough.
+1. **Scope vs W5.5 overlap:** ✅ ship as 5-phase chapter. **TODO during R2 expansion:** side-by-side re-read of W5.5 §1 + W5.6 §1 to confirm "demote W5.5 terminator to early-warn signal" framing reads cleanly and W5.5 does not feel obsolete.
+2. **ISA model layer:** ✅ Pydantic v2 (free JSON schema export benefits scaffolder LLM system prompt).
+3. **Scaffolder model:** ✅ haiku-tier (Qwen3.5-9B :8004). Re-evaluate after Phase 2 if ISC recall <80%.
+4. **LLM-judge fallback rubric:** ✅ structured `{verdict: pass|fail, reason: str}`. Free-text rubrics correlate with judge bias per Reflexion §6.
+5. **Reconciliation concurrency:** ✅ synchronous (avoids BCJ Entry 3 race condition). Note in §3 walkthrough.
 
 ---
 
