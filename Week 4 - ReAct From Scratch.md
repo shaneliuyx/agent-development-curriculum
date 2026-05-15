@@ -435,6 +435,165 @@ python scripts/probe_fleet.py --json > data/run_$(date +%s).json   # snapshot fo
 
 > **Re-run the probe after any vMLX engine upgrade.** A v?→v? bump in this lab changed Sonnet from "request timeout" to "301 ms median" with no model change. Engine version is a load-bearing variable in the role map; pin it in `RESULTS.md`.
 
+### 1.5 Refactor — MLX Studio gateway + role map (`src/models.py`, lab commit 2026-05-05)
+
+The §1.3 `.env` block and §1.4 probe results describe the **launch baseline**: each model on its own vMLX port (`:8002` / `:8003` / `:8004` / `:8001`), with one `OpenAI` client per port. As the role count grew (loop + tool_arg + classify + reason + compose + finisher + hard_loop), client construction + connection management became a per-loop tax. The 2026-05-05 lab refactor consolidates ALL models behind a single **MLX Studio API gateway** on `:8080/v1` and routes per-request via the `model:` field. Measured gateway overhead: zero (Sonnet 207→203 ms, Haiku 448→430 ms; within noise). Code lands in `src/models.py` (~150 LOC) as a single source of truth for role → endpoint mapping.
+
+```mermaid
+flowchart TD
+  subgraph BEFORE["Before 2026-05-05 — multi-port (BASELINE)"]
+    L1["react.py loop"] --> P1[":8002 vMLX<br/>Opus / 35B"]
+    L1 --> P2[":8003 vMLX<br/>Sonnet / 26B"]
+    L1 --> P3[":8004 vMLX<br/>Haiku / 9B"]
+    L1 --> P4[":8001 vMLX<br/>JANG_4M lazy"]
+  end
+  subgraph AFTER["After 2026-05-05 — gateway (SHIPPED)"]
+    L2["react.py loop"] --> G[":8080/v1 MLX Studio gateway"]
+    G --> M1["models/Qwen3.6-35B-A3B-nvfp4"]
+    G --> M2["models/gemma-4-26B-A4B-it-heretic-4bit"]
+    G --> M3["models/MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit"]
+    G --> M4["models/Gemma-4-31B-JANG_4M-CRACK"]
+  end
+```
+
+**Code:**
+
+```python
+# src/models.py — role → endpoint mapping behind one gateway (~151 LOC)
+"""All requests route through the MLX Studio API gateway on :8080/v1, with
+the specific model selected by the `model:` field. Gateway-vs-direct-port
+adds zero measurable overhead (Sonnet 207->203 ms, Haiku 448->430 ms —
+within noise; see data/fleet_probe_*v9_gateway.json).
+
+Probe-driven mapping as of 2026-05-05 (vMLX gateway, M5 Pro 48 GB):
+  loop, tool_arg, classify  -> Distill 9B (1.00 across 5 runs, only stable)
+  reason, compose           -> Gemma-26B  (reason+instr 1.00 when warm)
+  finisher, hard_loop       -> JANG_4M-CRACK (lazy; tool=1.00 + 4M context)
+
+Why JANG_4M-CRACK over gemma-31B-uncensored-heretic-mlx-4bit:
+  Both 31B Gemma-4 4-bit dense fine-tunes. heretic scored tool=0.00 —
+  uncensored fine-tune destroyed function-call alignment. JANG scored
+  tool=1.00, json=1.00, reason=1.00, instr=1.00 with 2135 ms median ping.
+  Same parameter scale, same quant, opposite agent-usability.
+"""
+from __future__ import annotations
+import os
+from dataclasses import dataclass
+from typing import Literal
+from openai import OpenAI
+
+_GATEWAY_URL = os.getenv("VMLX_GATEWAY_URL", "http://localhost:8080/v1")
+
+# Model identifiers carry the `models/` prefix expected by the gateway router.
+_HAIKU_MODEL   = os.getenv("MODEL_HAIKU",     "models/MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit")
+_SONNET_MODEL  = os.getenv("MODEL_SONNET",    "models/gemma-4-26B-A4B-it-heretic-4bit")
+_OPUS_LAZY_MODEL = os.getenv("MODEL_OPUS_LAZY", "models/Gemma-4-31B-JANG_4M-CRACK")
+
+API_KEY = os.getenv("VMLX_API_KEY", "not-needed")  # vMLX ignores; SDK requires non-empty
+
+Role = Literal["loop", "tool_arg", "classify", "reason", "compose",
+               "finisher", "hard_loop"]
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    url: str
+    model: str
+    timeout_s: float
+
+
+ROLE_MAP: dict[str, Endpoint] = {
+    "loop":      Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=30),
+    "tool_arg":  Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=30),
+    "classify":  Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=10),
+    "reason":    Endpoint(_GATEWAY_URL, _SONNET_MODEL,    timeout_s=45),
+    "compose":   Endpoint(_GATEWAY_URL, _SONNET_MODEL,    timeout_s=45),
+    "finisher":  Endpoint(_GATEWAY_URL, _OPUS_LAZY_MODEL, timeout_s=90),
+    "hard_loop": Endpoint(_GATEWAY_URL, _OPUS_LAZY_MODEL, timeout_s=60),
+}
+
+
+_CLIENT_CACHE: dict[tuple[str, float], OpenAI] = {}
+
+
+def get_client(role: Role) -> tuple[OpenAI, str]:
+    """Return (client, model_name) for a role. Reuses cached clients."""
+    ep = ROLE_MAP[role]
+    key = (ep.url, ep.timeout_s)
+    client = _CLIENT_CACHE.get(key)
+    if client is None:
+        client = OpenAI(
+            base_url=ep.url, api_key=API_KEY,
+            timeout=ep.timeout_s, max_retries=0,
+        )
+        _CLIENT_CACHE[key] = client
+    return client, ep.model
+
+
+def compose_final_answer(raw_answer: str, user_query: str,
+                         system: str | None = None) -> str:
+    """Lazy-spin the `finisher` model for high-quality post-loop polishing.
+
+    Cold-start tax ~5-15s; subsequent calls ~1.7-2s median. Tool calling
+    intentionally NOT requested — plain-text-in, plain-text-out. Returns
+    raw_answer on ANY error (broad except is deliberate: optional polish
+    must never block agent return path).
+    """
+    client, model = get_client("finisher")
+    sys_prompt = system or (
+        "Polish the agent's draft answer for a human reader. Keep all factual "
+        "content. Improve clarity, fix grammar, drop scratchpad noise."
+    )
+    try:
+        r = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"Query: {user_query}\nDraft: {raw_answer}"},
+            ],
+            temperature=0.3, max_tokens=2048,
+        )
+        return r.choices[0].message.content or raw_answer
+    except Exception:  # broad: lazy polish must never block return
+        return raw_answer
+
+
+__all__ = ["Role", "Endpoint", "ROLE_MAP", "get_client",
+           "compose_final_answer", "API_KEY"]
+```
+
+**Walkthrough:**
+
+**Block 1 — Single `_GATEWAY_URL` constant.** Lab launch had 4 separate `OpenAI(base_url=...)` instances, one per port. Refactor unifies on one URL. Why this matters: client construction is non-trivial (TCP pool init + httpx setup + auth header marshalling); with 7 roles bouncing across 4 ports, that's ~28 client constructions in a fresh `react.py` import. Gateway gives 1 URL + 1 client = constant-time setup. The `VMLX_GATEWAY_URL` env override is the production hook for swapping LAN / remote gateway URLs.
+
+**Block 2 — `models/` prefix on model IDs.** MLX Studio gateway dispatches by the `model:` field in the OpenAI request body. The literal prefix `models/` is the gateway's route table convention. Compare to launch-baseline where the model name was implicit (whatever the per-port server was loaded with). Trade-off: explicit naming = portable + multi-model-per-port, but every model identifier must carry the prefix or the gateway returns 404.
+
+**Block 3 — `@dataclass(frozen=True) Endpoint`.** Immutable per-role config. Why frozen: `ROLE_MAP` is module-level state; if any caller mutated an `Endpoint` (`map["loop"].timeout_s = 60`), the change would persist for all subsequent callers. Freezing forbids the mutation at construction time. CLAUDE.md immutability rule applied to runtime-shared state.
+
+**Block 4 — `ROLE_MAP` dict-of-Endpoints with 7 roles.** All 4 model choices map to one URL; the variation is in `model` field + `timeout_s`. Why per-role timeouts: classify is hot path (10s) → tight ceiling; reason/compose are content-bearing (45s) → wider; finisher is lazy + 31B (90s) → widest. Production rule: timeouts should encode task-shape expectations, not be uniform.
+
+**Block 5 — `_CLIENT_CACHE` keyed by `(url, timeout)`.** All 7 roles share `_GATEWAY_URL`, but timeouts vary (10/30/45/60/90). So the cache holds 5 distinct `OpenAI` instances even though there's 1 gateway URL. Why not key by URL alone: different timeout configs require distinct httpx clients (timeout is bound at client construction, not at request time). Caching at the (url, timeout) tuple gives correctness + reuse.
+
+**Block 6 — `compose_final_answer` lazy-loader bailout.** Returns `raw_answer` on ANY exception — deliberate broad `except`. Reason: this is OPT-IN polish. The agent's hot-path return already produces a working answer. If the lazy 31B model has a cold-start failure or OOM, the user still gets the unpolished draft. CLAUDE.md "fail open, not closed" pattern applied: the lazy polish must NEVER block the agent's primary return path.
+
+**Block 7 — JANG_4M-CRACK vs heretic — empirical tie-break.** Same parameter scale (31B), same quant (4-bit), same Gemma-4 family. Probe scores diverged: heretic `tool=0.00` (uncensored fine-tune destroyed function-call alignment); JANG `tool=1.00, json=1.00, reason=1.00, instr=1.00`. Pedagogical lesson: model selection is NOT a free choice within a family — fine-tune lineage matters for agent-usability. The chapter's earlier §1.4 fleet probe is the discovery mechanism; §1.5 ROLE_MAP is where the discovery becomes durable config.
+
+**Result** (measured 2026-05-05 lab commit, recorded in `data/fleet_probe_*v9_gateway.json`):
+
+- Gateway-vs-direct-port overhead: Sonnet 207→203 ms (-2%, within noise); Haiku 448→430 ms (-4%, within noise). **Effectively zero.**
+- Client cache hit rate after warm-up: 100% (5 distinct clients cover all 7 roles).
+- Cold-start: first call to a model on the gateway triggers ~5-15s lazy load (MLX Studio loads model weights on demand). Subsequent calls 1.7-2s median for compose_final_answer / ~200-450ms for hot-path roles.
+- Probe-driven verdicts that landed in ROLE_MAP: 5/5 stability runs at temp=0 across all 7 roles on M5 Pro 48 GB.
+
+`★ Insight ─────────────────────────────────────`
+- **Gateway refactor is an ARCHITECTURAL move masquerading as ops cleanup.** Pre-refactor, the loop had to know about ports. Post-refactor, the loop only knows about roles. Adding an 8th role costs one ROLE_MAP entry; pre-refactor it would have cost a new vMLX server + port + .env entry. The cost-of-change difference is what makes role-routing a first-class lab artifact instead of a config detail.
+- **Probe-driven ROLE_MAP is the load-bearing pedagogy of this lab.** Without measured probe results, "Distill 9B for loop, Gemma-26B for reason" is arbitrary. With probe results (Distill `tool=1.00`, Gemma `reason=1.00`, JANG `tool=1.00`, heretic `tool=0.00`), the mapping has empirical justification. Production teams should re-run the probe whenever a model swap is considered — exactly the pattern §1.4 established.
+- **`compose_final_answer`'s broad `except` is the chapter's first formal "fail open" pattern.** Phase 2's loop has `try`/`except` AROUND tool calls (errors-on-main-path per Concept 5); this is the same principle applied to OPTIONAL post-loop polish. Two different `try`/`except` shapes, two different failure-budget intents.
+- **W4.5 Model Routing chapter consumes this directly.** The role-tier framework — loop/tool/classify/reason/compose/finisher/hard_loop — is the same axis W4.5 extends with cost-latency Pareto + vote-on-disagreement. Reader who completes §1.5 has the role vocabulary before hitting W4.5's optimization questions.
+`─────────────────────────────────────────────────`
+
+> **Backward compat note:** §1.3's `.env` block (`VMLX_*` per-port) describes the launch-baseline config. The shipped lab uses `VMLX_GATEWAY_URL=http://localhost:8080/v1` + `MODEL_*` env vars to select model IDs. Both styles are illustrated for pedagogical contrast; use the gateway style for new work.
+
 ---
 
 ## Phase 2 — Implement the ReAct Loop From Scratch (~150 LOC, No Framework)
