@@ -1364,6 +1364,71 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 
 **Is the guild + EverCore architecture valid in production? Honest answer: VALID for the chapter's pedagogical thesis, NOT optimal for production performance or scalability.** The architecture exercises the most concepts (operational tier, conversation-shape extraction pipeline, the conversation-vs-fact contract mismatch, cross-agent recall via shared `user_id`) — which is exactly what a senior-engineer interview rewards. But for a real production workload it costs more than the alternatives. Both truths matter; teach both.
 
+### Paradigm commitment — full 8-paradigm taxonomy + W3.5.8's explicit choice
+
+Memory-system literature (Batchelor-Manning 2026 survey of 19 agent-memory systems) identifies **eight distinct paradigms** for "what memory fundamentally is" — each a different commitment about the primary retrieval mode:
+
+| # | Paradigm | One-sentence summary | Representative systems |
+|---|---|---|---|
+| 1 | **Flat vector RAG + structured extras** | Embed everything, retrieve top-k, prepend; add layers (provenance, types, confidence, dedup) on top | SimpleMem, Memex (early) |
+| 2 | **Knowledge-graph augmented** | Memory as typed graph of entities + relationships; traversal + vector ranking | Graphify, EdgeQuake, GitNexus |
+| 3 | **Progressive compression** | Hierarchy of increasingly summarised representations with heat-gated promotion between tiers | MemoryOS, SimpleMem (hybrid) |
+| 4 | **Multi-index hybrid search** | Multiple indexes + fusion stage (usually RRF k=60) | Hindsight, Supermemory, Graymatter, OpenContext, mem9 |
+| 5 | **LLM-as-retriever** | Hierarchical map of documents; LLM navigates by reading + tree-walking | Memex (final), OpenKB, Supermemory rewrite mode |
+| 6 | **Trace-as-memory** | Memory is the agent's own execution history, not the user's data | Moraine (pure), Hindsight (hybrid observation tier) |
+| 7 | **Karpathy LLM wiki** | Plain Markdown + wikilinks + frontmatter; index file as catalogue; user as final curator | Understand-Anything (reads), OpenKB (writes), LLM-Wiki (both) |
+| 8 | **Filesystem-native context store** | File is the artefact; database is a derivative cache; disk wins | OpenContext, Tolaria, second-brain |
+
+**The negative consensus across all 19 systems: flat vector RAG ALONE is not enough.** Every one of the 19 that started with Paradigm-1-as-sole-mechanism eventually added something on top. The agreement is total. The disagreement is on WHICH paradigm to compose with it.
+
+#### Where W3.5.8 sits (explicit composition)
+
+This lab implements a **Paradigm 1 + Paradigm 3 + Paradigm 6 composition** with **Paradigm 3 as primary retrieval**:
+
+| Component | Paradigm | Role |
+|---|---|---|
+| guild scrolls (raw quest reports + journals + timestamps + agent attribution) | **Paradigm 6** | Storage substrate. NOT in the read-time hot path; accessed only via `list_closed_quests` + `get_scroll` for forensics/replay. |
+| `consolidate()` pipeline (summarize → quality_gate → imprint) | **Paradigm 3** | Compresses Paradigm-6 traces into Paradigm-3 facts; heat-gated by `quality_score` + `promotion_threshold`. |
+| EverCore semantic tier (memcell + atomic_facts + profile aggregation) | **Paradigm 3** | Native shape: progressive compression with extraction pipeline. |
+| Qdrant variant (Phase 7: embed + upsert with type + confidence + provenance metadata) | **Paradigm 1 + structured extras** | Flat vector RAG with the write-time investment forms applied (forms #4-6 from §Production Considerations earlier). |
+| `query_context()` (user-facing retrieval) | **Paradigm 3** | Returns consolidated facts. THIS is the primary retrieval surface. |
+
+**Paradigms we explicitly did NOT implement** (with reason):
+
+| # | Paradigm | Why not in W3.5.8 |
+|---|---|---|
+| 2 | Knowledge-graph | Deferred to [[Week 3.5.9 - Memory Benchmarks and Hypergraph Three-Tier]] which adds HyperMem as the L3 relational tier. W3.5.8 stays two-tier. |
+| 4 | Multi-index hybrid (RRF) | EverCore does this INTERNALLY (Mongo + ES + Milvus); we don't compose it externally. Stretch lab candidate. |
+| 5 | LLM-as-retriever | Different chapter entirely — would be a W3.7-class agentic-RAG topic, not a memory chapter. |
+| 7 | Karpathy wiki | Not memory-system shape; closer to W6.7 Agent Skills (Anthropic-pattern skills as Markdown). |
+| 8 | Filesystem-native | The chapter assumes a database substrate (SQLite for guild, EverCore/Qdrant for semantic). Filesystem-native is a different bet on substrate ownership. |
+
+#### The Paradigm 3 / Paradigm 6 contradiction (and how composition resolves it)
+
+You cannot make BOTH Paradigm 3 and Paradigm 6 primary at the same retrieval call site without contradiction. The same user query "what did agent A do on the API deploy?" returns:
+
+- **Paradigm 3**: "Production deploys use Terraform IaC with VPC peering and 5-min budget." (consolidated lesson)
+- **Paradigm 6**: "Agent A claimed QUEST-74 at 14:03 UTC; ran terraform plan; ran terraform apply; got HTTP 200 at 14:08; verified VPC peering at 14:09; wrote scroll; fulfilled quest at 14:10." (audit trail)
+
+Both are "memory." They answer different questions. Routing the same query through both forces them to compete for primacy at the retrieval-fusion layer — which the literature shows degrades both.
+
+**The production composition pattern** (which W3.5.8 inherits): pick ONE paradigm primary; expose the other(s) as SEPARATE retrieval methods at distinct call sites. W3.5.8 picks Paradigm 3 primary via `query_context()`. The lab leaves Paradigm-6 retrieval as a Phase 10 stretch via `query_trajectory(query)` — searches raw scrolls in guild for audit/replay/explainability use cases. Different namespaces, different latency profiles, different ranking models. Caller commits per-query by picking the method.
+
+#### Architectural consequences of the choice
+
+Picking Paradigm 3 primary forces these consequences through the whole stack — every reader should be able to name them:
+
+1. **Consolidation pipeline is load-bearing.** Recall quality depends on summarizer quality + atomic_fact extraction quality. The BCJ Entry 8 reasoning-model token-budget fix matters BECAUSE the summarizer is on the critical path.
+2. **Conversation-shape contract matters** (BCJ Entry 13). EverCore's pipeline expects Paradigm-6-shaped INPUT (conversation transcripts) and emits Paradigm-3 OUTPUT (memcells). Our scrolls are already Paradigm-3-shaped; forcing the 2-turn synthetic wrap + flush is a workaround. A pure-Paradigm-6 architecture would not have this mismatch.
+3. **Per-imprint latency** is dominated by write-time investment (article above: 5-12 min per 50-scroll batch on EverCore; 1-2 min on Qdrant). Read latency is correspondingly low. A Paradigm-6-primary architecture would invert this — sub-second writes, expensive multi-hop reads over event logs.
+4. **The 6 write-time investment forms** (atomisation, type tagging, confidence scoring, provenance, multi-step ingest, online dedup-and-synthesis) are the Paradigm-1-with-extras pattern from the survey. Phase 7 Qdrant ships 4/6 today; Phase 9 stretch ships the 5th (dedup-and-synthesis); the 6th (multi-step ingest) is what `consolidate()` ALREADY does.
+
+`★ Insight ─────────────────────────────────────`
+- **Naming the paradigm IS the senior-engineer signal.** Candidates who say "I built a memory system" lose to ones who say "I built a Paradigm 1+3+6 composition with Paradigm 3 primary; here are the trade-offs that propagate" — same artifact, very different demonstration of architectural awareness.
+- **The negative consensus matters more than the positive choice.** All 19 surveyed systems agree flat-vector-RAG-only is insufficient; the field is in "informed eclecticism" — agreed on the problem, agreed on what doesn't work, no convergence on a single replacement. The lab teaches BOTH sides: Phase 7 Qdrant variant adds 4 of the 6 write-time-investment forms on TOP of vector RAG (Paradigm 1 + structured extras); EverCore variant uses Paradigm 3 progressive compression natively.
+- **Each paradigm has an Achilles' heel.** Paradigm 1 lacks temporal + relational queries; P2 KGs are hardest to maintain under source change; P3 progressive compression LOSES information by design; P4 multi-index needs explainable fusion; P5 LLM-as-retriever pays at read time; P6 trace-only has no synthesis; P7 wiki needs human curation at scale; P8 filesystem-native pushes synthesis onto the agent. The candidate who can name the weakness of their chosen paradigm is the one who already mitigated it.
+`─────────────────────────────────────────────────`
+
 ### Pre-design checklist — which bucket is your data in?
 
 Before picking a semantic backend, answer these three questions about your input shape. The answer tells you which bucket you're in and which backend earns its cost.
