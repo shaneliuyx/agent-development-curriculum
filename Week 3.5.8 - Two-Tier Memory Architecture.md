@@ -1801,7 +1801,15 @@ That answer is grounded in TWO measured experiments (Phase 7 + Phase 8), not one
 
 ---
 
-## Phase 9 — Optional Stretch: Online Dedup-and-Synthesis (~4 hours, SPEC)
+## Phase 9 — Optional Stretch: Online Dedup-and-Synthesis (~4 hours, IMPLEMENTED 2026-05-15)
+
+**Status:** Implemented in lab `lab-03-5-8-two-tier@bf1d091`. 4/4 tests pass in 43.86s against live Qdrant + local oMLX. Files shipped: `src/dedup_synthesis.py` (~165 LOC), `tests/test_dedup_synthesis.py` (4 tests), `consolidation.py` extended with `use_dedup: bool` kwarg + new counters (`facts_deduplicated`, `facts_updated`, `facts_deleted`). Scoped to Qdrant variant; EverCore's internal extraction pipeline already does its own dedup that's not externally composable.
+
+**Measured 2026-05-15:** Second scroll covering same ground as first → `facts_deduplicated=2`, validating the article's "compounds across every retrieval" claim with real data.
+
+**Test-design caveat surfaced:** Qdrant collection `lab358_memories` is shared across tests by default. First consolidate call in dedup-mode hit prior-test residue and dedup'd everything — test assertion broadened to accept "imprinted OR deduplicated >= 1" as evidence the pipeline ran. Production lesson: per-test collection isolation OR explicit pre-test cleanup is required when dedup is in the loop.
+
+
 
 Form #1 from Batchelor-Manning's survey of the 19 systems — the article's highest-leverage form by ROI ("compounds across every retrieval"). When a new fact arrives, the system queries the existing store for candidates that overlap, then issues a single batch LLM call that emits per-fact actions: `add`, `update`, `delete`, or `no-op`. SimpleMem's `add_memories` is the textbook version; mem9's `reconcile` is the same pattern at scale. The store never accumulates near-duplicates that have to be filtered or re-ranked on every later read. A subtler benefit is that synthesis surfaces contradictions that flat-write systems never detect (Hindsight's "user liked React then switched to Vue" example).
 
