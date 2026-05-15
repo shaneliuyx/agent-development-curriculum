@@ -1364,6 +1364,72 @@ Re-run the two-tier system against this set. EverCore's published score is **Lon
 
 **Is the guild + EverCore architecture valid in production? Honest answer: VALID for the chapter's pedagogical thesis, NOT optimal for production performance or scalability.** The architecture exercises the most concepts (operational tier, conversation-shape extraction pipeline, the conversation-vs-fact contract mismatch, cross-agent recall via shared `user_id`) — which is exactly what a senior-engineer interview rewards. But for a real production workload it costs more than the alternatives. Both truths matter; teach both.
 
+### Pre-design checklist — which bucket is your data in?
+
+Before picking a semantic backend, answer these three questions about your input shape. The answer tells you which bucket you're in and which backend earns its cost.
+
+```mermaid
+flowchart TB
+    Q1{"Inputs are<br/>multi-turn<br/>conversations?"}
+    Q2{"Need atomic-fact<br/>granularity in<br/>retrieval?"}
+    Q3{"Serve multiple<br/>identifiable users<br/>over long time horizon?"}
+    B1["Bucket 1: USE EverCore<br/>(pipeline earns its cost)"]
+    B2["Bucket 2: USE Qdrant + bge-m3<br/>(EverCore = 5x overhead, no gain)"]
+    B3["Bucket 3: USE BOTH<br/>(route by data shape)"]
+
+    Q1 -->|"yes"| Q2
+    Q1 -->|"no — pre-extracted facts"| B2
+    Q2 -->|"yes"| Q3
+    Q2 -->|"no — whole-conversation OK"| B2
+    Q3 -->|"yes — profile + episodes matter"| B1
+    Q3 -->|"no — single-user data"| B2
+    B1 --> B3Note["Production at scale<br/>often combines:<br/>both backends behind<br/>a router"]
+    B2 --> B3Note
+    B3Note --> B3
+
+    style Q1 fill:#f1c40f,color:#000
+    style Q2 fill:#f1c40f,color:#000
+    style Q3 fill:#f1c40f,color:#000
+    style B1 fill:#27ae60,color:#fff
+    style B2 fill:#4a90d9,color:#fff
+    style B3 fill:#9b59b6,color:#fff
+```
+
+**Bucket 1 — USE EverCore.** Three conditions converge: multi-turn conversations + atomic-fact granularity + multiple identifiable users over time. Ideal cases:
+- Customer support agents with cross-session memory (per-customer profile + episode recall)
+- Tutoring / coaching agents (per-student profile aggregates from session conversations)
+- Multi-participant team-chat assistants (tracks who said what when)
+- Long-term companion / relationship agents (months of conversation → emergent personality profile)
+- Meeting transcript analyzers (boundary detection breaks transcripts into topics)
+- Healthcare AI with cross-visit patient history
+
+In all six: the conversation IS the data. EverCore's pipeline does work (boundary detection + atomic_fact decomposition + profile aggregation) you'd otherwise hand-roll — ~700-1000 LOC of LLM-prompting + extraction + aggregation saved.
+
+**Bucket 2 — USE Qdrant + bge-m3.** Inputs are already-extracted facts, single-user data, or sub-100ms latency required. **This is the bucket THIS lab is in** — quest scrolls are pre-summarized facts, not raw dialogue. Phase 7 ships the Qdrant variant; for production with this shape, that's the right backend. Cases:
+- Tool-result memory (function outputs stored for later retrieval)
+- RAG knowledge bases (documents → chunks → embeddings)
+- Single-fact memory under sub-100ms search budget
+- Constrained-infrastructure deployments (edge, embedded, single-VM, 7 containers won't fit)
+
+**Bucket 3 — USE BOTH (route by data shape).** Production agent systems at scale often combine:
+- **Hot semantic tier** = Qdrant for fast tool-result lookups + document RAG (~80ms search)
+- **Cold semantic tier** = EverCore for user-conversation profiles + episodic memory (~300ms search)
+- **Operational tier** = guild for atomic-claim + quest board (unchanged from W3.5.5 / W3.5.8)
+
+Route at write-time by data shape: facts → Qdrant; dialogues → EverCore. Same agent, two semantic backends behind a router. This is the topology multi-modal production agent systems actually ship.
+
+### What EverCore's pipeline ACTUALLY does (the value you pay 5x latency for)
+
+| Capability | What it gives you | Cost without EverCore (DIY) |
+|---|---|---|
+| LLM-driven episode boundary detection | Auto-segment multi-turn conversations into topic episodes without manual cuts | ~200 LOC + LLM prompt engineering |
+| atomic_fact decomposition | One conversation → N retrievable single-fact rows | ~150 LOC + quality-tuned extractor |
+| profile aggregation across episodes | Per-user persistent profile built up from extracted facts over months | ~300 LOC + LLM merge + conflict resolution |
+| Hybrid retrieval (Mongo + ES + Milvus) | Semantic + keyword + structured filters in one query | Roll your own or live with semantic-only |
+| Episodic → semantic consolidation semantics | Old memories decay, profile facts update, recency-weighted retrieval | Significant ML/policy work |
+
+**Total saved by adopting EverCore: ~700-1000 LOC of LLM-prompting + extraction + aggregation code — IF your data is in Bucket 1.** Wasted IF you're in Bucket 2 (W3.5.8's actual case): you pay 5x latency for redundant work on already-extracted content.
+
 ### Measured cost (2026-05-14, 1-scroll round-trip on M5 Pro 48 GB)
 
 | Stage | guild + EverCore | guild + raw Qdrant + bge-m3 | Delta |
@@ -1582,6 +1648,65 @@ Re-run. The rest of the demo — `post_task`, `claim_task`, `complete_task`, `co
 - **The one-line import swap IS the interview soundbite.** Saying "my semantic tier is one wrapper class; I can swap it from a heavyweight extraction pipeline to a pure vector store by changing one import" demonstrates the seam-discipline interviewers reward.
 - **The Qdrant variant SKIPS the conversation-shape gymnastics from BCJ Entry 13** — no 2-turn synthetic wrap, no session_id-scoped flush, no waiting for memcell extraction. The contract on `TieredMemory.imprint()` stays the same; the implementation gets simpler because the backend's contract is simpler.
 - **bge-m3 stays as the embedding model across both variants** (oMLX serves it; EverCore uses it via VECTORIZE_*; Qdrant uses it directly). The embedding choice is orthogonal to the storage backend — another layer the wrapper isolates correctly.
+`─────────────────────────────────────────────────`
+
+---
+
+## Phase 8 — Optional Stretch: EverCore Earns Its Cost on Bucket-1 Data (~3 hours)
+
+Phase 7 showed that for THIS lab's data shape (already-extracted facts), Qdrant is the right backend and EverCore pays a 5x latency penalty for redundant work. Phase 8 is the symmetric demonstration: rewrite the imprint flow around DIALOGUE inputs (Bucket 1 data) and show EverCore's pipeline actually earning its cost — boundary detection segments naturally, atomic_facts decompose for retrieval granularity, profile aggregation builds per-participant state.
+
+The goal is pedagogical honesty: a reader who only sees Phase 7 might conclude "EverCore is always wrong." It's not. It's wrong for the wrong shape. Phase 8 is the right-shape demo.
+
+### 8.1 Scenario: Simulated multi-turn agent ↔ user dialogue
+
+Replace the "agent autonomously executes tasks" loop with a "AI assistant talks to a user about deployments" scenario. The user asks questions, the assistant answers, both contribute knowledge. EverCore's pipeline now has the data shape it was built for.
+
+```python
+# src/demo_conversational_imprint.py  (SPEC — TBD lab impl)
+"""Bucket-1 demo: EverCore on its native data shape.
+
+Pattern: simulate 3 multi-turn dialogues between an AI assistant
+('robot_001') and three users ('alice', 'bob', 'carol') over the
+course of a week. Each dialogue is ~10 turns spanning a single
+deployment topic (Alice: API rollout; Bob: token rotation; Carol:
+incident response). POST each dialogue as a single batch with
+unique session_id; let EverCore's LLM boundary detector decide
+when an episode is complete — no flush trickery needed.
+"""
+```
+
+### 8.2 Three load-bearing differences from the Bucket-2 lab
+
+| Aspect | Phase 4 (Bucket 2 — current lab) | Phase 8 (Bucket 1 — stretch) |
+|---|---|---|
+| Input shape | Pre-summarized scroll, 1 fact | Multi-turn dialogue, 10+ turns per session |
+| user_id | Single shared `"shared"` | Per-participant: `alice`, `bob`, `carol`, `robot_001` |
+| Imprint primitive | Synthetic 2-turn wrap + forced flush | Real conversation messages, no flush — let boundary detection fire naturally |
+| EverCore returns | 1 memcell per imprint | N memcells per dialogue + M atomic_facts per memcell + per-user profile aggregates |
+| Query | "what do we know about <subject>?" → 1 episode | "what does Alice care about?" → profile + relevant episodes |
+
+### 8.3 The interview signal (why this matters)
+
+Reader who has done both Phase 7 + Phase 8 can answer the senior question:
+
+> "When would you use EverCore-class memory vs raw vector store?"
+
+with concrete framing: "Bucket 1 cases need EverCore's extraction pipeline — boundary detection + atomic_facts + profile aggregation save 700-1000 LOC of LLM-prompting code I'd otherwise hand-roll. Bucket 2 cases — pre-extracted facts, single-user data, sub-100ms search — pay 5x latency for nothing; Qdrant is the right answer. Bucket 3 production systems route by data shape: facts to Qdrant, dialogues to EverCore, behind the same TieredMemory wrapper."
+
+That answer is grounded in TWO measured experiments (Phase 7 + Phase 8), not one. Beats "I think it depends."
+
+### 8.4 Lab deliverables (SPEC; not yet implemented in lab repo)
+
+1. `src/demo_conversational_imprint.py` — simulated 3-user, 3-dialogue scenario (each ~10 turns, hand-written or generated by a local LLM role-play prompt)
+2. `tests/test_conversational_extraction.py` — assert each dialogue produces ≥1 memcell + ≥3 atomic_facts; assert per-user profile is populated after consolidation
+3. Compare retrieval quality: ask `"what does Alice care about?"` against Phase 8 EverCore data vs Phase 7 Qdrant data — Phase 8 should return Alice's profile + relevant episodes; Phase 7 returns just nearest-vector fragments (since Qdrant has no profile concept)
+4. Updated RESULTS.md row: "Phase 8 — Bucket 1 EverCore on dialogue data: <measured imprint latency, atomic_fact count per dialogue, profile completeness%>"
+
+`★ Insight ─────────────────────────────────────`
+- **Phase 7 vs Phase 8 is the bucket-2 vs bucket-1 demonstration.** Phase 7 proves Qdrant wins when the data is pre-extracted. Phase 8 proves EverCore wins when the data is dialogue. Reader sees BOTH halves of the architectural trade-off.
+- **Phase 8 has no flush trickery.** BCJ Entry 13 is a Bucket-2 workaround; in Bucket 1 you don't need it because the LLM boundary detector actually finds episodes in real conversations. The fix matches the data shape.
+- **Profile aggregation is the EverCore feature most consumers underestimate.** Per-user profile facts built up over months are the thing customer-support / coaching / companion agents need that Qdrant cannot deliver out of the box. Phase 8 makes the gap concrete.
 `─────────────────────────────────────────────────`
 
 ---
