@@ -122,19 +122,268 @@ flowchart TB
 
 ## 4. Lab Phases (REQUIRED — TBD code, scoped now)
 
-### Phase 1 — Lab scaffold + add classifier-tier model to fleet (~30 min)
+### Phase 1 — Lab scaffold + classifier-tier endpoint (~30 min)
 
 Goal: extend the W4 vMLX fleet config with a Qwen-1.5B-Instruct classifier on `:8005`. Verify the four-endpoint fleet (`:8002 / :8003 / :8004 / :8005`) is reachable from Python.
 
-- **TBD code** — `src/fleet_config.py` extending W4's fleet config with classifier-tier endpoint.
-- **TBD verification** — curl smoke test against all 4 endpoints; latency measurement at idle.
+**Architecture mermaid:**
+
+```mermaid
+flowchart LR
+    Conf["fleet_config.py<br/>FLEET dict<br/>4 endpoints"]
+    Smoke["smoke_test.py<br/>probe each endpoint"]
+    OpusEP["opus tier<br/>Qwen3.6-35B :8002"]
+    SonnetEP["sonnet tier<br/>Gemma-4-26B :8003"]
+    HaikuEP["haiku tier<br/>Qwen3.5-9B :8004"]
+    ClsEP["classifier tier<br/>Qwen-1.5B :8005"]
+
+    Conf --> Smoke
+    Smoke --> OpusEP
+    Smoke --> SonnetEP
+    Smoke --> HaikuEP
+    Smoke --> ClsEP
+
+    style ClsEP fill:#f1c40f,color:#000
+    style Smoke fill:#27ae60,color:#fff
+```
+
+**Code:**
+
+`src/fleet_config.py`:
+
+```python
+"""W4.5 fleet config — extends W4 with a classifier-tier endpoint on :8005.
+
+Two design choices worth flagging:
+1. The classifier tier is a SEPARATE model + port from the executor tiers.
+   The router never picks the classifier as an executor — it's invariant
+   that the classifier ALWAYS runs first, then dispatches to one of the
+   3 executor tiers. Keeping them on different endpoints makes that
+   architectural invariant a deployment fact, not a runtime hope.
+2. Endpoint URLs are kept here (single source of truth) and consumed by
+   both router.py and tier_dispatch.py. Hand-edit ports here when oMLX
+   reassigns; do NOT scatter URL strings across the codebase.
+"""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FleetEndpoint:
+    name: str
+    tier: str  # "classifier" | "haiku" | "sonnet" | "opus"
+    model: str  # oMLX model id (see `curl :8000/v1/models`)
+    base_url: str  # full OpenAI-compatible base URL
+
+
+FLEET: dict[str, FleetEndpoint] = {
+    "classifier": FleetEndpoint(
+        name="classifier",
+        tier="classifier",
+        model="Qwen2.5-1.5B-Instruct-MLX-4bit",
+        base_url="http://127.0.0.1:8005/v1",
+    ),
+    "haiku": FleetEndpoint(
+        name="haiku",
+        tier="haiku",
+        model="MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit",
+        base_url="http://127.0.0.1:8004/v1",
+    ),
+    "sonnet": FleetEndpoint(
+        name="sonnet",
+        tier="sonnet",
+        model="gemma-4-26B-A4B-it-heretic-4bit",
+        base_url="http://127.0.0.1:8003/v1",
+    ),
+    "opus": FleetEndpoint(
+        name="opus",
+        tier="opus",
+        model="Qwen3.6-35B-A3B-4bit-DWQ",
+        base_url="http://127.0.0.1:8002/v1",
+    ),
+}
+```
+
+`src/smoke_test.py`:
+
+```python
+"""Probe every fleet endpoint with a 1-token completion + record idle latency."""
+import os
+import time
+
+from openai import OpenAI
+
+from src.fleet_config import FLEET
+
+
+def probe(name: str, ep) -> tuple[bool, float, str]:
+    client = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"))
+    t0 = time.perf_counter()
+    try:
+        r = client.chat.completions.create(
+            model=ep.model,
+            messages=[{"role": "user", "content": "Reply with one token: ok"}],
+            max_tokens=4,
+            temperature=0.0,
+        )
+        wall = time.perf_counter() - t0
+        return True, wall, (r.choices[0].message.content or "").strip()
+    except Exception as e:                                             # noqa: BLE001
+        return False, time.perf_counter() - t0, f"{type(e).__name__}: {e}"
+
+
+if __name__ == "__main__":
+    for name, ep in FLEET.items():
+        ok, wall, reply = probe(name, ep)
+        status = "OK" if ok else "FAIL"
+        print(f"{status:4s}  {name:11s} {ep.model:50s} {wall*1000:6.0f}ms  reply={reply!r}")
+```
+
+**Walkthrough:**
+
+- **Block 1 — `FleetEndpoint` is a frozen dataclass, not a dict.** Frozen because the fleet config is immutable per-process (a runtime override would be a deployment bug). Dataclass over dict so IDEs surface typos as type errors instead of `KeyError` at first use.
+- **Block 2 — `FLEET` is keyed by tier name, not by port.** Tier names are stable across infra changes; ports drift when oMLX reassigns. Callers reference `FLEET["haiku"]`, not `FLEET[":8004"]`.
+- **Block 3 — `smoke_test.py` probes ALL endpoints in one run.** Single-endpoint probing is what you do during dev; fleet-wide probing is what you do before running the bench. Fail-fast surfaces "one endpoint down silently degrading the router" — the canonical Phase-1 BCJ entry candidate.
+- **Block 4 — `temperature=0.0` and `max_tokens=4` keep the probe deterministic + cheap.** Idle-latency measurement is meaningful only when the request shape is bounded; an open-ended completion would inflate the latency number with output time, not endpoint-reachability time.
+
+**Result:**
+
+```
+OK    classifier  Qwen2.5-1.5B-Instruct-MLX-4bit                       45ms  reply='ok'
+OK    haiku       MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit                85ms  reply='ok'
+OK    sonnet      gemma-4-26B-A4B-it-heretic-4bit                     125ms  reply='ok'
+OK    opus        Qwen3.6-35B-A3B-4bit-DWQ                            210ms  reply='ok'
+```
+
+Idle latencies form the floor of the cost-latency Pareto front. Classifier-tier idle at ~45ms means the router's overhead-per-query is ~45ms — small enough to be amortized across the executor's 85-210ms even on haiku-tier routing decisions. Numbers are placeholder until your run; update `RESULTS.md` after.
+
+`★ Insight ─────────────────────────────────────`
+- **The classifier tier's IDLE LATENCY (~45ms) is the router's lower bound on per-query overhead.** If your classifier picks haiku (85ms idle), total dispatch latency is 45+85 = 130ms. Direct-to-opus would be 210ms. Routing wins on the easy-task path by ~80ms even with the classifier overhead — provided the classifier picks the cheap tier when correct.
+- **`max_tokens=4` is the right probe size.** Setting it to 1 fails on some MLX backends that need 2-3 tokens for proper EOS handling; 4 is the smallest reliable bound across the fleet.
+- **The probe-all-endpoints loop is your "is the fleet healthy?" check before Phase 5 benchmarks.** Run it BEFORE the bench, not after a failure — silent-endpoint-down is the canonical Phase 5 BCJ.
+`─────────────────────────────────────────────────`
 
 ### Phase 2 — Build the labelled probe set (~45 min)
 
-Goal: hand-label a 60-prompt training set covering 3 tiers × 3 modes × ~7 examples. Mix mathematical, summarization, code-debug, planning, multi-step-tool-use prompts. The labels are the ground truth the classifiers train against.
+Goal: hand-label a 60-prompt training-and-eval set covering 3 tiers × 3 modes × ~7 examples. Mix mathematical, summarization, code-debug, planning, multi-step-tool-use prompts. The labels are the ground truth the classifiers train against AND the eval set Phase 3 measures accuracy on.
 
-- **TBD artifact** — `tests/router_probes.jsonl` (60 rows: `prompt`, `expected_tier`, `expected_mode`, `domain`).
-- Pedagogical note: the labelled set IS the policy; hand-curating it forces the engineer to articulate what "needs opus" actually means in their domain. This is the unglamorous reusable-skill step.
+**Architecture mermaid:**
+
+```mermaid
+flowchart TB
+    Author["You<br/>(human labeller)"]
+    JSONL["tests/router_probes.jsonl<br/>60 rows"]
+    Loader["load_probes()<br/>+ split train/eval"]
+    Cls["Phase 3 classifier<br/>(few-shot consumer)"]
+    Eval["Phase 3 eval<br/>per-tier accuracy"]
+
+    Author --> JSONL
+    JSONL --> Loader
+    Loader -->|"40 rows (train)"| Cls
+    Loader -->|"20 rows (eval)"| Eval
+
+    style JSONL fill:#27ae60,color:#fff
+    style Author fill:#f1c40f,color:#000
+```
+
+**Code:**
+
+`tests/router_probes.jsonl` (12-row preview — full file is 60 rows; ~14 KB):
+
+```jsonl
+{"prompt": "What is 247 * 13?", "expected_tier": "haiku", "expected_mode": "minimal", "domain": "arithmetic"}
+{"prompt": "Summarize this paragraph in one sentence: <paragraph>", "expected_tier": "haiku", "expected_mode": "minimal", "domain": "summarization"}
+{"prompt": "What does git rebase --interactive do?", "expected_tier": "haiku", "expected_mode": "minimal", "domain": "factual-recall"}
+{"prompt": "Explain the difference between TCP and UDP for a backend developer.", "expected_tier": "sonnet", "expected_mode": "minimal", "domain": "concept-explanation"}
+{"prompt": "Why is my Python script hanging on this asyncio.gather? <code snippet, 30 lines>", "expected_tier": "sonnet", "expected_mode": "react", "domain": "code-debug"}
+{"prompt": "Refactor this function to reduce nested conditionals: <code, 50 lines>", "expected_tier": "sonnet", "expected_mode": "react", "domain": "code-refactor"}
+{"prompt": "Design a Postgres schema for a multi-tenant SaaS billing system. Cover row-level security, plan tiers, usage metering.", "expected_tier": "opus", "expected_mode": "deliberate", "domain": "architecture"}
+{"prompt": "Walk through how Raft consensus handles leader election with a split brain. Include diagrams.", "expected_tier": "opus", "expected_mode": "deliberate", "domain": "deep-explanation"}
+{"prompt": "Plan a 3-week migration from Mongo to Postgres for an e-commerce checkout service. Identify rollback gates.", "expected_tier": "opus", "expected_mode": "deliberate", "domain": "planning"}
+{"prompt": "Find the prime factorization of 18,723 and show your work.", "expected_tier": "haiku", "expected_mode": "react", "domain": "math-multistep"}
+{"prompt": "Given this stack trace, locate the bug in our authentication middleware: <trace + 200 LOC>", "expected_tier": "opus", "expected_mode": "react", "domain": "code-debug-deep"}
+{"prompt": "What's the capital of France?", "expected_tier": "haiku", "expected_mode": "minimal", "domain": "factual-recall"}
+```
+
+`src/probes.py`:
+
+```python
+"""Load + split + validate the hand-labelled probe set."""
+import json
+import random
+from pathlib import Path
+from typing import Literal
+
+Tier = Literal["haiku", "sonnet", "opus"]
+Mode = Literal["minimal", "react", "deliberate"]
+
+
+def load_probes(path: str = "tests/router_probes.jsonl") -> list[dict]:
+    """Load + validate every row has the expected fields + values."""
+    rows = []
+    valid_tiers = {"haiku", "sonnet", "opus"}
+    valid_modes = {"minimal", "react", "deliberate"}
+    for i, line in enumerate(Path(path).read_text().splitlines()):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        for k in ("prompt", "expected_tier", "expected_mode", "domain"):
+            if k not in row:
+                raise ValueError(f"row {i}: missing field {k!r}")
+        if row["expected_tier"] not in valid_tiers:
+            raise ValueError(f"row {i}: bad tier {row['expected_tier']!r}")
+        if row["expected_mode"] not in valid_modes:
+            raise ValueError(f"row {i}: bad mode {row['expected_mode']!r}")
+        rows.append(row)
+    return rows
+
+
+def train_eval_split(rows: list[dict], seed: int = 42, train_frac: float = 0.67):
+    """Stratified split: roughly preserve tier+mode distribution in both halves."""
+    rng = random.Random(seed)
+    by_label: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        key = (r["expected_tier"], r["expected_mode"])
+        by_label.setdefault(key, []).append(r)
+    train, eval_ = [], []
+    for key, group in by_label.items():
+        rng.shuffle(group)
+        cut = int(len(group) * train_frac)
+        train.extend(group[:cut])
+        eval_.extend(group[cut:])
+    rng.shuffle(train)
+    rng.shuffle(eval_)
+    return train, eval_
+```
+
+**Walkthrough:**
+
+- **Block 1 — Hand-labelling 60 rows is the unglamorous-but-essential step.** It forces you to ARTICULATE what your taxonomy means in your domain — "needs opus" is meaningless until you've decided which 20 prompts you'd label that way. RouteLLM 2024 used preference data scraped from public chat logs; this lab uses ~1 hour of hand-labelling, which beats anything else at the lab scale.
+- **Block 2 — JSONL not CSV.** Prompt fields contain commas, quotes, newlines. CSV escaping is fragile; JSONL is one row per line, JSON-validated, machine-readable, diff-friendly. Standard format for ML probe sets.
+- **Block 3 — Stratified train/eval split, not random.** A pure 67/33 random split risks putting all 7 opus+deliberate examples in training and 0 in eval. Stratifying by `(tier, mode)` key preserves the joint distribution across the split. With 60 rows + 9 cells, every cell gets ~5-6 train + ~2-3 eval.
+- **Block 4 — Validation at load-time.** Typo-catching ("opu" vs "opus") at load saves 10 minutes of debugging "why is my classifier accuracy 67% on a perfect-looking probe set." Strict enum validation > silent miscount.
+
+**Result:**
+
+After running `python -c "from src.probes import load_probes, train_eval_split; r = load_probes(); t, e = train_eval_split(r); print(len(t), len(e))"` you should see `40 20` (roughly — exact split varies by stratification).
+
+| Domain | Train rows | Eval rows |
+|---|---|---|
+| factual-recall | ~4 | ~2 |
+| arithmetic + math-multistep | ~5 | ~3 |
+| summarization | ~3 | ~2 |
+| code-debug + code-refactor | ~7 | ~4 |
+| concept-explanation | ~3 | ~2 |
+| architecture + deep-explanation | ~6 | ~3 |
+| planning | ~3 | ~2 |
+| (others) | ~9 | ~2 |
+
+Numbers vary by your specific labelling — the table is illustrative.
+
+`★ Insight ─────────────────────────────────────`
+- **Hand-labelling 60 rows takes ~1 hour and is non-negotiable.** Without your own probe set you can't measure routing accuracy in your domain; public benchmarks (RouterBench) tell you how the router does on someone else's domain. The 1-hour cost is paid once, amortized across every Phase 3-5 measurement.
+- **Stratified split matters more than pure-random at small N.** At N=60, random split has ~10% chance of producing an eval set with zero examples in some `(tier, mode)` cell. Stratification eliminates that failure mode for free.
+- **Validation at load-time IS the test.** Don't write a separate `test_probes_are_valid.py`; the `load_probes()` function raises on any malformed row, so just running the loader is the test. Saves writing tests for catching what's already caught by the validator.
+`─────────────────────────────────────────────────`
 
 ### Phase 3 — Build classifier-1 + dispatch (~1.5 hours)
 
