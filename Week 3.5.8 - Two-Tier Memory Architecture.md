@@ -1502,12 +1502,26 @@ Two measurement contexts — **Bucket-2 (pre-summarized fact)** = single scroll 
 | Stage | guild + EverCore | guild + raw Qdrant + bge-m3 | Delta |
 |---|---|---|---|
 | **Bucket-2 imprint** (1 pre-summarized fact, scroll path) | ~3-5s (LLM summarize + 2-turn wrap + flush + EverCore memcell extract) | ~150ms (LLM summarize-bypassed at imprint level; just embed + upsert) | **20-30x slower** |
-| **Bucket-1 imprint** (10-12 turn natural dialogue) | **188.68s** measured 2026-05-15 across 3 dialogues (Phase 8) — boundary detection + memcell + atomic_facts + profile aggregation | ~1.5s (10-12 embed calls + 1 upsert per turn) | **~125x slower** |
+| **Bucket-1 imprint** (10-12 turn natural dialogue) | **67-189s** range across two 2026-05-15 runs (Phase 8 solo: 188.68s mean; Phase 8 compare: 67.1s mean — variance comes from prompt-cache warmth + concurrent oMLX load) | **1.93s** measured 2026-05-15 (Phase 8 compare, 10-12 embed+upsert per turn) | **35-125x slower** (depending on EverCore contention) |
 | Cross-agent search | ~250-500ms (Mongo + Milvus + ES hybrid; `score=-100` sentinel when one episode per user) | ~50-150ms (pure HNSW + payload filter) | **3-5x slower** |
 | **Bucket-1 ATOMIC FACTS extracted per dialogue** | 3-5 typed atoms + 0-1 profile rows (Phase 8: 3/3 episodes, 2/3 profiles built on first dialogue) | 0 (raw vector store only) | EverCore wins where granularity matters |
 | **Bucket-2 atomic facts via Phase C atomisation pipeline** | 1 imprint per scroll (EverCore's atomic_fact extraction is separate from `consolidate()`'s output) | 5 typed atoms measured 2026-05-15 from a 5-fact scroll (use_atomisation=True) | Atomisation rewrite (form #2) closes the granularity gap for the Qdrant variant |
 
-**Reading the numbers honestly.** The 188s/dialogue number is the cost of EverCore EARNING its keep on Bucket-1 data: in exchange, you get 3-5 typed atomic_facts + 0-1 profile aggregation rows per session WITHOUT writing the extraction pipeline yourself. The Qdrant variant cannot produce profile rows or atomic_fact decomposition out of the box — but Phase C (`extract_atomic_facts` + `consolidate(use_atomisation=True)`) closes the granularity gap by adding 5 typed atoms per multi-fact scroll at ~3-5s per scroll wall (one extra LLM call vs the single-summary path). The 188s vs ~3-5s gap is what EverCore charges for the conversation-shape pipeline + profile aggregation; whether that's worth the cost is the Bucket-1 vs Bucket-2 decision.
+**Reading the numbers honestly.** The 67-189s/dialogue range is the cost of EverCore EARNING its keep on Bucket-1 data: in exchange, you get 3-5 typed atomic_facts + 0-1 profile aggregation rows per session WITHOUT writing the extraction pipeline yourself. The Qdrant variant cannot produce profile rows or atomic_fact decomposition out of the box — but Phase C (`extract_atomic_facts` + `consolidate(use_atomisation=True)`) closes the granularity gap by adding 5 typed atoms per multi-fact scroll at ~3-5s per scroll wall (one extra LLM call vs the single-summary path). The 67-189s vs ~1.93s gap is what EverCore charges for the conversation-shape pipeline + profile aggregation; whether that's worth the cost is the Bucket-1 vs Bucket-2 decision.
+
+### Retrieval-shape comparison (measured 2026-05-15, `src/demo_phase8_compare.py`)
+
+Same 3 dialogues, same 3 queries, BOTH backends. The side-by-side surfaces what EverCore's synthesis buys vs raw vector similarity:
+
+| Query | EverCore (Bucket 1) result shape | Qdrant (Bucket 2) result shape |
+|---|---|---|
+| "What does Alice care about?" | One coherent episode summary: "Deployment Plan for New Mobile API Endpoint — Terraform, VPC Peering, DNS – May 15, 2026" + per-user profile context | Top-3 nearest turn-pairs (cosine 0.62-0.64): "How long does the apply usually take?" / "We're cutting a new API endpoint..." / "Standard sequence: vpc-peering → api-stack → dns-stack..." |
+| "What did Bob ask about auth tokens?" | "Incident Review: Stale Auth Tokens, Key Rotation Cadence, and SDK Fixes" — synthesised topic + outcome arc | Top-3 turns (cosine 0.71-0.75): incident report + SDK bug fix + 30-min TTL fact — accurate but unconsolidated |
+| "What is the Sev1 MTTR target Carol learned?" | "Carol Joins On-Call Rotation: Incident Response Process, Severity Definitions, MTTR Metrics, and Preparation" — captures arc + Carol-as-trainee context | Top-3 turns including the literal "Sev1 MTTR target is 60 minutes; quarterly average is 47 minutes" — direct hit on the question's keyword |
+
+**Reading the shape difference.** EverCore returns A NARRATIVE PER USER ("here's what this user learned"). Qdrant returns RELEVANT FRAGMENTS ("here are the turns nearest your query"). Both are correct retrievals; they're answers to DIFFERENT QUESTIONS. EverCore is better when you want "tell me about this user" or "summarise this episode." Qdrant is better when you want "find me the specific fact" or "show me the turn where X was said." This is the article's Paradigm 3 (synthesised) vs Paradigm 1 (raw similarity) at retrieval time.
+
+For W3.5.8's specific Bucket-2 lab data (pre-summarized quest scrolls), Qdrant wins on every dimension — speed, simplicity, and "we already synthesised at write time so we don't need a second synthesis pass at read time." For a Bucket-1 conversational data shape (Phase 8 demo), the trade-off inverts.
 | Backend services running | 7 containers (Mongo + ES + Milvus etcd + Milvus minio + Milvus standalone + Redis + EverCore app) | 1 container (Qdrant) | **7x infrastructure** |
 | Idle RAM | ~2 GB | ~300 MB | **6x heavier** |
 | 50-scroll consolidate batch wall time | ~5-12 min | ~1-2 min | **5x slower** |
