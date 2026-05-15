@@ -387,10 +387,287 @@ Numbers vary by your specific labelling — the table is illustrative.
 
 ### Phase 3 — Build classifier-1 + dispatch (~1.5 hours)
 
-Goal: prompt-engineer Qwen-1.5B-Instruct to emit `{tier, mode}` as JSON. Implement `src/router.py` with `classify(prompt, scratchpad) -> dict`. Implement `src/tier_dispatch.py` that maps the verdict to the right fleet endpoint + spawns the right control-flow (re-use W4's `run_agent()` for `react` mode; new `run_minimal()` / `run_deliberate()` for the other two).
+Goal: prompt-engineer Qwen-1.5B-Instruct to emit `{tier, mode}` as JSON. Implement `src/router.py` with `classify(prompt, scratchpad) -> RouterVerdict`. Implement `src/tier_dispatch.py` that maps the verdict to the right fleet endpoint + spawns the right control-flow (re-use W4's `run_agent()` for `react` mode; new `run_minimal()` / `run_deliberate()` for the other two). Measure single-classifier accuracy on the eval split from §Phase 2.
 
-- **TBD code** — `src/router.py`, `src/tier_dispatch.py`.
-- **TBD measurement** — single-classifier accuracy on the 60-prompt probe set. Target ≥ 85% per-tier, ≥ 90% per-mode.
+**Architecture mermaid:**
+
+```mermaid
+flowchart LR
+    Prompt["User prompt + last-N<br/>scratchpad turns"]
+    Cls["classify()<br/>Qwen-1.5B :8005<br/>JSON {tier, mode, confidence}"]
+    Verdict["RouterVerdict<br/>(tier, mode, confidence)"]
+    Disp["tier_dispatch()<br/>routes to one of:"]
+    Min["run_minimal()<br/>one-shot completion"]
+    React["run_react()<br/>W4 ReAct loop"]
+    Del["run_deliberate()<br/>plan + execute"]
+    Hai["haiku :8004"]
+    Son["sonnet :8003"]
+    Opu["opus :8002"]
+
+    Prompt --> Cls
+    Cls --> Verdict
+    Verdict --> Disp
+    Disp --> Min
+    Disp --> React
+    Disp --> Del
+    Min --> Hai
+    Min --> Son
+    Min --> Opu
+    React --> Hai
+    React --> Son
+    React --> Opu
+    Del --> Hai
+    Del --> Son
+    Del --> Opu
+
+    style Cls fill:#f1c40f,color:#000
+    style Disp fill:#9b59b6,color:#fff
+```
+
+**Code:**
+
+`src/router.py`:
+
+```python
+"""Single-classifier router. Qwen-1.5B-Instruct on :8005 emits JSON
+{tier, mode, confidence} via a strict system prompt. JSON-parse with
+graceful fallback to (sonnet, react, 0.5) on malformed output — never
+crash the pipeline on a classifier hiccup; degrade to a safe middle tier.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from typing import Literal
+
+from openai import OpenAI
+
+from src.fleet_config import FLEET
+
+
+Tier = Literal["haiku", "sonnet", "opus"]
+Mode = Literal["minimal", "react", "deliberate"]
+
+
+@dataclass(frozen=True)
+class RouterVerdict:
+    tier: Tier
+    mode: Mode
+    confidence: float  # 0.0-1.0, self-reported by classifier
+
+
+ROUTER_PROMPT = """You route LLM queries to the right model+control-flow.
+
+Output ONE JSON object on a single line:
+  {"tier": "haiku" | "sonnet" | "opus",
+   "mode": "minimal" | "react" | "deliberate",
+   "confidence": 0.0-1.0}
+
+TIER:
+  haiku    — small (9B), fast, ~80ms idle. Use for: arithmetic, factual recall,
+             simple summarisation, single-fact lookup, short rewrites.
+  sonnet   — medium (26B), ~125ms idle. Use for: code debug/refactor (single file),
+             concept explanation, structured-output generation, light planning.
+  opus     — large (35B), ~210ms idle. Use for: multi-step architecture, deep
+             explanation requiring synthesis, multi-component planning,
+             ambiguous-spec reasoning.
+
+MODE:
+  minimal    — single LLM call, no tool use, no scratchpad. Use for: factual,
+               arithmetic, summarisation, one-shot rewrites.
+  react      — ReAct loop with tool calls and scratchpad. Use for: code debug,
+               multi-step math, anything needing observation-action cycles.
+  deliberate — plan-then-execute split (plan with one call, execute with another).
+               Use for: architecture, multi-component planning, deep explanation.
+
+CONFIDENCE: your self-assessed certainty. Drop below 0.7 if the prompt is
+ambiguous; downstream will escalate or trigger a vote when conf < 0.7.
+
+Return ONLY the JSON object. No prose, no markdown fence, no preamble."""
+
+
+def classify(prompt: str, scratchpad: str = "") -> RouterVerdict:
+    """Route the prompt to one (tier, mode) cell. Degrades to (sonnet, react, 0.5)
+    on any classifier failure — safer than crashing the dispatch pipeline.
+    """
+    ep = FLEET["classifier"]
+    client = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"))
+
+    user_msg = prompt
+    if scratchpad:
+        user_msg = f"{prompt}\n\nRecent scratchpad context:\n{scratchpad[-2000:]}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=ep.model,
+            messages=[
+                {"role": "system", "content": ROUTER_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            max_tokens=120,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        parsed = json.loads(raw)
+        tier = parsed.get("tier")
+        mode = parsed.get("mode")
+        conf = float(parsed.get("confidence", 0.5))
+        if tier in ("haiku", "sonnet", "opus") and mode in ("minimal", "react", "deliberate"):
+            return RouterVerdict(tier=tier, mode=mode, confidence=conf)
+    except Exception:                                                  # noqa: BLE001
+        pass
+    # Graceful fallback — safe-middle bias
+    return RouterVerdict(tier="sonnet", mode="react", confidence=0.5)
+```
+
+`src/tier_dispatch.py`:
+
+```python
+"""Dispatch a RouterVerdict to the executor: pick endpoint by tier, run
+the right control-flow by mode. Mode `react` re-uses W4's run_agent();
+`minimal` is a one-shot completion; `deliberate` is plan-then-execute.
+"""
+from __future__ import annotations
+
+import os
+from openai import OpenAI
+
+from src.fleet_config import FLEET
+from src.router import RouterVerdict
+
+
+def _client_for(tier: str) -> OpenAI:
+    ep = FLEET[tier]
+    return OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"))
+
+
+def run_minimal(prompt: str, tier: str) -> str:
+    """One-shot completion. ~85-210ms wall."""
+    ep = FLEET[tier]
+    r = _client_for(tier).chat.completions.create(
+        model=ep.model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=512,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+
+def run_react(prompt: str, tier: str) -> str:
+    """ReAct loop. Re-uses W4's run_agent() with the dispatch tier's endpoint."""
+    # W4 lab provides run_agent(prompt, base_url, model) — adapter here.
+    # For the chapter's purposes, stub it as run_minimal + a "think-act" prefix
+    # so the lab works end-to-end without depending on W4's local module.
+    from src.fleet_config import FLEET
+    ep = FLEET[tier]
+    prefix = "Use the Think→Act→Observe pattern. Show your reasoning steps."
+    r = _client_for(tier).chat.completions.create(
+        model=ep.model,
+        messages=[
+            {"role": "system", "content": prefix},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=2048,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+
+def run_deliberate(prompt: str, tier: str) -> str:
+    """Plan-then-execute. Two LLM calls: planner produces an outline, executor fills it."""
+    ep = FLEET[tier]
+    cli = _client_for(tier)
+    plan = cli.chat.completions.create(
+        model=ep.model,
+        messages=[
+            {"role": "system", "content": "Produce a numbered plan (3-6 steps). No execution."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=512,
+    ).choices[0].message.content or ""
+    exec_ = cli.chat.completions.create(
+        model=ep.model,
+        messages=[
+            {"role": "system", "content": "Execute this plan step by step. Show work."},
+            {"role": "user", "content": f"Question:\n{prompt}\n\nPlan:\n{plan}"},
+        ],
+        temperature=0.0,
+        max_tokens=2048,
+    ).choices[0].message.content or ""
+    return exec_.strip()
+
+
+def dispatch(verdict: RouterVerdict, prompt: str) -> str:
+    """Pick run_* by verdict.mode; pass verdict.tier as the executor endpoint."""
+    if verdict.mode == "minimal":
+        return run_minimal(prompt, verdict.tier)
+    if verdict.mode == "react":
+        return run_react(prompt, verdict.tier)
+    return run_deliberate(prompt, verdict.tier)
+```
+
+`tests/test_router_accuracy.py`:
+
+```python
+"""Measure classify() accuracy on the eval split of the probe set."""
+from src.probes import load_probes, train_eval_split
+from src.router import classify
+
+
+def test_router_per_tier_accuracy_meets_target():
+    rows = load_probes()
+    _, eval_ = train_eval_split(rows)
+    correct = sum(
+        1 for r in eval_
+        if classify(r["prompt"]).tier == r["expected_tier"]
+    )
+    acc = correct / len(eval_)
+    assert acc >= 0.85, f"per-tier accuracy {acc:.2%} below 0.85 target"
+
+
+def test_router_per_mode_accuracy_meets_target():
+    rows = load_probes()
+    _, eval_ = train_eval_split(rows)
+    correct = sum(
+        1 for r in eval_
+        if classify(r["prompt"]).mode == r["expected_mode"]
+    )
+    acc = correct / len(eval_)
+    assert acc >= 0.90, f"per-mode accuracy {acc:.2%} below 0.90 target"
+```
+
+**Walkthrough:**
+
+- **Block 1 — `RouterVerdict` is frozen.** A router verdict is a stamped decision; downstream code should not mutate it. Frozen dataclass enforces that at the type level; downstream "I'll override the tier just this once" hacks become type errors.
+- **Block 2 — `ROUTER_PROMPT` is the policy.** Every routing rule lives in this prompt. Adding a new task type = adding a paragraph to the prompt, not modifying classify(). The §2.2 "classifier-IS-policy" concept made concrete: the policy boundary is in data (the prompt + probe set), not in branches.
+- **Block 3 — Graceful fallback to `(sonnet, react, 0.5)`.** When the classifier produces malformed JSON or unknown values, the router DOES NOT crash — it picks a middle-tier default. Pipeline-degradation discipline: a router that crashes on classifier hiccups is worse than no router. Confidence 0.5 signals "this verdict came from the fallback path"; downstream can log + escalate.
+- **Block 4 — `dispatch()` is a dumb router on top of intelligent classify().** It's the boring switch statement that takes the smart decision and calls the right run_*. Keep dispatch dumb; keep classify smart. Inverting that distribution (smart dispatcher + dumb classifier) produces a 200-line dispatcher with embedded heuristics, which is the §2.2 hand-coded-rules anti-pattern.
+- **Block 5 — `run_react()` is a stub.** Real implementation should import W4's `run_agent()` from `lab-04-react/src/react.py` or similar. The chapter ships a Think-Act-prompt stub so the lab works end-to-end without that dependency; readers wire their own W4 import as a Phase 3 exercise.
+- **Block 6 — `run_deliberate()` is TWO LLM calls.** Plan with one (low max_tokens), execute with another (high max_tokens). The plan step gives the executor a scaffold; the deliberate-mode-on-haiku-tier wins on multi-step tasks where minimal-mode-on-opus fails (the RouteLLM counterintuitive finding from §2.2.1).
+
+**Result (expected after running on your hand-labelled set):**
+
+```
+$ uv run pytest tests/test_router_accuracy.py -v
+tests/test_router_accuracy.py::test_router_per_tier_accuracy_meets_target PASSED
+tests/test_router_accuracy.py::test_router_per_mode_accuracy_meets_target PASSED
+========================== 2 passed in ~30s ==========================
+```
+
+Target: per-tier ≥ 0.85, per-mode ≥ 0.90 on the 20-row eval split. If you miss the target, the §6 BCJ Entry 1 (domain-shift miscategorisation) is your starting hypothesis — your hand-labelling drifted from the classifier's domain priors. Inspect the misclassified rows; either retag them or add 2-3 few-shot examples to ROUTER_PROMPT covering that domain.
+
+`★ Insight ─────────────────────────────────────`
+- **The classifier prompt + probe set IS the system.** Phase 3 looks like "lots of code" but the load-bearing artifact is `ROUTER_PROMPT` (the policy) and `router_probes.jsonl` (the eval set). Everything else is plumbing. When the router misbehaves in production, you tune the prompt and the probe set — NOT the dispatcher.
+- **`max_tokens=120` on the classifier is the right size.** A JSON object with three fields fits in ~40 tokens; 120 leaves headroom for reasoning models' CoT prefix (per BCJ Entry 8 lesson from W3.5.8) without inviting verbose explanations. Increase only if the classifier model is reasoning-tuned and `content=None` shows up in your run.
+- **Graceful-fallback is your "I am not on fire" gauge in production.** A high rate of `confidence=0.5` verdicts (the fallback signature) means the classifier is failing OR your probe-set coverage is too thin for in-distribution prompts. The fallback rate per workload window is the metric to alert on, NOT raw classifier accuracy.
+`─────────────────────────────────────────────────`
 
 ### Phase 4 — Add classifier-2 + vote (~1.5 hours)
 
