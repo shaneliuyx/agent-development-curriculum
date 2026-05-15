@@ -634,6 +634,176 @@ Also patch `build_brk_graph.py` line 362: `brk_brk_entity_names` → `brk_entity
 
 ---
 
+## 2026-05-14 — Week 3.5.8 — `uv add` fails with "No pyproject.toml found"
+
+**Symptom:** `uv add --dev pytest pytest-asyncio` → `error: No pyproject.toml found in current directory or any parent directory`. Reader assumes the lab scaffold inherits uv config from W3.5.5; it does not.
+
+**Why it's a bad case:** Toolchain-generation drift across labs. Older labs predate `uv`; newer ones assume it.
+
+**Root cause:** W3.5.5 lab predates uv adoption (pip + requirements.txt era). The W3.5.8 lab directory needs its own `pyproject.toml` before any `uv add` works. `uv init` creates it, but `uv add` does not auto-init.
+
+**Fix:** Prepend an idempotent bootstrap before any `uv add`:
+`test -f pyproject.toml || uv init --no-readme --no-workspace --python 3.12`
+
+**5-second sanity test:** `ls pyproject.toml` before running `uv add`.
+
+**Generalizes to:** Any lab cluster mixing pre-`uv` (pip+requirements.txt) and post-`uv` (pyproject.toml + uv.lock) eras.
+
+**Tags:** #toolchain-drift #uv #python-packaging #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 6.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — `ModuleNotFoundError: openai` after `uv init` + `uv add --dev pytest`
+
+**Symptom:** Tests collected by pytest but fail at import — `from openai import OpenAI` in `src/consolidation.py` raises `ModuleNotFoundError`. The `uv` virtualenv has pytest but none of the lab's runtime imports.
+
+**Why it's a bad case:** Tool assumption — `uv init` does NOT introspect existing source for imports. Runtime deps from the pip-era never auto-port.
+
+**Root cause:** `uv init` creates an empty project skeleton; `uv add --dev` only installs DEV dependencies. Runtime imports must be listed manually. The W3.5.5-era requirements.txt was never ported, so the dep list was lost.
+
+**Fix:** `uv add openai httpx "mcp[cli]" pydantic`
+
+**5-second sanity test:** `grep -E "^(import|from) [a-z_]+" src/*.py | sort -u` to enumerate imports; cross-check against `pyproject.toml` `[project.dependencies]`.
+
+**Generalizes to:** Any migration to a lock-file-based package manager (uv, poetry, pnpm) on top of an existing source tree.
+
+**Tags:** #uv #python-packaging #migration #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 7.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — Reasoning-model `summarize_scroll` returns `None`; `finish_reason=length`
+
+**Symptom:** All 3 consolidation tests' scrolls land in `scrolls_skipped`, none in `scrolls_imprinted`, `errors=[]`. Direct repro on the input "deployed via terraform; ran apply; got 200; verified VPC peering" returns `message.content=None` with `finish_reason="length"` — but the response carries a non-empty `reasoning_content` field that contains the correct answer.
+
+**Why it's a bad case:** Silent failure that masquerades as a domain-policy decision (SKIP). The model SOLVED the task in its CoT trace; the caller just couldn't see it.
+
+**Root cause:** `gpt-oss-20b-MXFP4-Q8` is a REASONING model. It emits chain-of-thought into `reasoning_content` FIRST, then the final answer into `content`. With `max_tokens=80`, the CoT consumes the entire budget; `content` is never emitted; `finish_reason` becomes `length`. Caller reads `content` as empty, normalizes to `None`, skips.
+
+**Fix:** Bump `max_tokens` to 400. The 25-word output cap stays enforced by the SUMMARIZE_PROMPT, not by the token ceiling.
+
+**5-second sanity test:** When a structured-output LLM call returns `None`, check `finish_reason` AND `reasoning_content` BEFORE assuming the model declined.
+
+**Generalizes to:** Any reasoning model (gpt-oss, DeepSeek-R1, o1-class). Token-budget tuning that worked for non-reasoning models is wrong by ~5× for reasoning models.
+
+**Tags:** #reasoning-models #token-budget #silent-failure #llm-output #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 8.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — EverCore HTTP `POST /memory/imprint` returns 404 (assumed-API-surface contract bug)
+
+**Symptom:** After bumping the summarizer budget, `consolidate()` errors fill with `httpx.HTTPStatusError: Client error '404 Not Found' for url 'http://localhost:1995/memory/imprint'`. The chapter's wrapper uses `/memory/imprint` and `/memory/query`; EverCore's actual OpenAPI catalog does not expose these paths.
+
+**Why it's a bad case:** Wrapper written against assumed API surface, not probed surface. Classic hallucinated-contract bug.
+
+**Root cause:** Real EverCore endpoints (per `GET /openapi.json`): `POST /api/v1/memories` (personal add) takes `{user_id, session_id?, messages: [{role, timestamp, content}]}`; `POST /api/v1/memories/search` takes `{query, filters: {user_id}, top_k}` and returns `{data: {episodes: [...], profiles: [...]}}`. Conversation-shaped, not arbitrary key-value imprint.
+
+**Fix:** Rewrite `TieredMemory.imprint()` to POST `/api/v1/memories` with an assistant-role MessageItem; rewrite `query_context()` to POST `/api/v1/memories/search` with `filters={"user_id": ...}` + parse `data.episodes`.
+
+**5-second sanity test:** `curl -sf http://<service>/openapi.json | jq '.paths | keys'` to enumerate real paths BEFORE writing client code.
+
+**Generalizes to:** Any third-party HTTP service with auto-generated OpenAPI docs. Probe `/openapi.json` first; do NOT trust the README to be up to date.
+
+**Tags:** #api-contract #openapi #wrapper #lab-3.5.8 #evercore
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 9.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — EverCore HTTP 500 "Failed to store memory" (upstream LLM auth failure; provider-block env not read)
+
+**Symptom:** Imprint requests reach EverCore (no more 404), but every call returns `500 Internal Server Error` with `{"code":"HTTP_ERROR","message":"Failed to store memory, please try again later"}`. EverCore log: `[OpenAI-x-ai/grok-4-fast] HTTP 401: Missing Authentication header` → `LLMError: (all 1 keys exhausted)`.
+
+**Why it's a bad case:** Two-layer env-config trap. Policy-block setting (LLM_PROVIDER=openai) does NOT cause the executing client to read its own `LLM_API_KEY`; the openai provider reads `OPENAI_API_KEY` instead.
+
+**Root cause:** EverCore's `mem_memorize` flow calls an upstream LLM for memcell boundary-detection BEFORE storing. Upstream env.template defaults to `LLM_PROVIDER=openrouter, LLM_MODEL=x-ai/grok-4-fast` with placeholder key — fails on first call. Even after switching to `LLM_PROVIDER=openai`, the executing http client reads `OPENAI_API_KEY` + `OPENAI_BASE_URL` (the bare provider-specific block), NOT the policy-layer `LLM_*` block.
+
+**Fix:** Patch BOTH `LLM_*` and `OPENAI_*` blocks in `.env` to point at local oMLX:
+```
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-oss-20b-MXFP4-Q8
+LLM_API_KEY=$OMLX_API_KEY
+LLM_BASE_URL=http://127.0.0.1:8000/v1
+OPENAI_API_KEY=$OMLX_API_KEY
+OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+```
+Then restart EverCore (`Ctrl-C` + `uv run web`).
+
+**5-second sanity test:** When a service has BOTH a `LLM_*` policy block AND a `{PROVIDER}_*` provider-specific block in env, ASSUME the executing client reads only the provider-specific one; patch both.
+
+**Generalizes to:** Multi-layer config systems where policy-layer envs are advertised but provider-class internals read the bare-name envs. Common in OpenAI/Anthropic/OpenRouter wrappers.
+
+**Tags:** #env-config #provider-routing #third-party-llm #lab-3.5.8 #evercore
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 10.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — Idempotency test fails: QUEST-IDs sort alphabetically, seed quest never enters batch
+
+**Symptom:** `test_consolidation_idempotent_on_second_run` fails: `scrolls_seen=10, scrolls_imprinted=0, scrolls_skipped=3, errors=[]`. 10 scrolls reach the batch but the freshly-seeded quest contributes none.
+
+**Why it's a bad case:** Two interacting bugs that mask each other; either alone is debuggable; together produce a confusing "test seems right, fails anyway."
+
+**Root cause:** (1) `consolidate()` sorts QUEST-IDs alphabetically via `sorted(set(QUEST_ID_RE.findall(...)))`. With residue accumulation, `QUEST-1, QUEST-10, QUEST-11, ..., QUEST-2, QUEST-20, ...` puts oldest first — fresh seed quests (e.g. `QUEST-60+`) never enter the `max_batch=10` window. (2) All 3 tests shared `CAMPAIGN = "test-w358-consolidation"`. Guild's quests are append-only; debug-run residue accumulates under the same campaign tag.
+
+**Fix:** (a) Numerical sort: `sorted(quest_ids, key=lambda q: int(q.split('-', 1)[1]))[:max_batch]`. (b) Per-test unique campaign: `_fresh_campaign() -> f"test-w358-{uuid.uuid4().hex[:8]}"`.
+
+**5-second sanity test:** When sorting strings that EMBED integers (`QUEST-10`, `v1.10.0`, `item-100`), check the SECOND-position alphabetical ordering of two adjacent values. `QUEST-2 > QUEST-10` is a red flag.
+
+**Generalizes to:** Any sort over alphanumeric IDs (file names, version strings, batch identifiers). Also: any test that reuses a namespace across runs on an append-only store.
+
+**Tags:** #sort-order #test-isolation #append-only-store #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 11.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — Cross-agent semantic recall returns 0 memories; per-agent `user_id` partitioned the EverCore index
+
+**Symptom:** Phase 4 two-agent demo runs to completion without errors but Agent B's `query_context(query="how do we deploy production APIs?")` returns 0 memories. Consolidation reports `imprinted=1` so the data IS in EverCore. Direct probes of `/api/v1/memories/get` with `user_id=agent_a`, `user_id=agent_b`, `user_id=consolidator` all return 0 episodes.
+
+**Why it's a bad case:** Identity-scope conflation. The wrapper's `agent_id` (per-instance Python label) was threaded into EverCore's `user_id` (TENANT identity). Silently partitioned what was supposed to be a shared store.
+
+**Root cause:** EverCore's `user_id` field is the TENANT identity, not a per-persona label. The lab's first wrapper threaded `agent_id` directly into `imprint()`'s `user_id` — so the consolidator imprinted under `user_id="consolidator"` while Agent B searched under `user_id="agent_b"`. Disjoint user partitions; cross-agent recall silently impossible.
+
+**Fix:** Two-layer identity model. Add a `user_id` ctor arg to `TieredMemory` (defaults to `LAB358_USER_ID` env var or `"shared"`). Use `self.user_id` for EverCore filters; keep `self.agent_id` as the Python-side persona label propagated into imprint metadata only.
+
+**5-second sanity test:** When wrapping a memory store with multi-tenancy, ask: "is the primary-key field PERSONA identity or TENANT identity?" If wrapping for cross-agent recall, ensure the field is TENANT and shared.
+
+**Generalizes to:** Any multi-tenant data store (auth systems, DB row-level security, vector store payloads). Identity scope mismatch is one of the most common silent-partition bugs.
+
+**Tags:** #identity-scope #multi-tenant #silent-partition #lab-3.5.8 #evercore
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 12.
+
+---
+
+## 2026-05-14 — Week 3.5.8 — EverCore imprint returns `accumulated` / flush returns `no_extraction`; nothing reaches search index
+
+**Symptom:** `tm.imprint(content="...")` returns 200 OK with `{"status": "accumulated", "message": "Messages accepted"}`. Calling `POST /api/v1/memories/flush {user_id}` returns 200 OK but with `{"status": "no_extraction"}`. Subsequent `query_context` returns 0 episodes. Pytest tests pass (assertion is `scrolls_imprinted >= 1` which counts the imprint API call, not the resulting memcell), masking the failure. Even 15-turn synthetic conversations + explicit topic-close signals still return `no_extraction`.
+
+**Why it's a bad case:** Conversation-vs-fact contract mismatch at the API boundary. HTTP 200 conceals that the downstream extraction never ran.
+
+**Root cause:** EverCore is conversation-shaped: `/api/v1/memories` accumulates messages, runs LLM-driven boundary detection, only extracts a memcell when the boundary detector judges an episode complete. Single-message imprints AND 2-turn imprints both fail the LLM boundary check. The bypass flag is `flush=True` (short-circuits boundary detection in `conv_memcell_extractor.py` line 553: `if request.flush and all_msgs: create_memcell_directly(..., 'flush')`) — BUT the flush endpoint requires a `session_id` matching the imprint's session_id. Without it, flush hits an empty default session and returns `no_extraction`.
+
+**Fix:** Three-part imprint pattern: (a) wrap each consolidated fact as a 2-turn synthetic conversation (`user: "What about <subject>?"` + `assistant: "<fact>"`); (b) POST with a unique session_id per fact (the quest_id is a natural choice); (c) immediately POST `/api/v1/memories/flush {user_id, session_id}` with the SAME session_id.
+
+**5-second sanity test:** When a service returns 200 with a status field of `accumulated` / `queued` / `pending`, the operation is NOT YET COMPLETE. Re-fetch via a separate GET to confirm post-condition (data is now searchable) before declaring success.
+
+**Generalizes to:** Any async/queued data pipeline (Kafka producers, S3 multipart uploads, event-bus writers). 200 OK on ENQUEUE is not the same as 200 OK on PROCESSED.
+
+**Tags:** #async-pipeline #status-field #data-shape #conversation-vs-fact #lab-3.5.8 #evercore
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 13.
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.
