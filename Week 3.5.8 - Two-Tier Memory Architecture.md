@@ -50,6 +50,8 @@ Production systems that try to make ONE system do both jobs end up degrading bot
 
 The two-tier separation lets each system stay specialized.
 
+**Orthogonal axis — in-attention recurrent memory (Lei et al. 2026, "δ-mem", arXiv:2605.12357).** A different abstraction layer: rather than an external store retrieved at decision time, δ-mem augments a frozen backbone with a tiny (8×8) online associative-memory state matrix updated by delta-rule learning, producing low-rank corrections to attention during generation. Measured 1.31× on MemoryAgentBench + 1.20× on LoCoMo vs the frozen baseline. δ-mem solves **long-context efficiency** within a single inference run; it does NOT address cross-session sharing, cross-agent shared identity, or audit/provenance — the problems this chapter is built around. Treat in-attention memory as a parallel research direction, not a substitute for the two-tier external-store pattern. In production, both could compose: external two-tier for cross-session/cross-agent state, in-attention for long-context efficiency inside one agent's run.
+
 ### Concept 2 — The Biological Analogy (Hippocampus + Neocortex)
 
 The pattern is borrowed from neuroscience and is more than metaphor:
@@ -1378,8 +1380,11 @@ Memory-system literature (Batchelor-Manning 2026 survey of 19 agent-memory syste
 | 6 | **Trace-as-memory** | Memory is the agent's own execution history, not the user's data | Moraine (pure), Hindsight (hybrid observation tier) |
 | 7 | **Karpathy LLM wiki** | Plain Markdown + wikilinks + frontmatter; index file as catalogue; user as final curator | Understand-Anything (reads), OpenKB (writes), LLM-Wiki (both) |
 | 8 | **Filesystem-native context store** | File is the artefact; database is a derivative cache; disk wins | OpenContext, Tolaria, second-brain |
+| 9 | **In-attention online state** *(not in Batchelor-Manning's 8 — orthogonal axis)* | Memory lives INSIDE the attention computation as a compact learned state matrix; updates online via delta-rule; reads via low-rank correction to backbone attention — closer to Mamba/RWKV recurrent state than to RAG | δ-mem (Lei et al. 2026, arXiv:2605.12357 — 1.31× MemoryAgentBench, 1.20× LoCoMo with 8×8 state) |
 
-**The negative consensus across all 19 systems: flat vector RAG ALONE is not enough.** Every one of the 19 that started with Paradigm-1-as-sole-mechanism eventually added something on top. The agreement is total. The disagreement is on WHICH paradigm to compose with it.
+Paradigm 9 sits in a different abstraction layer than 1-8 — it solves long-context efficiency within ONE inference run, not cross-session/cross-agent/durable storage. Listed for completeness; out of scope for this chapter's two-tier external-store thesis.
+
+**The negative consensus across all 19 systems (P1-P8): flat vector RAG ALONE is not enough.** Every one of the 19 that started with Paradigm-1-as-sole-mechanism eventually added something on top. The agreement is total. The disagreement is on WHICH paradigm to compose with it.
 
 #### Where W3.5.8 sits (explicit composition)
 
@@ -2031,6 +2036,8 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 - **mathomhaus/guild** — multi-agent MCP coordinator. Single Go binary; embedded SQLite; the operational-tier reference used in this lab.
 - **LongMemEval** — Xiao Wu et al. *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory.* GitHub `xiaowu0162/LongMemEval`. Industry-standard 500-turn memory recall benchmark; optional Phase 5.3 measurement.
 - **LoCoMo** — Maharana, A. et al. (2024). *Evaluating Very Long-Term Conversational Memory of LLM Agents.* GitHub `snap-research/locomo`. Companion benchmark to LongMemEval.
+- **δ-mem (in-attention online state)** — Lei, J., Zhang, D., Li, J. (2026-05-12). *δ-mem: Efficient Online Memory for Large Language Models.* arXiv:2605.12357. Augments a frozen backbone with a tiny 8×8 online associative-memory state updated via delta-rule learning; readout produces low-rank corrections to attention. Measured 1.31× on MemoryAgentBench + 1.20× on LoCoMo vs frozen baseline. Paradigm 9 in the §Production Considerations taxonomy — orthogonal axis to the 8 external-store paradigms; solves long-context efficiency within a single inference run, not cross-session/cross-agent memory.
+- **MemoryAgentBench** — referenced via δ-mem above; benchmark suite for memory-heavy agent tasks complementary to LongMemEval + LoCoMo.
 - **Complementary Learning Systems (McClelland, McNaughton, O'Reilly 1995)** — the original neuroscience paper on hippocampus-neocortex memory consolidation. The biological grounding for the engineering analogy.
 
 ---
