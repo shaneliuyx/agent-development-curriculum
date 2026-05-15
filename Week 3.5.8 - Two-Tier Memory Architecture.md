@@ -1495,13 +1495,19 @@ Route at write-time by data shape: facts → Qdrant; dialogues → EverCore. Sam
 
 **Total saved by adopting EverCore: ~700-1000 LOC of LLM-prompting + extraction + aggregation code — IF your data is in Bucket 1.** Wasted IF you're in Bucket 2 (W3.5.8's actual case): you pay 5x latency for redundant work on already-extracted content.
 
-### Measured cost (2026-05-14, 1-scroll round-trip on M5 Pro 48 GB)
+### Measured cost (2026-05-15, real lab runs on M5 Pro 48 GB)
+
+Two measurement contexts — **Bucket-2 (pre-summarized fact)** = single scroll through `consolidate()` Phase 4 path; **Bucket-1 (raw multi-turn dialogue)** = 10-12 turn synthetic conversation through Phase 8 `demo_conversational_imprint.py`.
 
 | Stage | guild + EverCore | guild + raw Qdrant + bge-m3 | Delta |
 |---|---|---|---|
-| LLM summarize_scroll (oMLX gpt-oss-20b reasoning model, max_tokens=400) | ~3-5s | ~3-5s | tie — same summarizer |
-| Imprint pipeline (extract memcell + atomic_facts + embed + index) | ~3-5s (2-3 internal LLM calls + embed) | ~150ms (embed + insert) | **20-30x slower** |
-| Cross-agent search | ~250-500ms (Mongo + Milvus + ES hybrid) | ~50-150ms (pure HNSW) | **3-5x slower** |
+| **Bucket-2 imprint** (1 pre-summarized fact, scroll path) | ~3-5s (LLM summarize + 2-turn wrap + flush + EverCore memcell extract) | ~150ms (LLM summarize-bypassed at imprint level; just embed + upsert) | **20-30x slower** |
+| **Bucket-1 imprint** (10-12 turn natural dialogue) | **188.68s** measured 2026-05-15 across 3 dialogues (Phase 8) — boundary detection + memcell + atomic_facts + profile aggregation | ~1.5s (10-12 embed calls + 1 upsert per turn) | **~125x slower** |
+| Cross-agent search | ~250-500ms (Mongo + Milvus + ES hybrid; `score=-100` sentinel when one episode per user) | ~50-150ms (pure HNSW + payload filter) | **3-5x slower** |
+| **Bucket-1 ATOMIC FACTS extracted per dialogue** | 3-5 typed atoms + 0-1 profile rows (Phase 8: 3/3 episodes, 2/3 profiles built on first dialogue) | 0 (raw vector store only) | EverCore wins where granularity matters |
+| **Bucket-2 atomic facts via Phase C atomisation pipeline** | 1 imprint per scroll (EverCore's atomic_fact extraction is separate from `consolidate()`'s output) | 5 typed atoms measured 2026-05-15 from a 5-fact scroll (use_atomisation=True) | Atomisation rewrite (form #2) closes the granularity gap for the Qdrant variant |
+
+**Reading the numbers honestly.** The 188s/dialogue number is the cost of EverCore EARNING its keep on Bucket-1 data: in exchange, you get 3-5 typed atomic_facts + 0-1 profile aggregation rows per session WITHOUT writing the extraction pipeline yourself. The Qdrant variant cannot produce profile rows or atomic_fact decomposition out of the box — but Phase C (`extract_atomic_facts` + `consolidate(use_atomisation=True)`) closes the granularity gap by adding 5 typed atoms per multi-fact scroll at ~3-5s per scroll wall (one extra LLM call vs the single-summary path). The 188s vs ~3-5s gap is what EverCore charges for the conversation-shape pipeline + profile aggregation; whether that's worth the cost is the Bucket-1 vs Bucket-2 decision.
 | Backend services running | 7 containers (Mongo + ES + Milvus etcd + Milvus minio + Milvus standalone + Redis + EverCore app) | 1 container (Qdrant) | **7x infrastructure** |
 | Idle RAM | ~2 GB | ~300 MB | **6x heavier** |
 | 50-scroll consolidate batch wall time | ~5-12 min | ~1-2 min | **5x slower** |
@@ -1770,8 +1776,107 @@ That answer is grounded in TWO measured experiments (Phase 7 + Phase 8), not one
 
 `★ Insight ─────────────────────────────────────`
 - **Phase 7 vs Phase 8 is the bucket-2 vs bucket-1 demonstration.** Phase 7 proves Qdrant wins when the data is pre-extracted. Phase 8 proves EverCore wins when the data is dialogue. Reader sees BOTH halves of the architectural trade-off.
-- **Phase 8 has no flush trickery.** BCJ Entry 13 is a Bucket-2 workaround; in Bucket 1 you don't need it because the LLM boundary detector actually finds episodes in real conversations. The fix matches the data shape.
-- **Profile aggregation is the EverCore feature most consumers underestimate.** Per-user profile facts built up over months are the thing customer-support / coaching / companion agents need that Qdrant cannot deliver out of the box. Phase 8 makes the gap concrete.
+- **Empirical correction (2026-05-15 run): Phase 8 STILL needs flush at lab scale.** The pre-measurement assumption that "Bucket-1 natural dialogues trigger boundary detection without flush" did not survive a real run. Even 10-12 turn dialogues return `status=accumulated` — EverCore's LLM boundary detector is genuinely conservative at lab scale (its canonical example dataset is 104 messages). Flush is required even on Bucket-1 data. The difference vs Phase 4 (Bucket 2) is in the QUALITY of extracted content (atomic_facts + profiles materialise) not the call sequence.
+- **Profile aggregation is the EverCore feature most consumers underestimate.** Per-user profile facts built up over months are the thing customer-support / coaching / companion agents need that Qdrant cannot deliver out of the box. Phase 8 makes the gap concrete (measured 2/3 profiles built on first-dialogue input).
+`─────────────────────────────────────────────────`
+
+---
+
+## Phase 9 — Optional Stretch: Online Dedup-and-Synthesis (~4 hours, SPEC)
+
+Form #1 from Batchelor-Manning's survey of the 19 systems — the article's highest-leverage form by ROI ("compounds across every retrieval"). When a new fact arrives, the system queries the existing store for candidates that overlap, then issues a single batch LLM call that emits per-fact actions: `add`, `update`, `delete`, or `no-op`. SimpleMem's `add_memories` is the textbook version; mem9's `reconcile` is the same pattern at scale. The store never accumulates near-duplicates that have to be filtered or re-ranked on every later read. A subtler benefit is that synthesis surfaces contradictions that flat-write systems never detect (Hindsight's "user liked React then switched to Vue" example).
+
+W3.5.8's current consolidate() does EXACT-match dedup on QUEST-ID only (BCJ Entry 4 fix). Two scrolls about the same deployment topic from different quests BOTH land as separate memories — no semantic dedup at write time. Phase 9 closes that gap.
+
+### 9.1 The dedup-and-synthesis primitive
+
+```python
+# src/dedup_synthesis.py (SPEC — TBD lab impl)
+"""Online dedup-and-synthesis (Batchelor-Manning form #1).
+
+Replace consolidate()'s blind imprint with: query store for overlap,
+ask LLM to decide action, execute. One LLM call per incoming fact.
+
+Article's claim: 5x increase in retrieval F1 on LoCoMo benchmark vs naive
+flat-write systems. The 19-system corpus shows this is the HIGHEST-ROI
+write-time investment form.
+"""
+from typing import Literal
+from dataclasses import dataclass
+
+
+DEDUP_PROMPT = """You are deduplicating an agent's long-term memory store.
+
+NEW FACT:
+{new_fact}
+
+CANDIDATE EXISTING FACTS (top-k by semantic similarity):
+{candidates}
+
+Emit JSON: {{"action": "...", "target_id": "...", "merged_content": "..."}}
+
+Actions:
+  "add"      — new fact is genuinely novel; insert as new memory
+  "update"   — new fact REFINES one of the candidates; update target_id
+               with merged_content that captures the refinement
+  "delete"   — new fact CONTRADICTS one of the candidates; mark target_id
+               obsolete, then add new fact (handled as 2-step by caller)
+  "no-op"    — new fact is a duplicate; do nothing
+
+Return JSON only. No prose, no markdown fence."""
+
+
+@dataclass
+class DedupAction:
+    action: Literal["add", "update", "delete", "no-op"]
+    target_id: str | None = None
+    merged_content: str | None = None
+```
+
+### 9.2 Integration with consolidate()
+
+Add `online_dedup: bool = False` kwarg to `consolidate()`. When True, AFTER atomisation but BEFORE imprint, the pipeline:
+
+1. For each atomic fact, query the store for top-5 semantically nearest existing memories (same `query_context()` shape we already have)
+2. Single LLM call with the new fact + candidates → emit `DedupAction`
+3. Execute the action:
+   - `add` → tm.imprint(...) as before
+   - `update` → DELETE target_id then tm.imprint(merged_content)
+   - `delete` → DELETE target_id (or write a tombstone if append-only)
+   - `no-op` → continue, increment `facts_deduplicated` counter
+
+### 9.3 Lab deliverables (SPEC)
+
+1. `src/dedup_synthesis.py` — `decide_action(new_fact, candidates) -> DedupAction` + integration helper
+2. Extend `ConsolidationResult` with `facts_deduplicated: int` + `facts_updated: int` + `facts_deleted: int` counters — measures the synthesis lift
+3. `tests/test_dedup_synthesis.py`:
+   - Seed store with "Production deploys use Terraform IaC" → run consolidate() with a near-duplicate input → assert action=no-op (or update if confidence higher)
+   - Seed store with "Auth tokens expire after 30 minutes" → run with contradicting input "Auth tokens expire after 1 hour" → assert action=delete + new fact added
+   - Cross-check: facts_imprinted + facts_deduplicated + facts_updated + facts_deleted == total atoms produced
+
+### 9.4 Expected measurement deltas
+
+Article cites SimpleMem's LoCoMo F1 lift over naive vector retrieval. For W3.5.8's 15-Q benchmark (Phase 5 target), online dedup-and-synthesis should:
+
+| Metric | Without dedup-and-synthesis | With dedup-and-synthesis (predicted) | Delta |
+|---|---|---|---|
+| Aggregate recall @ k=5 | ~0.85 (Phase 5 estimate, Qdrant variant) | ~0.92 (article claims ~7-10pp lift on LoCoMo-class benchmarks) | +7-10pp |
+| Per-imprint wall | ~150ms (Qdrant) / ~3-5s (EverCore Bucket-2) | + ~2-3s LLM call per atom for action decision | 10-20x slower at write, lopsided trade per article |
+| Store growth rate | linear in raw atoms | sub-linear (dedup + update consolidate near-duplicates) | bounded growth |
+| Contradiction detection | none — both old + new persist | surfaces explicitly via delete-then-add action | qualitative win |
+
+### 9.5 The senior-engineer signal
+
+Reader who completes Phase 9 can defend the article's "pay at write time" thesis with concrete numbers from THEIR lab, not from someone else's paper. Interview soundbite:
+
+> "I implemented online dedup-and-synthesis on top of the consolidation pipeline. Per-imprint wall went from ~150ms to ~2-3s for the Qdrant variant — that's the cost of one LLM call to decide add/update/delete/no-op per atom against the top-5 nearest existing memories. Aggregate recall on my 15-Q benchmark went from 0.85 to 0.92. The store-growth rate became sub-linear because near-duplicates merge instead of accumulating. Bigger qualitative win: contradictions surface explicitly — when the same fact updates over time, the delete-then-add action records that history instead of silently letting both versions coexist."
+
+That's a measurement-anchored answer to "how do you handle long-term agent memory under contradiction?" — directly comparable to SimpleMem's published LoCoMo numbers.
+
+`★ Insight ─────────────────────────────────────`
+- **Online dedup-and-synthesis is the article's #1 ROI claim.** Across the 19-system corpus, this form is the one Batchelor-Manning calls "compounds across every retrieval" — every read pays interest if you skip it. Phase 9 is where the lab catches up to the field's strongest empirical claim.
+- **The "delete-then-add" action records history rather than silencing it.** Critical for incident-response or audit-heavy domains where "what was the user's preference last month vs now?" is an answerable question. Naive flat-write systems lose this signal.
+- **One LLM call per atom is the cost.** For batch consolidations on a 50-scroll backlog, this could be 50 × atoms-per-scroll × 2-3s. Phase 9 should ship a batched-decision variant (5-10 atoms per LLM call) for production-scale workloads — that's the Hindsight async-batch pattern.
 `─────────────────────────────────────────────────`
 
 ---
