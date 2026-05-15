@@ -826,6 +826,41 @@ Then restart EverCore (`Ctrl-C` + `uv run web`).
 
 ---
 
+## 2026-05-15 — Week 3.5.8 — Phase 9.6 prompt upgrade silently invalidates pre-existing test's acceptable-action set
+
+**Symptom:** `test_decide_action_handles_contradiction` FAILED after extending the dedup prompt from 4 to 6 actions:
+
+```
+AssertionError: unexpected action: supersede
+  assert 'supersede' in ('delete', 'update', 'add')
+   +  where 'supersede' = DedupAction(
+       action='supersede',
+       target_id='existing-1',
+       supersede_reason='The authentication system was updated to extend token validity to 1 hour.',
+       supersede_category='config',
+       relates_to=None,
+   ).action
+```
+
+**Why it's a bad case:** The CLASSIFIER WAS WORKING CORRECTLY. Auth-token TTL change reads as **config rotation** (state evolution = the new `supersede` action) rather than factual correction (the old `delete`/`update` actions). The test's narrow acceptable set was written when the prompt had 4 actions; after extending to 6, the assertion needed to widen with it. Silent regression by omission.
+
+**Root cause:** Test acceptable-set was tied to launch-baseline contract (4-action). Prompt upgrade in §9.6 Step 1 extended the contract to 6 actions, but the test's `in (...)` clause didn't get updated in the same commit. The Phase 9.6 contract is "any non-silencing action is acceptable"; the test was encoding "specific 3-action subset is acceptable."
+
+**Fix:**
+- Widen acceptable set: `assert action.action in ("delete", "update", "supersede")` (omit `add`/`no-op` — they silence the contradiction).
+- Add inner conditional: `if supersede then target_id == expected AND supersede_reason non-empty`.
+- Production rule: when extending a structured-output contract (prompt, API schema, enum, message protocol), audit ALL downstream tests for narrow assertion sets. Same shape as schema-evolution in any wire protocol — tests are part of the schema.
+
+**5-second sanity test:** Before extending a prompt that emits structured output, grep the test suite for `in (` against the same field. Any narrow assertion is a regression risk.
+
+**Generalizes to:** Any LLM classifier with `Literal[...]` action type. Adding a literal value to the type is a schema change; tests that assert specific values from the old type need to migrate. This is the test-side mirror of W2.7's reformulator-output schema and W6.5 MCP tool-call argument schema — adding a field/value is forward-compatible at the producer, breaks narrow consumers (tests OR code).
+
+**Tags:** #schema-evolution #test-isolation #classifier #prompt-engineering #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 15.
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.
