@@ -804,6 +804,28 @@ Then restart EverCore (`Ctrl-C` + `uv run web`).
 
 ---
 
+## 2026-05-15 — Week 3.5.8 — Phase 9 dedup test: first scroll on "fresh" campaign imprints 0 atoms because Qdrant collection has cross-test residue
+
+**Symptom:** `test_consolidate_use_dedup_increments_counters` fails on the FIRST consolidate call: `ConsolidationResult(scrolls_seen=1, scrolls_imprinted=0, facts_imprinted=0, facts_deduplicated=2, ...)`. Test asserts `facts_imprinted >= 1` on a freshly-seeded scroll — but every atom got dedup'd-as-noop against pre-existing similar facts from prior tests' Qdrant data.
+
+**Why it's a bad case:** Cross-test state leak via shared backend collection. The DEDUP PIPELINE IS WORKING CORRECTLY — finding similar prior facts and emitting no-op is exactly what it should do. The TEST's assumption that "fresh campaign ⇒ fresh collection" is wrong.
+
+**Root cause:** Qdrant collection `lab358_memories` is SHARED across all tests by default. Phase 8 + Phase 9 + atomisation tests all write to the same collection. When `decide_action()` queries top-5 candidates for a new "Production deploys use Terraform IaC" fact, it finds near-duplicates from prior runs and correctly emits `no-op`.
+
+**Fix:** Two production-relevant options:
+- (a) Test-level: broaden assertion to "imprinted OR deduplicated >= 1" — accept either outcome as evidence the pipeline ran. Quick and pragmatic.
+- (b) Stricter: per-test Qdrant collection (`COLLECTION = f"lab358_test_{uuid.uuid4().hex[:8]}"`) for full isolation. More work; correct in principle.
+
+**5-second sanity test:** When testing a dedup-style pipeline, ask: "is the BACKEND COLLECTION fresh, or does it carry state from prior runs?" If the latter, your "fresh test" isn't fresh — assertions must accommodate.
+
+**Generalizes to:** Any test against an append-or-merge store where the test fixture scopes only LOGICAL identifiers (campaign, user_id, session_id) but not the PHYSICAL backend (collection, table, namespace). The fix pattern is the same shape as BCJ entries 11 (per-test campaign for guild) and 12 (shared user_id for EverCore) — different layer, same isolation-vs-residue tension.
+
+**Tags:** #dedup #test-isolation #stateful-backend #shared-collection #lab-3.5.8 #qdrant
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 14.
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.
