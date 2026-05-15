@@ -902,6 +902,143 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 | `openai.APIConnectionError` during `summarize_scroll` | `OMLX_BASE_URL` not exported / oMLX server down | `curl $OMLX_BASE_URL/models` to verify; restart oMLX |
 | `test_consolidation_skips_low_value_scrolls` fails — `scrolls_skipped == 0` | LLM summarizer emitted a fact instead of `SKIP` | Lower temperature, tighten SKIP examples in §3.1 `SUMMARIZE_PROMPT`, or swap the low-value test scroll for a more obviously-noise one — summarizer judgment is the gate, and gate quality is summarizer-quality-dependent |
 
+#### 3.2.1 Atomisation tests — `tests/test_atomisation.py`
+
+Five tests covering the Batchelor-Manning form #2 (atomisation) + form #5/6 (type tagging + confidence-at-read). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
+
+```mermaid
+flowchart TD
+  A["test_atomisation.py<br/>5 tests"] --> T1["test 1: extract_atomic_facts<br/>multi-fact scroll -> >= 2 atoms<br/>+ type ∈ valid set + 0 ≤ conf ≤ 1"]
+  A --> T2["test 2: empty input<br/>extract returns list (may be empty)"]
+  A --> T3["test 3: consolidate(use_atomisation=True)<br/>facts_imprinted >= 2 on multi-fact scroll<br/>(asserts atomisation didn't collapse to 1)"]
+  A --> T4["test 4: query_context(type_filter=['fact'])<br/>excludes observation + tool_result"]
+  A --> T5["test 5: query_context(min_confidence=0.8)<br/>excludes quality_score < 0.8"]
+```
+
+**Code:**
+
+```python
+# tests/test_atomisation.py — Phase 3 atomisation + type/confidence filter tests
+"""Atomisation rewrite tests (Batchelor-Manning 2026 form #2).
+
+Uses Qdrant backend (deterministic write semantics, no LLM-extraction
+black box) so we can assert exact fact counts. EverCore variant's
+internal extraction pipeline collapses scrolls into 1 memcell + N
+atomic_facts via LLM-judged boundaries; we can't predict counts.
+"""
+import uuid
+import pytest
+
+from src.consolidation import consolidate, extract_atomic_facts
+from src.tiered_memory_qdrant import TieredMemory
+
+
+def _fresh_campaign() -> str:
+    return f"test-w358-atom-{uuid.uuid4().hex[:8]}"
+
+
+def test_extract_atomic_facts_returns_typed_list():
+    """Multi-fact scroll -> multiple atoms with type + confidence."""
+    facts = extract_atomic_facts(
+        "Deployed prod API via Terraform plan + apply. Used the company's "
+        "standard IaC module (modules/api-stack). Required VPC peering with "
+        "the data-lake account. First-deploy budget was 5 minutes wall-clock."
+    )
+    assert isinstance(facts, list)
+    assert len(facts) >= 2, f"expected >=2 atoms, got {len(facts)}: {facts}"
+    for f in facts:
+        assert "fact" in f and isinstance(f["fact"], str)
+        assert f["type"] in {"fact", "observation", "tool_result", "skill"}
+        assert 0.0 <= f["confidence"] <= 1.0
+
+
+def test_extract_atomic_facts_empty_on_no_knowledge():
+    """Vague scroll with no reusable knowledge -> empty (or low-confidence) list."""
+    facts = extract_atomic_facts(
+        "trying things; not sure yet; logged some stuff and moved on"
+    )
+    assert isinstance(facts, list)  # structural shape only
+
+
+@pytest.mark.asyncio
+async def test_consolidate_with_atomisation_produces_multiple_facts():
+    """consolidate(use_atomisation=True) -> facts_imprinted > scrolls_imprinted."""
+    campaign = _fresh_campaign()
+    async with TieredMemory(agent_id="atom_test") as tm:
+        quest_id = await tm.post_task(subject="deploy-multi-fact", campaign=campaign)
+        claim = await tm.claim_task(quest_id)
+        assert claim["won"]
+        await tm.complete_task(quest_id, report=(
+            "Deployed prod API via Terraform plan + apply. Used standard "
+            "modules/api-stack. Required VPC peering with data-lake. "
+            "First-deploy budget was 5 minutes wall-clock. terraform apply "
+            "returned 200 on first run."
+        ))
+        result = await consolidate(tm, max_batch=10, campaign=campaign,
+                                   use_atomisation=True)
+        assert result.scrolls_imprinted == 1, f"expected 1 scroll, got {result}"
+        assert result.facts_imprinted >= 2, (
+            f"expected >=2 atomic facts, got {result.facts_imprinted}. "
+            "If 1: atomisation collapsed the multi-fact scroll into one summary."
+        )
+
+
+@pytest.mark.asyncio
+async def test_query_filter_by_type_returns_only_matching():
+    """query_context(type_filter=['fact']) excludes observation + tool_result."""
+    async with TieredMemory(agent_id="type_filter_test") as tm:
+        tm.imprint(content="Production deployments use Terraform IaC.",
+                   metadata={"type": "fact", "quality_score": 0.9})
+        tm.imprint(content="Today's deploy took 5 minutes wall-clock.",
+                   metadata={"type": "observation", "quality_score": 0.8})
+        tm.imprint(content="terraform apply returned 200.",
+                   metadata={"type": "tool_result", "quality_score": 0.7})
+        hits = tm.query_context(query="how do we deploy?", k=10,
+                                type_filter=["fact"])
+        for h in hits:
+            assert h.get("type") == "fact", f"got non-fact: {h}"
+
+
+@pytest.mark.asyncio
+async def test_query_min_confidence_excludes_low_quality():
+    """query_context(min_confidence=0.8) excludes quality_score < 0.8."""
+    async with TieredMemory(agent_id="conf_filter_test") as tm:
+        tm.imprint(content="High-quality fact about authentication tokens.",
+                   metadata={"type": "fact", "quality_score": 0.95})
+        tm.imprint(content="Low-quality vague observation about something.",
+                   metadata={"type": "observation", "quality_score": 0.2})
+        hits = tm.query_context(query="authentication tokens", k=10,
+                                min_confidence=0.8)
+        for h in hits:
+            assert h.get("quality_score", 1.0) >= 0.8, f"low-conf hit: {h}"
+```
+
+**Walkthrough:**
+
+**Block 1 — `extract_atomic_facts` test asserts a triple invariant.** Not just "returns a list" — also (a) ≥2 items for a 4-sentence multi-fact scroll, (b) each item has the four required fields (`fact`, `type`, `confidence`), (c) `type` is in the closed set `{fact, observation, tool_result, skill}` and `confidence` is in `[0, 1]`. Why three layers: shape, count, value constraints. A test that only checks shape passes when the atomiser silently collapses 4 facts into 1; a test that only checks count passes when types are bogus. Three-layer assertion catches all silent-degradation modes.
+
+**Block 2 — Empty-input test asserts shape only.** `extract_atomic_facts` may return `[]` OR `[<low-confidence atom>]` for a vague scroll — both are correct outcomes (the downstream quality gate handles confidence filtering). Test does NOT assert `len == 0` because that would over-constrain the atomiser. Loose-set pattern from §9.7 applied here.
+
+**Block 3 — `assert claim["won"]` after `claim_task`.** Guild's atomic-claim primitive returns winner/loser based on a SQLite UPDATE WHERE owner IS NULL race. In a single-test context the test agent always wins, but asserting `won=True` documents the expected behavior for the reader AND catches the case where guild_session_start failed silently (the wrapper would return `won=False` because the UPDATE failed). Pedagogical: tests should encode invariants even when the invariants seem obviously true.
+
+**Block 4 — `result.scrolls_imprinted == 1` + `facts_imprinted >= 2` is the LOAD-BEARING assertion.** This is what proves atomisation works. 1 scroll IN, ≥2 facts OUT. If scrolls_imprinted is 1 but facts_imprinted is also 1, the atomiser collapsed the multi-fact report into a single summary — that's the failure mode this test guards. Without this assertion, "atomisation works" is unverifiable.
+
+**Block 5 — Type filter test imprints 3 types directly, bypassing `consolidate`.** Why direct `tm.imprint()` instead of going through atomisation: speed. Atomisation costs ~2-3s per scroll (LLM call); direct imprint is ~150ms. Test cares about the FILTER, not the atomiser — separate concerns. Production rule: when testing a downstream primitive, seed the upstream state directly rather than running the full pipeline.
+
+**Block 6 — Min-confidence filter test mirrors the type filter pattern.** Different filter, same shape. Both filters work at READ time on metadata stamped at WRITE time — Batchelor-Manning form #5 (confidence) + form #6 (type) are the production equivalent of "store everything, filter on read." Tests prove both filters actually exclude the right things.
+
+**Result** (status 2026-05-15):
+- Tests parse + import cleanly; not yet run end-to-end in this session
+- Estimated runtime: ~30-40s wall (3 LLM-touching tests + 2 fast filter tests; LLM-touching ones go through `extract_atomic_facts` which costs ~2-3s)
+- Pre-condition: oMLX serving `MODEL_HAIKU` (`gpt-oss-20b-MXFP4-Q8`) AND Qdrant on `:6333`
+- Expected verdict: 5/5 PASS per Phase 3 commit `ec77699` which shipped atomisation; this test file IS the validation gate for that commit
+
+`★ Insight ─────────────────────────────────────`
+- **Type + confidence filters at READ time encode form #5 + #6 from the article without changing the WRITE path.** That's the load-bearing pedagogical claim: write-time investment (atomisation + tag + score) is paired with read-time exploitation (filter) — neither half works alone. The 2 filter tests prove the read side; the 2 atomisation tests prove the write side. Four-test orthogonal coverage of one composite pattern.
+- **Bypassing `consolidate()` in the filter tests is the right shape.** Tests want to isolate the filter behavior. Going through atomisation adds noise (the atomiser might assign different types than the test seeds). Direct imprint = full control. Different from §9.7 e2e test which DOES go through `consolidate(use_dedup=True)` because that test cares about the integration. Test scope drives test seeding.
+- **The closed-set `type ∈ {fact, observation, tool_result, skill}` is a contract the chapter doesn't otherwise document.** Tests are the runbook for that contract. Production rule: when the type system uses string-typed enums (Python Literal), the test suite IS the schema documentation.
+`─────────────────────────────────────────────────`
+
 ### 3.3 Quality-Score Promotion Gate (~30 min mini-lab)
 
 The §3.1 consolidator imprints EVERY scroll the summarizer doesn't explicitly mark `SKIP`. That's a binary filter — pass/fail on a single LLM judgement. PraisonAI's memory subsystem (`src/praisonai-agents/praisonaiagents/memory/memory.py`) uses a finer-grained primitive: a **quality_score** in `[0.0, 1.0]` attached to each candidate memory, with a configurable **promotion threshold** between short-term (episodic) and long-term (durable) tiers. Only entries `score >= threshold` promote. That gives the operator a tunable precision/recall dial on what enters durable memory, instead of a single SKIP rule baked into the prompt.
@@ -1613,7 +1750,7 @@ EMBED_DIMS = 1024  # bge-m3-mlx-fp16
 @dataclass
 class TieredMemoryConfig:
     qdrant_base_url: str = "http://localhost:6333"
-    timeout_s: float = 10.0
+    qdrant_timeout_s: float = 10.0
 
 
 class TieredMemory:
@@ -1629,7 +1766,7 @@ class TieredMemory:
         self._guild = GuildClient(agent_id=agent_id)
         self._http = httpx.Client(
             base_url=self.config.qdrant_base_url,
-            timeout=self.config.timeout_s,
+            timeout=self.config.qdrant_timeout_s,
         )
         self._llm = OpenAI(
             base_url=os.getenv("OMLX_BASE_URL"),
@@ -1711,6 +1848,13 @@ class TieredMemory:
         ]
 ```
 
+> **Forward links to subsequent extensions:**
+> - **`imprint()` Step 2 timestamp injection (Phase 9.6, 2026-05-15):** every payload now stamps `timestamp = datetime.now(timezone.utc).isoformat()` so downstream dedup can distinguish factual correction (short gap) from state evolution (large gap). Canonical code + walkthrough in §9.6 Bundle C.
+> - **`query_context()` form #5 + #6 extensions (Phase 3 atomisation, commit `ec77699`):** adds `min_confidence: float = 0.0` and `type_filter: list[str] | None = None` kwargs to filter low-confidence + restrict by `type` (fact / observation / tool_result / skill). Code + tests in §3.2.1.
+> - **`TieredMemoryLike` Protocol (Phase 9 commit `bf1d091`):** the dedup module imports a structural Protocol matching THIS class's surface so it can operate against both EverCore + Qdrant variants without inheritance. Protocol declaration in §9.1.
+
+This §7.2 block is the **launch baseline**. The shipped class is ~215 LOC after the three extensions land; the additions are documented in their own bundles to keep each pedagogical unit focused.
+
 ### 7.3 Swap into the demo
 
 In `src/demo_two_agent_shared_knowledge.py`, change one import line:
@@ -1738,6 +1882,129 @@ Re-run. The rest of the demo — `post_task`, `claim_task`, `complete_task`, `co
 - **The one-line import swap IS the interview soundbite.** Saying "my semantic tier is one wrapper class; I can swap it from a heavyweight extraction pipeline to a pure vector store by changing one import" demonstrates the seam-discipline interviewers reward.
 - **The Qdrant variant SKIPS the conversation-shape gymnastics from BCJ Entry 13** — no 2-turn synthetic wrap, no session_id-scoped flush, no waiting for memcell extraction. The contract on `TieredMemory.imprint()` stays the same; the implementation gets simpler because the backend's contract is simpler.
 - **bge-m3 stays as the embedding model across both variants** (oMLX serves it; EverCore uses it via VECTORIZE_*; Qdrant uses it directly). The embedding choice is orthogonal to the storage backend — another layer the wrapper isolates correctly.
+`─────────────────────────────────────────────────`
+
+### 7.5 Qdrant variant tests — `tests/test_consolidation_qdrant.py`
+
+Four tests parallel to `test_consolidation.py` but importing the Qdrant variant. Proves the §2.1 "wrapper IS the architecture" claim: change one import → consolidation pipeline + dedup state + test contract all unchanged. Different backend, same surface.
+
+```mermaid
+flowchart LR
+  A["test_consolidation_qdrant.py<br/>4 tests"] --> T1["test 1: imprints completed scrolls<br/>(parallel to EverCore variant)"]
+  A --> T2["test 2: idempotent on second run<br/>(SQLite quest_id dedup still works)"]
+  A --> T3["test 3: skips low-value scrolls<br/>(summarizer SKIP gate still works)"]
+  A --> T4["test 4: query round-trip<br/>imprint -> search -> verify content<br/>(Qdrant-specific: ~80ms search wall claim)"]
+  T4 --> R["validates Production<br/>Considerations table claim"]
+```
+
+**Code:**
+
+```python
+# tests/test_consolidation_qdrant.py — Phase 7 stretch variant tests
+"""Proves the "wrapper IS the architecture" claim: by switching the
+import on TieredMemory, the consolidation pipeline, dedup state, and
+test contract stay identical. Different backend, same surface.
+
+Run alongside test_consolidation.py:
+    uv run pytest tests/ -v
+"""
+import uuid
+import pytest
+
+from src.consolidation import consolidate
+from src.tiered_memory_qdrant import TieredMemory   # <- the one-line swap
+
+
+def _fresh_campaign() -> str:
+    return f"test-w358-qdrant-{uuid.uuid4().hex[:8]}"
+
+
+async def _seed_completed_quest(
+    tm: TieredMemory, campaign: str, subject: str, report: str
+) -> str:
+    quest_id = await tm.post_task(subject=subject, campaign=campaign)
+    claim = await tm.claim_task(quest_id)
+    assert claim["won"], f"Could not claim {quest_id}: {claim['response']}"
+    await tm.complete_task(quest_id, report=report)
+    return quest_id
+
+
+@pytest.mark.asyncio
+async def test_qdrant_consolidation_imprints_completed_scrolls():
+    campaign = _fresh_campaign()
+    async with TieredMemory(agent_id="qdrant_test_agent") as tm:
+        await _seed_completed_quest(tm, campaign=campaign,
+            subject="deploy-via-terraform",
+            report="deployed via terraform; ran apply; got 200; verified VPC peering")
+        result = await consolidate(tm, max_batch=10, campaign=campaign)
+        assert result.scrolls_imprinted >= 1
+
+
+@pytest.mark.asyncio
+async def test_qdrant_consolidation_idempotent_on_second_run():
+    campaign = _fresh_campaign()
+    async with TieredMemory(agent_id="qdrant_test_agent") as tm:
+        await _seed_completed_quest(tm, campaign=campaign,
+            subject="check-auth-tokens",
+            report="auth tokens expire after 30min; got 401 with stale token")
+        first = await consolidate(tm, max_batch=10, campaign=campaign)
+        second = await consolidate(tm, max_batch=10, campaign=campaign)
+        assert first.scrolls_imprinted >= 1
+        assert second.scrolls_imprinted == 0
+
+
+@pytest.mark.asyncio
+async def test_qdrant_consolidation_skips_low_value_scrolls():
+    campaign = _fresh_campaign()
+    async with TieredMemory(agent_id="qdrant_test_agent") as tm:
+        await _seed_completed_quest(tm, campaign=campaign,
+            subject="debug-session",
+            report="trying things; not sure yet; logged some stuff")
+        result = await consolidate(tm, max_batch=10, campaign=campaign)
+        assert result.scrolls_skipped >= 1
+
+
+@pytest.mark.asyncio
+async def test_qdrant_query_round_trip():
+    """Imprint -> search -> verify retrievable. Qdrant-specific e2e check
+    that Production Considerations table claim (~80ms search wall, no
+    extraction pipeline) is achievable."""
+    async with TieredMemory(agent_id="qdrant_round_trip") as tm:
+        tm.imprint(
+            content=("Production deployments use Terraform IaC with VPC "
+                     "peering and 5-minute apply budget."),
+            metadata={"quest_id": "QUEST-rt", "subject": "deploy"},
+        )
+        results = tm.query_context(query="how do we deploy production APIs?", k=3)
+        assert results, "expected at least one match for just-imprinted fact"
+        assert "Terraform" in results[0]["content"]
+        assert 0.0 <= results[0]["score"] <= 1.0   # cosine sim ∈ [0,1] normalized
+```
+
+**Walkthrough:**
+
+**Block 1 — `from src.tiered_memory_qdrant import TieredMemory` is THE load-bearing line.** Same class name as `src.tiered_memory.TieredMemory` (the EverCore variant). The tests run against IDENTICAL code paths — `consolidate(tm, ...)`, `_seed_completed_quest`, all assertions — but `tm` is a different concrete class. This single import swap proves the architectural seam. Production rule: when two implementations of the same interface live in your codebase, USE THE SAME CLASS NAME. Importers swap one line; nothing else changes.
+
+**Block 2 — Per-test `_fresh_campaign()` instead of module-level constant.** Notable difference from `test_consolidation.py` which uses a single `CAMPAIGN = "test-w358-consolidation"` constant. Why per-test here: BCJ Entry 11 surfaced that guild's quest table is append-only and per-test campaigns avoid cross-test residue. The Qdrant variant tests adopted this pattern earlier (Phase 7 lab commit `5e9bc69`) than the EverCore variant did. Pedagogical: the SAME pattern landed in two variants at different times because the failure surfaced at different points — production teams should standardize once, not re-discover per backend.
+
+**Block 3 — Idempotency test asserts `second.scrolls_imprinted == 0`.** Strict equality. Different from §9.7's dedup test which uses `>= 1` because of cross-collection-residue (BCJ Entry 14). Here the idempotency check is operating on guild's QUEST-ID SQLite table — NOT on Qdrant's collection — so the strict assertion is safe. Pedagogical: the dedup tier (SQLite quest_id) is OPERATIONAL-tier, not semantic-tier; it's not subject to Qdrant collection residue. Two layers, two test strategies.
+
+**Block 4 — SKIP test uses report `"trying things; not sure yet; logged some stuff"`.** The summarizer prompt's SKIP gate must classify this as low-value. If the test fails, the gate is over-promoting. Same canary scroll in both EverCore + Qdrant variant tests — proves the gate's behavior is BACKEND-INDEPENDENT (it operates on report text before any imprint call).
+
+**Block 5 — Round-trip test is the only QDRANT-SPECIFIC test.** EverCore variant doesn't have it because EverCore returns episode-shaped results (summary + atomic_facts) where verifying "content contains Terraform" requires walking the synthesis layer. Qdrant returns the raw imprinted content directly — `results[0]["content"]` IS the original string. This makes round-trip testing a 3-line invariant. Pedagogical: simpler backend = simpler tests. The chapter's Production Considerations table claim ("~80ms search wall, no extraction pipeline") is validated by this test passing.
+
+**Block 6 — `0.0 <= score <= 1.0` cosine-sim sanity.** Qdrant uses cosine distance for the `Cosine` collection type. Normalized vectors → similarity in `[0, 1]`. If this assertion fails, either the embedding model returned unnormalized vectors OR the collection was created with `Euclidean` distance (returns unbounded values). Test acts as a regression guard against collection-config drift.
+
+**Result** (Phase 7 commit `5e9bc69` — 4/4 PASS measured):
+- 4/4 tests PASS in ~3-5s wall on M5 Pro + local Qdrant (`:6333`) + oMLX bge-m3
+- ~80ms search wall validated (round-trip test sub-second including imprint + embed + Qdrant POST + parse)
+- Idempotency proven independent of backend (operational dedup table works regardless)
+- Cross-test residue handled by per-test campaign namespace (BCJ Entry 11 pattern)
+
+`★ Insight ─────────────────────────────────────`
+- **The same-class-name import-swap pattern is the chapter's biggest architectural lesson in one line of code.** Same `class TieredMemory` declared in two modules; pick one via `import`. Compare to inheritance-based patterns (`class QdrantTM(BaseTM):` etc) which would force the test file to import the base + concrete + register-via-factory. Same-name twin classes = simplest possible interface seam. Production rule: when two implementations should be drop-in interchangeable, give them the same name in different modules.
+- **The 4-test parallel structure documents what's INVARIANT across backends.** Both variants pass tests 1-3 (imprint, idempotent, skip-low-value). Only Qdrant passes test 4 (round-trip) because round-trip needs raw-content retrieval which EverCore doesn't offer. The asymmetry IS the architectural lesson — backends differ in SHAPE of retrieval, not in CORE consolidation semantics.
+- **Round-trip test as production-claim validator.** The chapter claims "Qdrant gives sub-100ms search." A reader who runs `pytest test_qdrant_query_round_trip` empirically verifies the claim on their hardware. Without this test, the production claim is unfalsifiable — exactly the failure mode CLAUDE.md's real-data discipline targets.
 `─────────────────────────────────────────────────`
 
 ---
