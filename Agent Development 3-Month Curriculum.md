@@ -459,13 +459,13 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 **Infra bridge.** User memory is a slowly-changing dimension (SCD-2). Every contradiction archives the old row and writes a new one — identical to how a data warehouse tracks customer addresses. Archive-don't-delete isn't ops hygiene; it's SCD-2 by another name, and that framing lands with senior interviewers.
 
 ### Week 3.5.5 — Multi-Agent Shared Memory (Guild MCP) (half-week insert, ~4–6h)
-> Detailed runbook: [[Week 3.5.5 - Multi-Agent Shared Memory]] *(brief; runbook generated on demand)*
+> Detailed runbook: [[Week 3.5.5 - Multi-Agent Shared Memory]] *(chapter fully written 2026-05-12; lab `lab-03-5-5-guild` ships 5 src + 3 test files, commit `e5b91e9`)*
 
 **Theory (1–2h).**
 - Read: [`mathomhaus/guild`](https://github.com/mathomhaus/guild) README + `internal/store/sqlite/` schema + `internal/retrieve/` (BM25 + dense + RRF fusion k=60) + `internal/mcp/` tool surface. Anthropic's MCP spec — focus on the resource + tool primitives.
 - Master: where multi-agent memory diverges from single-agent W3.5 memory (atomic claims on concurrent task acquisition, scroll-versioning across timeline-overlapping sessions, oath as procedural principle vs lore as semantic archive), why MCP-protocol-native memory beats library-bound memory when agents span multiple harnesses (Claude Code / Cursor / Codex sharing one substrate).
 
-**Lab (3–4h) — `lab-03.5.5-guild-multiagent`.**
+**Lab (3–4h) — `lab-03-5-5-guild`.**
 1. Install guild via the pre-built `install.sh` (with `-tags=withembed` for semantic retrieval). Verify with `guild --version`. Run `guild init` in a fresh test project; answer the MCP-client-registration prompts.
 2. Open the test project in TWO MCP clients (e.g. Claude Code + Cursor). Confirm both clients see the same `guild_session_start()` output. Demonstrate "same state, any agent" with a 5-line scripted scenario.
 3. **Atomic-claim scenario**: spawn two agent sessions in parallel; have each call `quest_accept` on the same available quest within 2 seconds. Demonstrate that exactly ONE wins the lock and the other receives a "claimed by..." rejection. Trace the SQLite WAL to show the atomicity guarantee.
@@ -477,29 +477,34 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 **Infra bridge.** Multi-agent shared memory is a distributed-systems primitive in miniature. SQLite WAL + atomic-claim locks is the same pattern as Postgres advisory locks or DynamoDB conditional writes. Guild proves you don't need a Raft cluster or a service mesh to coordinate agents — embedded SQLite + careful schema design handles single-host parallel-agent workloads. When you DO need cross-host coordination, the pattern transfers to a real distributed lock service (Consul / etcd) without architectural rework — same primitive, different physical substrate.
 
-### Week 3.5.8 — Two-Tier Memory Architecture (guild + EverCore) (half-week insert, ~6–8h)
-> Detailed runbook: [[Week 3.5.8 - Two-Tier Memory Architecture]] *(brief; chapter file written)*
+### Week 3.5.8 — Two-Tier Memory Architecture (guild + EverCore + Qdrant + bitemporal dedup) (half-week insert, ~10–14h)
+> Detailed runbook: [[Week 3.5.8 - Two-Tier Memory Architecture]] *(R2-expanded, Phases 7/8/9/9.6 IMPLEMENTED 2026-05-14/15)*
 
-The capstone of the W3.5 cluster. W3.5 built single-agent memory; W3.5.5 added multi-agent coordination via guild; W3.5.8 wires guild (operational tier) and EverCore (semantic tier) into a single production-shaped two-tier architecture with an explicit consolidation pipeline between them. Includes the LongMemEval benchmark from the retired W3.5.7 as Phase 5's measurement step.
+The capstone of the W3.5 cluster. W3.5 built single-agent memory; W3.5.5 added multi-agent coordination via guild; W3.5.8 wires guild (operational tier) and EverCore (semantic tier) into a single production-shaped two-tier architecture, then EXTENDS with three stretch Phases (Qdrant drop-in, EverCore Bucket-1, online dedup-and-synthesis) and a bitemporal supersede/coexist extension (Phase 9.6). 15 BCJ entries (6–15 observed against live lab runs).
 
 **Theory (1.5h).**
-- Read: the biological-memory analogy — hippocampus (fast-write, short-term, coordination) + neocortex (slow-write, durable, semantic) + memory consolidation during sleep. [Letta (formerly MemGPT) paper](https://arxiv.org/abs/2310.08560) for the canonical RAM↔archive two-tier in agent systems. [LongMemEval](https://github.com/xiaowu0162/LongMemEval) + [LoCoMo](https://github.com/snap-research/locomo) for industry-standard memory benchmarks. EverOS's `methods/EverCore/evaluation/` for production-grade benchmark harness shape.
+- Read: hippocampus + neocortex biological analogy + REM-sleep consolidation. [Letta / MemGPT paper](https://arxiv.org/abs/2310.08560). [LongMemEval](https://github.com/xiaowu0162/LongMemEval) + [LoCoMo](https://github.com/snap-research/locomo). Batchelor-Manning 2026 corpus survey of 19 memory systems — surfaces the 6 write-time investment forms (atomisation, type tagging, confidence scoring, provenance, multi-step ingest, online dedup-and-synthesis). 8-paradigm retrieval-shape taxonomy + Paradigm 9 (δ-mem in-attention). EverCore's `methods/EverCore/evaluation/` for benchmark harness shape.
 - Master:
-  - WHEN to use each tier (atomic-claim → guild; semantic recall → EverCore; never the reverse)
-  - The consolidation pipeline as the load-bearing pattern (when to consolidate, what to consolidate, idempotency + ordering)
-  - The cache-aside / Debezium-style data-movement analogy from data engineering
-  - Why two-tier beats single-tier on cross-session-AND-cross-agent questions
+  - WHEN to use each tier (atomic-claim → guild; semantic recall → EverCore or Qdrant by data shape).
+  - The 3-bucket data-shape decision (Bucket-1 conversation → EverCore; Bucket-2 pre-extracted facts → Qdrant; Bucket-3 mixed → BOTH).
+  - The consolidation pipeline as load-bearing (idempotency + ordering + 6 write-time forms applied).
+  - Bitemporal memory: factual correction (update) vs state evolution (supersede) vs scope variants (coexist).
+  - Cache-aside / Debezium-style data-movement analogy.
 
-**Lab (5–6.5h) — `lab-03.5.8-two-tier-memory`.**
-1. **Phase 1 — Bring up both services (~30min)**: guild via homebrew install + EverCore via docker compose. Verify both reachable with smoke-test scripts.
-2. **Phase 2 — Two-tier Python orchestrator (~2h)**: build `TieredMemory(guild_client, evercore_client)` wrapper with `claim_task() / complete_task(scroll) / query_context(query) / consolidate()` methods. guild handles claim+scroll; EverCore handles semantic query+imprint.
-3. **Phase 3 — Consolidation pipeline (~1.5h)**: batch job that pulls closed scrolls from guild, extracts task summaries, imprints them into EverCore as semantic memories. Idempotency via scroll_id deduplication; ordering via timestamp. Tests for both.
-4. **Phase 4 — Two-agent shared-knowledge demo (~1.5h)**: agent A completes a task in session 1 → consolidation runs → agent B starts session 2 with cross-session context retrieved from EverCore, then claims next quest in guild.
-5. **Phase 5 — Four-way benchmark (~1.5h)**: same 15-Q multi-agent recall, run against (a) no-memory baseline, (b) guild-only, (c) EverCore-only, (d) **two-tier**. Optional extension: run LongMemEval `oracle` subset for industry-standard scoring (carries the retired W3.5.7's purpose into this lab's Phase 5).
+**Lab (8–11h) — `lab-03-5-8-two-tier`.**
+1. **Phase 1 — Bring up both services (~30min)**: guild via homebrew + EverCore via docker compose. Smoke-test both.
+2. **Phase 2 — Two-tier orchestrator (~2h)**: `TieredMemory` facade with two-layer identity (agent_id Python label + user_id EverCore tenant). Per-imprint synthetic-conversation wrap + forced flush (BCJ Entry 13 fix).
+3. **Phase 3 — Consolidation pipeline (~1.5h)**: batch job; SQLite idempotency table on quest_id; atomisation + quality-score promotion gate (forms #2 + #4); test_consolidation.py + test_consolidation_qdrant.py.
+4. **Phase 4 — Two-agent shared-knowledge demo (~1h)**: cross-session, cross-agent recall via shared user_id (BCJ Entry 12 fix).
+5. **Phase 5 — Four-way benchmark (~1.5h)**: 15-Q multi-agent recall × 4 backends + LongMemEval `oracle` subset.
+6. **Phase 7 STRETCH — Qdrant drop-in (~2h, IMPLEMENTED commit `5e9bc69`)**: drop-in `TieredMemory` variant with one-line import swap; **4/4 tests pass**. Measured 20-30× faster imprints + 3-5× faster searches vs EverCore on Bucket-2 data.
+7. **Phase 8 STRETCH — EverCore Bucket-1 demo (~3h, IMPLEMENTED 2026-05-15)**: 3 simulated dialogues (Alice / Bob / Carol) prove EverCore EARNS its cost on Bucket-1 conversation shape. Side-by-side compare yields **~35× Qdrant speedup on imprint** but EverCore wins on synthesised-episode retrieval shape. 3/3 episodes, 2/3 profiles measured.
+8. **Phase 9 STRETCH — Online dedup-and-synthesis (~4h, IMPLEMENTED commit `bf1d091`)**: Batchelor-Manning form #1 — top-k semantic candidates + LLM-classified action (add/update/delete/no-op) at write time. 4-action classifier; `facts_deduplicated=2` measured on duplicate-scroll test.
+9. **Phase 9.6 STRETCH — Bitemporal supersede + coexist (Step 1+2 IMPLEMENTED 2026-05-15)**: 6-action classifier splitting "contradiction" into update (factual correction) vs supersede (state evolution) vs coexist (scope variant). Timestamp injection cross-backend. **5/5 dedup-suite tests PASS in 76.5s** on `gpt-oss-20b-MXFP4-Q8`. BCJ Entry 15: 4→6 action assertion-set widening surfaced via auth-token TTL config-rotation upgrade.
 
-**Exit criteria.** 90-second answer to "how would you architect memory for a multi-agent system?" — name the two-tier pattern (operational + semantic), the biological analogy (hippocampus + neocortex + REM-sleep consolidation), the consolidation pipeline (REM-sleep-style batch transfer with idempotency + ordering). Cite the measured 4-way benchmark differential — two-tier should beat each single-tier by ≥10% on cross-session questions. Articulate WHY each system is wrong for the OTHER's job. Bonus: name Letta as the canonical production parallel.
+**Exit criteria.** 90-second answer to "how do you architect memory for a multi-agent system?" — name the two-tier pattern + biological analogy + consolidation pipeline + bucket-decision framework + measured 4-way benchmark differential. Articulate the 6 write-time investment forms + the bitemporal supersede/coexist split + the Step 3 deferred soft-delete carve-out. Cite the 5/5 dedup-suite 76.5s wall on `gpt-oss-20b` + Phase 8's 35× Qdrant speedup + Phase 9's `facts_deduplicated=2` measurement. Bonus: defend the contract-free Step 3 path (one-line `_qdrant_delete` → `_qdrant_supersede` swap; rest of the layer unchanged).
 
-**Infra bridge.** Two-tier memory is the cache-aside pattern applied to agent state. guild is Redis-tier (hot, sub-100ms, ephemeral). EverCore is Postgres-tier (cold, slower, durable, semantic-indexable). The consolidation pipeline is Debezium / Kafka Connect moving rows from transactional → analytical store — same primitive, different artifact. Pattern transfers directly to any agent system where short-term coordination and long-term institutional knowledge have different access patterns.
+**Infra bridge.** Two-tier memory is cache-aside applied to agent state; the consolidation pipeline is Debezium / Kafka Connect; the bitemporal extension is the SCD-Type-2 dimensional-modeling pattern (slowly-changing dimensions with effective-from/effective-to) applied to vector memory; soft-delete via payload patch is the production analogue of tombstone records in append-only stores. Each layer maps to a primitive any infra engineer has shipped before.
 
 ### Week 3.5.9 — Memory Benchmarks + Hypergraph Three-Tier (half-week insert, ~6–8h)
 > Detailed runbook: [[Week 3.5.9 - Memory Benchmarks and Hypergraph Three-Tier]]
@@ -598,18 +603,25 @@ The W3.5 memory cluster (W3.5 / W3.5.5 / W3.5.8 / W3.5.9) is all WORLD-facing �
 
 **Exit criteria.** Whiteboard the loop from memory. Name 5 stability failure modes and your mitigation for each.
 
-**Infra bridge.** A ReAct loop is a Kubernetes reconciliation loop. The mitigations (idempotency keys, retry budgets, dead-letter queues, circuit breakers) are exactly the patterns you already use.
+**Phase 1.5 — MLX Studio gateway + role map (lab commit 2026-05-05, chapter §1.5 synced 2026-05-15).** Lab originally shipped one vMLX server per port (`:8002` opus / `:8003` sonnet / `:8004` haiku / `:8001` JANG lazy). The 2026-05-05 refactor consolidates ALL models behind a single **MLX Studio API gateway** on `:8080/v1` and dispatches per-request via `model:` field. Measured overhead vs direct port: zero (within noise). Chapter §1.5 ships `src/models.py` (~150 LOC) with `ROLE_MAP` for 7 roles (loop / tool_arg / classify / reason / compose / finisher / hard_loop), `@dataclass(frozen=True) Endpoint` for per-role url+model+timeout, `_CLIENT_CACHE` keyed by `(url, timeout)`, plus `compose_final_answer()` lazy-load with fail-open `except`. Probe-driven verdicts that landed in ROLE_MAP: 5/5 stability runs at T=0 across all 7 roles. Why JANG_4M-CRACK over heretic at same 31B 4-bit scale: heretic `tool=0.00` (uncensored fine-tune destroyed function-call alignment); JANG `tool=1.00`. The role-routing vocabulary feeds directly into W4.5's cost-latency Pareto chapter.
+
+**Infra bridge.** A ReAct loop is a Kubernetes reconciliation loop. The mitigations (idempotency keys, retry budgets, dead-letter queues, circuit breakers) are exactly the patterns you already use. The §1.5 gateway refactor is the service-mesh consolidation pattern: N independent endpoints → 1 gateway with dispatch metadata. Same shape as nginx-as-LB in front of microservice pods.
 
 ### Week 4.5 — Model Routing and Effort Tiering (half-week insert, ~6h)
-> Detailed runbook: [[Week 4.5 - Model Routing and Effort Tiering]] *(SPEC v0 — phases scoped, code TBD)*
+> Detailed runbook: [[Week 4.5 - Model Routing and Effort Tiering]] *(R2 chapter expansion complete — 1172 lines, all 5 Phases R2-shipped 2026-05-15; §6 BCJ + §7 Soundbites + RESULTS.md await Phase 5 real-run population)*
 
 W4 built one ReAct loop calling one opus-tier model — every task pays the same 35B-parameter latency cost. Production agent systems (Claude.ai, ChatGPT, Cursor) pass requests through a routing layer that picks the smallest model competent for the request. PAI v6.3.0's mode classifier + agenticSeek's two-stage `AgentRouter` (Adaptive + BART-MNLI voted) are the convergent pattern. Cross-repo finding: 2/4 surveyed repos converge on local-classifier-before-tool-dispatch.
 
-**Theory (1.5h).** Routing-layer thesis; tier vs mode as orthogonal axes; closed-list classification (not free-text reasoning); calibration curves over accuracy; cost-latency Pareto front as the real metric. RouteLLM (arXiv:2406.18665), FrugalGPT (arXiv:2305.05176), RouterBench, Mixture-of-Experts (Shazeer 2017).
+**Theory (~1500 words R2-expanded).** Routing-layer thesis with 3 load-bearing properties (closed-list classifier not reasoning model; tier × mode orthogonal axes; vote-or-fallback for safety). Calibration over accuracy. Cost-latency Pareto front as the real metric. 9 references with descriptions + 4 distinguish-from contrasts. RouteLLM (arXiv:2406.18665), FrugalGPT (arXiv:2305.05176), RouterBench, Mixture-of-Experts (Shazeer 2017).
 
-**Lab (4.5h, SPEC) — `lab-04.5-routing`.** Extends the W4 vMLX fleet with a Qwen-1.5B classifier on `:8005`. 5 phases: (1) fleet scaffold; (2) hand-labelled 60-prompt probe set (tier × mode); (3) classifier + tier_dispatch (single-classifier accuracy target ≥85%); (4) second classifier + vote with disagreement logging; (5) four-way cost-latency benchmark: opus-always vs classifier-routed vs classifier+vote vs random-baseline.
+**Lab (4.5h, R2-expanded per-block bundles) — `lab-04.5-routing`** *(scaffold pending; spec runnable from chapter)*. 5 Phases, all with mermaid + code + walkthrough + insight per CLAUDE.md normative §4:
+1. **Phase 1 — Fleet config** (`fleet_config.py` + `smoke_test.py`).
+2. **Phase 2 — Probe set** (`router_probes.jsonl` + `probes.py` with stratified split).
+3. **Phase 3 — Single-classifier dispatch** (`router.py` + `tier_dispatch.py` + `test_router_accuracy.py`; target ≥0.85 per-tier accuracy).
+4. **Phase 4 — Vote layer** (`router_bart.py` BART-MNLI zero-shot + `router_vote.py` asyncio.gather parallel + SQLite disagreement log + safety-bias tie-break via TIER_ORDER / MODE_ORDER).
+5. **Phase 5 — Four-way cost-latency bench** (`test_four_way_bench.py` with 4 verdict factories — opus_always / classifier / vote / random; COST_PER_M_TOKENS rate card for cloud-equivalent reporting).
 
-**Exit criteria.** 90-second answer to "how would you design a routing layer for an LLM agent system?" — name the tier × mode axes + vote-for-safety pattern + the cost-latency Pareto plot. Cite measured 4-way bench numbers from Phase 5.
+**Exit criteria.** 90-second answer to "how would you design a routing layer for an LLM agent system?" — name the tier × mode axes + vote-for-safety pattern + the cost-latency Pareto plot. Cite measured 4-way bench numbers from Phase 5 (real run pending). Q9 interview cover (parallelized intent recognition) maps to §Phase 4 vote layer — see [[Interview Question Index]] Tier 4.
 
 **Infra bridge.** Routing is the API-gateway pattern applied to LLM serving — pick the right downstream based on cheap features of the request. Maps directly to Envoy / Istio request-classification, AWS Lambda function-routing, and the "policy layer" in any production ML system.
 
