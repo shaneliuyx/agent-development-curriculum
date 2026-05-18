@@ -1026,7 +1026,7 @@ For each, spend ~2 hours: 30 min thinking, 60 min talking through architecture a
 2. **Multi-agent customer-support triage** — classifier agent + specialist agents (billing/tech/account), human escalation, SLA tracking
 3. **Coding agent in Claude Code style** — sandboxed exec, git integration, permission model, context compaction
 4. **Financial-research agent** — tool-heavy (search + EDGAR + spreadsheet), citation-required, refusal on speculation, deterministic eval
-5. **Infra-aware SRE agent (your differentiator)** — reads Kubernetes API + Prometheus + distributed traces + Terraform plan JSON, can answer "why is `checkout-service` p99 up?" by hypothesis → verify reasoning
+5. **Infra-aware SRE agent (your differentiator)** — reads Kubernetes API + Prometheus + distributed traces + Terraform plan JSON, can answer "why is `checkout-service` p99 up?" by hypothesis → verify reasoning. Composes [[Week 11.6 - Production Tracing and Cost Telemetry]] (OTel spans + DuckDB cost rollups) + [[Week 11.8 - Continuous Training and MLOps Pipelines]] (PSI drift detector + shadow ramp) as primitives; the SRE agent IS a CT pipeline applied to infra metrics.
 
 **Self-critique rubric** (use this every time):
 - Did you draw the data flow before talking about prompts?
