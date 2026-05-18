@@ -2656,6 +2656,129 @@ This is the consolidated reflection for the whole §2.3 production-latency exper
 
 > **Interview soundbite (latency-focused):** "Per-query reranker latency on M5 Pro went from 112 ms (spec defaults) to 37.8 ms — a 2.97× speedup that comes mostly from fp16 (-63%, the dominant lever) and partly from batch=128 (-8%, kernel-launch reduction at production shape). 37.8 ms is 5.3× under the 200 ms p95 budget for synchronous RAG, leaving 162 ms headroom for compression and LLM generation. The same fp16 lever validated for offline-eval throughput (§2.2.1) transfers cleanly to per-query latency — the cross-query batching optimization (§2.2.4) does not, because production sees one query at a time. Same underlying mechanism, opposite direction on the same knob."
 
+### 2.6 The production wrapper — `src/retrieve.py` (NATIVE_RRF)
+
+The Phase 2 sub-sections ship `01_rerank.py` (dense + rerank) and `01_rerank_mlx.py` (MLX-backed reranker) as standalone evaluators. The **production-grade public API** is `src/retrieve.py` — a thin orchestrator over `shared/rag_hybrid` that downstream labs (W2.5 GraphRAG comparison, W2.7 PageIndex baseline, W3 RAGAS eval, W3.7 Agentic RAG fallback) import to get "the canonical Phase 2 pipeline" with one call. Refactored via `5516598 refactor(lab-02): switch retrieve.py to NATIVE_RRF (phase 8b/D)` to use Qdrant's server-side RRF fusion (Prefetch + FusionQuery) — same math (Cormack 2009, k=60), one HTTP roundtrip instead of two.
+
+```mermaid
+flowchart TD
+  Q["query string"] --> RT["search_with_rerank(q, k=5)"]
+  RT --> AC["autoconfig.recommend(M, R)<br/>device/mem/CPU probe"]
+  AC --> ENC["HybridEncoder(cfg)<br/>BGE-M3 dense + sparse one-pass"]
+  AC --> RNK["CrossEncoderReranker(cfg, fp16=True)<br/>BGE-Reranker-v2-M3"]
+  ENC --> R["Retriever(cfg=NATIVE_RRF)"]
+  RNK --> R
+  R --> M{"collection schema?"}
+  M -- dense-only --> D["BGE dense kNN -> rerank -> top-K"]
+  M -- hybrid --> H["BGE dense+sparse encode -><br/>Qdrant Prefetch + FusionQuery(RRF) -><br/>rerank -> top-K"]
+  D --> CTX["join top-K as context"]
+  H --> CTX
+  CTX --> LLM["LLM answer (MODEL_SONNET, T=0)"]
+  LLM --> A["{answer, chunks}"]
+```
+
+**Code:**
+
+```python
+# src/retrieve.py — production retrieve wrapper (108 LOC)
+"""Vector-RAG search-with-rerank wrapper. Public API for downstream comparison.
+
+Auto-detects retrieval mode from the target Qdrant collection schema:
+  - Dense-only collection (bge_m3_hnsw, tech_corpus_hnsw):
+      BGE-M3 dense kNN -> cross-encoder rerank -> top-K -> LLM answer
+  - Hybrid dense+sparse collection (bge_m3_hybrid, tech_corpus_hybrid):
+      dense + sparse encode -> Qdrant native RRF -> rerank -> LLM answer
+
+Set QDRANT_COLLECTION env var to choose collection — mode is inferred
+from the collection's vectors_config, no separate flag required.
+"""
+from __future__ import annotations
+import os, sys, dataclasses
+from pathlib import Path
+
+from openai import OpenAI
+from qdrant_client import QdrantClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
+from rag_hybrid import (   # noqa: E402
+    BGE_M3_HNSW, BGE_RERANKER_V2_M3,
+    CrossEncoderReranker, FusionStrategy,
+    HybridEncoder, RetrieveConfig, Retriever, autoconfig,
+)
+
+SONNET = os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
+_M = BGE_M3_HNSW.model
+_R = BGE_RERANKER_V2_M3
+_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", BGE_M3_HNSW.name)
+
+omlx = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
+qd = QdrantClient(url="http://127.0.0.1:6333")
+
+# System-aware config: probes device + memory + CPU, produces matching
+# encoder/reranker/ingest configs. On MPS encoder fp16=False (BGE-M3
+# sparse-head NaN risk); reranker fp16=True (cross-encoder is safe).
+_cfg = autoconfig.recommend(_M, _R)
+
+_encoder = HybridEncoder(_cfg.encoder)
+_reranker = CrossEncoderReranker(dataclasses.replace(_cfg.reranker, fp16=True))
+
+# NATIVE_RRF: server-side fusion via Qdrant Prefetch + FusionQuery.
+# Same RRF formula (Cormack 2009, k=60) as MANUAL_RRF; one HTTP roundtrip.
+_retriever = Retriever(
+    qd=qd, collection=_COLLECTION_NAME, encoder=_encoder,
+    cfg=RetrieveConfig(fusion=FusionStrategy.NATIVE_RRF),
+)
+
+_ANSWER_PROMPT = """Using ONLY the context below, answer the query in 1-3 sentences. If the context doesn't contain the answer, reply exactly: insufficient context.
+
+Context:
+{ctx}
+
+Query: {q}
+Answer:"""
+
+
+def search_with_rerank(query: str, k: int = 5, top_n: int | None = None) -> dict:
+    """Run vector retrieval + cross-encoder rerank + LLM answer on one query."""
+    top = _retriever.search_with_rerank(query, _reranker, k=k, top_n=top_n)
+    ctx = "\n\n".join(f"[{did}] {text}" for did, text, _ in top)
+    resp = omlx.chat.completions.create(
+        model=SONNET,
+        messages=[{"role": "user", "content": _ANSWER_PROMPT.format(ctx=ctx, q=query)}],
+        temperature=0.0,
+        max_tokens=400,
+    )
+    return {"answer": (resp.choices[0].message.content or "").strip(),
+            "chunks": top}
+```
+
+**Walkthrough:**
+
+**Block 1 — `autoconfig.recommend(_M, _R)` is the device-aware config layer.** Probes MPS / CUDA / CPU + memory + core count, returns matching encoder + reranker + ingest configs. On MPS it forces encoder `fp16=False` (BGE-M3's sparse head has a NaN risk in fp16 on MPS) but reranker stays `fp16=True` (cross-encoder is numerically safe). On CUDA both flip True. `autoconfig.notes` is the audit trail printed at startup.
+
+**Block 2 — `dataclasses.replace(_cfg.reranker, fp16=True)` is the explicit override.** Autoconfig already recommends fp16=True on MPS/CUDA — the explicit replace makes the choice VISIBLE at the call site. Preserves the frozen `comparison.json` hash that downstream comparison labs lock against.
+
+**Block 3 — `_COLLECTION_NAME` from env, schema-auto-detection.** Caller doesn't choose dense-vs-hybrid; Retriever inspects `vectors_config` from the collection and picks the right code path. Same wrapper handles both modes — downstream labs (W2.5, W2.7, W3) get the same import + call regardless of which Phase 1 collection they bound to.
+
+**Block 4 — `FusionStrategy.NATIVE_RRF` is the post-refactor default.** Pre-refactor (commit `f85e0f1` / `ff36452`): two HTTP roundtrips (dense query + sparse query, manual RRF client-side). Post-refactor (commit `5516598`): one HTTP roundtrip via Qdrant's `Prefetch` + `FusionQuery(RRF)` server-side. Math is identical (k=60); tied-score handling may differ but aggregate metrics are equivalent. The frozen comparison.json was produced against a dense collection (`tech_corpus_hnsw`), so the swap doesn't affect the comparison hash.
+
+**Block 5 — `omlx.chat.completions.create` at `T=0`.** Deterministic answer generation. `MODEL_SONNET` is the production answerer; reranker + encoder are quality levers. Compare to `01_rerank.py`'s direct-eval variant — that one returns chunks-only for downstream RAGAS scoring; `retrieve.py` returns the full pipeline output.
+
+**Block 6 — `{"answer": str, "chunks": list[tuple[id, text, score]]}` is the contract.** Two-key output: the LLM answer (consumer-facing) + the source chunks (audit / faithfulness-check). W3 RAGAS eval feeds `chunks` to its faithfulness scorer; W2.7 GT-judge comparison uses `answer` directly.
+
+**Result** (W2 + downstream lab consumers, measured 2026-05-01 commit `5516598`):
+
+- Per-query wall: ~280-450ms (encode ~50ms + Qdrant search ~80ms + rerank ~38ms + LLM ~120-250ms)
+- NATIVE_RRF vs MANUAL_RRF: one HTTP roundtrip saved, ~30-50ms reduction on hybrid collections
+- Downstream importers: W2.5 `compare.py`, W2.7 `compare_three.py`, W3 `02_pipeline.py`, W3.7 baseline_handrolled (via re-import). The wrapper is THE canonical "what Phase 2 produces."
+- Backward compat: same `search_with_rerank(query, k)` signature pre/post refactor. Pure server-side optimization; no consumer changes.
+
+`★ Insight ─────────────────────────────────────`
+- **`retrieve.py` IS the Phase 2 product.** Every downstream lab consumes it as `from src.retrieve import search_with_rerank`. The standalone evaluators (`01_rerank.py`, `01b_latency.py`) are the MEASUREMENT scripts that produced the §2.2 numbers; `retrieve.py` is what ships forward. Production rule: when a chapter's lab has both eval scripts AND a wrapper, the wrapper is the artifact, the evals are the proof.
+- **`shared/rag_hybrid` was extracted via phases 7c-8 refactors.** Before: each lab re-implemented HybridEncoder + Reranker + Retriever inline. After: one shared library, lab `retrieve.py` is the thin wrapper. This is the chapter's "Concept 5 — When to Stop Writing Primitives" pattern applied to its own codebase.
+- **The NATIVE_RRF refactor (5516598) preserved the frozen `comparison.json` hash** — downstream comparison labs that lock against this hash don't need re-running. Production rule for server-side optimization: if the math is identical AND the test harness can prove output equality, the change is "free." If either is violated, treat as a behavior change requiring re-baseline.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Phase 3 — Context Compression (~4 hours)

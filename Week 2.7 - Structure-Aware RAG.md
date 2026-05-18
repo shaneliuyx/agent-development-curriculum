@@ -971,6 +971,8 @@ Copies of lab-02-5's `build_graph.py` + `query_graph.py` with `s/Entity/BrkEntit
 
 Trade-off: ~1400 LOC duplicated vs env-var-parameterizing W2.5. Picked copy because the blast radius is smaller — W2.5 lab stays fully untouched, W2.7's graph data lives in its own namespace.
 
+> **Shared utility — `src/wikidata_qid.py`.** Byte-identical to `lab-02-5-graphrag/src/wikidata_qid.py` (~263 LOC) — the v12 QID resolver imported by `build_brk_graph.py` for entity-name-to-Q-ID linking at extraction time (`wbsearchentities` API + disk-backed cache). Pedagogy + code walkthrough live in [[Week 2.5 - GraphRAG#v12 — Wikidata QID linking at extraction time]]. W2.7 copies the file rather than imports cross-lab to keep `lab-02-7-pageindex` standalone-runnable; pattern is the same as the `build_graph.py` → `build_brk_graph.py` namespace-fork above. Don't duplicate the walkthrough here.
+
 #### `src/compare_three.py` — runner
 
 Imports vector backend (autoconfig'd shared/rag_hybrid against `brk_2023_dense`), graph backend (`from query_brk_graph import answer`), tree backend (`from query_tree import answer`). Cross-lab import for scoring helpers from `lab-02-5/src/compare.py`. Per-category aggregation surfaces the empirical findings reported in §4.3.1 — vector wins factoid; graph wins aggregate (refuted the "graph degenerates" pre-lab hypothesis); tree wins refusal and ties graph on cross-section synthesis.
