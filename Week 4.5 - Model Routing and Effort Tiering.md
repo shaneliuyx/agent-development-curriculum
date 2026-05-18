@@ -1134,6 +1134,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 - (a) "How would you design a routing layer for an LLM agent system?" — anchor on 4-way bench numbers.
 - (b) "Why two classifiers instead of one?" — anchor on disagreement rate + escalation safety.
 - (c) "What's the difference between routing and Mixture-of-Experts?" — anchor on the §2.4 distinguish-from material.
+- (d) "How do you parallelize intent recognition?" *(Interview Q9 cover; see [[Interview Question Index]] Tier 4)* — anchor on §Phase 4 vote layer: `asyncio.gather` runs two heterogeneous classifiers (closed-list LLM + BART-MNLI zero-shot) in parallel; ~3s wall vs ~6s sequential; disagreements get logged to SQLite + tie-break via safety-bias TIER_ORDER / MODE_ORDER. The point of parallel execution is NOT throughput per request — it's **two independent posterior samples on the same input** so voting catches single-classifier failure modes. Mention the disagreement rate from your run.
 
 ---
 

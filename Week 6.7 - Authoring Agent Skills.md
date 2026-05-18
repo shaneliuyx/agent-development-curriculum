@@ -475,6 +475,10 @@ Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `
 **Soundbite 3 — Trust model**
 "Skills run with the full permissions of the Claude Code session. `allowed-tools` is a hint to the model, not a sandbox. Distributing a skill to a team is equivalent to distributing a shell script with elevated permissions — same review threshold required. The marketplace makes installation trivially easy, which makes vetting before installation more important, not less."
 
+**Soundbite 4 — Skills implementation** *(Interview Q12 cover; see [[Interview Question Index]] Tier 4)*
+
+"A skill is a markdown file with YAML frontmatter — name, description, allowed-tools — plus a body that describes the workflow. The trigger is the description field; Claude Code's session bootstrap loads all installed skills' descriptions into context at session start. When a user message lands, the model scans descriptions for a match. If matched, the skill's body loads INTO the model's prompt context; the model then executes the workflow as instructions. There's no runtime separate from the model — it's pure prompt injection. The implementation IS the file system plus a one-shot description-loader at session boot. Compare to MCP tools: tools are typed function calls with structured input/output schemas. Skills win on workflow expression; tools win on deterministic execution. Production agents use both."
+
 ---
 
 ## References
