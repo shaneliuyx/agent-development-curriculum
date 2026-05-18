@@ -295,7 +295,7 @@ class TodoList:
 - **Builds on:** W4 (ReAct loop — context is what flows through the loop), W3.5.X (memory — semantic recall is one shape of context), W0.5 (token costs depend on tokenizer family)
 - **Distinguish from:**
   - *Memory systems (W3.5.X)*: memory is OUT-OF-CONTEXT storage; context engineering is how IN-CONTEXT material is curated. Different layer; same problem-space ancestor.
-  - *Prompt templates (W6.8)*: templates are the LANGUAGE; context engineering is the ALLOCATION. A great template inside a context-overflow is still failed.
+  - *Prompt templates (W6.85)*: templates are the LANGUAGE; context engineering is the ALLOCATION. A great template inside a context-overflow is still failed.
   - *Skills (W6.7)*: skills define what tools/text to inject WHEN triggered. Context engineering decides how that injection is BUDGETED.
 - **Connects to:** W6.7 (skills inject content per trigger), W6 Claude Code (TodoWrite as the reference impl), W11.6 (production tracing — cost attribution often shows context bloat as primary cost driver)
 - **Foreshadows:** W12 capstone — your agent demo's plausibility is heavily gated by context-engineering quality

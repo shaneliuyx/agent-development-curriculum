@@ -342,6 +342,13 @@ vmlx = OpenAI(base_url="http://localhost:8003/v1", api_key="not-used")
 
 > **Runbook pattern.** Each week has a dedicated step-by-step runbook in the vault: [[Week 1 - Vector Retrieval Baseline]], [[Week 2 - Rerank and Context Compression]], [[Week 2.5 - GraphRAG]], [[Week 2.7 - Structure-Aware RAG]], [[Week 3 - RAG Evaluation]], [[Week 3.5 - Cross-Session Memory]], [[Week 3.7 - Agentic RAG]]. The text below is the *overview*; the runbooks are the *how*. Treat each runbook like a preflight checklist — tick phases, don't just read. Runbooks for Weeks 4–12 follow the same template and are generated on demand (see §"Runbook Generation Pattern" at the bottom of this file).
 
+### Week 0.5 — LLM Internals Speedrun (foundations primer, ~6h)
+> Detailed runbook: [[Week 0.5 - LLM Internals Speedrun]]
+
+**Why this week exists (added 2026-05-18).** Every senior LLM Engineer interview probes fundamentals: "What does the model see when you type 'hello'?" "Walk me through self-attention." Candidates without a hands-on grounding pivot to "frameworks handle that" and lose the room. W0.5 is the minimum content to compute QKV by hand on a 4-token example, inspect tokenizer behavior across Qwen3 / Gemma-3 / gpt-oss, and prove "same token, different position" gives different output vectors on a real MLX model. Covers interview Q13 (transformer input pipeline) + Q14 (self-attention QKV). Self-attention formula rendered in LaTeX so chapter math reads as math, not pseudocode.
+
+**Exit criteria.** Answer "what does the model see?" with the 5-stage pipeline (tokenize → embed → positional → blocks → sample) in one breath. Compute QKV softmax weights $(0.39, 0.14, 0.235, 0.235)$ for row 0 of the 4-token worked example by hand. Run the MLX same-token-different-position cosine demo + report your hardware's measured number (expect 0.85-0.95).
+
 ### Week 1 — Embedding & Vector Retrieval Fundamentals
 > Detailed runbook: [[Week 1 - Vector Retrieval Baseline]]
 
@@ -764,6 +771,20 @@ W3.5.5 consumed MCP via `GuildClient` — reader has seen the client side. W6.6 
 
 **Infra bridge.** The three protocols are agent-world analogues to service-mesh primitives: MCP ≈ service-to-database (capability access), A2A ≈ service-to-service mTLS (peer communication), ANP ≈ service discovery + identity (Consul + SPIFFE). The protocol landscape is going through the same consolidation cycle that service meshes went through in 2018-2020 — bet on the open spec with multi-vendor adoption, hedge with thin wrappers around the others.
 
+### Week 6.85 — Prompt Template Engineering Patterns (half-week insert, ~5h)
+> Detailed runbook: [[Week 6.85 - Prompt Template Engineering Patterns]]
+
+**Why this week exists (added 2026-05-18).** Every curriculum chapter ships prompts (W3.5.8 dedup, W4 ReAct, W4.5 routing, W3.7 decomposition) but no chapter explains the design framework. W6.85 consolidates into a 5-axis design space — persona / task / output schema / few-shot / failure guards — plus 4 anti-patterns + a schema-enforcement-with-retry-once layer. Covers interview Q1 ("how are prompt templates constructed?"). Consolidation chapter, no new lab.
+
+**Exit criteria.** Audit 5 curriculum prompts against the 5 axes (table in §1 of the runbook). Implement the schema-enforce primitive (Pydantic + strip_fence + retry-once-with-error). Identify the 4 anti-patterns in your own past code.
+
+### Week 6.9 — Context Engineering + Todo Mechanisms (half-week insert, ~5h)
+> Detailed runbook: [[Week 6.9 - Context Engineering and Todo Mechanisms]]
+
+**Why this week exists (added 2026-05-18).** "The agent drifts off-task" is a context-management bug, not a model-quality bug. Every successful agent product (Claude Code TodoWrite, Cursor task list, Devin plan tracker) invests heavily in context engineering. W6.9 catalogs 4 context shapes (rolling buffer / summarized / RAG-recalled / structured-state-as-list), articulates the cognitive-narrowing argument for why todo lists focus models, and implements an 80-LOC TodoList primitive. Covers interview Q11.
+
+**Exit criteria.** Articulate the context-budget formula $T_{\text{sys}} + T_{\text{tools}} + T_{\text{hist}} + T_{\text{recall}} + T_{\text{state}} + T_{\text{out}} + T_{\text{margin}} \leq W$ with $T_{\text{out}} \geq 0.25 W$. Ship the TodoList primitive with add / mark_in_progress / mark_complete / mark_blocked semantics. Identify the 3 failure modes (overflow / drift / staleness).
+
 ---
 
 ## Phase 3 — Stability: Tools, Schema, Hallucination (Weeks 7–9)
@@ -812,6 +833,20 @@ W3.5.5 consumed MCP via `GuildClient` — reader has seen the client side. W6.6 
 **Exit criteria.** Cold answer to "when does computer use beat Playwright in production?" — name the breakpoint (cost-per-task vs human-maintenance), name one safety control you'd require before shipping.
 
 **Infra bridge.** CUA is RPA with an LLM as the recognizer. Same governance shape as RPA: every action is an audit-log event, every credential is a least-privilege principal, every page change is a regression candidate.
+
+### Week 7.7 — Quantization and Inference Optimization (half-week insert, ~10h)
+> Detailed runbook: [[Week 7.7 - Quantization and Inference Optimization]]
+
+**Why this week exists (added 2026-05-18).** Every JD with "resource-constrained environments + real-time inference" wants candidates who can explain why a 70B model in FP16 doesn't fit on a 48 GB laptop but the same model in MXFP4 does. The bit-width math is simple — bytes per parameter — but production teams routinely get it wrong. W7.7 measures the bit-width / accuracy / latency / memory trade-off ON THE LAB FLEET (gpt-oss-20b-MXFP4-Q8 / Qwen-9B-Q8 / Gemma-26B-Q4 / Qwen-35B-NVFP4). Covers JD#1 (quantization + real-time inference).
+
+**Exit criteria.** Defend $M_{\text{weights}} = N_{\text{params}} \times \text{bytes/param}$ + KV-cache formula on real fleet measurements. Identify memory-bound vs compute-bound regime via the bandwidth formula. Distinguish PTQ vs QAT vs AWQ / GPTQ / SmoothQuant / MXFP4. Plot a perplexity-vs-quant curve on a 100-sample probe.
+
+### Week 7.8 — Code-Agent Patterns: AST + Coverage + Mocks (half-week insert, ~10h)
+> Detailed runbook: [[Week 7.8 - Code-Agent Patterns AST Coverage Mocks]]
+
+**Why this week exists (added 2026-05-18).** Code-agent roles (Cursor / Claude Code / Devin / Cognition) ask the same 5-7 questions: "How does your agent parse code? How do you measure coverage? Which code resists auto-generated tests? How do you mock?" W7.8 is the explicit skill cluster — tree-sitter AST + multilspy LSP + branch coverage via coverage.py + signature-validated mock-injection. Covers interview Q3-Q7.
+
+**Exit criteria.** Extract testable functions from a Python file via AST walk + 4-flag testability filter (I/O / decorated / dynamic-dispatch / concurrency). Run a coverage-guided test-generation loop that lifts branch coverage from a 65% baseline to 92% on a target module. Articulate the 4 code classes that defeat naive AST test generation.
 
 ### Week 7.3 — Production LLM Infrastructure (supplemental, ~6–8h)
 > Detailed runbook: [[Week 7.3 - Production LLM Infrastructure]]
@@ -876,6 +911,13 @@ Final deliverable: a comparison table + the **canonical "5-layer defense" diagra
 **Exit criteria.** 90-second answer to "design a customer-support voice agent" that names the architecture choice, the latency budget, the interruption handling, and the cost ceiling.
 
 **Infra bridge.** Voice = real-time pipeline with a hard latency SLA. Same operational shape as a low-latency trading or ad-bidding pipeline — every component has a budget, every queue is bounded, every fallback is pre-wired.
+
+### Week 8.7 — Generative Media + Fine-tuning (half-week insert, ~12h)
+> Detailed runbook: [[Week 8.7 - Generative Media and Fine-tuning]]
+
+**Why this week exists (added 2026-05-18).** JDs targeting brand-consistent generative content (e-commerce hero images, product video, marketing audio) need engineers who can fine-tune diffusion models — not just call paid APIs. LoRA + DreamBooth + ControlNet + IP-Adapter is the production stack. Image generation extends to video via temporal-coherence mechanisms (AnimateDiff, SVD). Covers JD#4 (generative media + brand-consistent fine-tuning).
+
+**Exit criteria.** Articulate the diffusion forward + reverse process: $x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon$ with reverse via learned $\epsilon_\theta(x_t, t)$. Train a LoRA adapter on 10-15 brand reference images. Stack LoRA + ControlNet (Canny) + IP-Adapter (style) at inference time. Compute CLIP + FID + human-panel scores. Extend to video via SVD I2V.
 
 ### Week 9 — Hallucination Detection & Mitigation
 > Detailed runbook: [[Week 9 - Faithfulness Checker]]
@@ -999,6 +1041,20 @@ For each, spend ~2 hours: 30 min thinking, 60 min talking through architecture a
 **Exit criteria.** Cold-answer "design a permission system for an agent that writes files and sends emails" — name the trust tiers, name two attack classes, name two defenses, cite the Greshake paper or equivalent.
 
 **Infra bridge.** Agent security is RBAC + WAF + sandbox. Trust tiers = principals; tools = privileged operations; output filter = egress firewall. The composition is what's new; each primitive maps to something you've shipped.
+
+### Week 11.6 — Production Tracing + Cost Telemetry (half-week insert, ~8h)
+> Detailed runbook: [[Week 11.6 - Production Tracing and Cost Telemetry]]
+
+**Why this week exists (added 2026-05-18).** Production agents fail in ways that are invisible without tracing. "The agent is slow" hides which span (router / loop / tool / finisher) bears the cost; "the agent is expensive" hides which role + user combination dominates. W11.6 instruments the W4 ReAct loop with OpenTelemetry, sends spans to self-hosted Langfuse, and computes per-role / per-model rollups via DuckDB on append-only parquet. Covers JD#2 (fine-grained tracing + throughput optimization).
+
+**Exit criteria.** Wrap the W4 loop with `llm_call_span` + `traced` decorator. Self-host Langfuse + view trace tree in UI. Query DuckDB for cost-per-role-per-day + p99-latency-per-model-per-hour. Articulate the p99-vs-mean argument with a heavy-tailed example (e.g., p99 = 7800ms while mean = 850ms).
+
+### Week 11.8 — Continuous Training + MLOps Pipelines (half-week insert, ~8h)
+> Detailed runbook: [[Week 11.8 - Continuous Training and MLOps Pipelines]]
+
+**Why this week exists (added 2026-05-18).** Most engineering teams understand CI/CD. Few understand **CT** — Continuous Training — the third leg where production signals trigger automated retraining → eval gate → shadow → ramp. Skipping CT means models silently degrade for months. W11.8 wires the PSI drift detector + eval-gated CI workflow + shadow deployment + rollback. Covers JD#3 (production ML + CI/CD/CT automation).
+
+**Exit criteria.** Define MLOps maturity Levels 0-3 and pinpoint your stack on the ladder. Compute PSI: $\text{PSI}(P, Q) = \sum_i (p_i - q_i) \ln(p_i / q_i)$ on a real feature distribution. Wire the eval gate (PR fails if RAGAS faithfulness drops > $\epsilon$ vs main). Articulate why "3 consecutive days of PSI > 0.25" is a better trigger than a single-day spike.
 
 ### Week 12 — Mock Interviews + Portfolio Polish
 > Detailed runbook: [[Week 12 - Capstone and Mocks]]

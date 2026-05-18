@@ -1,5 +1,5 @@
 ---
-title: Week 6.8 — Prompt Template Engineering Patterns
+title: Week 6.85 — Prompt Template Engineering Patterns
 created: 2026-05-18
 updated: 2026-05-18
 tags:
@@ -12,7 +12,7 @@ audience: cloud-infra engineer transitioning to Agent / LLM Engineer; has built 
 stack: model-agnostic; examples drawn from W3.5.8 dedup, W4 ReAct, W4.5 routing prompts on local oMLX fleet
 ---
 
-# Week 6.8 — Prompt Template Engineering Patterns
+# Week 6.85 — Prompt Template Engineering Patterns
 
 ## Exit Criteria
 
