@@ -291,6 +291,57 @@ flowchart LR
 
 Compute theoretical KV at each L using Concept 3 formula; compare to measured RSS growth. They should match to within ~10%.
 
+**Code:** `lab-07-7-quantization/src/kv_cache_curve.py` (77 LOC) — measures per-token throughput across seq_len ∈ {512, 1024, 2048, 4096}; appends `theoretical_kv_gb` per row using $M_{\text{KV}} = 2 \cdot 32 \cdot 32 \cdot 64 \cdot L_{\text{seq}} \cdot 2$ for gpt-oss-20b.
+
+```python
+# src/kv_cache_curve.py — KV-cache memory + per-token latency vs seq_len
+import argparse, json, os, time
+from pathlib import Path
+
+import psutil
+from mlx_lm import load, generate
+
+
+def measure_at_seq_len(model_id: str, seq_len: int, n_generate: int = 200) -> dict:
+    loaded = load(model_id)
+    model, tokenizer = loaded[0], loaded[1]
+
+    base = "The model processes this sentence carefully. "
+    base_tokens = len(list(tokenizer.encode(base)))
+    repeats = max(1, seq_len // base_tokens)
+    prompt = base * repeats
+    actual_seq_len = len(list(tokenizer.encode(prompt)))
+
+    rss_before = psutil.Process(os.getpid()).memory_info().rss / 1e9
+    t0 = time.perf_counter()
+    _ = generate(model, tokenizer, prompt=prompt, max_tokens=n_generate, verbose=False)
+    wall = time.perf_counter() - t0
+    rss_after = psutil.Process(os.getpid()).memory_info().rss / 1e9
+
+    return {
+        "model": model_id, "target_seq_len": seq_len,
+        "actual_seq_len": actual_seq_len, "generated_tokens": n_generate,
+        "wall_seconds": wall, "tokens_per_sec": n_generate / wall if wall > 0 else 0,
+        "rss_delta_gb": rss_after - rss_before,
+    }
+
+
+def theoretical_kv_gb(n_layers: int, n_heads: int, d_head: int,
+                      seq_len: int, bytes_per_kv: int = 2) -> float:
+    """$M_{KV} = 2 \\cdot n_{layers} \\cdot n_{heads} \\cdot d_{head} \\cdot L_{seq} \\cdot b_{KV}$"""
+    return 2 * n_layers * n_heads * d_head * seq_len * bytes_per_kv / 1e9
+```
+
+**Walkthrough:**
+
+**Block 1 — Variable prompt construction.** Repeats a base sentence enough times to hit the target seq_len. Why not just pad with `<pad>` tokens: padded tokens may be masked-out by attention and not exercise the KV-cache code path. Real tokens = real measurement.
+
+**Block 2 — `_ = generate(...)` discards return value.** We only care about timing + RSS; the generated text itself is irrelevant.
+
+**Block 3 — `psutil.Process(os.getpid()).memory_info().rss` is cross-platform.** Avoids the `resource.getrusage` macOS-bytes vs Linux-KB pitfall mentioned in Phase 1.
+
+**Block 4 — `theoretical_kv_gb` returns GB.** Lets `kv_cache_curve.py` post-attach a theoretical column to each measured row + compare to actual RSS growth. Production rule: ALWAYS pair measurement with theoretical baseline; the gap is the diagnostic.
+
 ## Phase 4 — Memory-Bound vs Compute-Bound Diagnostic (~1 hour)
 
 Goal: empirically classify regimes by varying batch size.
@@ -302,6 +353,68 @@ $$
 If doubling batch size doubles throughput: compute-bound. If throughput plateaus: memory-bound.
 
 M5 Pro at MXFP4-Q8 on 20B: expect memory-bound at batch=1 (~25-35 tok/s). Batch=8 may go to ~150-200 tok/s if KV-cache shared via paged-attention; without paged-attention (mlx_lm default), batch=8 won't fit.
+
+**Code:** `lab-07-7-quantization/src/regime_diagnostic.py` (95 LOC) — varies batch size, measures aggregate throughput; classify_regime() compares the throughput-vs-batch scaling factor against thresholds (>0.8 = compute-bound, <0.4 = memory-bound, else mixed).
+
+```python
+# src/regime_diagnostic.py — memory-bound vs compute-bound classifier
+import argparse, json, time
+from pathlib import Path
+
+from mlx_lm import load, generate
+
+
+def measure_at_batch(model_id: str, batch_size: int, n_generate: int = 100,
+                    prompts: list[str] | None = None) -> dict:
+    """Note: mlx_lm.generate is single-stream by default. Cross-batch measurement
+    via sequential generate calls — measures LOWER-BOUND throughput. Real batching
+    needs paged-attention (vLLM-equivalent for MLX)."""
+    loaded = load(model_id)
+    model, tokenizer = loaded[0], loaded[1]
+
+    prompts = prompts or [
+        "Explain why the sky appears blue.",
+        "Write a haiku about a rainy afternoon.",
+        "Summarize the plot of Hamlet.",
+        "Describe the architecture of a transformer.",
+    ]
+    prompts = (prompts * ((batch_size // len(prompts)) + 1))[:batch_size]
+
+    t0 = time.perf_counter()
+    for p in prompts:
+        generate(model, tokenizer, prompt=p, max_tokens=n_generate, verbose=False)
+    wall = time.perf_counter() - t0
+
+    total_tokens = batch_size * n_generate
+    return {
+        "model": model_id, "batch_size": batch_size,
+        "n_generate_per_prompt": n_generate, "total_tokens": total_tokens,
+        "wall_seconds": wall,
+        "tokens_per_sec_aggregate": total_tokens / wall if wall > 0 else 0,
+    }
+
+
+def classify_regime(results: list[dict]) -> str:
+    """Scale factor = throughput_ratio / batch_ratio.
+    > 0.8  -> compute-bound; < 0.4 -> memory-bound; else mixed."""
+    if len(results) < 2:
+        return "insufficient_data"
+    r1, rN = results[0], results[-1]
+    batch_ratio = rN["batch_size"] / r1["batch_size"]
+    throughput_ratio = rN["tokens_per_sec_aggregate"] / r1["tokens_per_sec_aggregate"]
+    scaling_factor = throughput_ratio / batch_ratio
+    if scaling_factor > 0.8: return "compute-bound"
+    if scaling_factor < 0.4: return "memory-bound"
+    return "mixed"
+```
+
+**Walkthrough:**
+
+**Block 1 — Naive sequential batch.** Real batching needs paged-attention; mlx_lm doesn't support it natively. Sequential calls measure the SINGLE-STREAM throughput floor at increasing batch sizes. Production-grade comparison would need vLLM or a paged-attention MLX port; this lab measures within the constraint.
+
+**Block 2 — `scaling_factor = throughput_ratio / batch_ratio`.** Perfect compute-bound = 1.0 (doubling batch doubles throughput). Perfect memory-bound = 0.0 (batch makes no difference; bandwidth is the bottleneck). Threshold 0.8 / 0.4 carves out clear regimes with a "mixed" band for the in-between case.
+
+**Block 3 — `tokens_per_sec_aggregate` not per-prompt.** What matters for capacity planning is THROUGHPUT (tokens/sec across all requests), not latency-per-prompt. The aggregate number is what governs whether you can serve more users without adding hardware.
 
 ## Bad-Case Journal
 

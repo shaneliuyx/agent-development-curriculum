@@ -238,7 +238,7 @@ jobs:
 ```
 
 ```python
-# src/eval/compare.py — eval gate comparator
+# src/compare.py — eval gate comparator (flat layout per lab-11-8-ct)
 """PR gate: fail if candidate metric drops by more than tolerance vs baseline.
 Tolerance is the epsilon in eval_candidate >= eval_prod - epsilon."""
 import argparse, json, sys
@@ -277,7 +277,7 @@ if __name__ == "__main__":
 ## Phase 3 — Shadow Deployment + Rollback (~1 hour)
 
 ```python
-# src/ct/router.py — split traffic between prod + candidate
+# src/router.py — split traffic between prod + candidate (flat layout per lab-11-8-ct)
 """Routing layer: 5% to candidate, 95% to prod. Records both responses + user
 feedback so post-hoc analysis can compare beyond just the eval suite."""
 import random

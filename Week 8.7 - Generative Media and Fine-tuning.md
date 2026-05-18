@@ -202,6 +202,36 @@ LORA_CONFIG = LoraConfig(
 - **`bias="none"` means biases are not trained.** Bias updates in LoRA are usually destructive — they shift the baseline behavior of the model on unrelated prompts. Keep biases frozen.
 - **The forward-process closed form `x_t = sqrt_alpha_bar[t] * x_0 + ...`** is the load-bearing math. It lets you JUMP to any timestep in one operation instead of iterating; massive training-time speedup.
 
+**Lab module — `lab-08-7-genmedia/src/lora_config.py` (34 LOC):**
+
+```python
+# src/lora_config.py — LoRA configuration constants
+
+# Standard SDXL LoRA — use for general fine-tuning.
+# Pass as input to peft.LoraConfig(**STANDARD_LORA_CONFIG).
+STANDARD_LORA_CONFIG: dict = {
+    "r": 16,
+    "lora_alpha": 32,                # usually 2x rank
+    "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+    "lora_dropout": 0.05,
+    "bias": "none",
+}
+
+# Subject-driven (DreamBooth-style) — lower rank to reduce
+# catastrophic forgetting on a single subject.
+SUBJECT_LORA_CONFIG: dict = {
+    **STANDARD_LORA_CONFIG,
+    "r": 8,
+    "lora_alpha": 16,
+}
+```
+
+**Walkthrough:**
+
+- **Two named configs.** `STANDARD_LORA_CONFIG` is the diffusers default (rank 16, alpha 32, attention-only). `SUBJECT_LORA_CONFIG` overrides with lower rank (8) for brand-subject fine-tuning where catastrophic forgetting is the dominant risk.
+- **`**STANDARD_LORA_CONFIG`** dict-spread in `SUBJECT_LORA_CONFIG` makes the inheritance explicit. Pyright sees the merged shape; humans see the override at a glance.
+- **Module-level constants, not class.** Why dict over dataclass: `peft.LoraConfig` already is a dataclass; wrapping it in another dataclass adds a layer with no marginal value. Pass the dict via `**spread`; one less indirection.
+
 ## Phase 2 — Inference with Stacked LoRA + ControlNet + IP-Adapter (~1 hour)
 
 ```python

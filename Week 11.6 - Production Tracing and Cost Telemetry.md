@@ -278,6 +278,72 @@ docker-compose up -d
 
 Run the W4 ReAct lab once with `init_tracing()` enabled. Open Langfuse UI → "Traces" tab → click a trace → see the span tree + token counts + cost per call.
 
+**Code:** `lab-11-6-tracing/src/instrumented_react.py` (68 LOC) — minimal ReAct over local oMLX with full span instrumentation. Demonstrates the span tree (agent_turn → llm_call) end-to-end against Langfuse.
+
+```python
+# src/instrumented_react.py — instrumented ReAct loop demonstrating span tree
+import os, sys
+from openai import OpenAI
+from src.tracing import init_tracing, llm_call_span, annotate_usage, traced
+
+SYSTEM = (
+    "You are a math assistant. If the user asks an arithmetic question, "
+    "respond with the operation expressed as JSON: "
+    '{"op": "+|-|*|/", "a": <num>, "b": <num>}. '
+    "Otherwise, answer normally."
+)
+
+_client = OpenAI(
+    base_url=os.getenv("OMLX_BASE_URL", "http://localhost:8000/v1"),
+    api_key=os.getenv("OMLX_API_KEY", "not-set"),
+)
+_MODEL = os.getenv("MODEL_HAIKU", "MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit")
+
+
+@traced("agent_turn")
+def agent_turn(user_msg: str) -> str:
+    with llm_call_span(role="loop", model=_MODEL) as span:
+        resp = _client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0, max_tokens=200,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if resp.usage:
+            annotate_usage(span, _MODEL,
+                           tokens_in=resp.usage.prompt_tokens,
+                           tokens_out=resp.usage.completion_tokens)
+    return content
+
+
+@traced("calculator_tool")
+def calculator(op: str, a: float, b: float) -> float:
+    if op == "+": return a + b
+    if op == "-": return a - b
+    if op == "*": return a * b
+    if op == "/": return a / b
+    raise ValueError(f"unknown op: {op}")
+
+
+if __name__ == "__main__":
+    init_tracing()
+    query = sys.argv[1] if len(sys.argv) > 1 else "What's 7 + 5?"
+    print(f">>> {query}\n<<< {agent_turn(query)}")
+```
+
+**Walkthrough:**
+
+**Block 1 — `@traced("agent_turn")` decorator on the function.** Creates a parent span automatically; everything inside (including `llm_call_span`) becomes child spans. The trace tree builds itself from the call structure.
+
+**Block 2 — `with llm_call_span(role, model) as span:` context manager.** Wraps the LLM call. Caller has access to the live span to call `annotate_usage()` AFTER the response — that's where tokens_in / tokens_out / cost get written. Pattern: open span → make call → annotate with results → close span.
+
+**Block 3 — `calculator` is `@traced` even though it's a pure function.** Why instrument trivial code: in production, the agent calls many tools; the SHAPE of which tools get called (and how often) is the operational signal. A tool-call span tree shows the agent's behavior at a glance.
+
+**Block 4 — `init_tracing()` ONLY in `__main__`.** Production rule: instrumentation initialization happens at process boot, NOT at module import (avoid side effects on import). The test suite doesn't init OTel; production main() does.
+
 ## Phase 3 — DuckDB Cost Rollups (~1 hour)
 
 Langfuse handles the trace-tree UI; DuckDB handles ad-hoc SQL on a parquet append-only log.
