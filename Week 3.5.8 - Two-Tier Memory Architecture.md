@@ -430,47 +430,10 @@ class TieredMemory:
         self._http.close()
 
     # ── Operational tier (guild) ──────────────────────────────────────
-	async def post_task(
-		self,
-		subject: str,
-		spec: str | None = None,
-		campaign: str | None = None,
-		) -> str:
-		"""Create a quest. Returns server-assigned QUEST-ID (e.g. 'QUEST-42')."""
-		return await self._guild.quest_post(subject=subject, spec=spec, campaign=campaign)
-	
-	async def claim_task(self, quest_id: str) -> dict[str, Any]:
-		"""Atomically accept a quest. Returns {won: bool, response: str}.
-		guild's quest_accept uses an atomic SQLite UPDATE WHERE owner IS NULL
-		primitive; only one caller wins per QUEST-ID. Losers receive an
-		'already claimed' text response — classify via is_accept_winner().
-		"""
-		text = await self._guild.quest_accept(quest_id=quest_id)
-		return {"won": is_accept_winner(text), "response": text}
-	
-	async def complete_task(self, quest_id: str, report: str) -> str:
-		"""Mark quest fulfilled. `report` is REQUIRED by guild's schema."""
-		return await self._guild.quest_fulfill(quest_id=quest_id, report=report)
-	
-	async def list_closed_quests(self, campaign: str | None = None) -> str:
-		"""Raw text listing of done-status quests (parse caller-side).
-		guild has NO scroll_list_closed primitive (W3.5.5 §1.3 BCJ). Closed
-		quests are queried via quest_list(status='done'); per-quest scroll
-		text is then fetched via quest_scroll(quest_id).
-		"""
-		return await self._guild.quest_list(status="done", campaign=campaign)
-	
-	async def get_scroll(self, quest_id: str) -> str:
-	"""Fetch the journal + report scroll for a completed quest."""
-		return await self._guild.quest_scroll(quest_id=quest_id)
+    # (post_task, claim_task, complete_task, list_closed_quests, get_scroll
+    # unchanged from earlier section — see §2.1 for the guild methods)
 
     # ── Semantic tier (EverCore) ──────────────────────────────────────
-	# EverCore exposes a CONVERSATION-shaped API (POST /api/v1/memories with
-	# role/timestamp/content messages), NOT an arbitrary key-value imprint
-	# API. We adapt by storing each consolidated fact as a single
-	# assistant-role message under the agent's user_id, and parse search
-	# responses out of the `data.episodes` array. See W3.5.8 §2.1 walkthrough
-	# for the why-this-shape discussion.
 
     def _now_ms(self) -> int:
         import time
@@ -500,25 +463,26 @@ class TieredMemory:
         return episodes
 
     def imprint(self, content: str, metadata: dict[str, Any] | None = None) -> str:
-	"""Write a consolidated fact into long-term memory.
-	EverCore's POST /api/v1/memories pipeline is conversation-shaped:
-	accumulates messages, runs LLM boundary detection, only extracts a
-	memcell when the LLM judges an episode boundary has occurred. Single
-	isolated messages are stored as `accumulated` and never become
-	searchable. To make consolidated facts visible to search:
-	
-		1. Wrap each fact as a 2-turn synthetic conversation
-		(user "what about <subject>?" + assistant "<fact>") so the
-		session has both a query side and an answer side.
-		2. POST to /api/v1/memories with a unique session_id per fact.
-		3. Immediately POST /api/v1/memories/flush with the SAME session_id
-		— flush bypasses LLM boundary detection and forces memcell
-		creation (`flush=True` short-circuits `_detect_boundaries`
-		in EverCore's conv_memcell_extractor).
-		
-	Returns the session_id used (becomes the memcell anchor; one
-	memcell per imprint call).
-	"""
+        """Write a consolidated fact into long-term memory.
+
+        EverCore's POST /api/v1/memories pipeline is conversation-shaped:
+        accumulates messages, runs LLM boundary detection, only extracts a
+        memcell when the LLM judges an episode boundary has occurred. Single
+        isolated messages are stored as `accumulated` and never become
+        searchable. To make consolidated facts visible to search:
+
+          1. Wrap each fact as a 2-turn synthetic conversation
+             (user "what about <subject>?" + assistant "<fact>") so the
+             session has both a query side and an answer side.
+          2. POST to /api/v1/memories with a unique session_id per fact.
+          3. Immediately POST /api/v1/memories/flush with the SAME session_id
+             — flush bypasses LLM boundary detection and forces memcell
+             creation (`flush=True` short-circuits `_detect_boundaries`
+             in EverCore's conv_memcell_extractor).
+
+        Returns the session_id used (becomes the memcell anchor; one
+        memcell per imprint call).
+        """
         session_id = (metadata or {}).get("quest_id") or f"imp-{self._now_ms()}"
         subject = (metadata or {}).get("subject") or "this topic"
         now_ms = self._now_ms()
