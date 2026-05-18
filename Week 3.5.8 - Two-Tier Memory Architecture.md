@@ -906,7 +906,7 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 
 #### 3.2.1 Atomisation tests — `tests/test_atomisation.py`
 
-> **Brief — what "Batchelor-Manning form" means.** The phrase refers to a 2026 corpus survey by Batchelor and Manning of 19 production memory systems (Claude Code's TodoWrite, mem0, Letta, EverCore, PraisonAI's memcell pipeline, HyperMem, Cognition's plan tracker, etc.) that distilled **six recurring write-time investment patterns** — patterns where the system pays a one-time cost AT WRITE TIME to make every subsequent READ cheaper, more accurate, or more auditable. The article frames each as "pay at write time, harvest at read time" with measured ROI across the corpus. The six canonical forms:
+> **Brief — what "Batchelor-Manning form" means.** The phrase refers to a 2026 corpus survey by Batchelor and Manning ([source thread](https://x.com/S_BatMan/status/2054872818559361106)) of 19 production memory systems (Claude Code's TodoWrite, mem0, Letta, EverCore, PraisonAI's memcell pipeline, HyperMem, Cognition's plan tracker, etc.) that distilled **six recurring write-time investment patterns** — patterns where the system pays a one-time cost AT WRITE TIME to make every subsequent READ cheaper, more accurate, or more auditable. The article frames each as "pay at write time, harvest at read time" with measured ROI across the corpus. The six canonical forms:
 >
 > 1. **Online dedup-and-synthesis** — at write time, query top-k semantic candidates + LLM-classify the new fact's relationship to existing memory (add / update / supersede / coexist / delete / no-op), execute. Highest-ROI per the survey because savings compound across every later read.
 > 2. **Atomisation** — split a multi-fact scroll into N atomic facts at write time. Each fact gets its own embedding, type, confidence, and retrieval slot. Read-time filtering becomes precise.
@@ -3578,6 +3578,7 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 
 ## References
 
+- **Batchelor & Manning (2026).** *Pay-at-Write-Time: a 19-system survey of agent-memory write-time investment patterns.* X/Twitter thread, May 2026. https://x.com/S_BatMan/status/2054872818559361106. The source of the 6-form taxonomy + 8-paradigm classification used throughout this chapter. Coined the "pay at write time, harvest at read time" framing. Form #1 (online dedup-and-synthesis) called out as highest-ROI; W3.5.8 implements ALL six forms — §3 atomisation + §3.3 quality gate + §9 dedup + §9.6 bitemporal extension. Cited inline at §3.2.1 primer + §Production Considerations 8-paradigm table + §9.1 dedup-prompt comment.
 - **Letta (formerly MemGPT)** — Packer, C. et al. (2023). *MemGPT: Towards LLMs as Operating Systems.* arXiv:2310.08560. The canonical two-tier memory paper in the agent-systems literature; RAM↔archive separation is the engineering precedent for hippocampus↔neocortex.
 - **EverOS / EverCore** — biological-imprinting-inspired memory OS. arXiv:2601.02163. The semantic-tier reference architecture used in this lab.
 - **mathomhaus/guild** — multi-agent MCP coordinator. Single Go binary; embedded SQLite; the operational-tier reference used in this lab.
