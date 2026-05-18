@@ -430,10 +430,47 @@ class TieredMemory:
         self._http.close()
 
     # ── Operational tier (guild) ──────────────────────────────────────
-    # (post_task, claim_task, complete_task, list_closed_quests, get_scroll
-    # unchanged from earlier section — see §2.1 for the guild methods)
+	async def post_task(
+		self,
+		subject: str,
+		spec: str | None = None,
+		campaign: str | None = None,
+		) -> str:
+		"""Create a quest. Returns server-assigned QUEST-ID (e.g. 'QUEST-42')."""
+		return await self._guild.quest_post(subject=subject, spec=spec, campaign=campaign)
+	
+	async def claim_task(self, quest_id: str) -> dict[str, Any]:
+		"""Atomically accept a quest. Returns {won: bool, response: str}.
+		guild's quest_accept uses an atomic SQLite UPDATE WHERE owner IS NULL
+		primitive; only one caller wins per QUEST-ID. Losers receive an
+		'already claimed' text response — classify via is_accept_winner().
+		"""
+		text = await self._guild.quest_accept(quest_id=quest_id)
+		return {"won": is_accept_winner(text), "response": text}
+	
+	async def complete_task(self, quest_id: str, report: str) -> str:
+		"""Mark quest fulfilled. `report` is REQUIRED by guild's schema."""
+		return await self._guild.quest_fulfill(quest_id=quest_id, report=report)
+	
+	async def list_closed_quests(self, campaign: str | None = None) -> str:
+		"""Raw text listing of done-status quests (parse caller-side).
+		guild has NO scroll_list_closed primitive (W3.5.5 §1.3 BCJ). Closed
+		quests are queried via quest_list(status='done'); per-quest scroll
+		text is then fetched via quest_scroll(quest_id).
+		"""
+		return await self._guild.quest_list(status="done", campaign=campaign)
+	
+	async def get_scroll(self, quest_id: str) -> str:
+	"""Fetch the journal + report scroll for a completed quest."""
+		return await self._guild.quest_scroll(quest_id=quest_id)
 
     # ── Semantic tier (EverCore) ──────────────────────────────────────
+	# EverCore exposes a CONVERSATION-shaped API (POST /api/v1/memories with
+	# role/timestamp/content messages), NOT an arbitrary key-value imprint
+	# API. We adapt by storing each consolidated fact as a single
+	# assistant-role message under the agent's user_id, and parse search
+	# responses out of the `data.episodes` array. See W3.5.8 §2.1 walkthrough
+	# for the why-this-shape discussion.
 
     def _now_ms(self) -> int:
         import time
@@ -463,25 +500,25 @@ class TieredMemory:
         return episodes
 
     def imprint(self, content: str, metadata: dict[str, Any] | None = None) -> str:
-        """Write a consolidated fact into long-term memory.
-
-        EverCore's POST /api/v1/memories pipeline is CONVERSATION-SHAPED:
-        accumulates messages, runs LLM boundary detection, only extracts a
-        memcell when the LLM judges an episode boundary has occurred.
-        Single isolated messages return `accumulated` and never become
-        searchable. Two-step pattern to make consolidated facts visible:
-
-          1. Wrap each fact as a 2-turn synthetic conversation
-             (user "What do we know about <subject>?" + assistant "<fact>")
-             with a unique session_id per fact.
-          2. Immediately POST /api/v1/memories/flush with the SAME
-             session_id. flush=True short-circuits LLM boundary detection
-             in EverCore's conv_memcell_extractor (line 553) and forces
-             memcell creation directly.
-
-        Without (1) + (2) every imprint returns `no_extraction` and the
-        search index stays empty. See BCJ Entry 13.
-        """
+	"""Write a consolidated fact into long-term memory.
+	EverCore's POST /api/v1/memories pipeline is conversation-shaped:
+	accumulates messages, runs LLM boundary detection, only extracts a
+	memcell when the LLM judges an episode boundary has occurred. Single
+	isolated messages are stored as `accumulated` and never become
+	searchable. To make consolidated facts visible to search:
+	
+		1. Wrap each fact as a 2-turn synthetic conversation
+		(user "what about <subject>?" + assistant "<fact>") so the
+		session has both a query side and an answer side.
+		2. POST to /api/v1/memories with a unique session_id per fact.
+		3. Immediately POST /api/v1/memories/flush with the SAME session_id
+		— flush bypasses LLM boundary detection and forces memcell
+		creation (`flush=True` short-circuits `_detect_boundaries`
+		in EverCore's conv_memcell_extractor).
+		
+	Returns the session_id used (becomes the memcell anchor; one
+	memcell per imprint call).
+	"""
         session_id = (metadata or {}).get("quest_id") or f"imp-{self._now_ms()}"
         subject = (metadata or {}).get("subject") or "this topic"
         now_ms = self._now_ms()
@@ -503,8 +540,9 @@ class TieredMemory:
         }
         r = self._http.post("/api/v1/memories", json=body)
         r.raise_for_status()
-        # Force boundary close — without this, EverCore returns
-        # `accumulated` and never creates the memcell.
+		# Force boundary close so the memcell extracts immediately
+		# rather than waiting for LLM-judged conversational boundary
+		# (which may never fire for single-fact imprints).
         rf = self._http.post(
             "/api/v1/memories/flush",
             json={"user_id": self.user_id, "session_id": session_id},
@@ -904,7 +942,18 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 
 #### 3.2.1 Atomisation tests — `tests/test_atomisation.py`
 
-Five tests covering the Batchelor-Manning form #2 (atomisation) + form #5/6 (type tagging + confidence-at-read). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
+> **Brief — what "Batchelor-Manning form" means.** The phrase refers to a 2026 corpus survey by Batchelor and Manning of 19 production memory systems (Claude Code's TodoWrite, mem0, Letta, EverCore, PraisonAI's memcell pipeline, HyperMem, Cognition's plan tracker, etc.) that distilled **six recurring write-time investment patterns** — patterns where the system pays a one-time cost AT WRITE TIME to make every subsequent READ cheaper, more accurate, or more auditable. The article frames each as "pay at write time, harvest at read time" with measured ROI across the corpus. The six canonical forms:
+>
+> 1. **Online dedup-and-synthesis** — at write time, query top-k semantic candidates + LLM-classify the new fact's relationship to existing memory (add / update / supersede / coexist / delete / no-op), execute. Highest-ROI per the survey because savings compound across every later read.
+> 2. **Atomisation** — split a multi-fact scroll into N atomic facts at write time. Each fact gets its own embedding, type, confidence, and retrieval slot. Read-time filtering becomes precise.
+> 3. **Multi-step ingest** — pre-classify, normalise, tag, and route incoming content through a pipeline rather than a single imprint call. EverCore's conversation → memcell → atomic_fact extraction is this pattern.
+> 4. **Provenance** — every imprinted fact carries source attribution (quest_id, conversation_id, user_id, timestamp). Read-time audit becomes possible.
+> 5. **Confidence scoring** — each fact gets a numerical confidence at write time. Read-time `min_confidence` filter excludes low-quality facts without re-running extraction.
+> 6. **Type tagging** — each fact gets a categorical type (`fact` / `observation` / `tool_result` / `skill`). Read-time `type_filter` lets queries scope to one category.
+>
+> W3.5.8 implements ALL SIX forms: #1 (Phase 9 + bitemporal extension Phase 9.6), #2 + #5 + #6 (this section + Phase 3.3 quality gate), #3 (EverCore's internal pipeline, observed in Phase 3.1), #4 (every imprint carries `quest_id` + `agent_id` + `user_id` + `timestamp` metadata). The complete write-time investment surface is what makes the consolidation pipeline a senior-engineer artifact rather than a thin wrapper. The Phase 9.6 bitemporal extension splits form #1's `delete` action into update / supersede / coexist / delete sub-actions for richer audit semantics. See [[#9.6 Bitemporal Extension — Supersede and Coexist]] for the upgrade.
+
+Five tests covering Batchelor-Manning form #2 (atomisation) + form #5/6 (confidence-at-read + type tagging). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
 
 ```mermaid
 flowchart TD
