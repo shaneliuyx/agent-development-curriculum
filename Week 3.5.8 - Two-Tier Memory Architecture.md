@@ -743,6 +743,13 @@ async def consolidate(
 - **LLM summarization with tightened budget**: `max_tokens=80` + "MAXIMUM 25 words" in the prompt + `temperature=0.0`. BCJ Entry 3 documents the verbose-summary failure mode; this is the three-layer fix (prompt + token-budget + downstream rejection if you want belt+suspenders).
 - **Failure isolation**: per-quest try/except. One failure doesn't kill the whole batch; the next run retries because the dedup row wasn't written.
 
+> **Forward-link — metadata shape evolves across §3.x.** The `tm.imprint(metadata={...})` call above ships **only 3 fields** at this baseline: `quest_id` / `agent_id` / `source`. Later sections extend the shape:
+> - **§3.2.1 atomisation** adds `"type"` (one of `"fact" | "observation" | "tool_result" | "skill"`) so per-atom typing is visible at read-time.
+> - **§3.3 quality-score gate** adds `"quality_score": round(score, 3)` when `promotion_threshold` is set, so the gate's decision is recoverable from the imprint metadata.
+> - **§3.4 audit + atomisation wire-in** adds `"subject"` (first ~80 chars of the scroll's opening line) so cross-agent recall + audit-log entries have a human-readable anchor.
+>
+> On-disk `src/consolidation.py` (post §3.2.1 + §3.3 + §3.4) ships all 6 fields. This §3.1 baseline intentionally shows the **launch shape** — readers who want to see the final metadata dict per Pattern 18 fidelity should jump to the §3.3 gate-aware version of `consolidate()` (chapter line ~1714, with `subject` + `type` + optional `quality_score`).
+
 ### 3.2 Test the pipeline
 
 `tests/test_consolidation.py`:
@@ -941,15 +948,15 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 
 **Common failure modes:**
 
-| Symptom | Likely cause | Fix |
-| --- | --- | --- |
-| `error: No pyproject.toml found in current directory or any parent directory` | Lab dir was bootstrapped with pip + requirements.txt (W3.5.5 era), never converted to `uv` | `uv init --no-readme --no-workspace --python 3.12` first, then `uv add --dev pytest pytest-asyncio` |
-| `ModuleNotFoundError: No module named 'src'` | Missing `tests/conftest.py` or running `python tests/...` | Add the conftest sys.path bootstrap; always invoke via `uv run pytest`, never bare `python` |
-| `httpx.ConnectError: ... :1995` | EverCore data services up but app not running | `cd EverOS/methods/EverCore && uv run web` in another terminal (per §1.3) |
-| `mcp.errors.McpError: ... no active project` | guild not initialized in lab dir | `guild init --yes` from the lab root |
-| `test_consolidation_idempotent_on_second_run` reports `first.scrolls_imprinted == 0` on a clean run | Stale `.guild_consolidation_state.sqlite` from a prior run | `rm -f .guild_consolidation_state.sqlite` and retry |
-| `openai.APIConnectionError` during `summarize_scroll` | `OMLX_BASE_URL` not exported / oMLX server down | `curl $OMLX_BASE_URL/models` to verify; restart oMLX |
-| `test_consolidation_skips_low_value_scrolls` fails — `scrolls_skipped == 0` | LLM summarizer emitted a fact instead of `SKIP` | Lower temperature, tighten SKIP examples in §3.1 `SUMMARIZE_PROMPT`, or swap the low-value test scroll for a more obviously-noise one — summarizer judgment is the gate, and gate quality is summarizer-quality-dependent |
+| Symptom                                                                                             | Likely cause                                                                               | Fix                                                                                                                                                                                                                       |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `error: No pyproject.toml found in current directory or any parent directory`                       | Lab dir was bootstrapped with pip + requirements.txt (W3.5.5 era), never converted to `uv` | `uv init --no-readme --no-workspace --python 3.12` first, then `uv add --dev pytest pytest-asyncio`                                                                                                                       |
+| `ModuleNotFoundError: No module named 'src'`                                                        | Missing `tests/conftest.py` or running `python tests/...`                                  | Add the conftest sys.path bootstrap; always invoke via `uv run pytest`, never bare `python`                                                                                                                               |
+| `httpx.ConnectError: ... :1995`                                                                     | EverCore data services up but app not running                                              | `cd EverOS/methods/EverCore && uv run web` in another terminal (per §1.3)                                                                                                                                                 |
+| `mcp.errors.McpError: ... no active project`                                                        | guild not initialized in lab dir                                                           | `guild init --yes` from the lab root                                                                                                                                                                                      |
+| `test_consolidation_idempotent_on_second_run` reports `first.scrolls_imprinted == 0` on a clean run | Stale `.guild_consolidation_state.sqlite` from a prior run                                 | `rm -f .guild_consolidation_state.sqlite` and retry                                                                                                                                                                       |
+| `openai.APIConnectionError` during `summarize_scroll`                                               | `OMLX_BASE_URL` not exported / oMLX server down                                            | `curl $OMLX_BASE_URL/models` to verify; restart oMLX                                                                                                                                                                      |
+| `test_consolidation_skips_low_value_scrolls` fails — `scrolls_skipped == 0`                         | LLM summarizer emitted a fact instead of `SKIP`                                            | Lower temperature, tighten SKIP examples in §3.1 `SUMMARIZE_PROMPT`, or swap the low-value test scroll for a more obviously-noise one — summarizer judgment is the gate, and gate quality is summarizer-quality-dependent |
 
 #### 3.2.1 Atomisation tests — `tests/test_atomisation.py`
 
