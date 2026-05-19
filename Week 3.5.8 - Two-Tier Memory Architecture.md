@@ -1647,9 +1647,17 @@ def decide_action(new_fact: str, candidates: list[dict]) -> DedupAction:
     if action not in _VALID_ACTIONS:
         return DedupAction(action="add")
 
+    # Defensive: classifier may emit no-op without target_id (prompt
+    # requires it but LLM compliance drifts ~20%). Default to the
+    # highest-similarity candidate so audit log isn't lossy on
+    # duplicate-chain reconstruction.
+    target_id = parsed.get("target_id")
+    if action == "no-op" and not target_id and candidates:
+        target_id = candidates[0].get("id") or candidates[0].get("point_id")
+
     return DedupAction(
         action=action,
-        target_id=parsed.get("target_id"),
+        target_id=target_id,
         merged_content=parsed.get("merged_content"),
         supersede_reason=parsed.get("supersede_reason"),
         supersede_category=parsed.get("supersede_category"),
