@@ -350,3 +350,7 @@ This is the empirical proof for "same token, different output vector." Use the m
   - *Convolutional sequence models (ByteNet, ConvS2S)*: local-receptive-field; cannot see arbitrarily far back. Attention has global receptive field by construction.
 - **Connects to:** W1 (vector retrieval — embeddings underlie everything), W2 (rerank — uses cross-encoder attention specifically), W4 (ReAct — uses tool-calling-tuned attention heads), W4.5 (model routing — picks per role based on attention-head specialization), W6 (Claude Code — tokenization governs effective context size)
 - **Foreshadows:** W7.7 quantization (which numerical-precision parts of attention can be lowered safely), W11 system design (KV-cache sizing depends on `seq_len × hidden_dim × 2` per layer per request)
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W6.85**: Prompt Templates — template choice is constrained by attention / context-window internals from W0.5
+  - **W6.9**: Context Engineering — context-budget defense is informed by attention / KV-cache internals
+  - **W8.7**: Generative Media — image / video generation internals share the same forward-pass mental model

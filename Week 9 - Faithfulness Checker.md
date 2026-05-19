@@ -1677,3 +1677,9 @@ Week 10 shifts from evaluating LLM outputs to comparing the frameworks that orch
 - **Distinguish from:** W5.5 Metacognition — metacognition is *inline* self-correction within a forward pass / prompt chain. Faithfulness checking (W9) is *post-hoc external* validation: separate pipeline stage, separate model call, audits a completed answer against retrieved evidence. Key structural difference: independence — a metacognitive agent can still confirm own errors; an external faithfulness checker cannot, by design.
 - **Connects to:** W11 System Design — checker + abstention router become first-class runtime components; W11 treats faithfulness score as SLO with alert thresholds + human-review routing. W11.5 Agent Security — faithfulness is a correctness property; security is adversarial-robustness; distinct dimensions, separate instrumentation. A faithful answer to a poisoned context is still a security failure.
 - **Foreshadows:** W11 System Design (deploy NLI scorer + abstention router as production guardrail with SLO-based alerting); W12 Capstone (faithfulness checker is mandatory eval dimension for final agent system).
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W10**: Framework Shootout — frameworks are evaluated against faithfulness as a quality axis
+  - **W11.7**: Take-Home Dress Rehearsal — faithfulness is a mandatory evaluation gate in take-home rubrics
+  - **W2**: Rerank and Context Compression — retrieval quality directly drives faithfulness ceiling
+  - **W7.3**: Production LLM Infrastructure — faithfulness checking is one of the eval-pipeline stages in production deployments
+  - **W8**: Reliability — schema-reliability and faithfulness are orthogonal but co-required for production agents

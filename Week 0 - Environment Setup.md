@@ -904,3 +904,7 @@ Your Anki deck, bad-case journal, and lab `RESULTS.md` files are git-tracked —
 - **Distinguish from:** MLX (Apple's array framework, used inside oMLX/vMLX) vs PyTorch+MPS (used for BGE-M3, different optimization profile) vs Ollama (cross-platform LLM runner, not used here) vs llama.cpp (CPU-first quantized; slower on Apple Silicon for large models).
 - **Connects to:** Every subsequent week — oMLX/vMLX endpoints, Qdrant collection, Phoenix collector, BGE-M3, BGE reranker are persistent infrastructure all labs build on.
 - **Foreshadows:** W11 System Design (three-tier routing → cost-aware dispatch), W12 Capstone (full-stack smoke test → production startup probe).
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W1**: Vector Retrieval Baseline — W1 depends on W0's MLX endpoint + uv discipline
+  - **W6.5**: Hermes Agent Hands-On — Hermes setup builds on W0's local-first MLX stack
+  - **W7.3**: Production LLM Infrastructure — production setup extends W0's dev-stack to multi-tenant prod

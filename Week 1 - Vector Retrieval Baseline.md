@@ -989,3 +989,8 @@ Open [[Week 2 - Rerank and Context Compression]] when this week's `RESULTS.md` i
 - **Distinguish from:** BM25/sparse retrieval (exact token + IDF, no learned representation) vs dense retrieval (fixed vector, generalizes paraphrases) vs "semantic search" (marketing term, usually means dense). W1 builds the dense baseline so W2's hybrid comparison has a clean control.
 - **Connects to:** W2 Rerank (recall@10=0.782 is the ceiling reranker cannot exceed), W3 RAG Eval (W1's embed→index→retrieve loop is the retrieval leg of the eval harness), W3.7 Agentic RAG (Qdrant collection becomes the retrieval tool target).
 - **Foreshadows:** W11 System Design — the (model, index) CollectionSpec pattern scales to multi-tenant deployments; HNSW tradeoffs measured here inform production config.
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W0.5**: LLM Internals — embedding-model choice depends on the same internals (attention, pooling) as generation
+  - **W12**: Capstone — retrieval-quality numbers from W1 are reused as capstone interview evidence
+  - **W3.5**: Cross-Session Memory — semantic memory uses W1's embedding/retrieval primitives
+  - **W4**: ReAct — `read_file` / `web_search` tools depend on W1's retrieval substrate

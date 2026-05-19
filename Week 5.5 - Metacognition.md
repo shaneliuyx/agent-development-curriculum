@@ -606,3 +606,8 @@ An additional constraint: metacognition is only worth the token cost if baseline
 - **Distinguish from**: W9 Faithfulness Checker — W9 is a post-hoc external validator that audits final outputs against retrieved context. It does not participate in the agent's execution loop and does not influence retry behavior. Metacognition is inline: the reflection module fires during execution, writes to memory before the next trial begins, and directly shapes subsequent agent behavior.
 
 - **Consumed by**: W11 System Design — when designing a production Reflexion deployment, you will need to make explicit architectural decisions about verifier placement (inline vs async), memory eviction policy (recency vs relevance), and cost guardrails (max-trials × avg-episode-cost must fit your latency and spend budget). W11 builds those decisions into a full system diagram.
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W3.5**: Cross-Session Memory — reflection-driven memory writes flow through the same memory primitives
+  - **W3.5.95**: Self-Observability Memory — meta-cognitive traces become a memory tier under their own consolidation rules
+  - **W5**: Pattern Zoo — Reflexion is one of the 8 canonical patterns; metacognition is its central distinguisher
+  - **W5.6**: ISA-Driven Metacognition — extends the reflection module with explicit ISA-style introspection

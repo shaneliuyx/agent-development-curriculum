@@ -3672,6 +3672,11 @@ Tree-v3 looks deceptively expensive ("60s per query") until you compute the actu
   - [[Week 11 - System Design|Week 11 — System Design]] — the three-lane routing pattern is the canonical production architecture for heterogeneous corpora; W11 system-design interviews ask candidates to size each lane's cost and propose a router.
 - **Foreshadows:** [[Week 11 - System Design|Week 11 — System Design]] (full multi-lane RAG architecture with cost modelling) and [[Week 12 - Capstone and Mocks|Week 12 — Capstone and Mocks]] (capstone projects in regulated domains often use tree-index as the primary retrieval lane because of citation traceability).
 
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W2.5**: GraphRAG — graph-based retrieval is one alternative; W2.7's tree-index is another structural axis
+  - **W3**: RAG Evaluation — W2.7's tree-index is evaluated against W3's RAG eval methodology
+  - **W3.7**: Agentic RAG — typed-state-graph retrieval consumes W2.7's structural retrieval as one of its retriever options
+
 ---
 
 ## What's Next

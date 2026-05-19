@@ -1158,6 +1158,12 @@ Must include at least one production blog post or canonical implementation repo.
 - **Connects to:** [[Week 5.5 - Metacognition]] (self-routing is a metacognitive primitive — agent classifying its own confusion as "needs heavier tier"); [[Week 6.5 - Hermes]] (the classifier's structured-output discipline is the same as tool-call structured output).
 - **Foreshadows:** [[Week 11 - System Design]] (production routing topology, cost-latency Pareto front); [[Week 12 - Capstone]] (the routing layer is one of the load-bearing capstone components).
 
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W0.5**: LLM Internals — quantization / cache / serving choices set the routing-decision menu
+  - **W11.6**: Production Tracing — per-route cost telemetry is the read-side view of routing decisions
+  - **W6.85**: Prompt Templates — per-tier prompt-template adaptation is a routing concern
+  - **W7.7**: Quantization — routing across 4-bit / 8-bit / fp16 tiers IS effort-tiering applied to weight regimes
+
 ---
 
 ## Resolved design decisions (locked 2026-05-14)
