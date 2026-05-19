@@ -372,6 +372,10 @@ If probe 2 returns rows but the script returns `edges_used: 0`, the bug is in th
 
 ---
 
+## Pre-Pattern-20 historical entries (Entries 7-26)
+
+> **Pattern 20 status:** The numbered short-form entries below (Entry 7 through Entry 26, lines ~375-602) were authored before [[Engineering Decision Patterns#Pattern 20 — Real-Data-Only Discipline (BCJ entries from symptoms, not from imagination)|Pattern 20]] was codified. Each entry has the canonical Symptom / Root cause / Fix structure but lacks an explicit `YYYY-MM-DD` date in the heading — they were captured as patterns-from-experience rather than as dated incident logs. Symptoms are concrete (specific error strings, measured failure rates, named API calls); the entries describe real failure shapes observed during the curriculum's first 2-3 weeks of authoring. Going forward, all new entries follow the dated long-form pattern (`## YYYY-MM-DD — Week N — <symptom>`) seen above lines 149-334 and below line 602. If a future audit needs precise dates for entries 7-26, mine the curriculum git log around 2026-04-27..2026-05-05 for chapter-specific commit messages.
+
 **Entry 7 — Pixel-Aliased Screenshot Causes Wrong Click (CUA, W7.5).**
 
 *Symptom:* Agent takes screenshot via Playwright on a MacBook Pro Retina display. Playwright returns a 2560×1600 pixel image. Agent's context declares viewport as 1280×800. Claude reasons about pixel coordinates in the logical-pixel space (1280×800), but the screenshot is at physical density (2×). Agent clicks on a button at reported logical position (640, 400), which maps to physical pixel (1280, 800) in the image. The actual button is at (1200, 750) physically. Click lands 80 pixels to the right and 50 pixels down. Agent misclicks and books the wrong flight.
