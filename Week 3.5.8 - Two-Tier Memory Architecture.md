@@ -1269,16 +1269,23 @@ async def test_query_min_confidence_excludes_low_quality():
 
 The §3.1 consolidator imprints EVERY scroll the summarizer doesn't explicitly mark `SKIP`. That's a binary filter — pass/fail on a single LLM judgement. PraisonAI's memory subsystem (`src/praisonai-agents/praisonaiagents/memory/memory.py`) uses a finer-grained primitive: a **quality_score** in `[0.0, 1.0]` attached to each candidate memory, with a configurable **promotion threshold** between short-term (episodic) and long-term (durable) tiers. Only entries `score >= threshold` promote. That gives the operator a tunable precision/recall dial on what enters durable memory, instead of a single SKIP rule baked into the prompt.
 
-**Architecture mermaid:**
+**Where each piece lives (orient before reading the mermaid):**
+
+- **`src/quality_gate.py`** holds just the scoring math: one pure function `quality_score(summary, tm, weights) → float`. No orchestration, no counters, no I/O beyond an optional `tm.query_context(...)` call for the novelty subscore.
+- **`src/consolidation.py`** holds the orchestrator: the `consolidate()` per-scroll loop, the `ConsolidationResult` dataclass (with `scrolls_demoted` counter), and the import line `from src.quality_gate import quality_score`. The gate decision is invoked INSIDE consolidate's per-scroll loop — `score = quality_score(summary, tm=tm); if score < promotion_threshold: result.scrolls_demoted += 1; continue` — see the §3.3 integration code below.
+
+So the mermaid below shows the per-scroll flow *inside* `consolidate()`, NOT a separate pipeline before `consolidate()`. Read it as: "for each scroll, summarize → score → gate → (imprint OR drop)." The IMPRINT node IS the per-scroll consolidation action; the gate gates that imprint step.
+
+**Architecture mermaid (per-scroll flow inside `consolidate()`):**
 
 ```mermaid
 flowchart LR
-    SCR["Closed scroll"]
-    SUM["LLM summarize<br/>one fact"]
-    QS["derive quality_score<br/>length + specificity<br/>+ novelty"]
+    SCR["Closed scroll<br/>(input to one iteration)"]
+    SUM["LLM summarize<br/>(consolidation.py)"]
+    QS["quality_score(...)<br/>(quality_gate.py)<br/>length + specificity<br/>+ novelty"]
     GATE{"score >= threshold?"}
-    IMP["EverCore imprint"]
-    DROP["Discard<br/>stays in STM"]
+    IMP["EverCore imprint<br/>+ result.scrolls_imprinted++"]
+    DROP["result.scrolls_demoted++<br/>continue to next scroll"]
 
     SCR --> SUM
     SUM --> QS
