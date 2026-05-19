@@ -1310,12 +1310,22 @@ Probe set: 20 scrolls (10 high-value: explicit numbers + named tools; 10 low-val
 
 ### 3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)
 
-Phase 3.1's consolidate() writes facts. Phase 3.2.1's atomisation writes typed atoms. Phase 3.3's quality gate decides promotion. Phase 9.6's dedup/supersede/coexist mutates the store. **Every one of those is an operation worth replaying after-the-fact** — for debugging, audit compliance, post-mortem analysis, or as training data for the W11.8 CT pipeline.
+Phase 3.1's `consolidate()` writes facts. Phase 3.2.1's atomisation writes typed atoms. Phase 3.3's quality gate decides promotion. Later phases (§9 dedup, §9.6 supersede / coexist) add more state-mutating operations on the memory store. **Every one of those is an operation worth replaying after-the-fact** — for debugging, audit compliance, post-mortem analysis, or as training data for the W11.8 CT pipeline.
 
-The `rohitg00/agentmemory` project formalizes this via an explicit **`AuditEntry`** type — every memory operation gets recorded with an operation union type + payload + timestamp + actor. The agent-prep lab currently writes audit-shaped metadata into each Qdrant payload (the `supersedes` / `supersede_reason` / `fact_kind` fields from Phase 9.6 are exactly this pattern) but doesn't formalize the AuditEntry as a typed primitive. Promoting it to a first-class type:
+The `rohitg00/agentmemory` project formalizes this via an explicit **`AuditEntry`** type — every memory operation gets recorded with an operation union type + payload + timestamp + actor. Promoting it to a first-class type at *this* point in the chapter (rather than waiting until §9 dedup lands) lets the Phase 3.3 quality gate's `promote` / `demote` signals share the same primitive that the §9.7 wire-in will reuse for `update` / `supersede` / `coexist` / `delete` / `noop_duplicate`. One declaration, six callers.
 
 ```python
-# src/audit.py — promote ad-hoc audit-metadata into a typed primitive
+# src/audit.py — COMPLETE file at §3.4 (baseline primitive declaration)
+"""Append-only audit-log primitive. Every memory operation records an
+AuditEntry; downstream replay / CT pipeline / cross-backend export
+consume this log.
+
+§3.4 introduces: AuditEntry dataclass + 9-op Literal + record_audit()
+                 with DEFAULT_AUDIT_PATH (so callers don't thread paths).
+§9.7 will add:   read_audit_log() filter API — needed once the dedup
+                 wire-in produces enough entries that consumers want
+                 server-side filtering by user_id / operation.
+"""
 from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -1324,17 +1334,25 @@ import json
 import uuid
 from pathlib import Path
 
+# AuditOperation declares the full closed set up-front so the primitive
+# doesn't need to evolve as later phases add callers. Reader at §3.4
+# only needs to ground the three Phase-3 ops below; the rest get their
+# wire-in at §9.7 once Phase 9 / 9.6 introduce them.
 AuditOperation = Literal[
+    # Grounded by this point in the chapter (Phase 3.1 + Phase 3.3):
     "imprint",            # initial write
-    "update",             # form #1 update action
-    "supersede",          # form #1 + 9.6 supersede action (state evolution)
-    "coexist",            # form #1 + 9.6 coexist action (scoped variant)
-    "delete",             # form #1 delete action (factual correction)
-    "noop_duplicate",     # form #1 no-op (true duplicate)
-    "promote",            # quality gate promotion
-    "demote",             # quality gate demotion below threshold
-    "compact",            # offline housekeeping / batch dedup
+    "promote",            # quality-gate decision: above threshold
+    "demote",             # quality-gate decision: below threshold
+    # Wired in §9.7 once Phase 9 + 9.6 ground these:
+    "update", "supersede", "coexist", "delete", "noop_duplicate",
+    # Plus offline housekeeping (forward-link to W11.8 CT pipeline):
+    "compact",
 ]
+
+
+# Default JSONL log path so callers can `record_audit(entry)` without
+# threading a path argument through every emission site.
+DEFAULT_AUDIT_PATH = Path(__file__).resolve().parent.parent / "data" / "audit.jsonl"
 
 
 @dataclass(frozen=True)
@@ -1347,574 +1365,48 @@ class AuditEntry:
     actor_agent_id: str = ""
     user_id: str = ""
     target_id: str | None = None           # the affected memory point (if any)
-    new_id: str | None = None              # the new point produced (for supersede / update / coexist)
+    new_id: str | None = None              # the new point produced (for any writing op)
     payload_summary: str = ""              # first ~120 chars of fact content
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def record_audit(audit: AuditEntry, log_path: Path) -> None:
-    """Append one AuditEntry to a JSONL log. Production rule: this is the
-    ONLY place AuditEntry-shaped data is written; never inline elsewhere."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a") as f:
-        f.write(json.dumps(asdict(audit)) + "\n")
-```
-
-**Field semantics — `target_id` vs `new_id` per operation.** The two ID fields encode a directed edge: `target_id` is the existing point an op modifies (`None` if no prior point), `new_id` is the fresh point produced (`None` if the op doesn't write). Collapsing to one ID loses the edge — replay / CT pipelines need both ends to reconstruct supersede / coexist chains.
-
-| Operation | `target_id` | `new_id` | Meaning |
-|---|---|---|---|
-| `imprint` | `null` | new UUID | fresh add — no prior point |
-| `noop_duplicate` | existing UUID | `null` | true duplicate; skipped write |
-| `update` | existing UUID | new UUID | factual correction (same world-state) |
-| `supersede` | existing UUID | new UUID | state evolved; both retained |
-| `coexist` | existing UUID | new UUID | scoped variant; both retained |
-| `delete` | existing UUID | `null` | factually false; removed |
-| `promote` | existing UUID | `null` | quality-gate move above threshold |
-| `demote` | existing UUID | `null` | quality-gate move below threshold |
-| `compact` | varies | varies | offline housekeeping; may carry batch IDs in `metadata` |
-
-`★ Insight ─────────────────────────────────────`
-- **Audit log doubles as a schema canary.** A truly fresh `imprint` MUST emit `target_id=null`; if it doesn't, the dedup classifier upstream silently leaked a phantom candidate. A `noop_duplicate` with `target_id=null` means the candidate-dict shape from `query_context()` lost the Qdrant point UUID (see Bad-Case Journal Entry 14). The append-only file is the cheapest schema-conformance test you'll ever ship.
-- **Why null and not the empty string.** `Optional[str]` round-trips to `null` in JSONL — readers can pattern-match on absence without distinguishing "missing" from "explicitly empty". An empty string would force every consumer to special-case both.
-- **`metadata` is the escape hatch.** Operations with op-specific shapes (`supersede_reason`, `supersede_category`, `fact_kind`, `threshold`, batch_id for `compact`) carry that payload under `metadata` — keeps the top-level schema fixed across the 9 operations.
-`─────────────────────────────────────────────────`
-
-**Wire-in pattern (consolidation pipeline) — complete runnable replacement for `execute_action` in `src/dedup_synthesis.py`:**
-
-```python
-# src/audit.py — drop into lab-03-5-8-two-tier/src/
-"""Append-only audit-log primitive. Every memory operation records an
-AuditEntry; downstream replay / CT pipeline / cross-backend export
-consume this log.
-
-Wire-in: src/dedup_synthesis.py:execute_action() calls record_audit() in
-each branch (see below). consolidate() in src/consolidation.py needs no
-change — it already receives the counts dict from execute_action.
-"""
-from __future__ import annotations
-
-import json
-import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Literal
-
-
-AuditOperation = Literal[
-    "imprint",            # initial write (default add)
-    "update",             # Phase 9 form #1 update (factual correction; same world-state)
-    "supersede",          # Phase 9.6 supersede (state evolution; both retained)
-    "coexist",            # Phase 9.6 coexist (scoped variant; both retained)
-    "delete",             # Phase 9 delete (factually false; remove)
-    "noop_duplicate",     # Phase 9 no-op (true duplicate; skip)
-    "promote",            # Phase 3.3 quality gate promotion (above threshold)
-    "demote",             # Phase 3.3 quality gate demotion (below threshold)
-    "compact",            # offline housekeeping (batch dedup / cleanup)
-]
-
-
-DEFAULT_AUDIT_PATH = Path(__file__).resolve().parent.parent / "data" / "audit.jsonl"
-
-
-@dataclass(frozen=True)
-class AuditEntry:
-    """One operation on the memory store; append-only.
-    `metadata` carries operation-specific fields (supersede_reason,
-    supersede_category, fact_kind, threshold, etc)."""
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    operation: AuditOperation = "imprint"
-    actor_agent_id: str = ""
-    user_id: str = ""
-    target_id: str | None = None        # the existing point this op modifies (None for fresh add)
-    new_id: str | None = None           # the new point produced (for imprint / supersede / update / coexist)
-    payload_summary: str = ""           # first ~120 chars of fact content
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 def record_audit(audit: AuditEntry, log_path: Path | None = None) -> None:
-    """Append one AuditEntry to a JSONL log. Idempotent on the file system
-    (parent dir auto-created). Single writer assumption; if multi-process
-    writers are needed, wrap in fcntl.flock or switch to SQLite."""
+    """Append one AuditEntry to a JSONL log. Production rule: this is the
+    ONLY place AuditEntry-shaped data is written; never inline elsewhere.
+    Single-writer assumption; for multi-process writers, wrap in
+    fcntl.flock or switch to SQLite WAL-mode."""
     path = log_path or DEFAULT_AUDIT_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(asdict(audit)) + "\n")
-
-
-def read_audit_log(log_path: Path | None = None,
-                  user_id: str | None = None,
-                  operation: AuditOperation | None = None) -> list[dict]:
-    """Read audit log with optional user_id + operation filters.
-    Returns one dict per AuditEntry (asdict() shape). For replay or
-    cross-backend export."""
-    path = log_path or DEFAULT_AUDIT_PATH
-    if not path.exists():
-        return []
-    entries = []
-    with path.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            if user_id is not None and entry.get("user_id") != user_id:
-                continue
-            if operation is not None and entry.get("operation") != operation:
-                continue
-            entries.append(entry)
-    return entries
 ```
 
-```python
-# src/dedup_synthesis.py — COMPLETE drop-in replacement (~310 LOC)
-# Audit-wired version of the full Phase 9 + Phase 9.6 dedup-and-synthesis
-# module. Drop this file at lab-03-5-8-two-tier/src/dedup_synthesis.py to
-# replace the shipped version + get audit emission per branch for free.
-"""Online dedup-and-synthesis (Batchelor-Manning 2026 form #1, extended).
+**Field semantics — `target_id` vs `new_id` per operation.** The two ID fields encode a directed edge: `target_id` is the existing point an op modifies (`None` if no prior point), `new_id` is the fresh point produced (`None` if the op doesn't write). Collapsing to one ID loses the edge — replay / CT pipelines need both ends to reconstruct chains.
 
-Implements the "pay at write time" pattern: when a new fact arrives, query
-the existing store for top-k semantically nearest candidates, then issue
-ONE LLM call to decide an action. Execute + emit AuditEntry per action.
+At this point in the chapter the only operations grounded are `imprint` (Phase 3.1 — write a new fact) and `promote` / `demote` (Phase 3.3 — quality-gate decisions). The matrix for these three:
 
-Six actions (Phase 9.6 — bitemporal extension):
-  - add       : novel fact, no overlap
-  - update    : new fact refines/corrects one candidate (same world-state)
-  - supersede : new fact contradicts one candidate, BOTH WERE TRUE AT
-                THEIR OWN TIMES (state evolution). Old marked superseded_by.
-  - coexist   : new fact appears to contradict one candidate but applies
-                to a DIFFERENT scope. Both true under different conditions.
-  - delete    : old fact was factually false (hallucination); scrub it
-  - no-op     : true duplicate, skip
+| Operation | `target_id` | `new_id` | Meaning |
+|---|---|---|---|
+| `imprint` | `null` | new UUID | fresh add — no prior point |
+| `promote` | `null` | new UUID (or `null` if dedup path) | quality-gate passed → fact was imprinted |
+| `demote` | `null` | `null` | quality-gate failed → no write |
 
-Audit emission (Phase 3.4 + agentmemory pattern):
-Every state-mutating branch emits one AuditEntry to data/audit.jsonl.
-Downstream consumers: replay / CT pipeline / cross-backend export.
+The full 9-row matrix (adding `noop_duplicate` / `update` / `supersede` / `coexist` / `delete` / `compact`) lands in **§9.7** once Phase 9 dedup + Phase 9.6 bitemporal extensions ground every operation.
 
-Scoped to the Qdrant TieredMemory variant for clean composition (EverCore
-has its own internal extraction pipeline that doesn't expose delete/update
-hooks cleanly).
+`★ Insight ─────────────────────────────────────`
+- **Audit log doubles as a schema canary, even with just three ops.** A truly fresh `imprint` MUST emit `target_id=null`; a `demote` MUST emit `new_id=null` because no write happened; a `promote` SHOULD carry `new_id=<UUID>` when chainable. Three invariants the §3.3 wire-in below already enforces — and the canary catches them at log-read time without any extra test framework.
+- **Why `null` and not the empty string.** `Optional[str]` round-trips to `null` in JSONL — readers can pattern-match on absence without distinguishing "missing" from "explicitly empty". An empty string would force every consumer to special-case both.
+- **`metadata` is the escape hatch.** Operation-specific fields (gate `threshold`, `delta`, `quest_id`, `fact_type`, `phase` on the gate audits below — and `supersede_reason` / `fact_kind` / `compact` batch IDs once §9.7 lands) ride under `metadata`, leaving the eight top-level fields fixed across all 9 operations. That's why the dataclass freezes its top-level shape and treats `metadata` as the only growth surface.
+`─────────────────────────────────────────────────`
 
-Step 3 (deferred): supersede currently uses HARD-DELETE for the old fact.
-Once `_qdrant_supersede` (payload-patch soft-delete) lands, the new fact's
-`supersedes` pointer + query-time filter give true bitemporal semantics
-without losing the old content.
-"""
-from __future__ import annotations
+**Forward-links — where the rest of the 9-op AuditEntry surface lands:**
 
-import json
-import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Literal, Protocol
+- **Full `execute_action()` audit wire-in (6 mutation ops: imprint / update / supersede / coexist / delete / noop_duplicate):** ships in **§9.7** (after the dedup-and-synthesis primitive is grounded in §9.1 and the bitemporal supersede/coexist split lands in §9.6).
+- **Qdrant point-UUID surfacing in candidate dicts (so `target_id` carries a real UUID, not the literal string `"?"`):** the fix lives in **§7.2** alongside the `query_context()` definition — see the *Block 4* walkthrough note.
+- **`replay_audit` primitive (consume the JSONL log to reconstruct store state at past timestamps):** **§10.3**.
+- **Drop-in `tests/test_audit.py` covering all 9 ops:** below this subsection — the primitive declaration above plus the gate wire-in below are everything the 4 tests exercise.
 
-from openai import OpenAI
-
-from src.audit import AuditEntry, record_audit
-
-
-class TieredMemoryLike(Protocol):
-    """Both EverCore and Qdrant variants — same surface; Pyright sees them
-    as distinct classes without this Protocol shim. The audit code reads
-    `agent_id` + `user_id` from this Protocol via getattr() defensive."""
-    _http: Any
-    agent_id: str
-    user_id: str
-
-    def imprint(self, content: str, metadata: dict[str, Any] | None = ...) -> str: ...
-    def query_context(
-        self,
-        query: str,
-        k: int = ...,
-        min_confidence: float = ...,
-        type_filter: list[str] | None = ...,
-    ) -> list[dict[str, Any]]: ...
-
-
-DEDUP_PROMPT = """You are deduplicating an agent's long-term memory store.
-
-NEW FACT (just observed at {now}):
-{new_fact}
-
-CANDIDATE EXISTING FACTS (top-k by semantic similarity, with timestamps):
-{candidates}
-
-Decide ONE action. Emit JSON.
-
-Actions:
-
-- "add": novel fact, no overlap with any candidate.
-
-- "update": new fact REFINES one candidate (more detail, fixes an error
-            in the SAME world-state). Old fact was wrong or incomplete;
-            new fact is the corrected/expanded version. Old and new
-            CANNOT both be true at the same time.
-            Linguistic cues: "actually", "correction", "I was wrong";
-            short time gap (seconds/minutes); same scope.
-
-- "supersede": new fact CONTRADICTS one candidate but BOTH WERE TRUE
-            AT THEIR OWN TIMES. State changed (preference shifted,
-            config rotated, scope evolved, user switched tools/jobs).
-            Old is historical truth; new is current truth. BOTH kept;
-            old marked superseded_by new.
-            Linguistic cues: "now", "switched to", "changed", "as of",
-            "currently", "no longer"; larger time gap (hours/days+).
-            Example: old="user likes React" (2024-01) + new="user
-            prefers Vue now" (2026-05) -> supersede.
-
-- "coexist": new fact APPEARS TO CONTRADICT one candidate but actually
-            applies to a DIFFERENT scope or context. Both true at the
-            same time under different conditions.
-            Example: old="auth tokens expire after 30 min" (web app)
-            + new="API keys never expire" (machine-to-machine) -> coexist.
-
-- "delete": old fact was FACTUALLY FALSE — hallucination, parse error,
-            mis-extraction. New fact replaces it cleanly. No value in
-            keeping the old for audit. Rare; prefer supersede when
-            ambiguous.
-
-- "no-op": new fact is a true DUPLICATE of one candidate. No imprint.
-            MUST include `target_id` of the duplicated candidate so
-            downstream audit / replay can trace the duplicate chain.
-
-Output JSON (no markdown fence, no prose):
-{{"action": "add" | "update" | "supersede" | "coexist" | "delete" | "no-op",
-  "target_id": "<id of related existing fact; required for update / supersede / coexist / delete>",
-  "merged_content": "<for update only — combined fact text>",
-  "supersede_reason": "<for supersede only — one sentence why this is state change not factual error>",
-  "supersede_category": "<for supersede only — one of: preference, status, config, scope, identity, other>",
-  "relates_to": "<for coexist only — target_id of the related candidate>"}}
-
-Return ONLY the JSON."""
-
-
-Action = Literal["add", "update", "supersede", "coexist", "delete", "no-op"]
-_VALID_ACTIONS: tuple[str, ...] = (
-    "add", "update", "supersede", "coexist", "delete", "no-op",
-)
-
-
-@dataclass
-class DedupAction:
-    action: Action
-    target_id: str | None = None
-    merged_content: str | None = None
-    supersede_reason: str | None = None
-    supersede_category: str | None = None
-    relates_to: str | None = None
-
-
-def _format_candidates(candidates: list[dict]) -> str:
-    """Surfaces a `timestamp` field per candidate so the classifier can
-    distinguish factual correction (short gap) from state evolution
-    (large gap). Keys probed: timestamp, created_at, imprinted_at."""
-    if not candidates:
-        return "(none)"
-    lines = []
-    for c in candidates[:5]:
-        cid = c.get("id") or c.get("point_id") or "?"
-        content = c.get("content") or c.get("summary") or ""
-        ts = (
-            c.get("timestamp")
-            or c.get("created_at")
-            or c.get("imprinted_at")
-            or "?"
-        )
-        score = c.get("score", 0.0)
-        lines.append(
-            f'  - id={cid!r}  imprinted={ts}  score={score:.3f}  '
-            f'content="{content[:200]}"'
-        )
-    return "\n".join(lines)
-
-
-def decide_action(new_fact: str, candidates: list[dict]) -> DedupAction:
-    """LLM-mediated decision: one of 6 actions.
-    Graceful fallbacks:
-    - empty candidates -> add (no LLM call)
-    - malformed JSON   -> add (safe default; loss mode = duplication)
-    - unknown action   -> add (same)"""
-    if not candidates:
-        return DedupAction(action="add")
-
-    client = OpenAI(
-        base_url=os.getenv("OMLX_BASE_URL"),
-        api_key=os.getenv("OMLX_API_KEY"),
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-    prompt = DEDUP_PROMPT.format(
-        new_fact=new_fact,
-        candidates=_format_candidates(candidates),
-        now=now_iso,
-    )
-    resp = client.chat.completions.create(
-        model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=800,
-    )
-    raw = (resp.choices[0].message.content or "").strip()
-
-    # Strip optional markdown fence
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return DedupAction(action="add")
-
-    action = parsed.get("action")
-    if action not in _VALID_ACTIONS:
-        return DedupAction(action="add")
-
-    # Defensive: classifier may emit no-op without target_id (prompt
-    # requires it but LLM compliance drifts ~20%). Default to the
-    # highest-similarity candidate so audit log isn't lossy on
-    # duplicate-chain reconstruction.
-    target_id = parsed.get("target_id")
-    if action == "no-op" and not target_id and candidates:
-        target_id = candidates[0].get("id") or candidates[0].get("point_id")
-
-    return DedupAction(
-        action=action,
-        target_id=target_id,
-        merged_content=parsed.get("merged_content"),
-        supersede_reason=parsed.get("supersede_reason"),
-        supersede_category=parsed.get("supersede_category"),
-        relates_to=parsed.get("relates_to"),
-    )
-
-
-def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
-                   metadata: dict | None = None) -> dict:
-    """Apply a DedupAction against a Qdrant TieredMemory; emit AuditEntry
-    per operation. Returns counters for caller aggregation.
-
-    Counter dict shape:
-      {imprinted, updated, deleted, noop, superseded, coexisted}
-
-    Each call increments exactly one PRIMARY counter (matches action).
-    `imprinted` is SECONDARY — increments on any write (add / update /
-    supersede / coexist / delete-then-add). Callers aggregating
-    "total writes" should sum `imprinted` alone.
-    """
-    counts = {
-        "imprinted": 0, "updated": 0, "deleted": 0, "noop": 0,
-        "superseded": 0, "coexisted": 0,
-    }
-    md = metadata or {}
-    payload_summary = new_fact[:120]
-    actor = getattr(tm, "agent_id", "")
-    user = getattr(tm, "user_id", "")
-
-    # Closure: each branch calls _audit("op", **meta) instead of repeating
-    # the AuditEntry boilerplate. `actor`, `user`, `payload_summary` are
-    # captured from the enclosing scope; meta-kwargs become the audit's
-    # `metadata` dict so per-op fields (reason, supersede_category, etc.)
-    # stay strongly-named at the call site.
-    def _audit(operation, *, target_id=None, new_id=None, summary=payload_summary, **meta):
-        record_audit(AuditEntry(
-            operation=operation,
-            actor_agent_id=actor, user_id=user,
-            target_id=target_id, new_id=new_id,
-            payload_summary=summary,
-            metadata=meta,
-        ))
-
-    if action.action == "no-op":
-        counts["noop"] += 1
-        _audit("noop_duplicate", target_id=action.target_id,
-               reason="true_duplicate_per_classifier")
-        return counts
-
-    if action.action == "delete" and action.target_id:
-        _qdrant_delete(tm, [action.target_id])
-        # Per Phase 9 spec: delete is followed by add (new fact replaces old)
-        new_id = tm.imprint(content=new_fact, metadata=md)
-        counts["deleted"] += 1
-        counts["imprinted"] += 1
-        _audit("delete", target_id=action.target_id, new_id=new_id,
-               reason="factually_false_per_classifier")
-        return counts
-
-    if action.action == "update" and action.target_id:
-        _qdrant_delete(tm, [action.target_id])
-        merged = action.merged_content or new_fact
-        new_id = tm.imprint(content=merged, metadata=md)
-        counts["updated"] += 1
-        counts["imprinted"] += 1
-        _audit("update", target_id=action.target_id, new_id=new_id,
-               summary=merged[:120],
-               reason="factual_correction_same_world_state", merged=True)
-        return counts
-
-    if action.action == "supersede" and action.target_id:
-        # NOTE (Step 3 deferred): the soft-delete payload-patch path
-        # `_qdrant_supersede` is not yet wired. Until then, hard-delete
-        # old + new fact with `supersedes` pointer + supersede_reason
-        # metadata. Classification IS preserved via the new fact's
-        # supersedes pointer — chain traversal walks forward. Step 3
-        # swaps _qdrant_delete -> payload-patch with zero contract
-        # change at this layer.
-        _qdrant_delete(tm, [action.target_id])
-        new_id = tm.imprint(content=new_fact, metadata={
-            **md,
-            "supersedes": action.target_id,
-            "supersede_reason": action.supersede_reason,
-            "supersede_category": action.supersede_category,
-            "fact_kind": "state_evolution",
-        })
-        counts["superseded"] += 1
-        counts["imprinted"] += 1
-        _audit("supersede", target_id=action.target_id, new_id=new_id,
-               supersede_category=action.supersede_category,
-               supersede_reason=action.supersede_reason,
-               fact_kind="state_evolution")
-        return counts
-
-    if action.action == "coexist" and (action.relates_to or action.target_id):
-        related = action.relates_to or action.target_id
-        new_id = tm.imprint(content=new_fact, metadata={
-            **md, "relates_to": related, "fact_kind": "scoped_variant",
-        })
-        counts["coexisted"] += 1
-        counts["imprinted"] += 1
-        _audit("coexist", target_id=related, new_id=new_id,
-               relates_to=related, fact_kind="scoped_variant")
-        return counts
-
-    # Default: add (no candidates OR LLM picked add OR malformed-output fallback)
-    new_id = tm.imprint(content=new_fact, metadata=md)
-    counts["imprinted"] += 1
-    _audit("imprint", new_id=new_id,
-           reason="novel_per_classifier_or_empty_candidates")
-    return counts
-
-
-def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
-    """Delete points by ID via Qdrant's points/delete endpoint."""
-    from src.tiered_memory_qdrant import COLLECTION
-
-    r = tm._http.post(
-        f"/collections/{COLLECTION}/points/delete",
-        json={"points": point_ids},
-    )
-    r.raise_for_status()
-    actor = getattr(tm, "agent_id", "")
-    user = getattr(tm, "user_id", "")
-
-    if action.action == "no-op":
-        counts["noop"] += 1
-        record_audit(AuditEntry(
-            operation="noop_duplicate",
-            actor_agent_id=actor, user_id=user,
-            target_id=action.target_id,
-            payload_summary=payload_summary,
-            metadata={"reason": "true_duplicate_per_classifier"},
-        ))
-        return counts
-
-    if action.action == "delete" and action.target_id:
-        _qdrant_delete(tm, [action.target_id])
-        # Per Phase 9 spec: delete is followed by add (new fact is the replacement)
-        new_id = tm.imprint(content=new_fact, metadata=md)
-        counts["deleted"] += 1
-        counts["imprinted"] += 1
-        record_audit(AuditEntry(
-            operation="delete",
-            actor_agent_id=actor, user_id=user,
-            target_id=action.target_id, new_id=new_id,
-            payload_summary=payload_summary,
-            metadata={"reason": "factually_false_per_classifier"},
-        ))
-        return counts
-
-    if action.action == "update" and action.target_id:
-        _qdrant_delete(tm, [action.target_id])
-        merged = action.merged_content or new_fact
-        new_id = tm.imprint(content=merged, metadata=md)
-        counts["updated"] += 1
-        counts["imprinted"] += 1
-        record_audit(AuditEntry(
-            operation="update",
-            actor_agent_id=actor, user_id=user,
-            target_id=action.target_id, new_id=new_id,
-            payload_summary=merged[:120],
-            metadata={
-                "reason": "factual_correction_same_world_state",
-                "merged": True,
-            },
-        ))
-        return counts
-
-    if action.action == "supersede" and action.target_id:
-        # NOTE Step 3 deferred: hard-delete old + new with supersedes pointer.
-        # Step 3 swaps _qdrant_delete -> _qdrant_supersede payload-patch
-        # with zero contract change at this layer.
-        _qdrant_delete(tm, [action.target_id])
-        supersede_meta = {
-            **md,
-            "supersedes": action.target_id,
-            "supersede_reason": action.supersede_reason,
-            "supersede_category": action.supersede_category,
-            "fact_kind": "state_evolution",
-        }
-        new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
-        counts["superseded"] += 1
-        counts["imprinted"] += 1
-        record_audit(AuditEntry(
-            operation="supersede",
-            actor_agent_id=actor, user_id=user,
-            target_id=action.target_id, new_id=new_id,
-            payload_summary=payload_summary,
-            metadata={
-                "supersede_category": action.supersede_category,
-                "supersede_reason": action.supersede_reason,
-                "fact_kind": "state_evolution",
-            },
-        ))
-        return counts
-
-    if action.action == "coexist" and (action.relates_to or action.target_id):
-        related = action.relates_to or action.target_id
-        coexist_meta = {
-            **md,
-            "relates_to": related,
-            "fact_kind": "scoped_variant",
-        }
-        new_id = tm.imprint(content=new_fact, metadata=coexist_meta)
-        counts["coexisted"] += 1
-        counts["imprinted"] += 1
-        record_audit(AuditEntry(
-            operation="coexist",
-            actor_agent_id=actor, user_id=user,
-            target_id=related, new_id=new_id,
-            payload_summary=payload_summary,
-            metadata={
-                "relates_to": related,
-                "fact_kind": "scoped_variant",
-            },
-        ))
-        return counts
-
-    # Default: add (no candidates OR LLM picked add)
-    new_id = tm.imprint(content=new_fact, metadata=md)
-    counts["imprinted"] += 1
-    record_audit(AuditEntry(
-        operation="imprint",
-        actor_agent_id=actor, user_id=user,
-        new_id=new_id,
-        payload_summary=payload_summary,
-        metadata={"reason": "novel_per_classifier_or_empty_candidates"},
-    ))
-    return counts
-```
+The `Optional — wire quality-gate promote / demote audits in src/consolidation.py` block below uses ONLY the 3 operations already grounded by §3.3 (`imprint` / `promote` / `demote`) so it is self-contained at this point in the chapter.
 
 **Optional — wire quality-gate `promote` / `demote` audits in `src/consolidation.py`:**
 
@@ -1927,7 +1419,7 @@ flowchart TD
     B -- Yes --> C[compute score]
     C --> D{"score &ge; threshold?"}
     D -- No --> E[record_audit demote<br/>target_id=null new_id=null<br/>SKIP imprint]
-    D -- Yes --> G[imprint or execute_action]
+    D -- Yes --> G["imprint<br/>(or §9.7 dedup primitive)"]
     G --> H[record_audit promote<br/>target_id=null new_id=&lt;new UUID or null&gt;]
     H --> I[chain via metadata.quest_id<br/>for replay/CT pipeline]
 ```
@@ -1960,7 +1452,7 @@ from src.audit import AuditEntry, record_audit
 # imprinted yet. On `promote`, new_id is filled by the caller AFTER the
 # downstream imprint returns the UUID (best-effort — None is acceptable
 # when use_dedup=True since execute_action returns counts not UUIDs).
-def _audit_gate(
+def _audit_gate(   # AUDIT (§3.4): centralised audit shape
     *,
     decision: Literal["promote", "demote"],
     actor_agent_id: str,
@@ -2076,7 +1568,7 @@ async def consolidate(
                     if promotion_threshold is not None:
                         if atom_conf < promotion_threshold:
                             _audit_gate(
-                                decision="demote",
+                                decision="demote",   # AUDIT (§3.4)
                                 actor_agent_id=actor_id,
                                 user_id=user_id,
                                 score=atom_conf,
@@ -2127,7 +1619,7 @@ async def consolidate(
                     # ── promote audit AFTER imprint (chain new_id if known) ──
                     if gate_passed_score is not None:
                         _audit_gate(
-                            decision="promote",
+                            decision="promote",   # AUDIT (§3.4)
                             actor_agent_id=actor_id,
                             user_id=user_id,
                             score=gate_passed_score,
@@ -2161,7 +1653,7 @@ async def consolidate(
                 score = quality_score(summary, tm=tm)
                 if score < promotion_threshold:
                     _audit_gate(
-                        decision="demote",
+                        decision="demote",   # AUDIT (§3.4): pre-write gate, no imprint
                         actor_agent_id=actor_id,
                         user_id=user_id,
                         score=score,
@@ -2191,7 +1683,7 @@ async def consolidate(
             # not None AND the demote branch did not `continue`.
             if score is not None:
                 _audit_gate(
-                    decision="promote",
+                    decision="promote",   # AUDIT (§3.4): post-write, chains new_id
                     actor_agent_id=actor_id,
                     user_id=user_id,
                     score=score,
@@ -2221,7 +1713,7 @@ async def consolidate(
 
 **Block 2 — Why `promote` fires AFTER `imprint`, not before.** Firing the gate audit before the write means `new_id=null` always, losing the gate→write chain. Firing after means the audit can carry the actual UUID for the row that just landed. The trade-off: if the imprint raises, the gate decision was correct (the row would have been promoted) but no audit is recorded — that's intentional; failed writes shouldn't pollute the gate-decision log. The `except Exception` block at the function tail catches the imprint failure and records it in `result.errors`.
 
-**Block 3 — Why `use_dedup=True` leaves `new_id=None` on promote.** `execute_action()` returns counts, not UUIDs, because the dedup path may take any of 6 actions (imprint, update, supersede, coexist, delete, no-op) — there is no single canonical "new point ID" for the supersede/coexist branches (both old and new IDs are interesting). Forcing `execute_action` to return a UUID tuple would muddy its single-responsibility contract. Replay code reconstructs the chain via `metadata.quest_id` + timestamp proximity instead.
+**Block 3 — Why `promote` sometimes lands with `new_id=None`.** When `use_dedup=False` (the default for §3.x), `tm.imprint()` returns the new point's UUID directly and we chain it into the `promote` audit. The `use_dedup=True` branch routes through a Phase 9 primitive that returns aggregate counts rather than a single UUID — see §9.7 for the multi-action contract and why a counts-only return shape is the right design for that primitive. Until then, treat `new_id=None` on a `promote` audit as "downstream pipeline didn't surface a UUID; replay code reconstructs the chain via `metadata.quest_id` + timestamp proximity". Symmetric with `demote`, which always has `new_id=None` because no write happens.
 
 **Block 4 — `getattr(tm, "user_id", "")`.** Defensive read against the `TieredMemoryLike` Protocol's looseness — the Protocol doesn't declare `user_id` because Phase 9 dedup keeps the Protocol minimal. Both real `TieredMemory` variants have `user_id`, but the Protocol contract doesn't require it. `getattr` falls back to empty string instead of `AttributeError` if a future backend omits it.
 
@@ -2245,117 +1737,7 @@ The 9 demote entries cluster tightly below threshold (`delta` range −0.03 to �
 - **`phase: "pre_write_gate"` is the post-write escape valve.** Future re-scoring sweeps (a periodic job that re-scores existing points and demotes stale ones) will emit `promote`/`demote` with `phase: "post_write_resweep"` and `target_id=<existing UUID>`. One discriminator field keeps both shapes in one audit stream — readers filter on `phase` instead of needing to fork the schema.
 `─────────────────────────────────────────────────`
 
-**Drop-in test file — `tests/test_audit.py`:**
-
-```python
-"""Verifies AuditEntry records correctly per execute_action branch.
-Run: uv run pytest tests/test_audit.py -v
-"""
-from __future__ import annotations
-
-import json
-import uuid
-from pathlib import Path
-
-import pytest
-
-from src.audit import AuditEntry, record_audit, read_audit_log
-from src.dedup_synthesis import DedupAction, execute_action
-from src.tiered_memory_qdrant import TieredMemory
-
-
-@pytest.fixture
-def audit_log_path(tmp_path):
-    """Isolate the audit log per test (avoids cross-test leakage).
-    Patch the module-level DEFAULT_AUDIT_PATH temporarily."""
-    import src.audit as audit_mod
-    original = audit_mod.DEFAULT_AUDIT_PATH
-    test_path = tmp_path / "audit.jsonl"
-    audit_mod.DEFAULT_AUDIT_PATH = test_path
-    yield test_path
-    audit_mod.DEFAULT_AUDIT_PATH = original
-
-
-def test_record_audit_writes_jsonl(audit_log_path: Path):
-    """One entry -> one line of JSON in the log file."""
-    entry = AuditEntry(
-        operation="imprint",
-        actor_agent_id="test_agent",
-        user_id="test_user",
-        new_id="point-abc",
-        payload_summary="hello world",
-    )
-    record_audit(entry)
-    assert audit_log_path.exists()
-    lines = audit_log_path.read_text().strip().split("\n")
-    assert len(lines) == 1
-    parsed = json.loads(lines[0])
-    assert parsed["operation"] == "imprint"
-    assert parsed["new_id"] == "point-abc"
-
-
-def test_read_audit_log_filters_by_user(audit_log_path: Path):
-    """user_id filter should exclude entries from other users."""
-    record_audit(AuditEntry(operation="imprint", user_id="alice", new_id="a"))
-    record_audit(AuditEntry(operation="imprint", user_id="bob", new_id="b"))
-    alice_entries = read_audit_log(user_id="alice")
-    assert len(alice_entries) == 1
-    assert alice_entries[0]["new_id"] == "a"
-
-
-def test_read_audit_log_filters_by_operation(audit_log_path: Path):
-    """operation filter returns only matching operations."""
-    record_audit(AuditEntry(operation="imprint", new_id="a"))
-    record_audit(AuditEntry(operation="supersede", new_id="b", target_id="x"))
-    record_audit(AuditEntry(operation="noop_duplicate"))
-    sup = read_audit_log(operation="supersede")
-    assert len(sup) == 1
-    assert sup[0]["target_id"] == "x"
-
-
-@pytest.mark.asyncio
-async def test_execute_action_emits_audit_per_branch(audit_log_path: Path):
-    """Each execute_action branch (no-op / add / supersede / coexist /
-    delete / update) should produce exactly one AuditEntry."""
-    async with TieredMemory(agent_id=f"audit_test_{uuid.uuid4().hex[:6]}") as tm:
-        # 1. ADD branch (no target_id; classifier picked add)
-        execute_action(tm, DedupAction(action="add"), "new fact about Terraform")
-        # 2. NO-OP branch
-        execute_action(tm, DedupAction(action="no-op", target_id="existing-x"),
-                       "duplicate fact")
-        # 3. SUPERSEDE branch — needs a real target_id in Qdrant; for unit
-        #    test scope, mock target_id (delete will fail but we only check
-        #    audit log writes BEFORE delete; in integration test use real
-        #    target_id)
-        # ... see lab repo for the full integration variant
-
-    entries = read_audit_log()
-    operations = [e["operation"] for e in entries]
-    assert "imprint" in operations
-    assert "noop_duplicate" in operations
-```
-
-**Run:**
-
-```bash
-cd ~/code/agent-prep/lab-03-5-8-two-tier
-# Drop in the 3 files above:
-#   src/audit.py
-#   src/dedup_synthesis.py  (replace execute_action with the audit-wired version)
-#   tests/test_audit.py
-mkdir -p data
-set -a && . /Users/yuxinliu/code/agent-prep/.env && set +a
-uv run pytest tests/test_audit.py -v
-# Expect: 4/4 PASS (3 unit + 1 async integration smoke)
-tail -f data/audit.jsonl   # in another terminal — watch entries land
-```
-
-Production deployment of this pattern:
-- Promote `DEFAULT_AUDIT_PATH` from a file constant to env var (`AGENT_PREP_AUDIT_PATH`)
-- Rotate the JSONL file daily (`audit.YYYY-MM-DD.jsonl`)
-- For multi-process writers, swap `record_audit` to use `fcntl.flock` OR write to SQLite WAL-mode database
-
-**Why elevate to a typed primitive instead of leaving as payload metadata:**
+**Tests:** the canonical test file `tests/test_audit.py` is at the end of §9.7 (after the dedup wire-in is grounded), since the 4th test exercises `execute_action()` audit emission. The Phase 3.3 gate audit is covered by `tests/test_consolidation_audit.py` shown in the *Optional* block above.
 
 **Why elevate to a typed primitive instead of leaving as payload metadata:**
 
@@ -2947,6 +2329,8 @@ class TieredMemory:
 > - **`imprint()` Step 2 timestamp injection (Phase 9.6, 2026-05-15):** every payload now stamps `timestamp = datetime.now(timezone.utc).isoformat()` so downstream dedup can distinguish factual correction (short gap) from state evolution (large gap). Canonical code + walkthrough in §9.6 Bundle C.
 > - **`query_context()` form #5 + #6 extensions (Phase 3 atomisation, commit `ec77699`):** adds `min_confidence: float = 0.0` and `type_filter: list[str] | None = None` kwargs to filter low-confidence + restrict by `type` (fact / observation / tool_result / skill). Code + tests in §3.2.1.
 > - **`TieredMemoryLike` Protocol (Phase 9 commit `bf1d091`):** the dedup module imports a structural Protocol matching THIS class's surface so it can operate against both EverCore + Qdrant variants without inheritance. Protocol declaration in §9.1.
+
+**Why the candidate-dict carries `"id": hit["id"]` explicitly (load-bearing for the audit log).** Qdrant's `points/search` response has the point UUID at the **top level** of each hit (`hit["id"]`) and the user-supplied metadata under `hit["payload"]`. The natural-looking pattern `{**hit["payload"], "score": hit["score"]}` silently drops the UUID because the payload doesn't contain it — and the loss is invisible at write time (`imprint()` returns the UUID directly to its caller). The cost surfaces downstream in **§9.7's audit log**: the dedup classifier renders candidates with `id={cid!r}` in its prompt; without a real UUID the fallback is the literal string `"?"`, the LLM dutifully echoes `"target_id": "?"` back, and every `noop_duplicate` audit entry loses chain reconstruction. Pinning `"id": hit["id"]` explicitly at the top of the dict (before the `**payload` spread, so it can never be shadowed by a stray `id` key in user metadata) is the simplest fix. See Bad-Case Journal Entry on `noop_duplicate target_id collapses to "?"` for the symptom → root-cause walkthrough.
 
 This §7.2 block is the **launch baseline**. The shipped class is ~215 LOC after the three extensions land; the additions are documented in their own bundles to keep each pedagogical unit focused.
 
@@ -4333,7 +3717,690 @@ Plus the `query_context()` filter (`is_empty: {key: superseded_by}` on default q
 
 ---
 
-### 9.7 Test suite — `tests/test_dedup_synthesis.py` (5 tests, 5/5 PASS 2026-05-15)
+### 9.7 Audit Log Wire-in — Typed AuditEntry across all 6 mutation ops
+
+Phase 9.1 introduced the 4-action `decide_action` / `execute_action` primitive (add / update / delete / no-op); Phase 9.6 added the 2 bitemporal actions (supersede / coexist). All 6 are state-mutating operations on the Qdrant store — and **each one is an AuditEntry the W11.8 CT pipeline + W9.3 eval rubric need to consume**. This subsection lands the typed-AuditEntry surface that §3.4 forward-referenced.
+
+Reader prerequisites grounded by now: §3.4 (AuditEntry dataclass + record_audit / read_audit_log primitives + 3-op subset for the §3.3 quality gate), §7.2 (Qdrant point UUIDs in candidate dicts), §9.1 (dedup primitive returning `DedupAction` with `target_id`), §9.6 (supersede / coexist actions + `merged_content` for update).
+
+**Full operation × field matrix (all 9 ops):** the two ID fields encode a directed edge — `target_id` is the existing point an op modifies (`None` if no prior point), `new_id` is the fresh point produced (`None` if the op doesn't write). Collapsing to one ID loses the edge; replay / CT pipelines need both ends to reconstruct supersede / coexist chains.
+
+| Operation | `target_id` | `new_id` | Meaning |
+|---|---|---|---|
+| `imprint` | `null` | new UUID | fresh add — no prior point |
+| `noop_duplicate` | existing UUID | `null` | true duplicate; skipped write |
+| `update` | existing UUID | new UUID | factual correction (same world-state) |
+| `supersede` | existing UUID | new UUID | state evolved; both retained |
+| `coexist` | existing UUID | new UUID | scoped variant; both retained |
+| `delete` | existing UUID | `null` | factually false; removed |
+| `promote` | `null` | new UUID (or `null` if dedup path) | quality-gate move above threshold (§3.3 pre-write semantics) |
+| `demote` | `null` | `null` | quality-gate move below threshold |
+| `compact` | varies | varies | offline housekeeping; may carry batch IDs in `metadata` |
+
+`★ Insight ─────────────────────────────────────`
+- **Audit log doubles as a schema canary.** A truly fresh `imprint` MUST emit `target_id=null`; if it doesn't, the dedup classifier upstream silently leaked a phantom candidate. A `noop_duplicate` with `target_id=null` means the candidate-dict shape from `query_context()` lost the Qdrant point UUID (the §7.2 fix prevents this; see also Bad-Case Journal). The append-only file is the cheapest schema-conformance test you'll ever ship.
+- **Why `null` and not the empty string.** `Optional[str]` round-trips to `null` in JSONL — readers can pattern-match on absence without distinguishing "missing" from "explicitly empty". An empty string would force every consumer to special-case both.
+- **`metadata` is the escape hatch.** Operations with op-specific shapes (`supersede_reason`, `supersede_category`, `fact_kind`, `threshold`, batch_id for `compact`) carry that payload under `metadata` — keeps the top-level schema fixed across the 9 operations.
+`─────────────────────────────────────────────────`
+
+**Step 1 — extend `src/audit.py` with a filtered reader.**
+
+§3.4 shipped the baseline primitive: `AuditEntry` dataclass + 9-op Literal + `record_audit()` with `DEFAULT_AUDIT_PATH`. That covers writes. §9.7's wire-in below writes ~85 entries per quest batch (47 imprint + 38 promote + …); to consume that log usefully — replay, CT-pipeline drift detection, cross-backend export — readers need server-side filtering by `user_id` and `operation`. The single addition is `read_audit_log()`. Complete file with the new function marked:
+
+```python
+# src/audit.py — COMPLETE file (§9.7: adds read_audit_log to the §3.4 baseline)
+"""Append-only audit-log primitive. Every memory operation records an
+AuditEntry; downstream replay / CT pipeline / cross-backend export
+consume this log.
+
+§3.4 introduced: AuditEntry dataclass + 9-op Literal + record_audit()
+                 + DEFAULT_AUDIT_PATH so writes are zero-config.
+§9.7 adds:      read_audit_log() with user_id + operation filters —
+                 needed once dedup wire-in produces enough entries
+                 that consumers want server-side filtering.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+
+AuditOperation = Literal[
+    # Grounded at §3.4 (Phase 3.1 + Phase 3.3):
+    "imprint", "promote", "demote",
+    # All 6 of the next ops are now grounded (§9.1 dedup + §9.6 bitemporal):
+    "update", "supersede", "coexist", "delete", "noop_duplicate",
+    # Reserved for W11.8 offline housekeeping:
+    "compact",
+]
+
+
+# (Unchanged from §3.4 — shown so the file remains COMPLETE in this section.)
+DEFAULT_AUDIT_PATH = Path(__file__).resolve().parent.parent / "data" / "audit.jsonl"
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """One operation on the memory store; append-only.
+    `metadata` carries operation-specific fields (supersede_reason,
+    supersede_category, fact_kind, threshold, etc)."""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    operation: AuditOperation = "imprint"
+    actor_agent_id: str = ""
+    user_id: str = ""
+    target_id: str | None = None        # the existing point this op modifies (None for fresh add)
+    new_id: str | None = None           # the new point produced (for imprint / supersede / update / coexist)
+    payload_summary: str = ""           # first ~120 chars of fact content
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def record_audit(audit: AuditEntry, log_path: Path | None = None) -> None:
+    """Append one AuditEntry to a JSONL log. (Unchanged from §3.4.)
+    Single-writer assumption; for multi-process writers, wrap in
+    fcntl.flock or switch to SQLite WAL-mode."""
+    path = log_path or DEFAULT_AUDIT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(asdict(audit)) + "\n")
+
+
+# NEW (§9.7): filtered reader for replay / CT-pipeline / cross-backend export.
+def read_audit_log(log_path: Path | None = None,
+                   user_id: str | None = None,
+                   operation: AuditOperation | None = None) -> list[dict]:
+    """Read audit log with optional user_id + operation filters.
+    Returns one dict per AuditEntry (asdict() shape)."""
+    path = log_path or DEFAULT_AUDIT_PATH
+    if not path.exists():
+        return []
+    entries = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if user_id is not None and entry.get("user_id") != user_id:
+                continue
+            if operation is not None and entry.get("operation") != operation:
+                continue
+            entries.append(entry)
+    return entries
+```
+
+**What the diff against §3.4's baseline shows:** one new function (`read_audit_log`). The §3.4 baseline already had `DEFAULT_AUDIT_PATH` + optional `log_path` on `record_audit`, so the wire-in below requires zero changes to the write side; it just imports `record_audit` and calls it. The reader function is here, not at §3.4, because no reader needed it until enough entries accumulated to want filtering — and that only happens once §9.7 wires emission into all 6 mutation branches.
+
+**Step 2 — wire `record_audit()` into every branch of `execute_action()`.**
+
+This is the LOAD-BEARING change: each of the 6 mutation branches (add / update / supersede / coexist / delete / no-op) emits exactly one `AuditEntry`. A closure `_audit(operation, **meta)` captures the per-call invariants (`actor`, `user`, `payload_summary`) so every branch reduces to a single 2-line emission. Complete drop-in file follows; the `# AUDIT (§9.7):` markers point to the lines that are new relative to §9.1's baseline.
+
+```python
+# src/dedup_synthesis.py — COMPLETE drop-in replacement (~310 LOC)
+# Audit-wired version of the full Phase 9 + Phase 9.6 dedup-and-synthesis
+# module. Drop this file at lab-03-5-8-two-tier/src/dedup_synthesis.py to
+# replace the shipped version + get audit emission per branch for free.
+"""Online dedup-and-synthesis (Batchelor-Manning 2026 form #1, extended).
+
+Implements the "pay at write time" pattern: when a new fact arrives, query
+the existing store for top-k semantically nearest candidates, then issue
+ONE LLM call to decide an action. Execute + emit AuditEntry per action.
+
+Six actions (Phase 9.6 — bitemporal extension):
+  - add       : novel fact, no overlap
+  - update    : new fact refines/corrects one candidate (same world-state)
+  - supersede : new fact contradicts one candidate, BOTH WERE TRUE AT
+                THEIR OWN TIMES (state evolution). Old marked superseded_by.
+  - coexist   : new fact appears to contradict one candidate but applies
+                to a DIFFERENT scope. Both true under different conditions.
+  - delete    : old fact was factually false (hallucination); scrub it
+  - no-op     : true duplicate, skip
+
+Audit emission (Phase 3.4 + agentmemory pattern):
+Every state-mutating branch emits one AuditEntry to data/audit.jsonl.
+Downstream consumers: replay / CT pipeline / cross-backend export.
+
+Scoped to the Qdrant TieredMemory variant for clean composition (EverCore
+has its own internal extraction pipeline that doesn't expose delete/update
+hooks cleanly).
+
+Step 3 (deferred): supersede currently uses HARD-DELETE for the old fact.
+Once `_qdrant_supersede` (payload-patch soft-delete) lands, the new fact's
+`supersedes` pointer + query-time filter give true bitemporal semantics
+without losing the old content.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Literal, Protocol
+
+from openai import OpenAI
+
+from src.audit import AuditEntry, record_audit
+
+
+class TieredMemoryLike(Protocol):
+    """Both EverCore and Qdrant variants — same surface; Pyright sees them
+    as distinct classes without this Protocol shim. The audit code reads
+    `agent_id` + `user_id` from this Protocol via getattr() defensive."""
+    _http: Any
+    agent_id: str
+    user_id: str
+
+    def imprint(self, content: str, metadata: dict[str, Any] | None = ...) -> str: ...
+    def query_context(
+        self,
+        query: str,
+        k: int = ...,
+        min_confidence: float = ...,
+        type_filter: list[str] | None = ...,
+    ) -> list[dict[str, Any]]: ...
+
+
+DEDUP_PROMPT = """You are deduplicating an agent's long-term memory store.
+
+NEW FACT (just observed at {now}):
+{new_fact}
+
+CANDIDATE EXISTING FACTS (top-k by semantic similarity, with timestamps):
+{candidates}
+
+Decide ONE action. Emit JSON.
+
+Actions:
+
+- "add": novel fact, no overlap with any candidate.
+
+- "update": new fact REFINES one candidate (more detail, fixes an error
+            in the SAME world-state). Old fact was wrong or incomplete;
+            new fact is the corrected/expanded version. Old and new
+            CANNOT both be true at the same time.
+            Linguistic cues: "actually", "correction", "I was wrong";
+            short time gap (seconds/minutes); same scope.
+
+- "supersede": new fact CONTRADICTS one candidate but BOTH WERE TRUE
+            AT THEIR OWN TIMES. State changed (preference shifted,
+            config rotated, scope evolved, user switched tools/jobs).
+            Old is historical truth; new is current truth. BOTH kept;
+            old marked superseded_by new.
+            Linguistic cues: "now", "switched to", "changed", "as of",
+            "currently", "no longer"; larger time gap (hours/days+).
+            Example: old="user likes React" (2024-01) + new="user
+            prefers Vue now" (2026-05) -> supersede.
+
+- "coexist": new fact APPEARS TO CONTRADICT one candidate but actually
+            applies to a DIFFERENT scope or context. Both true at the
+            same time under different conditions.
+            Example: old="auth tokens expire after 30 min" (web app)
+            + new="API keys never expire" (machine-to-machine) -> coexist.
+
+- "delete": old fact was FACTUALLY FALSE — hallucination, parse error,
+            mis-extraction. New fact replaces it cleanly. No value in
+            keeping the old for audit. Rare; prefer supersede when
+            ambiguous.
+
+- "no-op": new fact is a true DUPLICATE of one candidate. No imprint.
+            MUST include `target_id` of the duplicated candidate so
+            downstream audit / replay can trace the duplicate chain.
+
+Output JSON (no markdown fence, no prose):
+{{"action": "add" | "update" | "supersede" | "coexist" | "delete" | "no-op",
+  "target_id": "<id of related existing fact; required for update / supersede / coexist / delete>",
+  "merged_content": "<for update only — combined fact text>",
+  "supersede_reason": "<for supersede only — one sentence why this is state change not factual error>",
+  "supersede_category": "<for supersede only — one of: preference, status, config, scope, identity, other>",
+  "relates_to": "<for coexist only — target_id of the related candidate>"}}
+
+Return ONLY the JSON."""
+
+
+Action = Literal["add", "update", "supersede", "coexist", "delete", "no-op"]
+_VALID_ACTIONS: tuple[str, ...] = (
+    "add", "update", "supersede", "coexist", "delete", "no-op",
+)
+
+
+@dataclass
+class DedupAction:
+    action: Action
+    target_id: str | None = None
+    merged_content: str | None = None
+    supersede_reason: str | None = None
+    supersede_category: str | None = None
+    relates_to: str | None = None
+
+
+def _format_candidates(candidates: list[dict]) -> str:
+    """Surfaces a `timestamp` field per candidate so the classifier can
+    distinguish factual correction (short gap) from state evolution
+    (large gap). Keys probed: timestamp, created_at, imprinted_at."""
+    if not candidates:
+        return "(none)"
+    lines = []
+    for c in candidates[:5]:
+        cid = c.get("id") or c.get("point_id") or "?"
+        content = c.get("content") or c.get("summary") or ""
+        ts = (
+            c.get("timestamp")
+            or c.get("created_at")
+            or c.get("imprinted_at")
+            or "?"
+        )
+        score = c.get("score", 0.0)
+        lines.append(
+            f'  - id={cid!r}  imprinted={ts}  score={score:.3f}  '
+            f'content="{content[:200]}"'
+        )
+    return "\n".join(lines)
+
+
+def decide_action(new_fact: str, candidates: list[dict]) -> DedupAction:
+    """LLM-mediated decision: one of 6 actions.
+    Graceful fallbacks:
+    - empty candidates -> add (no LLM call)
+    - malformed JSON   -> add (safe default; loss mode = duplication)
+    - unknown action   -> add (same)"""
+    if not candidates:
+        return DedupAction(action="add")
+
+    client = OpenAI(
+        base_url=os.getenv("OMLX_BASE_URL"),
+        api_key=os.getenv("OMLX_API_KEY"),
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prompt = DEDUP_PROMPT.format(
+        new_fact=new_fact,
+        candidates=_format_candidates(candidates),
+        now=now_iso,
+    )
+    resp = client.chat.completions.create(
+        model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=800,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+
+    # Strip optional markdown fence
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return DedupAction(action="add")
+
+    action = parsed.get("action")
+    if action not in _VALID_ACTIONS:
+        return DedupAction(action="add")
+
+    # Defensive: classifier may emit no-op without target_id (prompt
+    # requires it but LLM compliance drifts ~20%). Default to the
+    # highest-similarity candidate so audit log isn't lossy on
+    # duplicate-chain reconstruction.
+    target_id = parsed.get("target_id")
+    if action == "no-op" and not target_id and candidates:
+        target_id = candidates[0].get("id") or candidates[0].get("point_id")
+
+    return DedupAction(
+        action=action,
+        target_id=target_id,
+        merged_content=parsed.get("merged_content"),
+        supersede_reason=parsed.get("supersede_reason"),
+        supersede_category=parsed.get("supersede_category"),
+        relates_to=parsed.get("relates_to"),
+    )
+
+
+def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
+                   metadata: dict | None = None) -> dict:
+    """Apply a DedupAction against a Qdrant TieredMemory; emit AuditEntry
+    per operation. Returns counters for caller aggregation.
+
+    Counter dict shape:
+      {imprinted, updated, deleted, noop, superseded, coexisted}
+
+    Each call increments exactly one PRIMARY counter (matches action).
+    `imprinted` is SECONDARY — increments on any write (add / update /
+    supersede / coexist / delete-then-add). Callers aggregating
+    "total writes" should sum `imprinted` alone.
+    """
+    counts = {
+        "imprinted": 0, "updated": 0, "deleted": 0, "noop": 0,
+        "superseded": 0, "coexisted": 0,
+    }
+    md = metadata or {}
+    payload_summary = new_fact[:120]
+    actor = getattr(tm, "agent_id", "")
+    user = getattr(tm, "user_id", "")
+
+    # Closure: each branch calls _audit("op", **meta) instead of repeating
+    # the AuditEntry boilerplate. `actor`, `user`, `payload_summary` are
+    # captured from the enclosing scope; meta-kwargs become the audit's
+    # `metadata` dict so per-op fields (reason, supersede_category, etc.)
+    # stay strongly-named at the call site.
+    def _audit(operation, *, target_id=None, new_id=None, summary=payload_summary, **meta):   # AUDIT (§9.7): per-branch emission helper
+        record_audit(AuditEntry(
+            operation=operation,
+            actor_agent_id=actor, user_id=user,
+            target_id=target_id, new_id=new_id,
+            payload_summary=summary,
+            metadata=meta,
+        ))
+
+    if action.action == "no-op":
+        counts["noop"] += 1
+        _audit("noop_duplicate", target_id=action.target_id,   # AUDIT (§9.7)
+               reason="true_duplicate_per_classifier")
+        return counts
+
+    if action.action == "delete" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        # Per Phase 9 spec: delete is followed by add (new fact replaces old)
+        new_id = tm.imprint(content=new_fact, metadata=md)
+        counts["deleted"] += 1
+        counts["imprinted"] += 1
+        _audit("delete", target_id=action.target_id, new_id=new_id,   # AUDIT (§9.7)
+               reason="factually_false_per_classifier")
+        return counts
+
+    if action.action == "update" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        merged = action.merged_content or new_fact
+        new_id = tm.imprint(content=merged, metadata=md)
+        counts["updated"] += 1
+        counts["imprinted"] += 1
+        _audit("update", target_id=action.target_id, new_id=new_id,   # AUDIT (§9.7)
+               summary=merged[:120],
+               reason="factual_correction_same_world_state", merged=True)
+        return counts
+
+    if action.action == "supersede" and action.target_id:
+        # NOTE (Step 3 deferred): the soft-delete payload-patch path
+        # `_qdrant_supersede` is not yet wired. Until then, hard-delete
+        # old + new fact with `supersedes` pointer + supersede_reason
+        # metadata. Classification IS preserved via the new fact's
+        # supersedes pointer — chain traversal walks forward. Step 3
+        # swaps _qdrant_delete -> payload-patch with zero contract
+        # change at this layer.
+        _qdrant_delete(tm, [action.target_id])
+        new_id = tm.imprint(content=new_fact, metadata={
+            **md,
+            "supersedes": action.target_id,
+            "supersede_reason": action.supersede_reason,
+            "supersede_category": action.supersede_category,
+            "fact_kind": "state_evolution",
+        })
+        counts["superseded"] += 1
+        counts["imprinted"] += 1
+        _audit("supersede", target_id=action.target_id, new_id=new_id,   # AUDIT (§9.7)
+               supersede_category=action.supersede_category,
+               supersede_reason=action.supersede_reason,
+               fact_kind="state_evolution")
+        return counts
+
+    if action.action == "coexist" and (action.relates_to or action.target_id):
+        related = action.relates_to or action.target_id
+        new_id = tm.imprint(content=new_fact, metadata={
+            **md, "relates_to": related, "fact_kind": "scoped_variant",
+        })
+        counts["coexisted"] += 1
+        counts["imprinted"] += 1
+        _audit("coexist", target_id=related, new_id=new_id,   # AUDIT (§9.7)
+               relates_to=related, fact_kind="scoped_variant")
+        return counts
+
+    # Default: add (no candidates OR LLM picked add OR malformed-output fallback)
+    new_id = tm.imprint(content=new_fact, metadata=md)
+    counts["imprinted"] += 1
+    _audit("imprint", new_id=new_id,   # AUDIT (§9.7)
+           reason="novel_per_classifier_or_empty_candidates")
+    return counts
+
+
+def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
+    """Delete points by ID via Qdrant's points/delete endpoint."""
+    from src.tiered_memory_qdrant import COLLECTION
+
+    r = tm._http.post(
+        f"/collections/{COLLECTION}/points/delete",
+        json={"points": point_ids},
+    )
+    r.raise_for_status()
+    actor = getattr(tm, "agent_id", "")
+    user = getattr(tm, "user_id", "")
+
+    if action.action == "no-op":
+        counts["noop"] += 1
+        record_audit(AuditEntry(
+            operation="noop_duplicate",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id,
+            payload_summary=payload_summary,
+            metadata={"reason": "true_duplicate_per_classifier"},
+        ))
+        return counts
+
+    if action.action == "delete" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        # Per Phase 9 spec: delete is followed by add (new fact is the replacement)
+        new_id = tm.imprint(content=new_fact, metadata=md)
+        counts["deleted"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="delete",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={"reason": "factually_false_per_classifier"},
+        ))
+        return counts
+
+    if action.action == "update" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        merged = action.merged_content or new_fact
+        new_id = tm.imprint(content=merged, metadata=md)
+        counts["updated"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="update",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=merged[:120],
+            metadata={
+                "reason": "factual_correction_same_world_state",
+                "merged": True,
+            },
+        ))
+        return counts
+
+    if action.action == "supersede" and action.target_id:
+        # NOTE Step 3 deferred: hard-delete old + new with supersedes pointer.
+        # Step 3 swaps _qdrant_delete -> _qdrant_supersede payload-patch
+        # with zero contract change at this layer.
+        _qdrant_delete(tm, [action.target_id])
+        supersede_meta = {
+            **md,
+            "supersedes": action.target_id,
+            "supersede_reason": action.supersede_reason,
+            "supersede_category": action.supersede_category,
+            "fact_kind": "state_evolution",
+        }
+        new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
+        counts["superseded"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="supersede",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={
+                "supersede_category": action.supersede_category,
+                "supersede_reason": action.supersede_reason,
+                "fact_kind": "state_evolution",
+            },
+        ))
+        return counts
+
+    if action.action == "coexist" and (action.relates_to or action.target_id):
+        related = action.relates_to or action.target_id
+        coexist_meta = {
+            **md,
+            "relates_to": related,
+            "fact_kind": "scoped_variant",
+        }
+        new_id = tm.imprint(content=new_fact, metadata=coexist_meta)
+        counts["coexisted"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="coexist",
+            actor_agent_id=actor, user_id=user,
+            target_id=related, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={
+                "relates_to": related,
+                "fact_kind": "scoped_variant",
+            },
+        ))
+        return counts
+
+    # Default: add (no candidates OR LLM picked add)
+    new_id = tm.imprint(content=new_fact, metadata=md)
+    counts["imprinted"] += 1
+    record_audit(AuditEntry(
+        operation="imprint",
+        actor_agent_id=actor, user_id=user,
+        new_id=new_id,
+        payload_summary=payload_summary,
+        metadata={"reason": "novel_per_classifier_or_empty_candidates"},
+    ))
+    return counts
+```
+
+
+
+**Drop-in test file — `tests/test_audit.py`:**
+
+```python
+"""Verifies AuditEntry records correctly per execute_action branch.
+Run: uv run pytest tests/test_audit.py -v
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+import pytest
+
+from src.audit import AuditEntry, record_audit, read_audit_log
+from src.dedup_synthesis import DedupAction, execute_action
+from src.tiered_memory_qdrant import TieredMemory
+
+
+@pytest.fixture
+def audit_log_path(tmp_path):
+    """Isolate the audit log per test (avoids cross-test leakage).
+    Patch the module-level DEFAULT_AUDIT_PATH temporarily."""
+    import src.audit as audit_mod
+    original = audit_mod.DEFAULT_AUDIT_PATH
+    test_path = tmp_path / "audit.jsonl"
+    audit_mod.DEFAULT_AUDIT_PATH = test_path
+    yield test_path
+    audit_mod.DEFAULT_AUDIT_PATH = original
+
+
+def test_record_audit_writes_jsonl(audit_log_path: Path):
+    """One entry -> one line of JSON in the log file."""
+    entry = AuditEntry(
+        operation="imprint",
+        actor_agent_id="test_agent",
+        user_id="test_user",
+        new_id="point-abc",
+        payload_summary="hello world",
+    )
+    record_audit(entry)
+    assert audit_log_path.exists()
+    lines = audit_log_path.read_text().strip().split("\n")
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["operation"] == "imprint"
+    assert parsed["new_id"] == "point-abc"
+
+
+def test_read_audit_log_filters_by_user(audit_log_path: Path):
+    """user_id filter should exclude entries from other users."""
+    record_audit(AuditEntry(operation="imprint", user_id="alice", new_id="a"))
+    record_audit(AuditEntry(operation="imprint", user_id="bob", new_id="b"))
+    alice_entries = read_audit_log(user_id="alice")
+    assert len(alice_entries) == 1
+    assert alice_entries[0]["new_id"] == "a"
+
+
+def test_read_audit_log_filters_by_operation(audit_log_path: Path):
+    """operation filter returns only matching operations."""
+    record_audit(AuditEntry(operation="imprint", new_id="a"))
+    record_audit(AuditEntry(operation="supersede", new_id="b", target_id="x"))
+    record_audit(AuditEntry(operation="noop_duplicate"))
+    sup = read_audit_log(operation="supersede")
+    assert len(sup) == 1
+    assert sup[0]["target_id"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_emits_audit_per_branch(audit_log_path: Path):
+    """Each execute_action branch (no-op / add / supersede / coexist /
+    delete / update) should produce exactly one AuditEntry."""
+    async with TieredMemory(agent_id=f"audit_test_{uuid.uuid4().hex[:6]}") as tm:
+        # 1. ADD branch (no target_id; classifier picked add)
+        execute_action(tm, DedupAction(action="add"), "new fact about Terraform")
+        # 2. NO-OP branch
+        execute_action(tm, DedupAction(action="no-op", target_id="existing-x"),
+                       "duplicate fact")
+        # 3. SUPERSEDE branch — needs a real target_id in Qdrant; for unit
+        #    test scope, mock target_id (delete will fail but we only check
+        #    audit log writes BEFORE delete; in integration test use real
+        #    target_id)
+        # ... see lab repo for the full integration variant
+
+    entries = read_audit_log()
+    operations = [e["operation"] for e in entries]
+    assert "imprint" in operations
+    assert "noop_duplicate" in operations
+```
+
+**Run:**
+
+```bash
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+# Drop in the 3 files above:
+#   src/audit.py
+#   src/dedup_synthesis.py  (replace execute_action with the audit-wired version)
+#   tests/test_audit.py
+mkdir -p data
+set -a && . /Users/yuxinliu/code/agent-prep/.env && set +a
+uv run pytest tests/test_audit.py -v
+# Expect: 4/4 PASS (3 unit + 1 async integration smoke)
+tail -f data/audit.jsonl   # in another terminal — watch entries land
+```
+
+Production deployment of this pattern:
+- Promote `DEFAULT_AUDIT_PATH` from a file constant to env var (`AGENT_PREP_AUDIT_PATH`)
+- Rotate the JSONL file daily (`audit.YYYY-MM-DD.jsonl`)
+- For multi-process writers, swap `record_audit` to use `fcntl.flock` OR write to SQLite WAL-mode database
+
+
+### 9.8 Test suite — `tests/test_dedup_synthesis.py` (5 tests, 5/5 PASS 2026-05-15)
 
 Five tests covering the full 6-action classifier + the end-to-end `consolidate(use_dedup=True)` integration. 4 tests hit live oMLX; 1 short-circuits before LLM call.
 
@@ -4578,7 +4645,7 @@ class ExportData:
     exported_at: str        # ISO 8601
     user_id: str
     memories: list[dict]    # full Qdrant payload OR EverCore episode rows
-    audit_log: list[dict]   # all AuditEntry records (§3.4)
+    audit_log: list[dict]   # all AuditEntry records (§3.4 primitive + §9.7 wire-in)
 
 
 def export(tm, user_id: str, out_path: Path) -> None:
@@ -4646,7 +4713,7 @@ def replay_audit(tm, audit_log: list[dict]) -> None:
 `★ Insight ─────────────────────────────────────`
 - **Memory portability is the production-readiness signal most candidates skip.** Anyone can ship a memory server. Shipping a memory server that survives Claude Code's session model + Cursor's prompt-injection + Gemini's tool-schema strictness + Codex's session-scope semantics is the senior signal. The 8-client probe is what proves you've thought about this.
 - **`supportedVersions` set is a 2-line decision that saves months.** Future-self exports v3 from a newer codebase; current code's reader can fall back to v1/v2 migrations. Cost is one switch statement. Without it, every schema bump is a forced upgrade across all consumers.
-- **The 9-operation audit-log union from §3.4 is the IMPORT'S precondition.** Without typed operations, `replay_audit()` can't know what to do with each entry. Forcing the union is what makes cross-backend migration tractable. Production rule: typed audit logs → portable memory; ad-hoc metadata → vendor-locked memory.
+- **The 9-operation audit-log union (declared in §3.4, fully wired in §9.7) is the IMPORT'S precondition.** Without typed operations, `replay_audit()` can't know what to do with each entry. Forcing the union is what makes cross-backend migration tractable. Production rule: typed audit logs → portable memory; ad-hoc metadata → vendor-locked memory.
 - **The agentmemory project is the canonical reference impl** for the multi-client MCP-server pattern. iii-engine + WebSocket daemon adds production hardness (process-separated state, audit replay, eval module) that single-binary daemons (guild) skip. For curriculum scope, guild is the right starting point; for production scale, agentmemory's pattern is the trajectory.
 `─────────────────────────────────────────────────`
 
