@@ -120,7 +120,7 @@ flowchart TB
 
 ---
 
-## 4. Lab Phases (REQUIRED — TBD code, scoped now)
+## 4. Lab Phases (REQUIRED — (SPEC — code lands when lab runs))
 
 ### Phase 1 — Lab scaffold + classifier-tier endpoint (~30 min)
 
@@ -1106,7 +1106,7 @@ Walkthroughs live inline per the per-Python-block bundle in §4.
 
 ---
 
-## 6. Bad-Case Journal (3-5 entries — TBD AFTER LAB RUN)
+## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in PAI + agenticSeek + RouteLLM literature; final entries populated post-implementation.
 
@@ -1127,7 +1127,7 @@ Pre-flight entries scoped from convergent failure modes in PAI + agenticSeek + R
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — TBD AFTER LAB RUN)
+## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
@@ -1138,7 +1138,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (TBD-fill)
+## 8. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.

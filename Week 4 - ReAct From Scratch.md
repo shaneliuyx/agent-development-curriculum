@@ -2838,3 +2838,15 @@ zation for large results: `summarize_text(result)` for read_file if file is larg
 - **Distinguish from:** Chain-of-Thought (synthetic reasoning, no external calls; ReAct makes tool results load-bearing); one-shot tool calls (single dispatch when tool + args fully determined; ReAct only when intermediate results change what to call).
 - **Connects to:** W5 Pattern Zoo (ReAct is one of 8 patterns); W5.5 Metacognition (Reflexion = ReAct + episodic scratchpad + self-critique); W7 Tool Harness (`run_tool()` and per-tool budget registry seed the production harness); W11.5 Agent Security (path-containment guards on `read_file`/`write_file`, subprocess sandbox on `python_repl`).
 - **Foreshadows:** W6 Context Governance (FIFO eviction → proper autocompact with reserved 20K-token summary); W11 System Design (production ReAct deployment — observability, escalation ladders, stop conditions); W12 Capstone (the loop in `src/react.py` is the runtime substrate).
+- **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W0.5**: LLM internals primer — ReAct's per-call cost is the runtime-relevant view of the same forward-pass internals
+  - **W10**: Framework Shootout — each framework's ReAct implementation is benchmarked against this from-scratch baseline
+  - **W11.6**: Production Tracing — ReAct turn-level spans are the canonical telemetry unit
+  - **W3.5**: Cross-Session Memory — ReAct's scratchpad evolves into persistent memory in W3.5
+  - **W5.6**: Skill Bench — ReAct loops are the substrate for the skill-creation runtime
+  - **W6.5**: Hermes — Hermes's `delegate_task` primitive is ReAct's loop wrapped in a delegation contract
+  - **W6.85**: Prompt Templates — ReAct's Thought/Action/Observation format is one of the canonical templates W6.85 catalogues
+  - **W6.9**: Context Engineering — ReAct turn count is the primary context-growth driver W6.9 governs
+  - **W7.3**: Production LLM Infrastructure — ReAct's per-turn QPS shape determines model-server sizing
+  - **W7.8**: Code-Agent Patterns — code-fixing agents are ReAct loops with tool-restricted action space
+  - **W8.5**: Voice AI — voice agents are ReAct loops with audio-modal Observation steps

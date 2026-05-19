@@ -33,7 +33,7 @@ W3.5.5 plugged the reader into the **consumer** side of MCP: a `GuildClient` tha
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED — OUTLINED, FULL TEXT IN ROUND 2)
+## 2. Theory Primer (~1000 words — REQUIRED — SPEC)
 
 ### 2.1 The schema-as-contract thesis
 
@@ -47,7 +47,7 @@ The MCP spec's load-bearing claim is that a tool is defined by its **JSON Schema
 4. **Streaming via `AsyncGenerator` + content-type protocol.** A scalar tool returns once; a streaming tool yields N partial results. MCP supports this via a multi-frame response protocol — each yielded `BlockOutputEntry` (AutoGPT's term) becomes one frame on the wire, with a final terminator frame. The Python signature is `async def tool(...) -> AsyncGenerator[OutputT, None]`; the decorator detects `AsyncGenerator` in the return annotation and registers a streaming-capable tool instead of a scalar one.
 5. **Schema versioning + backward-compat.** A tool's schema is part of its public contract. Adding a non-required field is safe; adding a required field is a breaking change for older consumers. Renaming a field is breaking. Changing `type: integer → type: number` is safe (widening); the reverse is breaking (narrowing). The mature pattern: version the tool name (`calculator_v2`) on breaking changes, keep `calculator_v1` registered for a deprecation window, surface a deprecation warning in the description string.
 
-### 2.3 Papers + references to cite (TBD-fill in round 2)
+### 2.3 Papers + references to cite (SPEC)
 
 - Anthropic. *Model Context Protocol Specification* (latest revision at time of writing). https://modelcontextprotocol.io/specification — canonical wire-format reference.
 - JSON Schema. *Draft 2020-12 Core + Validation.* https://json-schema.org/draft/2020-12 — the schema dialect MCP uses; `prefixItems` for tuples, `oneOf` for unions, `enum` for literals.
@@ -108,7 +108,7 @@ flowchart TB
 
 ---
 
-## 4. Lab Phases (REQUIRED — TBD code, scoped now)
+## 4. Lab Phases (REQUIRED — (SPEC — code lands when lab runs))
 
 ### Phase 1 — `python_type_to_json_schema` helper (~1 hour)
 
@@ -161,7 +161,7 @@ Walkthroughs live inline per the per-Python-block bundle in §4.
 
 ---
 
-## 6. Bad-Case Journal (3-5 entries — TBD AFTER LAB RUN)
+## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in MCP / FastMCP / PraisonAI / AutoGPT issue trackers; final entries populated post-implementation.
 
@@ -182,7 +182,7 @@ Pre-flight entries scoped from convergent failure modes in MCP / FastMCP / Prais
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — TBD AFTER LAB RUN)
+## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
@@ -192,7 +192,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (TBD-fill)
+## 8. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.

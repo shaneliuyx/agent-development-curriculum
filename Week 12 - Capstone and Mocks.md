@@ -1538,3 +1538,19 @@ The work is not.
 - **Distinguish from:** generic ML interview prep — agent interviews center on system design (eval methodology, tool reliability, context management, observability) rather than modeling (training, loss functions, hyperparameters). Six Appendix A categories map to production agent concerns, not academic ML.
 - **Connects to:** `Bad-Case Journal.md` — best entry becomes Card 4 in Lock-In Anki set + behavioral answer to "production failure" question. `Engineering Decision Patterns.md` — use both during mock prep; pattern library supplies tradeoffs section of every system design answer.
 - **Foreshadows:** post-curriculum — first 30/60/90-day plan in `RESULTS.md` is operational roadmap for the new role. Open-source contribution to Outlines, Instructor, Phoenix, Qdrant, or LangGraph is recommended next public artifact. Teaching (internal tech talk, second post at 6 months) is the final proof of mastery.
+- **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W10**: Framework Shootout — comparative analysis is direct system-design interview material
+  - **W11.6**: Production Tracing — observability deep-dive is a recurring system-design round
+  - **W11.8**: Continuous Training — CT pipeline becomes case study for the long-tail-failures section of capstone
+  - **W2**: Rerank and Context Compression — retrieval-quality numbers are direct capstone evidence
+  - **W3.7**: Agentic RAG — typed-state-graph retrieval is the capstone's reference architecture for retrieval-heavy products
+  - **W4**: ReAct — capstone runtime is built on the W4 loop; runtime decisions are interview-questionable
+  - **W6.5**: Hermes — local-first deployment is one of three canonical capstone deployment shapes
+  - **W6.85**: Prompt Templates — capstone prompts are catalogued against this chapter's template families
+  - **W6.9**: Context Engineering — context-budget defense is a capstone interview staple
+  - **W7**: Tool Harness — production tool registry is a capstone artifact
+  - **W7.3**: Production LLM Infrastructure — model-serving choice is a capstone deployment decision
+  - **W7.5**: Computer Use — CUA pattern is a capstone option for ops / scraping / forms applications
+  - **W7.7**: Quantization — quantization regime × technique table appears in capstone cost analysis
+  - **W7.8**: Code-Agent Patterns — code-agent capstone option (AST coverage, mocks)
+  - **W9**: Faithfulness Checker — post-hoc validation is a capstone eval-strategy choice

@@ -1691,3 +1691,16 @@ Most pragmatic shape for teams without GPU infra: run compute-light data-heavy s
 - **Connects to:** W11.5 Agent Security — security is a system design concern; allowlist permission model, capability scoping, audit logging from this chapter are W11.5's implementation targets.
 - **Connects to:** [[Week 11.7 - Take-Home Dress Rehearsal]] — W11.7 applies the 7-point rubric (especially Gate 7 quotable cost-cut) at take-home scope; the 4-hour timed exercise rehearses the format reviewers see in 33% of disclosed interview processes.
 - **Foreshadows:** W12 Capstone — seven-gate rubric, five trade-off patterns, cheat sheet from this chapter are the evaluation scaffold for the capstone system design artifact. Gate 7 specifically becomes the offer-closing line in W12 mocks.
+- **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W0**: Environment Setup — production deployment depends on the same dependency-pin / MLX-stack discipline introduced in W0
+  - **W0.5**: LLM Internals — system design rounds expect candidate to explain quantization / cache / serving choices at internals level
+  - **W11.6**: Production Tracing — observability section of every system design rubric maps to this chapter's tracing model
+  - **W2.5**: GraphRAG — knowledge-graph retrieval is a system-design choice; the trade-offs are W2.5's content
+  - **W3.7**: Agentic RAG — agent-as-retriever is a system-design pattern with measurable cost / latency cells
+  - **W4**: ReAct — the runtime substrate every production agent system designs around
+  - **W5.5**: Metacognition — Reflexion-style retry loops are a system-design choice with cost-budget implications
+  - **W6.5**: Hermes — local-first deployment shape that maps to the cost-curve scaling axis of system design
+  - **W7.3**: Production LLM Infrastructure — model-serving choices (vLLM / TGI / Triton) are first-class system-design inputs
+  - **W7.7**: Quantization — quantization regime × technique is a system-design cell with cost / quality trade-offs
+  - **W8.5**: Voice AI — voice agents add audio-modal latency budgets to the system-design space
+  - **W8.7**: Generative Media — image / video generation pipelines impose serving / batching constraints orthogonal to text

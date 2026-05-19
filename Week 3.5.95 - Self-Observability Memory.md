@@ -32,7 +32,7 @@ W4's ReAct loop logs every tool call to `obs.py` and never reads from it again. 
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED — OUTLINED, FULL TEXT IN ROUND 2)
+## 2. Theory Primer (~1000 words — REQUIRED — SPEC)
 
 ### 2.1 The self-facing vs world-facing memory split
 
@@ -46,7 +46,7 @@ World-facing memory (W3.5, W3.5.8, W3.5.9) answers "what is true about the domai
 4. **Metacognitive recall = decision-time query** — at each ReAct step, before the agent picks its next action, query LEARNING for facts relevant to the current prompt and inject the top-K. The injection is in-context, not fine-tuning. Cheap, immediate, observable.
 5. **Failure-mode self-attribution** — the LEARNING extractor must distinguish "tool X failed because of network" from "I keep mis-using tool X". The first is environmental, not a self-pattern. The second is. The extractor's system prompt must enforce this distinction or LEARNING saturates on noise.
 
-### 2.3 Papers + references to cite (TBD-fill in round 2)
+### 2.3 Papers + references to cite (SPEC)
 
 - Shinn et al. (2023). *Reflexion: Language Agents with Verbal Reinforcement Learning.* arXiv:2303.11366 — closest academic analog to LEARNING; self-generated linguistic feedback used at next decision.
 - Wang et al. (2023). *Voyager: An Open-Ended Embodied Agent with Large Language Models.* arXiv:2305.16291 — skill library accreted from self-observation; LEARNING-like persistence.
@@ -105,7 +105,7 @@ flowchart TB
 
 ---
 
-## 4. Lab Phases (REQUIRED — TBD code, scoped now)
+## 4. Lab Phases (REQUIRED — (SPEC — code lands when lab runs))
 
 ### Phase 1 — OBSERVABILITY SQLite schema + W4 obs.py extension (~45 min)
 
@@ -152,7 +152,7 @@ Walkthroughs live inline per the per-Python-block bundle in §4.
 
 ---
 
-## 6. Bad-Case Journal (3-5 entries — TBD AFTER LAB RUN)
+## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in PAI v7.6 documentation + Reflexion/Voyager literature; final entries populated post-implementation.
 
@@ -173,7 +173,7 @@ Pre-flight entries scoped from convergent failure modes in PAI v7.6 documentatio
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — TBD AFTER LAB RUN)
+## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
@@ -183,7 +183,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (TBD-fill)
+## 8. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.

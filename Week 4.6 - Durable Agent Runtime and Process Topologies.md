@@ -34,7 +34,7 @@ W4 built a ReAct loop that lives inside one Python process: kill the terminal, l
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED — OUTLINED, FULL TEXT IN ROUND 2)
+## 2. Theory Primer (~1000 words — REQUIRED — SPEC)
 
 ### 2.1 The durable-runtime thesis
 
@@ -48,7 +48,7 @@ The bug at the heart of classic AutoGPT was not "the agent is dumb." It was an a
 4. **Process topology as a first-class choice** — PraisonAI exposes four: *sequential* (one node at a time, ordered), *parallel* (all-fan-out, gather), *hierarchical* (manager-delegates-to-workers tree), *workflow* (explicit DAG with validation-feedback loops + retry counters). Choosing the wrong topology for the task is a bigger lift-or-tank decision than choosing the wrong model.
 5. **Triggers, not self-prompts** — production agents are triggered by cron, webhook, or external event. They are not allowed to wake themselves up. This is the explicit rebuke of classic-AutoGPT's "give the agent infinite resources and a goal." Trigger-based scheduling is the architectural guardrail that makes agent systems debuggable.
 
-### 2.3 Papers + references to cite (TBD-fill in round 2)
+### 2.3 Papers + references to cite (SPEC)
 
 - Vogels (2007). *Eventually Consistent.* CACM. — durable distributed state foundations.
 - Fowler, Martin. *Event Sourcing.* martinfowler.com — canonical pattern reference for append-only execution logs.
@@ -218,7 +218,7 @@ flowchart TB
 
 ---
 
-## 4. Lab Phases (REQUIRED — TBD code, scoped now)
+## 4. Lab Phases (REQUIRED — (SPEC — code lands when lab runs))
 
 ### Phase 1 — SQLite graph schema + persistence layer (~1 hour)
 
@@ -268,7 +268,7 @@ Walkthroughs live inline per the per-Python-block bundle in §4.
 
 ---
 
-## 6. Bad-Case Journal (3–5 entries — TBD AFTER LAB RUN)
+## 6. Bad-Case Journal (3–5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in AutoGPT Platform issue tracker + PraisonAI process-mode bug reports + durable-workflow literature; final entries populated post-implementation.
 
@@ -289,7 +289,7 @@ Pre-flight entries scoped from convergent failure modes in AutoGPT Platform issu
 
 ---
 
-## 7. Interview Soundbites (2–3 entries — TBD AFTER LAB RUN)
+## 7. Interview Soundbites (2–3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
@@ -299,7 +299,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (TBD-fill)
+## 8. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv / URL. One-line description.

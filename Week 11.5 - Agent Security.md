@@ -653,6 +653,15 @@ if __name__ == "__main__":
 
 **Connects to: [[Week 4.6 - Durable Agent Runtime and Process Topologies]].** The PreToolUse hook integration in §11.5.Y wires `ContainmentGuard` into the W4.6 durable runtime's tool dispatcher. The trigger surface (cron / webhook / manual) defined as an auth boundary in §11.5.Y is the same surface W4.6 treats as the agent's entry point — W4.6 covers the durability story; W11.5 covers the auth story for those triggers. The two chapters are co-required for any production-grade durable agent.
 
+- **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W11**: System Design — security is a system-design concern; this chapter implements W11's threat-model gate
+  - **W11.6**: Production Tracing — audit log + cost telemetry feed the security observability surface
+  - **W11.8**: Continuous Training — CT pipelines must respect the same threat model when consuming agent traces
+  - **W3**: RAG Evaluation — prompt-injection via retrieved documents is a known W3 failure mode handled here
+  - **W4**: ReAct — `read_file` / `write_file` / `python_repl` tools from W4 are the canonical attack surface
+  - **W6**: Claude Code Source Dive — Claude Code's `useCanUseTool` predicate is the enforcement primitive W11.5 stress-tests
+  - **W6.85**: Prompt Templates — system-prompt-injection-resistance is a template design concern
+  - **W7.8**: Code-Agent Patterns — code-execution agents have the highest blast radius; W11.5's containment guards are their primary defense
 
 ---
 

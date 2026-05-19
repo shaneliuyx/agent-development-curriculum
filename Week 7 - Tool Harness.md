@@ -2469,6 +2469,17 @@ if __name__ == "__main__":
 - **Builds on**: W7 §MCP Setup — A2A's wire format extends MCP's JSON-RPC conventions
 - **Foreshadows**: W11 Multi-Agent System Design — A2A agent cards become building blocks for agent registries, capability routing, trust hierarchies
 
+- **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W3.5**: Cross-Session Memory — memory `imprint`/`recall` are tools that pass through this harness
+  - **W3.7**: Agentic RAG — retrieval-as-tool depends on this harness's schema validation + permission model
+  - **W5**: Pattern Zoo — each of 8 patterns invokes tools through this harness's allow/deny/ask predicate
+  - **W6**: Claude Code Source Dive — Claude Code's tool dispatch is the reference implementation this chapter teaches from
+  - **W6.5**: Hermes — Hermes's leaf-worker tool restrictions are an instance of this harness's permission model
+  - **W6.7**: Agent Skills — skill execution wraps tools; the skill's schema must match this harness's contract
+  - **W6.85**: Prompt Templates — tool-schema prompts are the canonical template family
+  - **W7.3**: Production LLM Infrastructure — tool-call rate-limiting + token accounting layer on top of this harness
+  - **W8**: Reliability — schema-reliability benchmark is direct evidence for this harness's tested-validation discipline
+  - **W8.5**: Voice AI — voice-modal tools (TTS, ASR) pass through the same harness; only the schema shape differs
 
 ---
 

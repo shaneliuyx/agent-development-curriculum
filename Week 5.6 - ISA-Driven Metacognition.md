@@ -32,7 +32,7 @@ W4 ReAct built a loop that calls Think → Act → Observe until the model emits
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED — OUTLINED, FULL TEXT IN ROUND 2)
+## 2. Theory Primer (~1000 words — REQUIRED — SPEC)
 
 ### 2.1 The spec-as-test invariant
 
@@ -50,7 +50,7 @@ The ISA pattern collapses two artifacts most software pipelines keep separate: t
 
 5. **The difference between "done" and "satisfied"** — *done* means "all ISCs pass right now". *Satisfied* means "all ISCs pass AND the user's higher-order Vision section is met". Done is mechanical; satisfied is a judgment call. The ISA pattern explicitly separates these so the loop can terminate on *done* and surface to the user for *satisfied* — instead of conflating them and getting stuck.
 
-### 2.3 Papers + references to cite (TBD-fill in round 2)
+### 2.3 Papers + references to cite (SPEC)
 
 - Beck, K. (2002). *Test-Driven Development: By Example.* Addison-Wesley. — Foundational text; ISA is TDD applied to agent tasks.
 - Shinn et al. (2023). *Reflexion: Language Agents with Verbal Reinforcement Learning.* arXiv:2303.11366 — self-reflection loop; ISA pattern's mechanical-verification preference is a direct response to Reflexion's LLM-judge cost.
@@ -122,7 +122,7 @@ flowchart TB
 
 ---
 
-## 4. Lab Phases (REQUIRED — TBD code, scoped now, ~6 hours total)
+## 4. Lab Phases (REQUIRED — (SPEC — code lands when lab runs), ~6 hours total)
 
 ### Phase 1 — ISA YAML schema + Pydantic model (~45 min)
 
@@ -172,7 +172,7 @@ Walkthroughs live inline per the per-Python-block bundle in §4.
 
 ---
 
-## 6. Bad-Case Journal (3-5 entries — TBD AFTER LAB RUN)
+## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in PAI v5.0.0 release notes + Reflexion paper §6 + Anthropic agents blog post §evaluation. Final entries populated post-implementation.
 
@@ -193,7 +193,7 @@ Pre-flight entries scoped from convergent failure modes in PAI v5.0.0 release no
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — TBD AFTER LAB RUN)
+## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics, anchored on the "termination criteria" interview question:
 
@@ -203,7 +203,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (TBD-fill)
+## 8. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.
