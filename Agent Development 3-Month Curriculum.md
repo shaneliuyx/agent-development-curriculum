@@ -82,36 +82,52 @@ The full list above is **the artifact bar**, not the chapter scope — chapters 
 
 If you study this material day-by-day on a strict schedule (12–15 hrs/week × 12 weeks ≈ **150–180 hours total**) and complete every lab carefully — meaning you write the code yourself, capture measured numbers in each `RESULTS.md`, and speak each interview soundbite aloud before moving on — here is the concrete competency floor you reach. None of these claims are aspirational; each maps to a runnable artifact + a measured number you will own in your own repo.
 
-### After Phase 1 (Weeks 1–3.7, ~55 hours) — RAG Senior-Engineer Bar
+### After Phase 1 (Weeks 0.3–3.7, ~70 hours) — RAG + Memory Senior-Engineer Bar
 
-- You hold **empirically-measured numbers on five RAG backends** on your own corpus: vector hybrid (W1–2), GraphRAG (W2.5), tree-index PageIndex (W2.7 with the **16/16 = 1.000 GT-judge** result), RAG eval with RAGAS (W3), agentic 5-node graph (W3.7).
-- You can defend each backend's failure mode in interviews with cited deltas (HyDE = −0.007 on `answer_relevancy`; multi-query tied on faithfulness; tree-v3 = 1.000 vs vector 0.500 vs graph 0.375) — not abstract pros/cons.
-- Cross-session memory works end-to-end (W3.5): 15/15 recall benchmark + Phase 5 mem0 cross-check (10/14, four measured architectural differences).
-- **You hit a hireable bar for:** any RAG-leaning take-home, leading a RAG project, mentoring junior engineers on retrieval quality.
+- **Foundations** (W0.3 + W0.5): 5-era agent narrative (Symbolic → Reactive → BDI → RL → LLM) + 3-property agent definition + transformer internals (5-stage forward pass + self-attention QKV by hand on 4-token example). Interview Q13/Q14 covered with measured anchors (cosine sim same-token-different-position ~0.85-0.95 on local MLX).
+- **5 RAG backends** with empirically-measured numbers on your own corpus: vector hybrid (W1-W2 including §2.6 NATIVE_RRF production wrapper), GraphRAG (W2.5 v12.4m), tree-index PageIndex (W2.7 with the **16/16 = 1.000 GT-judge** result vs vector 0.500 / graph 0.375), RAG eval with RAGAS (W3), agentic 5-node graph (W3.7 with W2.7 BUDGET-prompt + chunk-fallback patterns).
+- **The full memory cluster** (W3.5 → W3.5.5 → W3.5.8 → W3.5.9 → W3.5.95): cross-session memory (15/15 recall + mem0 cross-check 10/14), multi-agent shared memory via guild MCP atomic-claim (W3.5.5), **two-tier architecture + Phase 7 Qdrant drop-in + Phase 8 EverCore Bucket-1 + Phase 9 online dedup-and-synthesis + Phase 9.6 bitemporal supersede/coexist** (W3.5.8 — 5/5 dedup-suite tests PASS in 76.5s + 35× Qdrant speedup measured + 15 BCJ entries), 5-way LongMemEval benchmark + HyperMem L3 relational tier (W3.5.9), self-observability memory primer (W3.5.95).
+- Defend each backend + memory tier with cited deltas — not abstract pros/cons.
+- **You hit a hireable bar for:** any RAG-leaning take-home, any memory-architecture interview, leading a RAG-or-memory project, mentoring junior engineers on retrieval + memory quality.
 
-### After Phase 2 (Weeks 4–6.7, ~50 hours) — Agent Architect Bar
+### After Phase 2 (Weeks 4–6.9, ~70 hours) — Agent Architect Bar
 
-- You wrote a **ReAct loop from scratch in ~150 lines** (W4). You can name the three dominant failure modes (infinite loop / tool hallucination / scratchpad bloat) and cite the exact fix for each.
-- You read Claude Code's source end-to-end (W6) and authored three production-quality skills with measured trigger-tuning logs (W6.7).
-- You shipped multi-agent shared memory via the guild MCP integration (W3.5.5) — you understand atomic-claim vs blackboard vs message-queue coordination and can defend which fits which use case.
-- **You hit a hireable bar for:** designing an agent system from a one-line product spec; reading a competing framework's source and identifying where it cut corners.
+- **ReAct loop from scratch in ~150 lines** (W4) + **MLX Studio gateway role-map** with 7-role ROLE_MAP (W4 §1.5 — JANG `tool=1.00` vs heretic `tool=0.00` empirical tie-break). Three failure modes (infinite loop / tool hallucination / scratchpad bloat) with exact fix per.
+- **Model routing + effort tiering** (W4.5 — R2-complete chapter, 1172 lines, 5 Phases R2-shipped): closed-list classifier + BART-MNLI vote layer + 4-way cost-latency Pareto bench. Q9 parallelized-intent-recognition covered.
+- **Durable agent runtime + 4 process topologies** (W4.6 — SPEC): AutoGPT executor/scheduler/lock kernel + PraisonAI sequential/parallel/hierarchical/workflow.
+- **Pattern Zoo + Metacognition** (W5 + W5.5 + W5.6): ReAct vs Plan-and-Solve vs Reflexion vs Orchestrator-Worker on one task + Reflexion outer loop + ISA-driven falsifiable termination contract.
+- **Claude Code source dive end-to-end** (W6) — 8 subsystem study sheets + Architecture Cheat Sheet for interviews.
+- **Low-code platform fluency** (W6.4 — hello-agents Ch5 cross-ref): Dify + Coze + n8n side-by-side comparison; 5-axis low-code-vs-custom decision matrix; senior signal = "I know what each Dify node abstracts because I built it from scratch."
+- **MCP / A2A / ANP protocol fluency** (W6.6 schema bridge + W6.8 protocol survey): type-hint → JSON Schema producer + AsyncGenerator streaming + 1-page ADR comparing the three protocols.
+- **Skills authoring** (W6.7) — three production-quality skills with measured trigger-tuning logs. Q12 skills-implementation interview cover.
+- **Prompt + context engineering** (W6.85 + W6.9): 5-axis prompt design space + 4 anti-patterns + schema-enforce-with-retry-once primitive; 4 context shapes (rolling buffer / summarized / RAG-recalled / structured-state-as-list) + cognitive-narrowing argument for todo lists + 80-LOC TodoList primitive. Q1 + Q11 interview covers.
+- **You hit a hireable bar for:** designing an agent system from a one-line product spec; reading a competing framework's source and identifying where it cut corners; shipping an agent via low-code AND defending why for the audience; routing across heterogeneous fleet to a cost-latency target.
 
-### After Phase 3 (Weeks 7–9.5, ~50 hours) — Production Reliability Bar
+### After Phase 3 (Weeks 7–9.5, ~70 hours) — Production Reliability Bar (closes all 4 JD axes)
 
-- You ship a tool harness with a **20-scenario bad-case suite** (W7) covering retry, timeout, budget, idempotency, idle-watchdog, false-completion gate, and typed-error envelope routing.
-- You ship the production-LLM-infra stack (W7.3): LiteLLM gateway routing 3 providers + Anthropic/OpenAI prompt caching + GPTCache semantic cache + LangSmith cost-attribution + circuit-breaker fallback. You walk into interviews with a **measured cost-per-faithful-answer number** in your back pocket.
-- You ship the schema reliability bench (W8): 5-strategy × 5-model matrix on 100 prompts. **This is your signature question — it can move you up a level in a single answer.**
-- You ship faithfulness checker + abstention router (W9) and the pretrain → SFT → GRPO 4-row ablation table on GSM8K-mini (W9.5).
-- **You hit a hireable bar for:** Akshay 6-area rubric **all six areas covered with measured artifacts** — harness engineering + inference serving + structured output reliability + evals/observability + production infra + fine-tune-vs-in-context decision making. **This is the staff-track AI engineer signal.**
+- **Tool harness** with **20-scenario bad-case suite** (W7) covering retry, timeout, budget, idempotency, idle-watchdog, false-completion gate, typed-error envelope routing.
+- **Production LLM infrastructure** (W7.3): LiteLLM gateway routing 3 providers + Anthropic/OpenAI prompt caching + GPTCache semantic cache + LangSmith cost-attribution + circuit-breaker fallback. Measured **cost-per-faithful-answer number** in your back pocket. Akshay 6-area #2+#5.
+- **Computer Use + browser agents** (W7.5): same task three ways (Playwright / browser-use / Computer Use) + 10-task suite + safety wrapper.
+- **JD#1 — Quantization + Inference Optimization** (W7.7): FP16 → MXFP4 hierarchy + KV-cache math + memory-bound regime + measured 4-model fleet (gpt-oss-20b / Qwen-9B / Gemma-26B / Qwen-35B-nvfp4) audit.
+- **Q3-Q7 — Code-agent skill cluster** (W7.8): tree-sitter AST + multilspy LSP + branch coverage + 4-class testability filter + signature-validated MagicMock injection. Coverage-guided test-generation lifts branch coverage 65% → 92% on a target module.
+- **Schema reliability bench** (W8): 5-strategy × 5-model matrix on 100 prompts + the **5-layer defense diagram**. The signature question.
+- **Voice AI agents** (W8.5): cascaded pipeline + barge-in handling + OpenAI Realtime API head-to-head.
+- **JD#4 — Generative media + fine-tuning** (W8.7): diffusion forward+reverse process in LaTeX + LoRA + ControlNet + IP-Adapter stack + CLIP / FID / human panel eval + SVD I2V extension.
+- **Faithfulness checker + abstention router** (W9) — claim-splitter + NLI + SelfCheckGPT-lite + 30-Q hand-labeled set.
+- **Q3-Q7 + agent-eval discipline** (W9.3 — hello-agents Ch12 cross-ref): distinguishes LLM eval vs RAG eval vs AGENT eval; 5-dim per-trajectory rubric; LLM-as-judge harness with Cohen's κ ≥ 0.6 gate; W4 ReAct on AgentBench-OS subset vs published GPT-4 baseline.
+- **Agentic RL fine-tuning** (W9.5 — hello-agents Ch11 cross-ref): pretrain → SFT (LoRA r=16) → GRPO (N=8 group-relative + KL penalty) 4-row ablation table on GSM8K-mini + optional tool-use reward variant.
+- **You hit a hireable bar for:** Akshay 6-area rubric **all six areas with measured artifacts** + the 4 explicit JD axes (#1 quantization, #2 tracing, #3 CT, #4 gen-media). **This is the staff-track AI engineer signal.**
 
-### After Phase 4 (Weeks 10–12, ~25 hours) — Interview-Ready Senior Bar
+### After Phase 4 (Weeks 10–12, ~30 hours) — Interview-Ready Senior Bar
 
-- You re-implemented your agent loop in **four frameworks** (LangGraph / LlamaIndex / OpenAI Agents SDK / DSPy) and ship a decision matrix on LOC + traceability + testability + cost (W10).
-- You whiteboarded **five system designs** out loud and self-recorded against a 7-point rubric (W11), including the infra-aware SRE agent as your interview-closer differentiator.
-- You shipped a 10-attack red-team suite + 3 defense layers with **kill-rate-per-layer table** (W11.5).
-- You ran a 4-hour timed take-home dress rehearsal (W11.7) with `git log` showing evals-first discipline visible to any reviewer.
-- You shipped 1 capstone repo + 30 mock-interview recordings + 10 tailored applications with one quoted measured number per cover letter.
-- **You hit a hireable bar for:** Senior AI / LLM / Agent / Applied AI Engineer roles, with a portfolio that reads like a tech-design doc rather than a tutorial collection.
+- **4-framework re-implementation** (W10): LangGraph / LlamaIndex / OpenAI Agents SDK / DSPy with LOC + traceability + testability + cost decision matrix.
+- **5 system designs whiteboarded out loud** (W11) self-recorded against the 7-point rubric. Infra-aware SRE agent (#5) is the interview-closer differentiator — composes W11.6 (OTel tracing) + W11.8 (PSI drift + CT pipeline) as primitives; the SRE agent IS a CT pipeline applied to infra metrics.
+- **Agent security** (W11.5): 10-attack red-team suite + 3 defense layers + **kill-rate-per-layer table**.
+- **JD#2 — Production tracing + cost telemetry** (W11.6): OpenTelemetry instrumentation of W4 ReAct + Langfuse self-hosted UI + DuckDB cost-per-role-per-day + p99-latency-per-model rollups. Why-p99-not-mean argument with heavy-tail measured example.
+- **Take-home dress rehearsal** (W11.7): 4-hour timed simulation + evals-first `git log` discipline + 5-min Loom defense + 30/30/25/15 rubric scoring.
+- **JD#3 — Continuous Training + MLOps** (W11.8): PSI drift detector + eval-gated CI workflow + shadow ramp + MLOps Level 3. Critical for the "how do you keep your agent good in production?" question.
+- **Capstone** (W12): 1 polished repo (capstone direction A/B/C) + 30 mock-interview recordings + 10 tailored applications with measured numbers per cover letter.
+- **You hit a hireable bar for:** Senior AI / LLM / Agent / Applied AI Engineer roles, with a portfolio that reads like a tech-design doc rather than a tutorial collection, AND with explicit coverage of every JD axis (#1-#4) + every interview question pattern (Q1, Q3-Q7, Q9, Q11, Q12, Q13, Q14) in the [[Interview Question Index]].
 
 ### What "competently" really means
 
