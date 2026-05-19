@@ -1550,6 +1550,8 @@ Actions:
             ambiguous.
 
 - "no-op": new fact is a true DUPLICATE of one candidate. No imprint.
+            MUST include `target_id` of the duplicated candidate so
+            downstream audit / replay can trace the duplicate chain.
 
 Output JSON (no markdown fence, no prose):
 {{"action": "add" | "update" | "supersede" | "coexist" | "delete" | "no-op",
@@ -3622,6 +3624,8 @@ Actions:
             ambiguous.
 
 - "no-op": new fact is a true DUPLICATE of one candidate. No imprint.
+            MUST include `target_id` of the duplicated candidate so
+            downstream audit / replay can trace the duplicate chain.
 
 Output JSON (no markdown fence, no prose):
 {{"action": "add" | "update" | "supersede" | "coexist" | "delete" | "no-op",
