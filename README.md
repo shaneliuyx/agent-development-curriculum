@@ -10,6 +10,7 @@ Open `Agent Development 3-Month Curriculum.md` first — top-level overview + di
 
 ```
 Week 0  — Environment Setup
+Week 0.3 — Agent History + Foundational Narrative ← 5-era lineage (symbolic → reactive → BDI → RL → LLM) + 3-property agent def (hello-agents Ch1+2, SPEC, v0)
 Week 0.5 — LLM Internals Speedrun              ← tokenize → embed → QKV → sample (interview Q13/Q14 cover, SPEC, v0)
 Week 1  — Vector Retrieval Baseline
 Week 2  — Rerank and Context Compression
@@ -29,6 +30,7 @@ Week 5  — Pattern Zoo                           ← ReAct vs PaS vs Reflexion
 Week 5.5 — Metacognition
 Week 5.6 — ISA-Driven Metacognition             ← PAI v5.0 Ideal-State Artifact as falsifiable termination contract (SPEC, v0)
 Week 6  — Claude Code Source Dive
+Week 6.4 — Low-Code Agent Platforms (Dify / Coze / n8n / LangFlow) ← 5-axis low-code-vs-custom matrix + Dify/Coze/n8n side-by-side (hello-agents Ch5, SPEC, v0)
 Week 6.5 — Hermes Agent Hands-On
 Week 6.6 — MCP Schema Bridge                    ← type-hint → JSON Schema producer + AsyncGenerator streaming (SPEC, v0)
 Week 6.7 — Authoring Agent Skills
@@ -44,6 +46,7 @@ Week 8  — Schema Reliability Bench
 Week 8.5 — Voice AI Agents
 Week 8.7 — Generative Media + Fine-tuning       ← diffusion + LoRA + ControlNet + IP-Adapter for brand-consistent gen (JD#4, SPEC, v0)
 Week 9  — Faithfulness Checker
+Week 9.3 — Agent Performance Evaluation         ← AgentBench / GAIA / SWE-bench + 5-dim per-trajectory rubric + LLM-as-judge with Cohen's κ (hello-agents Ch12, SPEC, v0)
 Week 10 — Framework Shootout                    ← LangGraph vs LlamaIndex vs OAI Agents SDK
 Week 11 — System Design
 Week 11.5 — Agent Security
