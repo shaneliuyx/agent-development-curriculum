@@ -2319,6 +2319,8 @@ async def run_one_question(tm: TieredMemory, q: dict, llm: OpenAI, judge_model: 
     answer_s = time.perf_counter() - t2
 
     # (d) Score answer via LLM-as-judge.
+    # max_tokens=400 leaves room for reasoning-model chain-of-thought
+    # prelude AND the final verdict token.
     judge_resp = llm.chat.completions.create(
         model=judge_model,
         messages=[
@@ -2328,10 +2330,31 @@ async def run_one_question(tm: TieredMemory, q: dict, llm: OpenAI, judge_model: 
              )},
         ],
         temperature=0.0,
-        max_tokens=10,
+        max_tokens=400,
     )
-    verdict = (judge_resp.choices[0].message.content or "").strip().upper()
-    correct = verdict.startswith("CORRECT")
+    judge_raw = (judge_resp.choices[0].message.content or "").strip()
+    judge_upper = judge_raw.upper()
+
+    # Reasoning models (gpt-oss-20b) emit chain-of-thought BEFORE the
+    # verdict. Scanning the whole response for token match — prefer the
+    # LATER occurrence (verdict usually comes at the end of reasoning).
+    last_correct = judge_upper.rfind("CORRECT")
+    last_incorrect = judge_upper.rfind("INCORRECT")
+    if last_incorrect > -1 and last_incorrect + len("IN") > last_correct:
+        # INCORRECT token appears at or after the CORRECT token (since
+        # "INCORRECT" contains "CORRECT", the index of "INCORRECT" is 2
+        # less than the index of its "CORRECT" substring). Use the offset
+        # to disambiguate.
+        verdict = "INCORRECT"
+        correct = False
+    elif last_correct > -1:
+        verdict = "CORRECT"
+        correct = True
+    else:
+        verdict = "UNKNOWN"
+        correct = False
+        # Dump first 200 chars of raw judge response for diagnostic
+        print(f"    [judge-unknown] raw: {judge_raw[:200]!r}")
 
     return {
         "question_id": qid,
@@ -2339,6 +2362,7 @@ async def run_one_question(tm: TieredMemory, q: dict, llm: OpenAI, judge_model: 
         "gold": gold,
         "agent_answer": agent_answer,
         "verdict": verdict,
+        "judge_raw": judge_raw[:500],   # truncate to keep results JSON small
         "correct": correct,
         "facts_imprinted": result.facts_imprinted,
         "scrolls_demoted": result.scrolls_demoted,
