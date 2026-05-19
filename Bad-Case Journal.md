@@ -865,6 +865,29 @@ AssertionError: unexpected action: supersede
 
 ---
 
+## 2026-05-19 — Week 3.5.8 — §3.x consolidation pipeline destroys conversational details when applied to LongMemEval haystacks
+
+**Symptom:** §5.3 LongMemEval 20-Q smoke first attempt: 0/20 correct. Agent answer = `NO_ANSWER_IN_CONTEXT` on questions whose haystack DEMONSTRABLY contained the answer. Example: "What was the first issue with my new car?" → gold "GPS not working" → 3 candidates retrieved from Qdrant, but agent says context doesn't contain the answer. Per-candidate inspection: retrieved candidates were tech-flavored summaries ("Vehicle diagnostic procedures involve dealership firmware updates") with the original "user had GPS issue" detail eliminated. `candidates_returned > 0` AND `facts_imprinted > 0` ruled out retrieval/imprint failure.
+
+**Root cause:** The chapter's `src/consolidation.py:SUMMARIZE_PROMPT` is **scenario-bound to guild task scrolls** — few-shot examples are technical knowledge (`deployed-via-terraform`, `auth-tokens-expire-after-30min`), and the explicit `SKIP` rule for "in-progress notes, failed attempts, debug traces" matches the LongMemEval haystack shape (conversational user notes about everyday events). Each stage of the §3.x cascade carries the same technical-knowledge bias:
+
+| Stage | Mechanism | Failure on conversational data |
+|---|---|---|
+| `summarize_scroll` | Tech-flavored few-shots + SKIP rule | SKIPs conversational scrolls OR produces tech-flavored paraphrases that destroy personal details |
+| `extract_atomic_facts` | 4-type enum (`fact / observation / tool_result / skill`) + "reusable knowledge" gate | LLM emits `[]` (zero atoms) on conversation scrolls that don't match production-knowledge shape |
+| §3.3 quality gate | `length + specificity + novelty` scoring tuned for cross-task reuse | Demotes the few conversational atoms that survive |
+| §9.x dedup | Cross-fact overlap detection (Phase 9 form #1) | Zero benefit on per-question-isolated haystacks (each question is fresh; no overlap to dedup) |
+
+**Fix:** Bypass `consolidate()` entirely for LongMemEval. Direct-imprint each haystack session as one Qdrant point: `tm.imprint(content=session_text, metadata={"qid": qid, "session_idx": i})`. Preserves raw conversation text verbatim; retrieval works against actual user statements. **Measured impact: 0/20 → 13/20** (Gemma 26B compose) → 14/20 (Qwen 27B Claude-Opus-distill compose) on the same 20-Q slice.
+
+**Generalizes to:** memory ingest pipeline = data-shape commitment. The §3.x cascade is one cell in an input-shape × ingest-strategy 2D matrix (see [[Engineering Decision Patterns#Pattern 16 — Multi-Axis Comparison Table]]). Applying it to a different data shape silently degrades — measure cross-over with a known-answer eval (LongMemEval is one) before assuming transfer. Same shape as W2 reranker (designed for short Q+passage pairs, degrades on long-document inputs) and W2.7 tree-index (designed for hierarchical docs, degrades on flat text). The senior-engineer signal is naming WHICH scenario your pipeline encodes, not claiming it's universal.
+
+**Tags:** #scenario-binding #ingest-strategy #conversational-data #measurement-driven #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 16 + [[Week 3.5.8 - Two-Tier Memory Architecture#5.3.1 Why the runner uses DIRECT-IMPRINT instead of `consolidate()` — scenario-binding finding (2026-05-19 measurement)|§5.3.1 scenario-binding finding]] + [[Week 3.5.8 - Two-Tier Memory Architecture#Ingest strategy is data-shape-bound — input-shape × ingest-cascade 2D matrix|Production Considerations: 2D matrix]].
+
+---
+
 ## 2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)
 
 Seven recurring multi-agent failure shapes, synthesized from Russell's engineering survey of Codex / Claude Code / OpenClaw / Hermes (X, 2026-05). These are not chapter-local entries — each one is a *production-grade* class of failure that recurs across systems. Reference these from any chapter that spawns subagents.
