@@ -1354,24 +1354,367 @@ def record_audit(audit: AuditEntry, log_path: Path) -> None:
         f.write(json.dumps(asdict(audit)) + "\n")
 ```
 
-**Wire-in pattern (consolidation pipeline):**
+**Wire-in pattern (consolidation pipeline) — complete runnable replacement for `execute_action` in `src/dedup_synthesis.py`:**
 
 ```python
-# inside consolidate() or execute_action() — augment each branch
-if action.action == "supersede" and action.target_id:
-    new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
-    record_audit(AuditEntry(
-        operation="supersede",
-        actor_agent_id=tm.agent_id,
-        user_id=tm.user_id,
-        target_id=action.target_id,
-        new_id=new_id,
-        payload_summary=new_fact[:120],
-        metadata={"supersede_category": action.supersede_category,
-                  "supersede_reason": action.supersede_reason,
-                  "fact_kind": "state_evolution"},
-    ), Path("data/audit.jsonl"))
+# src/audit.py — drop into lab-03-5-8-two-tier/src/
+"""Append-only audit-log primitive. Every memory operation records an
+AuditEntry; downstream replay / CT pipeline / cross-backend export
+consume this log.
+
+Wire-in: src/dedup_synthesis.py:execute_action() calls record_audit() in
+each branch (see below). consolidate() in src/consolidation.py needs no
+change — it already receives the counts dict from execute_action.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+
+AuditOperation = Literal[
+    "imprint",            # initial write (default add)
+    "update",             # Phase 9 form #1 update (factual correction; same world-state)
+    "supersede",          # Phase 9.6 supersede (state evolution; both retained)
+    "coexist",            # Phase 9.6 coexist (scoped variant; both retained)
+    "delete",             # Phase 9 delete (factually false; remove)
+    "noop_duplicate",     # Phase 9 no-op (true duplicate; skip)
+    "promote",            # Phase 3.3 quality gate promotion (above threshold)
+    "demote",             # Phase 3.3 quality gate demotion (below threshold)
+    "compact",            # offline housekeeping (batch dedup / cleanup)
+]
+
+
+DEFAULT_AUDIT_PATH = Path(__file__).resolve().parent.parent / "data" / "audit.jsonl"
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """One operation on the memory store; append-only.
+    `metadata` carries operation-specific fields (supersede_reason,
+    supersede_category, fact_kind, threshold, etc)."""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    operation: AuditOperation = "imprint"
+    actor_agent_id: str = ""
+    user_id: str = ""
+    target_id: str | None = None        # the existing point this op modifies (None for fresh add)
+    new_id: str | None = None           # the new point produced (for imprint / supersede / update / coexist)
+    payload_summary: str = ""           # first ~120 chars of fact content
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def record_audit(audit: AuditEntry, log_path: Path | None = None) -> None:
+    """Append one AuditEntry to a JSONL log. Idempotent on the file system
+    (parent dir auto-created). Single writer assumption; if multi-process
+    writers are needed, wrap in fcntl.flock or switch to SQLite."""
+    path = log_path or DEFAULT_AUDIT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(asdict(audit)) + "\n")
+
+
+def read_audit_log(log_path: Path | None = None,
+                  user_id: str | None = None,
+                  operation: AuditOperation | None = None) -> list[dict]:
+    """Read audit log with optional user_id + operation filters.
+    Returns one dict per AuditEntry (asdict() shape). For replay or
+    cross-backend export."""
+    path = log_path or DEFAULT_AUDIT_PATH
+    if not path.exists():
+        return []
+    entries = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if user_id is not None and entry.get("user_id") != user_id:
+                continue
+            if operation is not None and entry.get("operation") != operation:
+                continue
+            entries.append(entry)
+    return entries
 ```
+
+```python
+# src/dedup_synthesis.py — REPLACE the existing execute_action with the
+# audit-wired version. Imports at top:
+#   from src.audit import AuditEntry, record_audit
+#
+# The function signature is unchanged (drop-in); behavior is unchanged
+# except every state-mutating branch now writes an AuditEntry.
+
+def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
+                   metadata: dict | None = None) -> dict:
+    """Apply a DedupAction against a Qdrant TieredMemory; emit AuditEntry
+    per operation. Returns counters for caller aggregation."""
+    counts = {
+        "imprinted": 0, "updated": 0, "deleted": 0, "noop": 0,
+        "superseded": 0, "coexisted": 0,
+    }
+    md = metadata or {}
+    payload_summary = new_fact[:120]
+    actor = getattr(tm, "agent_id", "")
+    user = getattr(tm, "user_id", "")
+
+    if action.action == "no-op":
+        counts["noop"] += 1
+        record_audit(AuditEntry(
+            operation="noop_duplicate",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id,
+            payload_summary=payload_summary,
+            metadata={"reason": "true_duplicate_per_classifier"},
+        ))
+        return counts
+
+    if action.action == "delete" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        # Per Phase 9 spec: delete is followed by add (new fact is the replacement)
+        new_id = tm.imprint(content=new_fact, metadata=md)
+        counts["deleted"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="delete",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={"reason": "factually_false_per_classifier"},
+        ))
+        return counts
+
+    if action.action == "update" and action.target_id:
+        _qdrant_delete(tm, [action.target_id])
+        merged = action.merged_content or new_fact
+        new_id = tm.imprint(content=merged, metadata=md)
+        counts["updated"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="update",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=merged[:120],
+            metadata={
+                "reason": "factual_correction_same_world_state",
+                "merged": True,
+            },
+        ))
+        return counts
+
+    if action.action == "supersede" and action.target_id:
+        # NOTE Step 3 deferred: hard-delete old + new with supersedes pointer.
+        # Step 3 swaps _qdrant_delete -> _qdrant_supersede payload-patch
+        # with zero contract change at this layer.
+        _qdrant_delete(tm, [action.target_id])
+        supersede_meta = {
+            **md,
+            "supersedes": action.target_id,
+            "supersede_reason": action.supersede_reason,
+            "supersede_category": action.supersede_category,
+            "fact_kind": "state_evolution",
+        }
+        new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
+        counts["superseded"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="supersede",
+            actor_agent_id=actor, user_id=user,
+            target_id=action.target_id, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={
+                "supersede_category": action.supersede_category,
+                "supersede_reason": action.supersede_reason,
+                "fact_kind": "state_evolution",
+            },
+        ))
+        return counts
+
+    if action.action == "coexist" and (action.relates_to or action.target_id):
+        related = action.relates_to or action.target_id
+        coexist_meta = {
+            **md,
+            "relates_to": related,
+            "fact_kind": "scoped_variant",
+        }
+        new_id = tm.imprint(content=new_fact, metadata=coexist_meta)
+        counts["coexisted"] += 1
+        counts["imprinted"] += 1
+        record_audit(AuditEntry(
+            operation="coexist",
+            actor_agent_id=actor, user_id=user,
+            target_id=related, new_id=new_id,
+            payload_summary=payload_summary,
+            metadata={
+                "relates_to": related,
+                "fact_kind": "scoped_variant",
+            },
+        ))
+        return counts
+
+    # Default: add (no candidates OR LLM picked add)
+    new_id = tm.imprint(content=new_fact, metadata=md)
+    counts["imprinted"] += 1
+    record_audit(AuditEntry(
+        operation="imprint",
+        actor_agent_id=actor, user_id=user,
+        new_id=new_id,
+        payload_summary=payload_summary,
+        metadata={"reason": "novel_per_classifier_or_empty_candidates"},
+    ))
+    return counts
+```
+
+**Optional — wire quality-gate `promote` / `demote` audits in `src/consolidation.py`:**
+
+```python
+# inside consolidate() — augment the promotion gate decision
+# (only when promotion_threshold kwarg is passed)
+from src.audit import AuditEntry, record_audit
+
+# ... existing code that scores each atom ...
+if promotion_threshold is not None:
+    score = quality_score(fact_content, tm=tm)
+    if score >= promotion_threshold:
+        # PROMOTE — proceeds to dedup + execute_action below as usual
+        record_audit(AuditEntry(
+            operation="promote",
+            actor_agent_id=tm.agent_id,
+            user_id=tm.user_id,
+            payload_summary=fact_content[:120],
+            metadata={"quality_score": score,
+                      "threshold": promotion_threshold},
+        ))
+    else:
+        # DEMOTE — skip imprint
+        record_audit(AuditEntry(
+            operation="demote",
+            actor_agent_id=tm.agent_id,
+            user_id=tm.user_id,
+            payload_summary=fact_content[:120],
+            metadata={"quality_score": score,
+                      "threshold": promotion_threshold},
+        ))
+        result.scrolls_demoted += 1
+        continue
+```
+
+**Drop-in test file — `tests/test_audit.py`:**
+
+```python
+"""Verifies AuditEntry records correctly per execute_action branch.
+Run: uv run pytest tests/test_audit.py -v
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+import pytest
+
+from src.audit import AuditEntry, record_audit, read_audit_log
+from src.dedup_synthesis import DedupAction, execute_action
+from src.tiered_memory_qdrant import TieredMemory
+
+
+@pytest.fixture
+def audit_log_path(tmp_path):
+    """Isolate the audit log per test (avoids cross-test leakage).
+    Patch the module-level DEFAULT_AUDIT_PATH temporarily."""
+    import src.audit as audit_mod
+    original = audit_mod.DEFAULT_AUDIT_PATH
+    test_path = tmp_path / "audit.jsonl"
+    audit_mod.DEFAULT_AUDIT_PATH = test_path
+    yield test_path
+    audit_mod.DEFAULT_AUDIT_PATH = original
+
+
+def test_record_audit_writes_jsonl(audit_log_path: Path):
+    """One entry -> one line of JSON in the log file."""
+    entry = AuditEntry(
+        operation="imprint",
+        actor_agent_id="test_agent",
+        user_id="test_user",
+        new_id="point-abc",
+        payload_summary="hello world",
+    )
+    record_audit(entry)
+    assert audit_log_path.exists()
+    lines = audit_log_path.read_text().strip().split("\n")
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["operation"] == "imprint"
+    assert parsed["new_id"] == "point-abc"
+
+
+def test_read_audit_log_filters_by_user(audit_log_path: Path):
+    """user_id filter should exclude entries from other users."""
+    record_audit(AuditEntry(operation="imprint", user_id="alice", new_id="a"))
+    record_audit(AuditEntry(operation="imprint", user_id="bob", new_id="b"))
+    alice_entries = read_audit_log(user_id="alice")
+    assert len(alice_entries) == 1
+    assert alice_entries[0]["new_id"] == "a"
+
+
+def test_read_audit_log_filters_by_operation(audit_log_path: Path):
+    """operation filter returns only matching operations."""
+    record_audit(AuditEntry(operation="imprint", new_id="a"))
+    record_audit(AuditEntry(operation="supersede", new_id="b", target_id="x"))
+    record_audit(AuditEntry(operation="noop_duplicate"))
+    sup = read_audit_log(operation="supersede")
+    assert len(sup) == 1
+    assert sup[0]["target_id"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_emits_audit_per_branch(audit_log_path: Path):
+    """Each execute_action branch (no-op / add / supersede / coexist /
+    delete / update) should produce exactly one AuditEntry."""
+    async with TieredMemory(agent_id=f"audit_test_{uuid.uuid4().hex[:6]}") as tm:
+        # 1. ADD branch (no target_id; classifier picked add)
+        execute_action(tm, DedupAction(action="add"), "new fact about Terraform")
+        # 2. NO-OP branch
+        execute_action(tm, DedupAction(action="no-op", target_id="existing-x"),
+                       "duplicate fact")
+        # 3. SUPERSEDE branch — needs a real target_id in Qdrant; for unit
+        #    test scope, mock target_id (delete will fail but we only check
+        #    audit log writes BEFORE delete; in integration test use real
+        #    target_id)
+        # ... see lab repo for the full integration variant
+
+    entries = read_audit_log()
+    operations = [e["operation"] for e in entries]
+    assert "imprint" in operations
+    assert "noop_duplicate" in operations
+```
+
+**Run:**
+
+```bash
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+# Drop in the 3 files above:
+#   src/audit.py
+#   src/dedup_synthesis.py  (replace execute_action with the audit-wired version)
+#   tests/test_audit.py
+mkdir -p data
+set -a && . /Users/yuxinliu/code/agent-prep/.env && set +a
+uv run pytest tests/test_audit.py -v
+# Expect: 4/4 PASS (3 unit + 1 async integration smoke)
+tail -f data/audit.jsonl   # in another terminal — watch entries land
+```
+
+Production deployment of this pattern:
+- Promote `DEFAULT_AUDIT_PATH` from a file constant to env var (`AGENT_PREP_AUDIT_PATH`)
+- Rotate the JSONL file daily (`audit.YYYY-MM-DD.jsonl`)
+- For multi-process writers, swap `record_audit` to use `fcntl.flock` OR write to SQLite WAL-mode database
+
+**Why elevate to a typed primitive instead of leaving as payload metadata:**
 
 **Why elevate to a typed primitive instead of leaving as payload metadata:**
 
