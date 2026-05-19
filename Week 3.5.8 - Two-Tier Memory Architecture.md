@@ -2168,20 +2168,27 @@ For industry-standard comparison against EverCore's published 83% baseline. Stat
 
 - Phases 1-4 complete; `TieredMemory` instance + `consolidate()` working end-to-end against guild + EverCore (or Qdrant via Phase 7 swap).
 - oMLX endpoint up (or equivalent LLM-as-judge endpoint for scoring).
-- ~$0-2 cloud spend if using a cloud judge model; $0 with local oMLX scoring.
-- ~45-90 min wall-clock for a full 50-Q run (depends on session-replay length and judge-model latency).
+- ~$0-2 cloud spend if using a cloud judge model + 20-Q first run; $0 with local oMLX scoring.
+- Wall-clock budgets: ~15-30 min for `--limit 20` (smoke + first signal); ~45-90 min for `--limit 50` (typical interview-prep number); ~6-10 hours for a full 500-question oracle pass. Start small.
 
-**Step 1 — Download the oracle subset.**
+**Step 1 — Download the oracle subset (HuggingFace, not the GitHub repo).**
+
+> **⚠️ Common pitfall.** Cloning `xiaowu0162/LongMemEval` does NOT give you the eval data — the GitHub repo's `data/` dir only ships helper scripts (`custom_history/sample_haystack_and_timestamp.py`). Per the repo's README, the actual question JSON files are hosted at HuggingFace (`xiaowu0162/longmemeval-cleaned`) and must be downloaded separately via `wget` or `huggingface-cli`.
 
 ```bash
-cd ~/code && git clone https://github.com/xiaowu0162/LongMemEval.git
-# Copy oracle subset into the lab's data dir
-mkdir -p ~/code/agent-prep/lab-03-5-8-two-tier/data/longmemeval
-cp LongMemEval/data/longmemeval_oracle.json \
-   ~/code/agent-prep/lab-03-5-8-two-tier/data/longmemeval/
+# From lab root
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+mkdir -p data/longmemeval
+
+# Download via wget (lightest dep — no huggingface-hub required)
+cd data/longmemeval
+wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
+# Optional — also fetch the small + medium subsets if you want larger eval runs later
+# wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+# wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_m_cleaned.json
+cd ../..
 
 # Verify the file landed + inspect shape
-cd ~/code/agent-prep/lab-03-5-8-two-tier
 uv run python -c "
 import json
 data = json.load(open('data/longmemeval/longmemeval_oracle.json'))
@@ -2191,7 +2198,16 @@ print(f'First question: {data[0][\"question\"][:120]}')
 "
 ```
 
-Expected output: `Total questions: ~50` (oracle subset; exact count varies by repo version), keys include `question_id`, `question`, `answer`, `haystack_sessions` (list of past conversations the memory system should have ingested), `answer_session_ids` (the specific sessions containing the answer evidence).
+Expected output: `Total questions: ~500` (oracle subset; the full release ships 500 questions, NOT ~50 as an earlier draft of this section mis-stated). Keys typically include `question_id`, `question`, `answer`, `haystack_sessions` (list of past conversations the memory system should have ingested), `answer_session_ids` (the specific sessions containing the answer evidence), plus per-question metadata like `question_type` (information-extraction / multi-session-reasoning / knowledge-update / temporal-reasoning / abstention) for per-category breakdown.
+
+> **Alternative — `huggingface-cli` if you already have `huggingface-hub` installed:**
+> ```bash
+> huggingface-cli download xiaowu0162/longmemeval-cleaned longmemeval_oracle.json \
+>     --repo-type dataset --local-dir data/longmemeval
+> ```
+> Equivalent outcome; `wget` is one less dependency.
+
+> **Note on `--limit` for the runner.** The oracle subset is 500 questions — running all 500 will take ~6-10 hours wall-clock. Start with `--limit 20` for first measurement; expand to `--limit 50` or `--limit 100` once the pipeline is stable. Full-500 runs only make sense once you're publishing a final RESULTS.md number.
 
 **Step 2 — Add a runner script `scripts/run_longmemeval_oracle.py`.**
 
@@ -2394,14 +2410,27 @@ for q in r['per_question']:
     print(f\"  {q.get('verdict', 'ERROR')}: {q['question'][:80]}\")
 "
 
-# Full 50-Q run if smoke looks reasonable
+# First measurement run — 20 questions (~15-30 min wall, ~$0-1 cloud judge cost)
+uv run python scripts/run_longmemeval_oracle.py \
+    --limit 20 \
+    --campaign longmemeval-first-$(date +%Y%m%d) \
+    --out results/longmemeval_first20.json
+
+# Larger measurement once pipeline is stable — 50 questions (~45-90 min wall)
 uv run python scripts/run_longmemeval_oracle.py \
     --limit 50 \
     --campaign longmemeval-oracle-$(date +%Y%m%d) \
     --out results/longmemeval_oracle.json
+
+# Full-500 publishable run — only after the 50-Q number is reproducible
+# Wall-clock: ~6-10 hours; consider running overnight + nohup'ing the process.
+# nohup uv run python scripts/run_longmemeval_oracle.py \
+#     --limit 500 \
+#     --campaign longmemeval-full-$(date +%Y%m%d) \
+#     --out results/longmemeval_full500.json > longmemeval.log 2>&1 &
 ```
 
-Expected wall-clock: ~45-90 min for full 50-Q run. Per-question: ~1-2 min for haystack replay, ~10-20s for consolidate atomisation+imprint, ~5-10s for query + answer compose + judge.
+Per-question wall-clock: ~1-2 min for haystack replay (varies with `len(haystack_sessions)` — some questions have 5-10 sessions, multi-session-reasoning category goes higher), ~10-20s for consolidate atomisation+imprint per session, ~5-10s for query + answer compose + judge. The dominant term is haystack-replay × per-session-count; questions with deep multi-session contexts are 3-5× slower than information-extraction questions.
 
 **Step 4 — Inspect results + interpret.**
 
