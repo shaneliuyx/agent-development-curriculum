@@ -429,11 +429,52 @@ class TieredMemory:
         await self._guild.__aexit__(*exc)
         self._http.close()
 
-    # ── Operational tier (guild) ──────────────────────────────────────
-    # (post_task, claim_task, complete_task, list_closed_quests, get_scroll
-    # unchanged from earlier section — see §2.1 for the guild methods)
+    # ── Operational tier (guild) — thin delegating wrappers around GuildClient ──
+
+    async def post_task(
+        self,
+        subject: str,
+        spec: str | None = None,
+        campaign: str | None = None,
+    ) -> str:
+        """Create a quest. Returns server-assigned QUEST-ID (e.g. 'QUEST-42')."""
+        return await self._guild.quest_post(subject=subject, spec=spec, campaign=campaign)
+
+    async def claim_task(self, quest_id: str) -> dict[str, Any]:
+        """Atomically accept a quest. Returns {won: bool, response: str}.
+
+        guild's quest_accept uses an atomic SQLite UPDATE WHERE owner IS NULL
+        primitive; only one caller wins per QUEST-ID. Losers receive an
+        'already claimed' text response — classify via is_accept_winner().
+        """
+        text = await self._guild.quest_accept(quest_id=quest_id)
+        return {"won": is_accept_winner(text), "response": text}
+
+    async def complete_task(self, quest_id: str, report: str) -> str:
+        """Mark quest fulfilled. `report` is REQUIRED by guild's schema."""
+        return await self._guild.quest_fulfill(quest_id=quest_id, report=report)
+
+    async def list_closed_quests(self, campaign: str | None = None) -> str:
+        """Raw text listing of done-status quests (parse caller-side).
+
+        guild has NO scroll_list_closed primitive (W3.5.5 §1.3 BCJ). Closed
+        quests are queried via quest_list(status='done'); per-quest scroll
+        text is then fetched via quest_scroll(quest_id).
+        """
+        return await self._guild.quest_list(status="done", campaign=campaign)
+
+    async def get_scroll(self, quest_id: str) -> str:
+        """Fetch the journal + report scroll for a completed quest."""
+        return await self._guild.quest_scroll(quest_id=quest_id)
 
     # ── Semantic tier (EverCore) ──────────────────────────────────────
+    #
+    # EverCore exposes a CONVERSATION-shaped API (POST /api/v1/memories
+    # with role/timestamp/content messages), NOT an arbitrary key-value
+    # imprint API. We adapt by storing each consolidated fact as a single
+    # assistant-role message under the agent's user_id, and parse search
+    # responses out of the `data.episodes` array. See the walkthrough
+    # below for the why-this-shape discussion.
 
     def _now_ms(self) -> int:
         import time
