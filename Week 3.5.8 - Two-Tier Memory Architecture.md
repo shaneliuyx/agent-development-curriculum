@@ -2221,7 +2221,7 @@ resulting memory, score the answer against the oracle gold via
 LLM-as-judge. Aggregate accuracy + per-question pass/fail.
 
 Run: uv run python scripts/run_longmemeval_oracle.py \\
-        --limit 50 --campaign longmemeval-oracle-2026-05-19
+        --limit 20 --campaign longmemeval-first-2026-05-19
 """
 from __future__ import annotations
 
@@ -2229,8 +2229,14 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
+
+# Bootstrap — let this script import `src.*` regardless of the cwd.
+# scripts/ lives one level below the lab root; prepend the lab root
+# so `from src.tiered_memory import ...` resolves.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import OpenAI
 
