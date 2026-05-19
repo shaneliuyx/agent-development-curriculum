@@ -985,7 +985,7 @@ Final deliverable: a comparison table + the **canonical "5-layer defense" diagra
 **Infra bridge.** Agent eval is integration-testing applied to LLM systems. Per-trajectory rubric = your test-suite coverage matrix. LLM-as-judge with κ-gate = your CI-as-judge with required-checks. Multi-benchmark coverage = your test-pyramid (unit / integration / e2e). Industry-benchmark scores = your published-baseline comparison. Same discipline shape; different artifact.
 
 ### Week 9.5 — Agentic RL Fine-Tuning (half-week insert, ~8–10h)
-> Detailed runbook: [[Week 9.5 - Agentic RL Fine-Tuning]] *(brief; runbook generated on demand)*
+> Detailed runbook: [[Week 9.5 - Agentic RL Fine-Tuning]] *(chapter fully written 2026-05-19; covers SFT + GRPO + DPO + LoRA + 4-row ablation discipline)*
 
 **Theory (3h).**
 - Read: hello-agents Ch 11 [Agentic-RL](https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter11/Chapter11-Agentic-RL.md) (the canonical SFT→GRPO walkthrough). DeepSeek-R1 paper (GRPO algorithm origin). RLHF survey (Ouyang et al. 2022 — InstructGPT). DPO paper (Rafailov et al. 2023 — preference learning without RL). Anthropic's Constitutional AI paper for the RLAIF variant. **OpenAI's *Optimizing LLM Accuracy — A Practical Guide* (platform.openai.com/docs)** — the decision matrix for prompt engineering vs RAG vs fine-tuning vs all-three; required reading before this lab to anchor *why* you would fine-tune at all when RAG covers most of the surface. **IBM's *RAG vs Fine-tuning* explainer** (ibm.com/think) — the canonical 2024–2025 framing that the two are non-substitutable: RAG fixes *knowledge gap*, fine-tuning fixes *behavior gap*, prompt engineering fixes *clarity gap*. Read both before deciding what to optimize.
