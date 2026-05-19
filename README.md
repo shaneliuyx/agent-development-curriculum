@@ -47,10 +47,12 @@ Week 8.5 — Voice AI Agents
 Week 8.7 — Generative Media + Fine-tuning       ← diffusion + LoRA + ControlNet + IP-Adapter for brand-consistent gen (JD#4, SPEC, v0)
 Week 9  — Faithfulness Checker
 Week 9.3 — Agent Performance Evaluation         ← AgentBench / GAIA / SWE-bench + 5-dim per-trajectory rubric + LLM-as-judge with Cohen's κ (hello-agents Ch12, SPEC, v0)
+Week 9.5 — Agentic RL Fine-Tuning (SFT + GRPO)  ← LoRA r=16 SFT + GRPO group-relative + 4-row ablation table on GSM8K-mini (hello-agents Ch11)
 Week 10 — Framework Shootout                    ← LangGraph vs LlamaIndex vs OAI Agents SDK
 Week 11 — System Design
 Week 11.5 — Agent Security
 Week 11.6 — Production Tracing + Cost Telemetry ← OpenTelemetry + Langfuse + DuckDB rollups + p99 vs mean argument (JD#2, SPEC, v0)
+Week 11.7 — Take-Home Dress Rehearsal           ← 4-hour timed take-home + evals-first git discipline + 5-min Loom defense + 30/30/25/15 rubric scoring
 Week 11.8 — Continuous Training + MLOps         ← PSI drift detector + eval-gated CI + shadow ramp + MLOps Level 3 (JD#3, SPEC, v0)
 Week 12 — Capstone and Mocks
 ```

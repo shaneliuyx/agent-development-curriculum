@@ -1090,6 +1090,15 @@ For each, spend ~2 hours: 30 min thinking, 60 min talking through architecture a
 
 **Exit criteria.** Wrap the W4 loop with `llm_call_span` + `traced` decorator. Self-host Langfuse + view trace tree in UI. Query DuckDB for cost-per-role-per-day + p99-latency-per-model-per-hour. Articulate the p99-vs-mean argument with a heavy-tailed example (e.g., p99 = 7800ms while mean = 850ms).
 
+### Week 11.7 — Take-Home Dress Rehearsal (half-week insert, ~4h timed)
+> Detailed runbook: [[Week 11.7 - Take-Home Dress Rehearsal]]
+
+**Why this week exists.** Real take-home interviews are timed (4-6 hours, sometimes 24-hour async). Most candidates blow the budget on the code + skip the writeup + skip the eval. W11.7 is the dress rehearsal: a 4-hour timed simulation that PROVES you can ship a small RAG-with-citations + a RAGAS eval committed BEFORE the main code (evals-first discipline visible in `git log`) + a 5-min Loom defense screencast + a RESULTS.md scored against the 30/30/25/15 take-home rubric (correctness / code quality / eval discipline / writeup). Output: one quotable cost-cut number captured for the W12 mock-interview funnel.
+
+**Exit criteria.** Run the 4-hour timer + produce all 4 artifacts (code + eval-first commit + Loom screencast + RESULTS.md). Score yourself against the rubric; identify weakest dimension; queue improvement for the next dress rehearsal OR for W12 capstone.
+
+**Infra bridge.** Take-home dress rehearsal is the production-launch dry-run discipline applied to interview prep. Same shape as your pre-prod ship-readiness gate: artifacts produced + rubric scored + weakest-link iteration before the real event.
+
 ### Week 11.8 — Continuous Training + MLOps Pipelines (half-week insert, ~8h)
 > Detailed runbook: [[Week 11.8 - Continuous Training and MLOps Pipelines]]
 
