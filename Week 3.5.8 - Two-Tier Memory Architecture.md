@@ -958,7 +958,7 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 | `openai.APIConnectionError` during `summarize_scroll`                                               | `OMLX_BASE_URL` not exported / oMLX server down                                            | `curl $OMLX_BASE_URL/models` to verify; restart oMLX                                                                                                                                                                      |
 | `test_consolidation_skips_low_value_scrolls` fails — `scrolls_skipped == 0`                         | LLM summarizer emitted a fact instead of `SKIP`                                            | Lower temperature, tighten SKIP examples in §3.1 `SUMMARIZE_PROMPT`, or swap the low-value test scroll for a more obviously-noise one — summarizer judgment is the gate, and gate quality is summarizer-quality-dependent |
 
-#### 3.2.1 Atomisation tests — `tests/test_atomisation.py`
+#### Background — Batchelor-Manning 2026 form #2 (atomisation), forms #5 + #6 (confidence + type)
 
 > **Brief — what "Batchelor-Manning form" means.** The phrase refers to a 2026 corpus survey by Batchelor and Manning ([source thread](https://x.com/S_BatMan/status/2054872818559361106)) of 19 production memory systems (Claude Code's TodoWrite, mem0, Letta, EverCore, PraisonAI's memcell pipeline, HyperMem, Cognition's plan tracker, etc.) that distilled **six recurring write-time investment patterns** — patterns where the system pays a one-time cost AT WRITE TIME to make every subsequent READ cheaper, more accurate, or more auditable. The article frames each as "pay at write time, harvest at read time" with measured ROI across the corpus. The six canonical forms:
 >
@@ -981,6 +981,154 @@ Guild quests themselves are append-only (W3.5.5 §1.3 BCJ: lore/quest data is fo
 > 4. **Test-isolation friendly.** Qdrant collection can be wiped + recreated for clean-slate testing OR scoped via `uuid` suffix per test (BCJ Entry 14 pattern). EverCore's per-user index is stateful across sessions; reset requires DB-level operations.
 >
 > **The TWO-TIER architecture stays load-bearing.** What changes between Phase 4 (EverCore-backed) and §3.2.1 (Qdrant-backed) is the SEMANTIC-TIER IMPLEMENTATION — both are valid choices for the abstract "semantic tier" role per the bucket-decision framework. Phase 4 demonstrates the EverCore path; §3.2.1 + Phase 7 demonstrate the Qdrant path. Production agents may run EITHER or BOTH (bucket-3 hybrid) behind the same orchestrator. The Phase 9.6 bitemporal extension was ALSO scoped to Qdrant for the same reasons — its dedup-action testing needs deterministic write semantics + LLM-free verification.
+
+#### 3.2.1 The atomisation primitive — `extract_atomic_facts`
+
+Before the tests can exercise it, the function itself needs to land. `extract_atomic_facts` is the canonical implementation of Batchelor-Manning 2026 form #2 (atomisation) + form #5 (confidence-at-write) + form #6 (type-tagging). It lives in `src/consolidation.py`; the test block below imports it as `from src.consolidation import consolidate, extract_atomic_facts`.
+
+**Code (lives in `src/consolidation.py` alongside `summarize_scroll`):**
+
+```python
+# ── Atomisation prompt (Batchelor-Manning 2026 form #2) ──
+# Returns a JSON list of typed atomic facts. Each fact is ONE
+# self-contained proposition with type + confidence at write time.
+ATOMIZE_PROMPT = """Extract ALL distinct atomic facts from this task scroll.
+
+Output a JSON array. Each element:
+  {"fact": str, "type": str, "confidence": number}
+
+Rules:
+- `fact`: one self-contained proposition (≤ 25 words, present tense, no anaphora)
+- `type`: one of "fact" | "observation" | "tool_result" | "skill"
+    - "fact": durable knowledge ("Production deploys use Terraform")
+    - "observation": time/context-bound ("Today's run took 5 min")
+    - "tool_result": output of a tool execution ("terraform apply returned 200")
+    - "skill": reusable procedure ("To rotate auth tokens: stop service, run keycloak-rotation, restart")
+- `confidence`: 0.0-1.0, your judgment of fact reliability + reusability
+
+Output exactly `[]` (empty array) if the scroll encodes no reusable knowledge.
+
+Example:
+  Scroll: "deployed via terraform; ran apply got 200; verified VPC peering with data-lake; first-deploy budget 5 minutes"
+  Output: [
+    {"fact": "Production deployments use Terraform IaC with VPC peering to the data-lake account.", "type": "fact", "confidence": 0.95},
+    {"fact": "First-deploy wall-clock budget is 5 minutes.", "type": "fact", "confidence": 0.9},
+    {"fact": "terraform apply returned HTTP 200 on this run.", "type": "tool_result", "confidence": 0.85}
+  ]
+
+Return ONLY the JSON array. No prose, no markdown fence, no explanation."""
+
+
+def _strip_scroll_wrapper(scroll_text: str) -> str:
+    """Strip guild's metadata wrapper from a scroll, keeping only the
+    substantive content (journal entries + completion report).
+
+    guild's quest_scroll() output looks like:
+        📜 QUEST-N [P2 · done]  <subject>
+          owner: agent
+          notes: K
+            · [spec] subject: X; priority: ...
+            · [checkpoint] accepted by agent — starting fresh
+            · [completed] <the actual report text we want>
+            · [journal] <agent-written progress notes>
+
+    The LLM is confused by the metadata header and emits 0 facts on the
+    wrapped form. Pull only the lines tagged [completed] or [journal] —
+    those are the substantive content. Falls back to the full text if
+    no tagged lines are found (defensive).
+    """
+    keep = []
+    for line in scroll_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("· [completed]"):
+            keep.append(stripped[len("· [completed]"):].strip())
+        elif stripped.startswith("· [journal]"):
+            keep.append(stripped[len("· [journal]"):].strip())
+    return " ".join(keep) if keep else scroll_text
+
+
+def extract_atomic_facts(scroll_text: str) -> list[dict]:
+    """LLM-extract N typed atomic facts from a scroll.
+
+    Returns list of dicts {fact, type, confidence}. Empty list if scroll
+    encodes no reusable knowledge (replaces old SKIP sentinel).
+
+    max_tokens=800 gives reasoning models room for chain-of-thought AND
+    JSON output (~3-5 facts × ~50 tokens each + JSON overhead).
+
+    Resilient to malformed JSON: if parsing fails OR a fence is wrapped
+    around the array, strip and retry; on second failure, fall back to
+    one-fact list using the raw text as the summary (so the pipeline
+    degrades gracefully instead of hard-failing on LLM output drift).
+    """
+    import json
+
+    # Strip guild's metadata wrapper — the LLM extracts 0 facts on the
+    # wrapped form because the header looks like noise. Substantive
+    # content lives in [completed] + [journal] tagged lines only.
+    content = _strip_scroll_wrapper(scroll_text)
+
+    client = OpenAI(
+        base_url=os.getenv("OMLX_BASE_URL"),
+        api_key=os.getenv("OMLX_API_KEY"),
+    )
+    resp = client.chat.completions.create(
+        model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
+        messages=[
+            {"role": "system", "content": ATOMIZE_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.0,
+        max_tokens=800,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    if not raw or raw == "[]":
+        return []
+
+    # Strip optional ```json ... ``` fence
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        facts = json.loads(raw)
+    except json.JSONDecodeError:
+        # Graceful fallback: treat raw as one fact, default type+confidence.
+        return [{"fact": raw[:200], "type": "fact", "confidence": 0.5}]
+
+    if not isinstance(facts, list):
+        return []
+
+    # Validate + coerce each entry
+    out = []
+    for f in facts:
+        if not isinstance(f, dict) or "fact" not in f:
+            continue
+        out.append({
+            "fact": str(f["fact"])[:300],
+            "type": str(f.get("type", "fact")),
+            "confidence": float(f.get("confidence", 0.5)),
+        })
+    return out
+```
+
+**Walkthrough — design choices**:
+
+- **`ATOMIZE_PROMPT` carries 4-element type enum + few-shot example.** The closed `type ∈ {fact, observation, tool_result, skill}` enum is enforceable downstream (`type_filter` at read time, BCJ Entry 22 traceability). Without the closed set, the LLM produces free-form types ("knowledge", "info", "data") and read-time filtering becomes string-matching whack-a-mole. The few-shot example with 3 distinct types in one scroll is the strongest signal — instruction-following models emulate examples more reliably than they parse rule lists.
+- **`_strip_scroll_wrapper` exists because of a real bug, not pre-emptive polish.** Early atomisation runs on raw `quest_scroll()` output produced 0 facts — the LLM treated the 📜 emoji + bullet-tagged metadata as the content. Pulling only `[completed]` + `[journal]` lines gives the LLM substantive prose and recovers ~5 facts per multi-fact scroll. Documented as BCJ Entry 6 + the W3.5.5 §1.3 wrapper-shape note.
+- **`max_tokens=800`, not 400.** Reasoning models (gpt-oss-20b-MXFP4-Q8, default) need ~300 tokens of chain-of-thought scratchpad BEFORE emitting the JSON array. Setting 400 produces truncated output that `json.loads()` rejects ~30% of the time. 800 leaves ~500 tokens for the actual JSON, enough for 5 atoms × ~80 tokens each.
+- **Three-layer JSON parse defence.** Layer 1: `raw == "[]"` short-circuit (zero-knowledge scrolls). Layer 2: optional ```json fence strip (gpt-oss tends to wrap in code blocks despite "no markdown" instruction). Layer 3: graceful fallback to a single fact on JSONDecodeError — keeps the pipeline running rather than crashing on LLM output drift. Each layer was added in response to a real failure observed during early runs.
+- **Field validation + coercion at write time.** `str(...)[:300]` caps fact length so a runaway LLM can't emit 10KB strings into Qdrant payloads. `float(f.get("confidence", 0.5))` defaults missing confidence to 0.5 (mid-band) rather than rejecting the atom. The `if not isinstance(f, dict) or "fact" not in f: continue` filter drops malformed atoms without aborting the batch.
+
+`★ Insight ─────────────────────────────────────`
+- **`type` + `confidence` are write-time decisions, not read-time inferences.** The LLM that produced the fact also produced its type tag — same call, same context. Trying to type-tag at read time means a SECOND LLM call against MORE candidates, costlier + lower accuracy. Atomisation captures both at write time precisely because the producer-LLM has the freshest context.
+- **The closed type enum is a contract between writers and readers.** §3.4 audit log + §9.7 dedup wire-in + production query-context `type_filter` ALL assume the type values are in the closed set. Free-form types would break read-side filtering silently — queries for `type='fact'` would miss atoms tagged `type='knowledge'`. Closed enum + write-time defaulting (`f.get("type", "fact")`) keep the contract honest.
+- **The function name reads as a noun-phrase, not a verb-phrase: "extract atomic facts" = "extractor of atomic facts."** Compare to `summarize_scroll` (verb-phrase). The naming carries the design intent — `extract_atomic_facts` *returns a list of atomic facts*; the verb is downstream of the noun. Subtle but matters for API-discoverability.
+`─────────────────────────────────────────────────`
+
+#### 3.2.2 Test suite — `tests/test_atomisation.py` (5 tests)
 
 Five tests covering Batchelor-Manning form #2 (atomisation) + form #5/6 (confidence-at-read + type tagging). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
 
