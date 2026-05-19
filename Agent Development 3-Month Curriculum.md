@@ -608,7 +608,7 @@ The W3.5 memory cluster (W3.5 / W3.5.5 / W3.5.8 / W3.5.9) is all WORLD-facing �
   ```
 
 **Lab (8h) — `lab-04-react-from-scratch`.**
-1. Implement the loop above in **~150 lines of Python**, no framework. Use `mlx-openai-server` with Qwen 2.5 14B as the model.
+1. Implement the loop above in **~150 lines of Python**, no framework. Models routed via the W4 §1.5 MLX Studio gateway on `:8080/v1` — for the loop role use `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` (probe verdict `tool=1.00`, fast inner-loop iteration); for the finisher / hard_loop role lazy-load `Gemma-4-31B-JANG_4M-CRACK` (`tool=1.00`, 4M context).
 2. Tools: `web_search` (use a free DuckDuckGo wrapper), `python_repl` (sandboxed), `read_file`, `write_file`.
 3. Add **observability** by hand: log every (iteration, prompt_tokens, completion_tokens, tool_name, tool_latency, tool_error) row to a SQLite table.
 4. Build a **bad-case test suite** with 10 scenarios designed to break the loop:
@@ -848,7 +848,7 @@ W3.5.5 consumed MCP via `GuildClient` — reader has seen the client side. W6.6 
 1. Build a generic tool-calling harness (Python) that:
    - Takes a list of `Tool` objects (name, description, JSON schema, callable)
    - Exposes one method `run(query)` that drives the loop
-   - Uses Qwen 2.5 14B locally
+   - Uses the W4 §1.5 gateway-routed fleet (loop = `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit`; opus_lazy = `Gemma-4-31B-JANG_4M-CRACK`)
    - Supports: parallel tool calls, retry with error feedback, max-iter cap (15), per-tool timeout, per-tool budget (max calls)
    - Logs every event to Phoenix
 2. Build a **bad-case test suite** of 20 scenarios (extend Week 4's 10):
@@ -1434,7 +1434,7 @@ Pair with logging + alerting. Field-level fallback is a degraded mode, not a tar
 1. **Restate** the question: "There are five layers of defense; let me walk through each, then say how I'd combine them for your use case."
 2. **Walk the diagram.** ~30 sec per layer.
 3. **Give the reasoning-before-answer detail** as your "I've actually shipped this" tell.
-4. **Drop one number from your benchmark** ("In my benchmark on Qwen 2.5 14B, naive prompting gave 73% valid; constrained decoding + Instructor pushed it to 99.4%, with p95 latency increasing only 8%").
+4. **Drop one number from your benchmark** ("In my benchmark on `Qwen3.5-9B-Distill` via the W4 gateway, naive prompting gave 73% valid; constrained decoding + Instructor pushed it to 99.4%, with p95 latency increasing only 8%").
 5. **Close with the tradeoff.** "I default to constrained decoding + Instructor + minimal repair. I avoid heavy repair loops because they hide the underlying schema problem and inflate cost."
 
 That's a 5-minute answer that demonstrates depth, hands-on experience, and engineering taste. **Practice it until it's muscle memory.**
@@ -1601,7 +1601,7 @@ Pick **one** capstone in Week 12. The other two stay as labs.
 
 ### Capstone Option B — Coding Agent (Claude Code style)
 - **Pitch:** A minimal coding agent that can read/write files, run shell, run tests, with a permission model and append-only session log.
-- **Stack:** Local Qwen 2.5 32B (better tool use than Gemma), custom tool harness (your Week 7 work), SQLite session storage, simple CLI UI.
+- **Stack:** Local `Gemma-4-31B-JANG_4M-CRACK` (W4 §1.5 fleet's opus_lazy tier — `tool=1.00` per fleet probe; preferred over heretic which scored `tool=0.00`), custom tool harness (your Week 7 work), SQLite session storage, simple CLI UI.
 - **Differentiator:** the permission model (don't ship dangerous shell commands without confirmation), session replay (event-sourced), the bad-case test suite from Week 4.
 - **Show in interviews:** the permission flow, a session replay, your "5 failure modes I patched" list.
 
