@@ -1405,6 +1405,7 @@ The full 9-row matrix (adding `noop_duplicate` / `update` / `supersede` / `coexi
 - **Qdrant point-UUID surfacing in candidate dicts (so `target_id` carries a real UUID, not the literal string `"?"`):** the fix lives in **§7.2** alongside the `query_context()` definition — see the *Block 4* walkthrough note.
 - **`replay_audit` primitive (consume the JSONL log to reconstruct store state at past timestamps):** **§10.3**.
 - **Drop-in `tests/test_audit.py` covering all 9 ops:** below this subsection — the primitive declaration above plus the gate wire-in below are everything the 4 tests exercise.
+- **Why this matters at the multi-agent system level** — Russell's 2026 anti-pattern catalog (Codex / Claude Code / OpenClaw / Hermes survey) names *"no observability / audit trail"* as the 7th canonical multi-agent failure mode. The AuditEntry primitive declared in this section is the direct remediation: every state-mutating operation emits one structured entry, append-only, queryable. See [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Entry MA-7]] for the symptom→cause→fix shape, and [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]] for the *write-side* mirror of this *read-side* audit log.
 
 The `Optional — wire quality-gate promote / demote audits in src/consolidation.py` block below uses ONLY the 3 operations already grounded by §3.3 (`imprint` / `promote` / `demote`) so it is self-contained at this point in the chapter.
 

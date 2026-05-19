@@ -861,6 +861,64 @@ AssertionError: unexpected action: supersede
 
 ---
 
+## 2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)
+
+Seven recurring multi-agent failure shapes, synthesized from Russell's engineering survey of Codex / Claude Code / OpenClaw / Hermes (X, 2026-05). These are not chapter-local entries — each one is a *production-grade* class of failure that recurs across systems. Reference these from any chapter that spawns subagents.
+
+**Entry MA-1 — Complexity-as-trigger (parallelizing strongly-coupled work).**
+*Symptom:* user asks for "comprehensive analysis" / "deep investigation" / "thorough review"; system auto-spawns 4-8 subagents; workers produce contradictory or duplicated output; main agent's reduce phase explodes; net wall-clock is *worse* than single-agent run.
+*Root cause:* the orchestrator treated *task complexity* as a fan-out trigger. But complexity ≠ independence. A task can be complex AND strongly ordered (e.g., "find bug → write fix → add test → review"); parallelizing it forces later workers to operate on wrong assumptions from earlier workers that haven't returned yet.
+*Fix:* use *independence* as the fan-out trigger, not complexity. If sub-tasks have dependencies, use pipeline topology, not fan-out. Codex's design is the model here: requires *explicit* `Use parallel subagents` keyword from the user; refuses to auto-promote "deep investigation" into multi-agent. Adopt Codex's posture in your own orchestrator.
+*Tags:* #multi-agent #topology #fan-out #anti-pattern
+
+**Entry MA-2 — Subagents know nothing (under-briefed children guess).**
+*Symptom:* delegated subagent returns plausible-looking but factually wrong output; the wrong output references files that don't exist, uses APIs from old versions, or solves a different problem than the one asked.
+*Root cause:* parent agent had the full project context in working memory; child started fresh. Parent passed in a one-line goal ("fix the bug"); child's only recourse was to guess the missing 95% of context.
+*Fix:* fill the 8-field Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]]): Role / Goal / Context / Allowed / Ownership / Forbidden / Output / Stop. Production rule: child should *never* need to ask the user a clarifying question. If it did, the parent's Context field was incomplete — that's a parent bug, not a child bug.
+*Tags:* #multi-agent #delegation #context #anti-pattern
+
+**Entry MA-3 — Unbounded parallel writes without ownership.**
+*Symptom:* two or more workers edit the same file in the same run; one worker's diff overwrites another's; tests pass against one worker's view but fail against the merged state; git conflicts at the orchestrator's `reduce` step.
+*Root cause:* fan-out without per-worker write boundaries. Both workers had write capability AND overlapping scope; nothing prevented them from racing.
+*Fix:* before any parallel-write spawn, write down explicit Ownership (Pattern 14, Ownership field). Two acceptable shapes: (a) **file-boundary split** — worker A owns `src/api/*`, worker B owns `src/web/*`; (b) **read-write split** — workers A/B/C are read-only explorers, worker D is the sole writer, runs after A/B/C return. Claude Code `worktrees` and `/batch` operationalize (a) at the filesystem level. If you can't articulate the boundary in one sentence, don't parallelize the writes.
+*Tags:* #multi-agent #fan-out #write-conflict #anti-pattern
+
+**Entry MA-4 — No reducer (multi-agent system that produces opinions, not output).**
+*Symptom:* 4 subagents return 4 separate analyses; user receives them concatenated or summarized; no single artifact (patch, decision, document) is produced; the multi-agent system shows "more thinking" but delivers nothing the user can act on.
+*Root cause:* the system was designed as fan-out without an explicit reducer. The parent agent didn't claim responsibility for the merge step — it just relayed.
+*Fix:* every fan-out needs a named reducer. Codex's pattern: `Main agent must synthesize findings, resolve conflicts, and present one final plan` is literally part of the prompt template. Without a reducer instruction, the parent will default to relay-mode. Production rule: if you spawn N workers, the reducer prompt should be at least as detailed as the worker prompts.
+*Tags:* #multi-agent #fan-out #reducer #anti-pattern
+
+**Entry MA-5 — Wrong primitive for lifecycle (RPC for long, queue for short).**
+*Symptom (a):* a 2-day research project is run via `delegate_task` (RPC-style); parent agent's context is held open for hours; one timeout or interrupt loses all state; restarts mean starting over. *Symptom (b):* a 30-second three-source lookup is run via Kanban / durable queue; setup overhead dominates wall-clock; observability layers make a simple parallel-fetch look like a distributed system.
+*Root cause:* the engineer chose the primitive based on familiarity, not lifecycle. RPC-style `delegate_task` is right for short, in-turn work (seconds to minutes). Durable queues / Kanban are right for cross-turn, cross-day work (with handoffs, retries, comments, human-in-loop pauses).
+*Fix:* Hermes's split is the canonical answer — `delegate_task` for short RPC, Kanban for durable workflows. Picking the wrong one is not a small mistake; it's a category error that costs hours or wakes up at 3 AM. Decision rule: if the task could pause and resume across user sessions, it needs a queue. If it definitely finishes in one turn, RPC is fine.
+*Tags:* #multi-agent #lifecycle #durability #anti-pattern
+
+**Entry MA-6 — Permissions too wide (capability creep across agent network).**
+*Symptom:* a "harmless" review agent rewrites code it was only supposed to analyze; a personal-assistant agent calls a corporate API; a leaf subagent spawns its own children, exploding the call graph; cost or blast radius becomes unpredictable.
+*Root cause:* parent agent or framework granted maximal capabilities by default (write + network + shell + spawn-child). Each individual capability seemed reasonable; the combination was not.
+*Fix:* use the Forbidden field of Pattern 14 to explicitly disallow capabilities the worker shouldn't have, even if technically capable. Hermes leaf restrictions are the model: leaf workers can't `delegate_task`, can't clarify-ask-user, can't write shared memory, can't cross-platform message, can't run dangerous executors. OpenClaw isolates by channel: ops-channel agent has deploy tools, family-channel agent does not. Production rule: principle of least capability, declared per-spawn, not per-framework.
+*Tags:* #multi-agent #permissions #blast-radius #anti-pattern
+
+**Entry MA-7 — No observability / audit trail (multi-agent debugging is impossible after the fact).**
+*Symptom:* a multi-agent run produces wrong output; user asks "what went wrong?"; the only artifact is a long chat log; no way to see who spawned who, what context was passed, what tools each worker used, what summary it returned, where the failure was.
+*Root cause:* the system emitted no structured audit log per operation. Every state-mutating action (spawn, delegate, write, replace, deduplicate, retry) needed an `AuditEntry`-shaped record; instead, the system kept those events only as conversation messages.
+*Fix:* every state-mutating operation emits one `AuditEntry` to an append-only JSONL log (canonical implementation: [[Week 3.5.8 - Two-Tier Memory Architecture#3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)|W3.5.8 §3.4 AuditEntry primitive]]). Required fields: operation, actor_agent_id, target_id, new_id, payload_summary, metadata. Production rule: if a state change isn't in the audit log, it didn't happen — and you can't debug it. The W3.5.8 audit log is the *direct* remediation for this anti-pattern.
+*Tags:* #multi-agent #observability #audit #anti-pattern
+
+`★ Cross-cutting insight ─────────────────────────────────────`
+- **The 7 anti-patterns map 1:1 to the 8 fields of Pattern 14 (Delegation Contract).** MA-2 = empty Context. MA-3 = empty Ownership. MA-4 = empty Output format + no reducer prompt. MA-5 = wrong choice of primitive (independent of the contract). MA-6 = empty Forbidden. MA-1 + MA-7 are meta — they sit one level above the contract (topology choice + system-level observability). Conclusion: fill the contract → eliminate ~70% of the catalog automatically.
+- **MA-7 is the anti-pattern that *justifies* the W3.5.8 audit log work retroactively.** Until you've tried to debug a misbehaving multi-agent system without structured audit, the value of the AuditEntry primitive feels theoretical. Once you have, the audit log becomes mandatory infrastructure — same way distributed tracing went from "Google-scale luxury" to "table stakes" between 2012 and 2018.
+- **The catalog is closed at 7 because Russell synthesized across 4 production systems** (Codex / Claude Code / OpenClaw / Hermes). If a future system surfaces an 8th distinct shape, add it; don't manufacture additions for completeness.
+`─────────────────────────────────────────────────`
+
+**Source:** Russell (2026), [多智能体协作调查：Agent 到底该怎么分工](https://x.com/Russell3402/status/2056331558223786416). Engineering survey on X, 2026-05. Synthesis paraphrases Russell's "7 anti-patterns" subsection (§"反模式：多 agent 最容易坏在哪里").
+
+**Captured in curriculum at:** [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]] (write-side), [[Week 3.5.8 - Two-Tier Memory Architecture#3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)|W3.5.8 §3.4]] (read-side audit log = MA-7 remediation), [[Week 4.6 - Durable Agent Runtime and Process Topologies]] §1-2 (topology choice = MA-1 remediation).
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.

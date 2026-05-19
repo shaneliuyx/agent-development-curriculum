@@ -67,6 +67,76 @@ The bug at the heart of classic AutoGPT was not "the agent is dumb." It was an a
 - **Trigger-based scheduling ≠ cascade.** A trigger fires once on an external event; a cascade chains sub-runs internally. Confusing the two leads to runaway-cost failure modes (BCJ Entry 5).
 - **Distributed lock ≠ mutex.** Mutex is in-process; distributed lock is cross-process and survives process death. The minimal viable version is a file lock (`fcntl.flock`); Redis is the heavier option.
 
+### 2.5 The 4-trigger × 6-topology design space (Russell 2026 synthesis)
+
+Most chapter-zero discussions of multi-agent systems conflate two orthogonal axes. Russell's 2026 survey of Codex / Claude Code / OpenClaw / Hermes is the cleanest split published to date. The reader who internalizes the 2D grid below stops asking "is this multi-agent or single-agent?" and starts asking "which trigger × which topology?"
+
+**Trigger axis — when does the system go from 1 agent to N?**
+
+| Trigger | What fires the fan-out | Canonical system |
+|---|---|---|
+| **Explicit** | User says `Use parallel subagents` or `Spawn one agent per category` | Codex (refuses to auto-spawn from "deep investigation") |
+| **Semantic** | Parent agent matches task content against subagent `description` field | Claude Code default subagents |
+| **Routing** | Message entry point (Slack channel, Telegram peer, Discord thread, guild, role) binds to a specific agent | OpenClaw |
+| **Queue** | Task lands in a board / cron / background-job table; dispatcher pulls workers by `assignee` | Hermes Kanban |
+
+**Topology axis — once the system is multi-agent, how are the agents organized?**
+
+| Topology | Shape | Best for | Worst for |
+|---|---|---|---|
+| **Single** | 1 agent | Small changes, strong-order tasks, fuzzy requirements | Long context that pollutes main agent |
+| **Star fan-out / fan-in** | 1 parent → N workers; workers don't talk; reduce at parent | PR review (security / tests / perf in parallel), code-search exploration | Tasks where workers need to challenge each other |
+| **Pipeline** | A → B → C → D, strictly ordered | Locate-bug → write-fix → add-test → review; ETL-shaped tasks | Anything where worker N's output doesn't feed worker N+1 |
+| **Tree** | Orchestrator subagent spawns leaf workers; bounded depth | Large tasks needing sub-decomposition (Codex `max_depth=2`; OpenClaw default `maxSpawnDepth=1`) | Tasks that don't compose hierarchically — depth-N×breadth-N fan-out explodes ($) |
+| **Mesh** | Teammates communicate peer-to-peer, share task list | Multi-hypothesis debug (login fails → frontend? token? session? cache? deploy?) | Anything where the worker count > 4-5 — coordination overhead dominates |
+| **Gateway routing** | Different entry points → different agents (no fan-out per task) | Multi-channel personal assistant (Slack vs Telegram vs family group) | Single-channel coding tasks (where Codex/Claude Code already dominate) |
+| **Durable board** | Tasks + comments + handoffs in persistent storage; workers attached to states | Cross-turn, cross-day, human-in-loop work (research reports, migrations, audits) | Sub-minute tasks (board overhead dominates wall-clock) |
+
+The 2D grid is roughly 4 × 7 = 28 cells, but only ~10 are well-populated in production. The empty cells are the most useful — they say "this combination has no good system precedent, so think before you ship it."
+
+### 2.6 The 7-step call chain — anatomy of a multi-agent task
+
+Russell's article distills every multi-agent system into one canonical pipeline. If you can name what your system does at each of these steps, you can debug it. If you can't, you'll be guessing.
+
+```text
+input event
+  → router / dispatcher          (decide: spawn? who?)
+  → context builder              (decide: what does child know?)
+  → worker profile selection     (decide: what role?)
+  → execution sandbox            (decide: what can child do?)
+  → state store                  (decide: where does state live?)
+  → merge / reduce               (decide: who owns the output?)
+  → final output OR next task    (decide: in-turn return or queue handoff?)
+```
+
+Each step is a *design decision*, not an implementation detail:
+- **Router / dispatcher**: explicit user-driven (Codex), description-match (Claude Code), channel-binding (OpenClaw), or queue-pull (Hermes Kanban).
+- **Context builder**: the *write-side* of the Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]]). What's in here determines whether the child can succeed or has to guess.
+- **Worker profile selection**: read-only explorer vs implementation worker vs security reviewer. Role choice cascades into the next two steps.
+- **Execution sandbox**: shell? network? write? spawn child? Hermes leaf restrictions are the canonical reference; OpenClaw's tool-policy isolation is the canonical pattern.
+- **State store**: ephemeral (lives in the turn), session (lives in agent workspace), durable (lives in board / SQLite / postgres). Picking wrong here is the difference between "kill -9 → resume" and "kill -9 → start over."
+- **Merge / reduce**: most demos skip this step. Most production systems fail here. Pre-declare who reduces, with what merge logic, before spawning the workers.
+- **Final output or next task**: in-turn return is RPC-shaped; queue handoff is durable-board-shaped. Choosing wrong is the same category error as [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Entry MA-5]] (wrong primitive for lifecycle).
+
+### 2.7 The 8-question decision order — what to ask BEFORE picking a topology
+
+Russell's most useful contribution is reframing topology choice as a *decision sequence*, not a menu pick. Run through these in order; the answer to question N constrains question N+1. Most engineers reach for "star fan-out" by reflex; the questions below catch the cases where that's wrong.
+
+1. **Can a single agent do this?** Small changes, strong-order tasks, and fuzzy requirements are most stable with one agent. Multi-agent isn't free — it adds tokens, latency, coordination cost. Don't pay it until you have to.
+2. **Will the main context get polluted?** Long logs, large searches, multi-file reads, and many failure stacks make the main agent dumber. Off-loading those to explorer subagents is a *context isolation* play, not a parallelism play — and that's reason enough to fan out.
+3. **Can sub-tasks run independently?** Security review + test review + performance review = yes. Locate-bug → write-fix → add-test = no (that's a pipeline). Independence ≠ complexity. (See [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Entry MA-1]] for the complexity-as-trigger anti-pattern.)
+4. **Must the result return in *this* turn?** Yes → fork/join RPC (Codex subagents, Hermes `delegate_task`). No → background job. Need cross-day, cross-restart, or human-in-loop pauses → durable board (Hermes Kanban, AutoGPT Platform graph store). Picking wrong here is anti-pattern MA-5.
+5. **Do workers need to challenge each other?** No → star fan-out is enough. Yes → mesh / team topology (Claude Code Agent Teams). Mesh costs ~3-5× the tokens of star — only pay that cost for genuinely multi-hypothesis problems.
+6. **Will workers write to overlapping files?** Yes → write down ownership boundaries (file-path split or read-only/write split) BEFORE spawning. No ownership → don't fan out the writes. Anti-pattern MA-3.
+7. **Are there multiple entry points with different identities / permissions?** Yes → Gateway routing (OpenClaw shape) is upstream of any per-task topology choice. The first question isn't "how do I fan out this task?" — it's "which agent does this message even belong to?"
+8. **How does the system recover from failure?** Retry semantics? Block / unblock state? Handoff trace? Worker-level audit? These are durable-board concerns. If the answers are "no / no / no / no," the system isn't production-grade no matter how clever the topology.
+
+`★ Insight ─────────────────────────────────────`
+- **The 8 questions are the inverse of the 7 anti-patterns.** Q1 ↔ MA-1, Q3 ↔ MA-1, Q4 ↔ MA-5, Q5 ↔ MA-3/MA-4, Q6 ↔ MA-3, Q7 ↔ MA-6, Q8 ↔ MA-7. Running the questions in order proactively prevents the catalog of failures retroactively. The questions are the *write-side* discipline; the BCJ entries are the *read-side* forensic record.
+- **Routing (Q7) goes BEFORE topology**, even though most multi-agent literature treats topology as the first decision. Russell's OpenClaw walkthrough is the case for this re-ordering: gateway-routed systems are not a special case of fan-out — they're an *orthogonal* design dimension, and ignoring it produces a system where the "first agent to see the message" determines the run, which is rarely what you want.
+- **Question 2 (context pollution) is the most under-appreciated reason to spawn a subagent.** Most engineers think multi-agent = parallelism; the cleaner mental model is multi-agent = *context isolation*. A read-only explorer subagent that reads 50 files and returns a 200-token summary is doing context engineering, not parallel computation. The parallelism is a side effect.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## 3. System Architecture (REQUIRED — Mermaid)
