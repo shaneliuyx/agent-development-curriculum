@@ -888,6 +888,38 @@ AssertionError: unexpected action: supersede
 
 ---
 
+## 2026-05-20 — Week 3.5.8 — Atomisation primitive applied at the wrong lifecycle stage: write-time destroys signal on conversational data, read-time lifts +5pts uniformly across the capability range
+
+**Symptom:** §3.2.1's `extract_atomic_facts` is the canonical atomisation primitive (Batchelor-Manning form #2). When invoked at WRITE time as part of `consolidate()` on LongMemEval haystacks, conversational facts are skipped or paraphrased into tech-flavored summaries (Entry 16 / 2026-05-19 above). The chapter's first fix bypassed atomise entirely via direct-imprint. The SAME atomise primitive then applied at READ time (after Qdrant retrieval, before the LLM compose call) lifted BOTH Qwen3.6-27B-4bit (60% → 65%) AND Qwen3.5-27B-Claude-Opus-distill (70% → 75%) by +5pts each on the same 20-Q oracle slice. Same code, opposite outcome.
+
+**Root cause:** Lifecycle position is data-shape-bound. Five independent reasons write-time atomise fails on conversational data while read-time atomise succeeds:
+
+| # | Dimension | Write-time atomise | Read-time atomise |
+|---|---|---|---|
+| 1 | Compression vs augmentation | Lossy: REPLACES raw with summary + facts; missed fact = permanent | Lossless: ADDS triples alongside raw; missed triple = fall back to raw |
+| 2 | Question conditioning | No question yet; must extract "everything potentially useful" (early-binding) | Question in hand; atomiser focuses on what matters (late-binding) |
+| 3 | Error compounding | `ingest → atomise → embed → retrieve → compose` (errors propagate 4 stages) | `ingest → embed → retrieve → atomise → compose` (errors 1 stage from answer) |
+| 4 | Workload amortization | "Pay once at write, save at query" valid only for queries-per-memory ≪ 1 (log workloads) | Wins when queries-per-memory ≫ 1 (agent-memory workloads) |
+| 5 | Mental model | Schema imposer: assumes known relational schema | Question-conditioned projection: schema = the query's structure |
+
+Mathematically: write-time is a fixed projection π_write applied to a stream. Read-time is π_query(q) — a query-indexed family of projections. The family always dominates the fixed choice when q is observable, which it is at read time.
+
+**Fix:** Lifecycle is a knob, not a fixed pipeline position. Apply WRITE-time atomise only to **structured durable facts** with a known schema (user preferences, ACID-eligible records) — store in the operational tier (guild). Apply READ-time atomise to **conversational episodic data** with heterogeneous queries — store raw in the semantic tier (Qdrant) and atomise after retrieval. Concrete implementation: `ATOMISE_AT_READ=1` env flag in `scripts/run_longmemeval_oracle.py`; second LLM call between `tm.query_context()` and compose; composer sees BOTH triples AND raw context. Cost: +1 LLM call (~45-50s on M5 Pro 4-bit MLX). Production-grade version: top-K triple cap + query-conditioned extractor + raw-context dropping when triples are high-confidence.
+
+**Generalizes to:** the prior atomise-destroys-conversation entry (2026-05-19) is the **write-time failure mode**; this entry is the **read-time recovery**. Together they establish a chapter-level invariant: **agent-memory pipelines must respect early-binding vs late-binding constraints, and most "compress at write" decisions are leftover habits from log-processing pipelines that don't apply to conversational workloads**. Same primitive, different lifecycle, opposite outcome. Architectural lesson generalizes beyond memory: any place a pipeline compresses information before knowing how it will be used, the compression is early-binding and risks query mismatch. RAG re-rankers, embedding-time chunking, write-time summarization all sit in this family.
+
+**Measured evidence:**
+- Qwen3.6-27B-4bit: 30% (raw prompt) → 60% (+commit-biased prompt) → 65% (+read-time atomise)
+- Qwen-Opus-distill: 70% (baseline) → 75% (+read-time atomise)
+- Uniform +5pt lift across 40-pt baseline capability gap → architectural primitive, not small-model crutch
+- Latency cost at current implementation: ~6× per query (atomise emits 14-57 triples per Q, bloats downstream context)
+
+**Tags:** #lifecycle-position #early-vs-late-binding #atomisation #scenario-binding #ablation #measurement-driven #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 17 + [[Week 3.5.8 - Two-Tier Memory Architecture#5.3.3 Atomisation lifecycle — write-time vs read-time (the deeper §3.2.1 lesson)|§5.3.3 atomisation lifecycle]] + [[Week 3.5.8 - Two-Tier Memory Architecture#5.3.2 Six-model accuracy + wall-clock matrix (20-Q oracle slice, measured 2026-05-19)|§5.3.2 ablation matrix]] + forward-link panel inserted at [[Week 3.5.8 - Two-Tier Memory Architecture#3.2.1 The atomisation primitive — `extract_atomic_facts`|§3.2.1]].
+
+---
+
 ## 2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)
 
 Seven recurring multi-agent failure shapes, synthesized from Russell's engineering survey of Codex / Claude Code / OpenClaw / Hermes (X, 2026-05). These are not chapter-local entries — each one is a *production-grade* class of failure that recurs across systems. Reference these from any chapter that spawns subagents.

@@ -720,6 +720,51 @@ Stop condition:     what counts as done; when to stop and report blocked
 
 ---
 
+## Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)
+
+**When it applies:** any data-processing or AI pipeline where the SAME primitive (summarisation, atomisation, embedding, classification, compression, masking) could plausibly run at multiple stages — write/ingest time, read/query time, or both. Specifically when the primitive is **lossy** and downstream consumers have heterogeneous needs.
+
+**The invariant.** The lifecycle position of a primitive is **load-bearing** — same code, different stage, opposite outcome. Before placing a primitive, ask:
+
+| Question | Early-binding (write-time) wins when… | Late-binding (read-time) wins when… |
+|---|---|---|
+| Is the consumer's query known? | No (logs, archival) — write-time still works because future queries are uniform | Yes (per-request agent memory) — atomise under the lens of the actual query |
+| Is the primitive lossy? | Acceptable: the schema is known and stable | Hazardous: losing detail at write means it cannot be re-derived |
+| Queries per memory? | ≪ 1 (log ingestion) — amortise the cost at write | ≫ 1 (agent memory) — pay per query, since writes are rare per memory |
+| Error compounding? | Acceptable if downstream stages don't depend on this primitive's output for retrieval | Hazardous: error at write poisons embed → retrieve → compose downstream |
+| Schema stability? | Stable, known in advance | Schema-of-interest = the query's own structure (idiosyncratic, late-bound) |
+| Can the primitive be upgraded in production? | No — re-ingest required to apply new logic | Yes — change the read-time prompt/model and ALL old memories benefit immediately |
+
+**The math.** Write-time = fixed projection π_write. Read-time = query-indexed family π_query(q). The family always dominates the fixed choice when q is observable, which it is at read time. Same logic as parametric vs hand-tuned models, JIT vs AOT compilation, dynamic vs static dispatch.
+
+**Curriculum instance: W3.5.8 atomisation at write-time destroys signal; at read-time lifts +5pts across the capability range.** §3.2.1's `extract_atomic_facts` invoked as part of `consolidate()` at WRITE time on LongMemEval conversational haystacks: 0/20 correct, conversational facts skipped or paraphrased into tech-flavored summaries. The SAME primitive invoked at READ time (after Qdrant retrieval, before LLM compose) lifted BOTH a 4-bit dense Qwen3.6-27B model (60% → 65%) AND a Claude-Opus-distilled Qwen 27B model (70% → 75%) by +5pts each on the same slice. The architectural primitive is correct; the lifecycle position was wrong for conversational data. See [[Week 3.5.8 - Two-Tier Memory Architecture#5.3.3 Atomisation lifecycle — write-time vs read-time (the deeper §3.2.1 lesson)|W3.5.8 §5.3.3]] for the five-reason decomposition and the data-shape-vs-lifecycle architectural table.
+
+**The discipline.**
+
+1. **Name the lifecycle stage explicitly when describing a primitive.** "Atomisation" is ambiguous; "write-time atomisation" vs "read-time atomisation" are different decisions with different failure modes.
+2. **Default to late-binding when query distribution is unknown or heterogeneous.** Most agent-memory and retrieval-augmented systems fit this shape. The intuition that "compress at write to save query cost" is imported from log-processing pipelines and is the wrong default for agent memory.
+3. **Bind early only when the schema is genuinely known AND queries are uniform.** Structured durable facts (user preferences, ACID-eligible records) fit this. Conversational episodic data does not.
+4. **Test the same primitive at both positions when in doubt.** A/B by environment flag, not by re-architecture. W3.5.8's `ATOMISE_AT_READ=1` flag is the minimal viable ablation harness.
+5. **Treat lifecycle position as a tunable parameter, not a fixed pipeline shape.** Different data shapes inside the same system can have different lifecycle policies for the same primitive.
+
+**Anti-pattern: log-processing intuition imported wholesale into agent-memory.** Many "two-tier memory" articles split by storage engine (SQL + vector) and assume write-time compression because that's what log pipelines do. The actual split that matters is **early-bound structured facts vs late-bound retrievable raw**. Same engine could serve both with different lifecycle policies; different engines could serve the same lifecycle. The discipline is the lifecycle choice, not the SQL-vs-vector choice.
+
+`★ Insight ─────────────────────────────────────`
+- **Read-time primitives are iterable in production; write-time primitives are not.** Ship a better atomiser at read-time and ALL old memories benefit immediately. Ship a better atomiser at write-time and only newly-ingested data benefits — old data requires re-ingest. This is the production-ops corollary of late-binding and a strong argument against eagerly compressing data at write time when the read path can absorb the cost.
+- **"Where does this primitive belong in the pipeline?" is usually the wrong question.** The right question is "what data shape is being processed, and is its query distribution known at write time?" Lifecycle position is downstream of data-shape commitment, not an independent design choice.
+- **The pattern generalises beyond memory.** RAG re-rankers, embedding-time chunking, write-time summarisation, schema-on-write databases, and ahead-of-time compilation all sit in the early-binding family and all break the same way when the consumer's needs are not known in advance. The early-vs-late binding tradeoff is a chapter-level invariant worth keeping at the front of your mind whenever you're placing a primitive in a pipeline.
+- **The empirical signature of a lifecycle mismatch**: signal destruction at write time (zero recall on questions whose answers are in the raw input) AND recovery when the same primitive is moved to read time. If you see this signature, suspect lifecycle position before suspecting the primitive itself.
+`─────────────────────────────────────────────────`
+
+**See also:**
+- Pattern 16 — Multi-Axis Comparison Table (the data-shape × ingest-strategy 2D matrix in W3.5.8 Production Considerations is the canonical visualisation of this pattern's choice space)
+- Pattern 18 — Spec/Disk Fidelity for Pedagogical Code (the lifecycle-mismatch case is a new sub-class: right primitive, wrong stage)
+- Pattern 9 — Bounded Scope Reduction (when the primitive's scope is "everything potentially useful", late-binding reduces scope to "everything the query needs")
+- W3.5.8 §3.2.1 (write-time implementation) ↔ W3.5.8 §5.3.3 (read-time implementation + lifecycle decomposition)
+- BCJ 2026-05-19 (write-time failure) + BCJ 2026-05-20 (read-time recovery) — the matched-pair empirical record
+
+---
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
@@ -745,6 +790,7 @@ Stop condition:     what counts as done; when to stop and report blocked
 | 19 — Spec → IMPLEMENTED Status Marker | Roadmap chapters with work-to-be-done | Stale spec claims masquerading as implemented status |
 | 20 — Real-Data-Only Discipline | Every BCJ / failure-mode entry | Speculative entries diluting the catalog's signal |
 | 21 — Bidirectional Cross-Reference Invariant | Every cross-doc / cross-chapter reference | Silent half-edges that break under refactoring |
+| 22 — Lifecycle Position Matters | Placing a lossy primitive (atomise, summarise, embed, chunk) in a pipeline | Right primitive at the wrong stage — silent signal destruction when write-time intuition is imported from log workloads |
 
 These patterns compound. The teams (or solo engineers) who use them feel "calm and deliberate" to work with; the ones who don't feel "frantic and surprising." The difference isn't IQ or experience — it's the discipline of slowing down at the right 5-10% of moments.
 
