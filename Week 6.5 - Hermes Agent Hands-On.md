@@ -1,7 +1,7 @@
 ---
 title: "Week 6.5 — Hermes Agent Hands-On"
 created: 2026-04-26
-updated: 2026-05-14
+updated: 2026-05-19
 tags: [agent, curriculum, week-6.5, hermes, nous-research, extensibility, runbook, expansion-week]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-06.5-hermes-handson"
@@ -158,6 +158,56 @@ Hermes Agent is deliberately designed to span the cost spectrum from "barely-run
 The architectural lesson worth carrying forward: **separate orchestration from inference.** This is the same lesson Claude Code teaches (the agent is small, models are external). Frameworks that bundle inference and orchestration into a single binary lose this flexibility and can't span the cost curve. Hermes' design honors the separation; that's why it can run on a $5 VPS.
 
 > **Interview soundbite:** "Hermes' cost-curve flexibility comes from a clean separation of orchestration and inference — the agent process is small, models are external. That's the same architectural lesson Claude Code teaches. Frameworks that bundle inference into the agent process can't span from $5 VPS to GPU cluster — they're locked at one tier. Worth knowing as a design principle even if you never deploy Hermes specifically."
+
+---
+
+### Concept 4 — Two Delegation Primitives: `delegate_task` (RPC) vs Kanban (Durable Queue)
+
+Russell's 2026 multi-agent survey (see [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Multi-Agent Anti-Patterns]]) calls Hermes's most teach-worthy design choice the **explicit split between short-program parallelism and long-running workflows**. Most agent frameworks pick one primitive and use it for both — RPC-style `crew.kickoff` or `agent.invoke` for everything (which loses state on long jobs), or queue-style task boards for everything (which adds heavy overhead to 30-second tasks). Hermes ships both, with clear lifecycle boundaries.
+
+**`delegate_task` — short-program RPC.** Parent agent calls; child agent executes; parent waits; child returns summary. Conversation is fresh per call. State lives in the call — no persistence after return. Right for: parallel research lookups, dependency probes, exploratory reads, scoped patches that finish in seconds-to-minutes. Wrong for: anything that pauses for human input or needs to survive a process restart.
+
+**Kanban — durable workflow queue.** Tasks land in a SQLite task board with state machine semantics (TODO / IN_PROGRESS / BLOCKED / DONE). Workers have named profiles, persistent memory, and explicit handoffs via comment threads. State survives process death, can pause indefinitely for human input, supports retries, and produces an audit trail. Right for: multi-day research reports, audited migrations, long-running ops work, anything where the wall-clock could exceed one user session. Wrong for: ~30-second probes that the board's setup overhead dominates.
+
+**The empirical guardrails Hermes ships with** (per Hermes docs, Russell synthesis 2026):
+
+| Guardrail | Default | Why this number |
+|---|---|---|
+| Max concurrent children in one `delegate_task` batch | **3** | Beyond 3, parent's reduce phase becomes the bottleneck; token budget ceilings hit; observability fragments. |
+| Default leaf recursion depth | **1** (depth-1 from parent — leaves CANNOT spawn) | Depth-N × breadth-N explodes fast. 3 layers × 3 children = 27 leaves; cost and latency become unpredictable. |
+| Leaf worker tool restrictions | Cannot call `delegate_task`, cannot ask the user, cannot write shared persistent memory, cannot cross-platform message, cannot use dangerous executors | Leaf workers are deliberately constrained — they execute, they don't orchestrate. |
+| Result order on batch return | Stable input order | Reducer can rely on positional indexing for merge logic. |
+| Parent interrupt → child interrupt | Propagates automatically | No "zombie children running after parent is canceled" failure mode. |
+
+**The Hermes maxim: "subagents know nothing."** Spelled out verbatim in Hermes documentation. Means: a child agent has zero implicit access to the parent's context. Path? Pass it in. Error reproduction? Pass it in. Project conventions? Pass them in. The cost of forgetting this is silent — the child guesses, returns plausible-looking but wrong output, and the parent has to debug the guess. This maxim is the *write-side* of [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]]: the 8-field contract is the operationalization of "subagents know nothing."
+
+**Lifecycle decision tree:**
+
+```text
+                ┌─ in-turn return needed? ──→ delegate_task (RPC)
+                │
+task arrives ──┼─ pauses for human input? ──→ Kanban (durable queue)
+                │
+                └─ takes hours/days?         ──→ Kanban (durable queue)
+                                              ↳ may use delegate_task internally
+                                                for short sub-probes
+```
+
+A two-day research report goes on the Kanban board. WITHIN a board task, the worker may invoke `delegate_task` to fan out three parallel source-lookups that return in 30 seconds — those return summaries back to the worker, which updates the task's state. The two primitives are not exclusive; they compose along the lifecycle dimension.
+
+**Russell's anti-pattern #5 (Wrong Primitive for Lifecycle):**
+- Symptom (a): a 2-day research project run via `delegate_task` — parent context stays open for hours, one timeout loses all state, restarts mean starting over.
+- Symptom (b): a 30-second three-source lookup run via Kanban — setup overhead dominates wall-clock, observability layers make a parallel-fetch look like a distributed system.
+
+The fix is mechanical once the split is internalized: pick the primitive whose lifecycle matches the task's expected duration + pause behavior + restart sensitivity.
+
+> **Interview soundbite:** "Hermes splits delegation into two primitives — `delegate_task` for short-lived RPC-style fan-out (default max 3 concurrent, depth-1, leaves can't spawn) and Kanban for durable queue workflows (state machine, profiles, comment threads, survives restarts). Mismatching the primitive to the lifecycle is the most common multi-agent mistake — RPC for a 2-day job loses state on every timeout; Kanban for a 30-second probe is overhead theater. The Hermes maxim 'subagents know nothing' is the discipline: every delegation needs an 8-field contract because the child starts with zero context."
+
+`★ Insight ─────────────────────────────────────`
+- **The two-primitive split is what makes Hermes Russell's "engineering choice" exemplar.** Most agent frameworks ship one primitive and force users to bend it. Hermes shipping both forces an engineering decision (which lifecycle is mine?) instead of hiding it.
+- **The empirical guardrails (max 3 concurrent, depth-1) are framework-level Pattern 14 application.** Allowed-actions + Forbidden-actions from the Delegation Contract Template are baked into the runtime: leaf workers literally cannot delegate, ask, or write shared memory. The contract is enforced, not just documented.
+- **The "subagents know nothing" maxim deserves to be a memorable phrase in every multi-agent engineer's vocabulary.** Like "everything fails all the time" (AWS) or "make invalid states unrepresentable" (Yaron Minsky), it compresses a load-bearing discipline into 4 words.
+`─────────────────────────────────────────────────`
 
 ---
 
@@ -791,6 +841,6 @@ Open [[Week 7 - Tool Harness]] when this lab's `RESULTS.md` is committed. The He
 
 - **Builds on:** W0 Environment Setup (MLX endpoint, OpenAI-compatible config); W6 Claude Code Source Dive (curated-maximalism end of extensibility spectrum that W6.5 contrasts against); W4 ReAct (loop mechanics Hermes' skill-creation hook wraps around).
 - **Distinguish from:** API-based frontier models (Claude, GPT-4) — Hermes trades lower instruction-following ceiling + higher setup friction for zero recurring inference cost + accumulating skill library; frontier APIs offer higher single-call quality + zero ops overhead but no cross-session learning + per-token billing compounding with multi-step loops. Also distinguish from Pi (W6 callout): Pi scripts extensions on demand within session and does not persist; Hermes persists autonomously across sessions.
-- **Connects to:** W7 Tool Harness — MCP permission model + error handling read differently after watching Hermes generate skills that may lack error handling; W10 Framework Shootout — Hermes is one of the backends evaluated.
+- **Connects to:** W7 Tool Harness — MCP permission model + error handling read differently after watching Hermes generate skills that may lack error handling; W10 Framework Shootout — Hermes is one of the backends evaluated; W3.5.8 §3.4 Audit Log — the read-side mirror of Hermes's "subagents know nothing" maxim; the AuditEntry primitive captures what `delegate_task` and Kanban writers emit; W4.6 §2.5 Durable Agent Runtime — Hermes's two-primitive split (`delegate_task` RPC + Kanban durable queue) is one of the canonical implementations of the 4-trigger × 6-topology design space; [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]] — the 8-field write-side contract operationalizes "subagents know nothing"; [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Multi-Agent Anti-Patterns]] — MA-2 ("subagents know nothing") + MA-5 ("wrong primitive for lifecycle") are the canonical failure modes Hermes's design guards against.
 - **Foreshadows:** W11 System Design — local-first deployment with Hermes as inference-decoupled orchestration; cost-curve ($5 VPS to GPU cluster) maps to W11's multi-tenancy and scaling. W12 Capstone — auditability gap and decision tree for Hermes vs curated alternative are live design constraints.
 - **Forward link (producer-side schema bridge):** [[Week 6.6 - MCP Schema Bridge]] — full deep-dive on `function_to_mcp_schema`-style introspection (PraisonAI), AutoGPT's `block.py` class-attribute schemas, and the agenticSeek planner-JSON consumer side. This week's Mini-Lab is the entry vignette; W6.6 is the canonical reference for typed-block I/O across the three-repo convergence.
