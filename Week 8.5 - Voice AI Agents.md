@@ -629,3 +629,6 @@ Realtime ~2.5× faster at p50, 3× more expensive. Consumer products: cost premi
 **Connects to: W11 System Design.** Voice is one deployment shape. W11 covers production architecture; voice adds the constraint that each inference path must complete in under 500ms.
 
 **Distinguish from: W7 Tool Harness.** Voice itself is not a tool — it is the interface modality. Voice agent uses the same tool harness from W7, but the harness is invoked by an agent whose I/O happens to be audio. Confusing the two leads to architectural mistakes like trying to make speech synthesis a callable tool.
+
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W8.7**: Generative Media — voice synthesis and image generation share multi-modal serving architecture; latency-budget trade-offs converge

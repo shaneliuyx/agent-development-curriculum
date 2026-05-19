@@ -4876,6 +4876,10 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 - **Connects to:** [[Week 4 - ReAct From Scratch]] (the agent loop that consumes this memory architecture); [[Week 7 - Tool Harness]] (tools to call from the agent; tool results feed scrolls); [[Week 3.5.95 - Self-Observability Memory]] (reuses §3.3's quality-score promotion-gate pattern for its LEARNING extractor — same precision/recall dial, different signal source)
 - **Foreshadows:** [[Week 11 - System Design]] (architect a production multi-agent system with two-tier memory as a load-bearing component); [[Week 12 - Capstone]] (capstone-A RAG variant could use two-tier memory for cross-session research)
 
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W6.5**: Hermes — Hermes's `delegate_task` and Kanban primitives operate against memory backends; the AuditEntry primitive here is their natural read-side mirror
+  - **W6.85**: Prompt Templates — memory-recall prompts are catalogued under W6.85's template families; the dedup classifier prompt is one such template
+
 ---
 
 ## What's Next

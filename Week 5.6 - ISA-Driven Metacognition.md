@@ -224,6 +224,9 @@ Must include at least one production blog post or canonical implementation repo.
 - **Connects to:** [[Week 3.5.95 - Self-Observability]] (ISC pass/fail events feed the LEARNING / observability layer — every verification result is a structured row for offline analysis); [[Week 6.7 - Agent Skills]] (Agent Skills authoring discipline echoes the ISA pattern — a Skill with no acceptance test is a Skill that ships broken); [[Week 7.5 - Computer Use and Browser Agents]] §Enum-Bounded Action Space mini-lab — the browser agent's report-quality score is a concrete ISC, and the K-consecutive-parse-miss fallback IS an ISC verification step.
 - **Foreshadows:** [[Week 12 - Capstone]] (every capstone component ships with an ISA; the capstone rubric IS an ISA over the entire program); [[Week 11 - System Design]] (production agent topologies surface ISCs as the audit-trail primary key).
 
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W7.5**: Computer Use — CUA's screenshot-then-decide loop is a metacognitive primitive; W5.6's introspection patterns apply directly
+
 ---
 
 ## Resolved design decisions (locked 2026-05-14)

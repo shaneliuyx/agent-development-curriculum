@@ -1761,3 +1761,6 @@ And one last thing: **keep the signature recording on your phone.** Listen to it
 - **Distinguish from:** retry-on-error (band-aid that adds latency per failure, cannot prevent the failure) vs constrained decoding (mechanism that makes failure structurally unreachable). Retry belongs at L3-L4 for semantic rules FSM cannot express; not a substitute for L2.
 - **Connects to:** W9 Faithfulness Checker — field-level validation logic feeds the faithfulness eval harness; faithfulness checker is itself a structured output consumer depending on same Pydantic schemas. W7 Tool Harness — `tool_choice` forced-tool pattern is provider-native equivalent of strict JSON mode; understanding L2 explains why forcing a tool call is a schema-reliability primitive.
 - **Foreshadows:** W11 System Design — reliability SLAs require knowing which layers are deployed and per-layer validity rates; 25-cell benchmark matrix is empirical input. W12 Capstone — every structured output step gets explicit layer assignment + measured fallback.
+
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W7.3**: Production LLM Infrastructure — schema-reliability is one of the staged eval gates in production deployments

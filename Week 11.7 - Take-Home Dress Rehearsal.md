@@ -439,3 +439,5 @@ Push to GitHub. Add the repo to your portfolio list in `target_companies.md` (Ap
 - **Connects to:** [[Week 12 - Capstone and Mocks]] — W11.7's quotable number + defense screencast feeds directly into W12's mock-interview narrative; the `target_companies.md` from Appendix H consumes the take-home repo as a portfolio anchor.
 - **Connects to:** [[Agent Development 3-Month Curriculum#Appendix H — Job-Search Execution]] — H.5 Project Deep-Dive Defense Rehearsal references this lab as the canonical "PROJECT_DEFENSE.md" template lab.
 - **Foreshadows:** [[Week 12 - Capstone and Mocks]] mock-interview round where one of the 30 mocks must be a project deep-dive on this lab.
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W11**: System Design — W11.7 applies the W11 7-point system-design rubric at take-home scope (4-hour timed exercise rehearses the format reviewers see)

@@ -499,3 +499,6 @@ Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `
 **Distinguish from: W7 Tool Harness.** Tools are callable functions with JSON schemas. Skills are loaded prompts. A skill can invoke tools; a tool cannot invoke a skill. Most production agents need both layers.
 
 **Builds on: [[Week 6.6 - MCP Schema Bridge]].** W6.6 covers per-tool schema as the atomic primitive — JSON-schema validation, input/output contracts, the smallest unit of agent capability. This chapter composes over that primitive: a packaged Skill bundles one or more schema-defined tools, declares them via `entry_points`, and registers the whole bundle as a versioned, pip-installable unit. Schema is the cell; Skill package is the organ.
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W6.9**: Context Engineering — skill-level context budgets are governed by the same patterns as turn-level context
+  - **W7.8**: Code-Agent Patterns — code-agent skills (refactor, test-gen) are canonical examples of the W6.7 skill authoring discipline

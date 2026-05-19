@@ -468,3 +468,5 @@ def classify_regime(results: list[dict]) -> str:
   - *Speculative decoding*: a smaller model drafts tokens; bigger model verifies. Latency optimization; orthogonal to quantization.
 - **Connects to:** W4.5 (fleet routing decisions depend on quant tradeoffs), W11.6 (production tracing — token cost depends on quant + memory bandwidth), W11 system design (capacity planning uses these formulas)
 - **Foreshadows:** W12 capstone — production-readiness story requires quant decisions with measured numbers, not vibes
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W8.7**: Generative Media — diffusion-model quantization shares the regime × technique grid with text-LLM quantization; the trade-offs converge

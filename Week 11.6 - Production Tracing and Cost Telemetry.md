@@ -530,3 +530,6 @@ Fix: monthly reconciliation — compare DuckDB rollup against actual invoice; in
   - *APM (Application Performance Monitoring)*: includes traces + metrics + logs but is built for web apps; LLM-specific UIs (Langfuse, Phoenix) are better fit.
 - **Connects to:** W4.5 (cost-latency Pareto front uses these measurements), W11.5 agent security (audit log lives in spans), W12 capstone (demo's production-readiness story leans on observability)
 - **Foreshadows:** continuous training (W11.8) uses traces as the data source for retraining triggers; drift detection runs on aggregated span attributes
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W6.9**: Context Engineering — context-budget overruns surface as cost-telemetry anomalies; tracing closes the feedback loop
+  - **W7.7**: Quantization — per-regime cost differences are the read-side view of routing decisions; tracing makes the trade-off measurable

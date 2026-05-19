@@ -322,6 +322,10 @@ Must include at least one production blog post or canonical implementation repo.
 - **Connects to:** [[Week 11.5 - Agent Security]] (trigger surface is the auth boundary — webhook trigger is an unauthenticated entry point until you secure it; cron triggers run as the system identity); [[Week 12 - Capstone]] (the capstone agent runs on this runtime, not a one-shot script).
 - **Foreshadows:** production deployment topology (multi-host worker pool, Redis-backed lock, cron-leader election); cost-attribution dashboards; multi-tenant agent platforms.
 
+- **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
+  - **W11.5**: Agent Security — the PreToolUse hook integration wires security guards into W4.6's durable runtime tool dispatcher
+  - **W6.5**: Hermes — Hermes's two-primitive split (`delegate_task` + Kanban) is one canonical implementation of W4.6's trigger × topology design space
+
 ---
 
 ## Resolved design decisions (locked 2026-05-14)
