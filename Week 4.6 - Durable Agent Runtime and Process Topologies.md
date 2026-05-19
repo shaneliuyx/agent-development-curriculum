@@ -238,6 +238,7 @@ Must include at least one production blog post or canonical implementation repo.
 - AutoGPT Platform repo `autogpt_platform/backend/backend/executor/` (canonical durable-runtime impl)
 - PraisonAI `src/praisonai-agents/praisonaiagents/process/process.py` (canonical four-topology impl)
 - Temporal.io engineering blog (durable-workflow thesis)
+- **`rohitg00/agentmemory`** — alternative durable-runtime reference built on **iii-engine** (3-primitive Worker/Function/Trigger model + WebSocket daemon on `:49134` + file-based SQLite via StateModule). Same "execution state separate from LLM loop" thesis but lighter-weight than Temporal.io (single-host, embedded SQLite, no separate workflow cluster). Pattern: memory ops registered as functions; HTTP endpoints registered as triggers; state daemon as a separate process. Production reference for the lightweight end of the durable-runtime spectrum.
 - Cadence Workflow whitepaper (Uber)
 - Significant-Gravitas AutoGPT classic→Platform architecture-doc diff (the postmortem)
 - Martin Fowler — *Event Sourcing* article

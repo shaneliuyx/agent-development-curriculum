@@ -349,6 +349,8 @@ def assert_called_matching_signature(mock: MagicMock, real_callable: Callable) -
 - **Meta's Sapienz paper** — automated test generation at Meta scale. Older but foundational.
 - **Claude Code's code-agent loop** — read the source for the canonical reference implementation (W6 chapter).
 
+> **Persistent memory for code agents — cross-ref to `rohitg00/agentmemory`.** W7.8 covers the AST + LSP + coverage + mock layer of a code agent. For the PERSISTENT-MEMORY layer specifically tuned for code agents (so the agent doesn't re-explain context across sessions), see `rohitg00/agentmemory` — an MCP-server-first memory system shipping integrations for Claude Code / Cursor / Gemini CLI / Codex CLI / Hermes / OpenClaw / pi / OpenCode. Production reference for the "code agent + persistent memory" composition. See W3.5.8 §10 for the multi-client portability extension that abstracts this pattern.
+
 ## Cross-References
 
 - **Builds on:** W4 (ReAct loop hosts the code-agent), W6.7 (Skills pattern for "generate-tests" skill), W6 Claude Code (reference implementation)

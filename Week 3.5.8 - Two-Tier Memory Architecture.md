@@ -1302,6 +1302,92 @@ Probe set: 20 scrolls (10 high-value: explicit numbers + named tools; 10 low-val
 - **This is the missing measurement layer for §3.1.** The SKIP-only filter is a 1-bit decision; the score-based gate is a continuous signal. When you later observe LTM drift in production, the score histogram is the diagnostic — you cannot debug a binary you can't see.
 `─────────────────────────────────────────────────`
 
+### 3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)
+
+Phase 3.1's consolidate() writes facts. Phase 3.2.1's atomisation writes typed atoms. Phase 3.3's quality gate decides promotion. Phase 9.6's dedup/supersede/coexist mutates the store. **Every one of those is an operation worth replaying after-the-fact** — for debugging, audit compliance, post-mortem analysis, or as training data for the W11.8 CT pipeline.
+
+The `rohitg00/agentmemory` project formalizes this via an explicit **`AuditEntry`** type — every memory operation gets recorded with an operation union type + payload + timestamp + actor. The agent-prep lab currently writes audit-shaped metadata into each Qdrant payload (the `supersedes` / `supersede_reason` / `fact_kind` fields from Phase 9.6 are exactly this pattern) but doesn't formalize the AuditEntry as a typed primitive. Promoting it to a first-class type:
+
+```python
+# src/audit.py — promote ad-hoc audit-metadata into a typed primitive
+from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Any, Literal
+from dataclasses import dataclass, asdict, field
+import json
+import uuid
+from pathlib import Path
+
+AuditOperation = Literal[
+    "imprint",            # initial write
+    "update",             # form #1 update action
+    "supersede",          # form #1 + 9.6 supersede action (state evolution)
+    "coexist",            # form #1 + 9.6 coexist action (scoped variant)
+    "delete",             # form #1 delete action (factual correction)
+    "noop_duplicate",     # form #1 no-op (true duplicate)
+    "promote",            # quality gate promotion
+    "demote",             # quality gate demotion below threshold
+    "compact",            # offline housekeeping / batch dedup
+]
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """One operation on the memory store; append-only.
+    Replaces ad-hoc metadata fields scattered across imprint payloads."""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    operation: AuditOperation = "imprint"
+    actor_agent_id: str = ""
+    user_id: str = ""
+    target_id: str | None = None           # the affected memory point (if any)
+    new_id: str | None = None              # the new point produced (for supersede / update / coexist)
+    payload_summary: str = ""              # first ~120 chars of fact content
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def record_audit(audit: AuditEntry, log_path: Path) -> None:
+    """Append one AuditEntry to a JSONL log. Production rule: this is the
+    ONLY place AuditEntry-shaped data is written; never inline elsewhere."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(json.dumps(asdict(audit)) + "\n")
+```
+
+**Wire-in pattern (consolidation pipeline):**
+
+```python
+# inside consolidate() or execute_action() — augment each branch
+if action.action == "supersede" and action.target_id:
+    new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
+    record_audit(AuditEntry(
+        operation="supersede",
+        actor_agent_id=tm.agent_id,
+        user_id=tm.user_id,
+        target_id=action.target_id,
+        new_id=new_id,
+        payload_summary=new_fact[:120],
+        metadata={"supersede_category": action.supersede_category,
+                  "supersede_reason": action.supersede_reason,
+                  "fact_kind": "state_evolution"},
+    ), Path("data/audit.jsonl"))
+```
+
+**Why elevate to a typed primitive instead of leaving as payload metadata:**
+
+1. **Operation enumeration is a contract.** A `Literal[...]` union forces every caller to use one of the 9 known operations; ad-hoc string fields drift over time as new ops get added without renaming old ones.
+2. **Audit log is replayable.** JSONL append-only with timestamp + actor + target lets you reconstruct the store's state at any past timestamp — same pattern as W11.8 CT's PSI history + W11.6's span parquet log.
+3. **`AuditEntry` is the integration point** for the W11.8 CT pipeline's drift detector (PSI over audit-entry counts per category) AND the W9.3 agent-eval rubric (trajectories that include memory ops get traced via AuditEntry IDs).
+4. **Cross-system contract.** When agent-prep eventually integrates with `rohitg00/agentmemory` (or any MCP-memory server with the same shape), the AuditEntry union is the wire-protocol-friendly export shape. See §10 for the multi-client portability extension.
+
+**Failure mode this prevents:** without an explicit AuditEntry type, every place that mutates the store invents its own metadata schema. The Phase 9.6 supersede fields (`supersedes`, `supersede_reason`, `supersede_category`) were added inline; the Phase 9 dedup fields (`facts_deduplicated` counter) lived elsewhere; the Phase 3.3 promote/demote signal lived in a third place. AuditEntry unifies them so future eval / replay / export code has ONE source of truth.
+
+`★ Insight ─────────────────────────────────────`
+- **The agentmemory project's `AuditEntry` type is the single most-portable design pattern in its codebase.** Everything else (iii-engine, WebSocket daemon, MCP server) is implementation choice; the AuditEntry union is the operating discipline.
+- **Audit log as JSONL + append-only is the cheapest production pattern that survives across deployments.** No DB schema migration, no ORM, no special tooling. A jq command + `tail -f` is a debugging session. The trade-off vs SQLite audit table is queryability: SQLite gives you indexed queries; JSONL gives you portability. For curriculum scale, JSONL wins; for production at >100K ops/day, swap to SQLite/Postgres.
+- **The 9-operation union is intentionally small.** Production teams often start with 3 (imprint / update / delete) + add 6 more over time. The point isn't to enumerate every possible op; it's to FORCE every place that mutates state to declare what kind of mutation it is. The discipline matters more than the completeness.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Phase 4 — Two-Agent Shared-Knowledge Demo (~1.5 hours)
@@ -3437,6 +3523,144 @@ test_consolidate_use_dedup_increments_counters               PASSED [100%]
 - **Test 3 acted as the canary for the 4→6 action upgrade.** Pre-Phase-9.6 it passed asserting `in ("delete", "update", "add")`. Post-Phase-9.6 it FAILED because the classifier (correctly) chose `supersede`. Widening the assertion to include `supersede` is the right fix — it encodes the EXPANDED contract, not a regression. CLAUDE.md real-data discipline applied at the test layer: when measurement says the system improved, tests follow.
 - **The 76.5s aggregate wall is the "ship-it" budget on M5 Pro.** Each LLM-touching test ~15-19s. 5-test suite well under 90s. Acceptable for a manual `uv run pytest` cycle but too slow for CI-on-every-PR. Production pattern: tag these `pytest.mark.slow` (the Phase 8 tests already do this) + gate them on the nightly job, NOT the per-PR check.
 - **76.5s for 5 tests vs 43.86s for the Phase 9 baseline 4 tests.** Adding 1 test (the supersede probe) added ~33s — that's NOT 1 × 15s; it's the 6-action prompt being ~30% longer than the 4-action and the reasoning model spending more tokens. Pedagogical: prompt length × test count × per-token latency = total wall. Production teams need to budget all three.
+`─────────────────────────────────────────────────`
+
+---
+
+## Phase 10 — Memory-as-MCP-Server: Multi-Client Portability + Versioned Export/Import (~3 hours, SPEC)
+
+> **Pattern source:** `rohitg00/agentmemory` — persistent memory for AI coding agents built on iii-engine (3-primitive Worker/Function/Trigger model + WebSocket daemon on `:49134` + file-based SQLite via StateModule). Ships first-class integrations for **Claude Code / Cursor / Gemini CLI / Codex CLI / Hermes / OpenClaw / pi / OpenCode** + any MCP client.
+
+Curriculum coverage gap: W3.5.5 + W3.5.8 expose memory as MCP tools (via `guild` + EverCore / Qdrant) but client-portability tests are scoped to Claude Code + Cursor only. Production memory servers must work across 8+ MCP clients with different transport conventions, schema interpretations, and session models. Phase 10 closes the gap.
+
+### 10.1 The multi-client portability matrix
+
+```mermaid
+flowchart LR
+  SERVER["TieredMemory MCP server<br/>(guild + Qdrant + EverCore)"] --> M["MCP tool registry:<br/>memory_store / memory_query /<br/>memory_supersede / memory_export /<br/>memory_import / audit_replay"]
+  M --> C1["Claude Code"]
+  M --> C2["Cursor"]
+  M --> C3["Gemini CLI"]
+  M --> C4["Codex CLI"]
+  M --> C5["Hermes"]
+  M --> C6["OpenClaw"]
+  M --> C7["pi (Anthropic)"]
+  M --> C8["OpenCode"]
+  C1 --> PROBE["8-client × 5-task<br/>portability probe set"]
+  C2 --> PROBE
+  C3 --> PROBE
+  C4 --> PROBE
+  C5 --> PROBE
+  C6 --> PROBE
+  C7 --> PROBE
+  C8 --> PROBE
+  PROBE --> MATRIX["RESULTS.md:<br/>per-client × per-task pass matrix<br/>+ per-client integration notes"]
+```
+
+**5 portability tasks per client:**
+
+1. **Store** — single `memory_store(content, type, tags)` call; verify the audit log records `imprint`.
+2. **Query** — `memory_query(query, k=5)` returns relevant memories; relevance scored 0/1 against expected.
+3. **Supersede** — call `memory_supersede(old_id, new_content, reason)`; verify the AuditEntry has `operation="supersede"`.
+4. **Export** — `memory_export()` returns versioned JSONL bundle; verify schema matches the supportedVersions union.
+5. **Import** — round-trip: export → wipe collection → import → re-query; verify content survives.
+
+### 10.2 Versioned `ExportData` + `supportedVersions` set
+
+```python
+# src/portability.py — versioned export with forward + backward compat
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from typing import Literal, Union
+import json
+from pathlib import Path
+
+# When we bump the export schema, we add a new literal here AND we set
+# `supportedVersions` to include all versions we can READ (write-back is
+# always the LATEST version). Old exports remain importable; new exports
+# may not be readable by old code — that's the standard semver shape.
+ExportVersion = Literal["v1", "v2", "v3"]
+SUPPORTED_VERSIONS: set[ExportVersion] = {"v1", "v2", "v3"}
+CURRENT_VERSION: ExportVersion = "v3"
+
+
+@dataclass
+class ExportData:
+    version: ExportVersion
+    schema_url: str         # e.g. "https://shaneliuyx/agent-prep/.../v3.json"
+    exported_at: str        # ISO 8601
+    user_id: str
+    memories: list[dict]    # full Qdrant payload OR EverCore episode rows
+    audit_log: list[dict]   # all AuditEntry records (§3.4)
+
+
+def export(tm, user_id: str, out_path: Path) -> None:
+    memories = tm.dump_all_for_user(user_id)
+    audit = read_audit_log_for_user(user_id)
+    bundle = ExportData(
+        version=CURRENT_VERSION,
+        schema_url=f"https://github.com/shaneliuyx/agent-prep/schemas/{CURRENT_VERSION}.json",
+        exported_at=datetime.now(timezone.utc).isoformat(),
+        user_id=user_id,
+        memories=memories,
+        audit_log=audit,
+    )
+    out_path.write_text(json.dumps(asdict(bundle), indent=2))
+
+
+def import_(tm, in_path: Path) -> None:
+    raw = json.loads(in_path.read_text())
+    v = raw.get("version")
+    if v not in SUPPORTED_VERSIONS:
+        raise ValueError(
+            f"export version {v!r} not in supported set {SUPPORTED_VERSIONS}; "
+            f"upgrade your reader OR re-export from the source"
+        )
+    # Migrate per-version if needed; route to the latest internal shape
+    bundle = migrate_to_current(raw)
+    for memory in bundle["memories"]:
+        tm.imprint(content=memory["content"], metadata=memory.get("metadata"))
+    # Replay audit log to capture supersede / coexist relationships
+    replay_audit(tm, bundle["audit_log"])
+```
+
+### 10.3 The `replay_audit` primitive
+
+Audit replay reconstructs the store's state from the audit log alone. Production use cases:
+
+- **Disaster recovery** — store corrupted; replay audit log into a fresh backend.
+- **CT pipeline training data** — W11.8's PSI drift detector consumes the audit log as the input distribution; rerunning the agent on stored prompts + replaying the audit log generates SFT/GRPO training pairs.
+- **Cross-backend migration** — export from EverCore; replay into Qdrant. The semantics are preserved as long as both backends honor the audit operation contract.
+
+```python
+# src/replay.py — reconstruct store state from audit log
+def replay_audit(tm, audit_log: list[dict]) -> None:
+    """Replay every AuditEntry against an empty TieredMemory. Idempotent
+    when applied to an empty target. NOT idempotent on a non-empty target;
+    caller is responsible for resetting state."""
+    for entry in audit_log:
+        op = entry["operation"]
+        if op == "imprint":
+            tm.imprint(content=entry["payload_summary"], metadata=entry.get("metadata", {}))
+        elif op in {"supersede", "update", "coexist", "delete"}:
+            # Reconstruct the action sequence; depends on Phase 9 / 9.6
+            pass  # see lab repo for full impl
+        elif op == "noop_duplicate":
+            continue  # nothing to replay
+```
+
+### 10.4 Lab deliverables
+
+- `src/portability.py` (~150 LOC) — `ExportData` + `export()` + `import_()` + migration map.
+- `src/replay.py` (~100 LOC) — `replay_audit()` with idempotency contract.
+- `tests/test_portability_round_trip.py` — export → wipe → import → verify content survived; verify per-supersede chains preserved.
+- `RESULTS.md` row: per-client × per-task pass matrix (e.g., Claude Code 5/5 / Cursor 5/5 / Gemini CLI 4/5 — `memory_supersede` lacked Gemini's tool-schema support pre-v1.2). Honest reporting beats optimistic.
+
+`★ Insight ─────────────────────────────────────`
+- **Memory portability is the production-readiness signal most candidates skip.** Anyone can ship a memory server. Shipping a memory server that survives Claude Code's session model + Cursor's prompt-injection + Gemini's tool-schema strictness + Codex's session-scope semantics is the senior signal. The 8-client probe is what proves you've thought about this.
+- **`supportedVersions` set is a 2-line decision that saves months.** Future-self exports v3 from a newer codebase; current code's reader can fall back to v1/v2 migrations. Cost is one switch statement. Without it, every schema bump is a forced upgrade across all consumers.
+- **The 9-operation audit-log union from §3.4 is the IMPORT'S precondition.** Without typed operations, `replay_audit()` can't know what to do with each entry. Forcing the union is what makes cross-backend migration tractable. Production rule: typed audit logs → portable memory; ad-hoc metadata → vendor-locked memory.
+- **The agentmemory project is the canonical reference impl** for the multi-client MCP-server pattern. iii-engine + WebSocket daemon adds production hardness (process-separated state, audit replay, eval module) that single-binary daemons (guild) skip. For curriculum scope, guild is the right starting point; for production scale, agentmemory's pattern is the trajectory.
 `─────────────────────────────────────────────────`
 
 ---

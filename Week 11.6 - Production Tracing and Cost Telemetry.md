@@ -420,6 +420,38 @@ p99_latency_per_model (24h):
 
 Interview-grade read of this table: "**Finisher is 50x more expensive per call than loop, but only 1% of calls — total finisher spend matches loop. P99 on JANG (finisher) is 12s; we should set the SLA expectation accordingly OR shorten finisher prompts.**"
 
+### Phase 3.5 — Replay Module (production pattern, optional ~30 min)
+
+> **Pattern source:** `rohitg00/agentmemory` ships a dedicated `src/replay/` module. The thesis: spans + cost data become 10× more valuable when the system can REPLAY a past session against the current agent code, against a new model variant (for W11.8 CT eval gate), or with a tweaked prompt (for W6.85 A/B tests).
+
+Spans + audit log together are a full session record. Add a `src/replay.py` that takes a `trace_id` + a callable agent → re-executes against the captured inputs:
+
+```python
+# src/replay.py — session replay primitive
+def replay_trace(trace_id: str, agent_fn) -> dict:
+    """Pull all spans for trace_id from parquet; reconstruct the (user_msg,
+    tool_responses) sequence; re-execute agent_fn(user_msg) with the SAME
+    tool responses injected. Compare new spans vs original for drift."""
+    spans = duckdb.sql(f"""
+        SELECT * FROM '{DEFAULT_SPANS_PATH}'
+        WHERE trace_id = '{trace_id}' ORDER BY timestamp
+    """).df()
+    root_user_msg = next(s["attributes"]["user_msg"] for _, s in spans.iterrows()
+                         if s["span_name"] == "agent_turn")
+    # ... reconstruct tool-response cache from original spans
+    # ... run agent_fn(root_user_msg) with cache injected
+    # ... return drift report (new spans vs original)
+```
+
+**Production use cases:**
+
+1. **Regression detection.** Replay yesterday's 100 successful sessions against today's code; flag any that fail.
+2. **CT eval gate.** W11.8's PSI-triggered retrain uses replay-against-the-candidate-model as the eval signal.
+3. **Cost-impact analysis.** Replay a sample of sessions against a cheaper model tier; project the cost-quality trade-off before rolling out.
+4. **Prompt A/B.** Replay against the same agent code but with a new system prompt; compare outputs side-by-side.
+
+The replay module IS the integration glue between W11.6 (tracing) + W11.8 (CT) + W6.85 (prompt versioning). Without it, span data is read-only telemetry; with it, span data becomes a re-executable dataset.
+
 ## Phase 4 — Anti-Patterns + the 4 Production Failure Modes
 
 ### Failure 1 — Spans Lost on Process Crash
