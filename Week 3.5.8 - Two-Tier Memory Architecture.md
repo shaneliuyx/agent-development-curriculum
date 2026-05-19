@@ -2213,6 +2213,10 @@ Expected output: `Total questions: ~500` (oracle subset; the full release ships 
 
 The runner does three things per question: (a) feed `haystack_sessions` through the two-tier consolidation pipeline (so the memory system has seen the relevant facts), (b) query the memory + compose an LLM answer using `query_context()`, (c) score the answer against gold via LLM-as-judge.
 
+> **Why the runner defaults to the Qdrant variant (`tiered_memory_qdrant`), not the EverCore variant.** EverCore's internal pipeline runs 3-4 LLM calls per `flush` (boundary detection → episode extraction → foresight associations → profile + atomic-fact extraction). On a local oMLX `gpt-oss-20b-MXFP4-Q8` stack each LLM call takes 30-100s, so a single haystack session can burn 3-5 minutes wall-clock. A 50-question oracle pass with ~5 sessions per question becomes ~12-15 hours. Measured 2026-05-19: a smoke run hit `[OpenAI-gpt-oss-20b-MXFP4-Q8] Duration too long: 97.35s` on a single foresight extraction. The §5.3 eval only needs "store + retrieve" semantics; EverCore's foresight / clustering / profile pipeline is overhead for this benchmark. The Qdrant variant (Phase 7) ships the same `imprint()` + `query_context()` API but does ONE embed + ONE upsert per imprint (~150 ms per call vs 30-100 s) — ~200-1000× faster on this workload, no LLM call at write time. The two-tier ARCHITECTURE thesis is preserved (semantic-tier choice is interchangeable; see §3.2.1 "Why Qdrant here" note); only the implementation switches.
+>
+> **Override if you specifically want the EverCore path:** change `from src.tiered_memory_qdrant import TieredMemory` to `from src.tiered_memory import TieredMemory` in the script. Budget 12-15 hours wall-clock for a 50-Q run; consider running overnight + tightening to `--limit 5` for the smoke step.
+
 ```python
 """LongMemEval oracle eval runner — two-tier memory architecture.
 
@@ -2240,7 +2244,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import OpenAI
 
-from src.tiered_memory import TieredMemory   # or tiered_memory_qdrant
+from src.tiered_memory_qdrant import TieredMemory   # DEFAULT for §5.3 — see "Why Qdrant" note below
 from src.consolidation import consolidate
 
 
