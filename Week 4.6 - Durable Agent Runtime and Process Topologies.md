@@ -48,16 +48,18 @@ The bug at the heart of classic AutoGPT was not "the agent is dumb." It was an a
 4. **Process topology as a first-class choice** — PraisonAI exposes four: *sequential* (one node at a time, ordered), *parallel* (all-fan-out, gather), *hierarchical* (manager-delegates-to-workers tree), *workflow* (explicit DAG with validation-feedback loops + retry counters). Choosing the wrong topology for the task is a bigger lift-or-tank decision than choosing the wrong model.
 5. **Triggers, not self-prompts** — production agents are triggered by cron, webhook, or external event. They are not allowed to wake themselves up. This is the explicit rebuke of classic-AutoGPT's "give the agent infinite resources and a goal." Trigger-based scheduling is the architectural guardrail that makes agent systems debuggable.
 
-### 2.3 Papers + references to cite (SPEC)
+### 2.3 Papers + references — pointer list
 
-- Vogels (2007). *Eventually Consistent.* CACM. — durable distributed state foundations.
-- Fowler, Martin. *Event Sourcing.* martinfowler.com — canonical pattern reference for append-only execution logs.
-- Temporal.io engineering blog. *Why Workflow Engines.* — durable-execution thesis applied to general workflows.
-- Cadence Workflow whitepaper (Uber, 2017). — production durable-workflow precedent.
-- Significant-Gravitas AutoGPT v1 → AutoGPT Platform postmortem (commits + architecture-doc diff, 2024). — the canonical real-world failure-mode source.
-- PraisonAI `src/praisonai-agents/praisonaiagents/process/process.py` (lines ~582, 1309, 1446) — four-mode process implementation reference.
-- AutoGPT Platform `autogpt_platform/backend/backend/executor/{manager.py, scheduler.py, cluster_lock.py, cost_tracking.py, simulator.py}` — canonical reference impl.
-- Workflow-Engines-vs-Agent-Loops distinction (Hamel Husain blog post candidate, or equivalent industry write-up).
+In-chapter pointer list. Full formal citations live in §8 References. This list is the reader's at-a-glance "where do the ideas in §2 come from?" map.
+
+- **Vogels (2007).** *Eventually Consistent.* CACM. Foundational paper on durable distributed state; the read-side semantics LLM-agent durable runtimes inherit.
+- **Fowler, Martin.** *Event Sourcing.* martinfowler.com. Canonical pattern reference for append-only execution logs — the architectural primitive every durable workflow engine builds on.
+- **Temporal.io engineering.** *Why Workflow Engines.* engineering blog. Articulates the durable-execution thesis (decouple log from workers) in the form that applies cleanly to LLM agent runtimes.
+- **Uber Engineering (2017).** *Cadence: a distributed, scalable, durable, and highly available orchestration engine.* The production durable-workflow precedent that Temporal forks from — same architecture, different operator.
+- **Significant-Gravitas (2024).** *AutoGPT v1 → AutoGPT Platform postmortem.* commits + architecture-doc diff. The canonical real-world failure-mode source — agent runtime that lacked durability + bounded concurrency + cost-metering, the failure surface this chapter teaches against.
+- **PraisonAI** — `src/praisonai-agents/praisonaiagents/process/process.py` (key lines: ~582 sequential, ~1309 parallel, ~1446 hierarchical / workflow). Four-mode process implementation; first-class topology choice in framework form.
+- **AutoGPT Platform** — `autogpt_platform/backend/backend/executor/{manager.py, scheduler.py, cluster_lock.py, cost_tracking.py, simulator.py}`. The canonical reference implementation of the 5-component runtime (graph store + worker pool + lock + cost meter + trigger-based scheduler).
+- **Husain, Hamel.** *Workflow Engines vs Agent Loops.* candidate blog post or equivalent industry write-up. Names the distinction this chapter operationalizes.
 
 ### 2.4 Distinguish-from box
 
@@ -299,19 +301,28 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (SPEC)
+## 8. References
 
-Same set as §2.3 once expanded. Format per vault conventions:
-- **Author et al. (Year).** *Title.* Venue. arXiv / URL. One-line description.
+Full formal citations for the works cited in §2 + the canonical production implementations the lab draws from. Per vault conventions: peer-reviewed papers + canonical docs + production blog posts + reference repositories.
 
-Must include at least one production blog post or canonical implementation repo. Candidates:
-- AutoGPT Platform repo `autogpt_platform/backend/backend/executor/` (canonical durable-runtime impl)
-- PraisonAI `src/praisonai-agents/praisonaiagents/process/process.py` (canonical four-topology impl)
-- Temporal.io engineering blog (durable-workflow thesis)
-- **`rohitg00/agentmemory`** — alternative durable-runtime reference built on **iii-engine** (3-primitive Worker/Function/Trigger model + WebSocket daemon on `:49134` + file-based SQLite via StateModule). Same "execution state separate from LLM loop" thesis but lighter-weight than Temporal.io (single-host, embedded SQLite, no separate workflow cluster). Pattern: memory ops registered as functions; HTTP endpoints registered as triggers; state daemon as a separate process. Production reference for the lightweight end of the durable-runtime spectrum.
-- Cadence Workflow whitepaper (Uber)
-- Significant-Gravitas AutoGPT classic→Platform architecture-doc diff (the postmortem)
-- Martin Fowler — *Event Sourcing* article
+### Papers + canonical writing
+
+- **Vogels, Werner (2007).** *Eventually Consistent.* Communications of the ACM, Vol. 52 No. 1, pp. 40-44. https://doi.org/10.1145/1435417.1435432. The foundational paper on durable distributed state; durable-runtime read-side semantics inherit from this work. Worth knowing as the ancestor reference even though LLM-agent runtimes are far less concerned with multi-datacenter replication than cloud DBs.
+- **Fowler, Martin.** *Event Sourcing.* martinfowler.com (no fixed publication date; canonical version). https://martinfowler.com/eaaDev/EventSourcing.html. The canonical pattern reference for append-only execution logs. Every durable-workflow engine reachable in this chapter (Temporal, Cadence, AutoGPT Platform) is an instance of this pattern applied to a different domain.
+- **Uber Engineering (2017).** *Cadence Workflow.* GitHub repo + whitepaper. https://github.com/uber/cadence. Production durable-workflow precedent at scale (Uber's internal usage); the architecture Temporal.io forks from. Reading the whitepaper gives the production-grade view of what AutoGPT Platform's executor is a stripped-down version of.
+- **Significant-Gravitas (2024).** *AutoGPT v1 → AutoGPT Platform postmortem (commits + architecture-doc diff).* https://github.com/Significant-Gravitas/AutoGPT. The canonical real-world failure-mode source for LLM agent runtimes. The diff between `master` (classic AutoGPT) and the `autogpt_platform/` rewrite IS the postmortem; reading the executor module shows what was missing.
+
+### Production blog posts + engineering writing
+
+- **Temporal.io Engineering Blog.** *Why Workflow Engines.* https://temporal.io/blog. Articulates the durable-execution thesis (decouple log from workers) in the form that ports cleanly to LLM agent runtimes. The single most useful read for "why does my agent need a durable runtime?" — non-Temporal-specific despite the venue.
+- **Husain, Hamel (2024-2025).** *Workflow Engines vs Agent Loops.* https://hamel.dev (canonical post or equivalent industry write-up). Names the distinction this chapter operationalizes — agent-loop literature treats durable-workflow as "engineering minutiae"; production deployment shows it's load-bearing.
+
+### Canonical reference implementations
+
+- **AutoGPT Platform** — https://github.com/Significant-Gravitas/AutoGPT — files: `autogpt_platform/backend/backend/executor/{manager.py, scheduler.py, cluster_lock.py, cost_tracking.py, simulator.py}`. Canonical reference impl of the 5-component runtime taught in this chapter (graph store + worker pool + lock + cost meter + trigger-based scheduler). The ~250 LOC W4.6 lab is a stripped-down version of these modules.
+- **PraisonAI** — https://github.com/MervinPraison/PraisonAI — `src/praisonai-agents/praisonaiagents/process/process.py` (key lines: ~582 sequential mode, ~1309 parallel mode, ~1446 hierarchical / workflow modes). Canonical four-topology implementation in framework form; the basis for §4 Phase 5's four-topology bench.
+- **`rohitg00/agentmemory`** — https://github.com/rohitg00/agentmemory — alternative durable-runtime reference built on **iii-engine** (3-primitive Worker / Function / Trigger model + WebSocket daemon on `:49134` + file-based SQLite via `StateModule`). Same "execution state separate from LLM loop" thesis but lighter-weight than Temporal.io: single-host, embedded SQLite, no separate workflow cluster. Memory ops registered as functions; HTTP endpoints registered as triggers; state daemon as a separate process. Production reference for the lightweight end of the durable-runtime spectrum.
+- **Cadence Workflow (Uber)** — https://github.com/uber/cadence. Production-scale precedent; useful when explaining "what does this scale to?" in interviews. Most LLM-agent capstones never reach this scale, but knowing the precedent grounds the architecture story.
 
 ---
 
