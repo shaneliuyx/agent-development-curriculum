@@ -522,8 +522,33 @@ class Interaction:
             self._speak(response)
         return response
 
-    def _capture_audio(self) -> bytes: ...  # impl elided
-    def _play(self, audio) -> None: ...     # impl elided
+    def _capture_audio(self) -> bytes:
+        """Block on the mic until the user finishes speaking. ~5 lines of
+        pyaudio per the established Phase 4/5 pattern; returns raw PCM bytes
+        for the STT engine. VAD-based end-of-speech detection is the variant
+        used in §3 — this minimal version reads a fixed window.
+        """
+        import pyaudio
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                         input=True, frames_per_buffer=1024)
+        # 3-second fixed window for the minimal version; swap to VAD loop
+        # (§3 / §5 main-loop pattern) when integrating with full agent.
+        frames = b"".join(stream.read(1024, exception_on_overflow=False)
+                          for _ in range(int(16000 / 1024 * 3)))
+        stream.close(); pa.terminate()
+        return frames
+
+    def _play(self, audio: bytes) -> None:
+        """Stream raw PCM audio bytes to the default output device.
+        Matches the §2 ElevenLabs `speak()` shape — same pyaudio open/write
+        /close ritual, ~22050 Hz mono int16 for ElevenLabs / Piper streams.
+        """
+        import pyaudio
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=22050, output=True)
+        stream.write(audio)
+        stream.close(); pa.terminate()
 ```
 
 **Walkthrough:**
