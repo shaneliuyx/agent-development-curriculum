@@ -2160,17 +2160,302 @@ async def test_two_tier_beats_singles_on_aggregate():
 
 Two-tier should beat each single-tier by ≥20% absolute on aggregate.
 
-### 5.3 Optional — LongMemEval `oracle` subset
+### 5.3 Optional — LongMemEval `oracle` subset (STRETCH)
 
-For industry-standard comparison:
+For industry-standard comparison against EverCore's published 83% baseline. Status: `(SPEC — to be measured on actual run)`. The procedure below is fully runnable; the comparison number depends on YOUR specific consolidation-pipeline + summarizer choices.
+
+**Prerequisites:**
+
+- Phases 1-4 complete; `TieredMemory` instance + `consolidate()` working end-to-end against guild + EverCore (or Qdrant via Phase 7 swap).
+- oMLX endpoint up (or equivalent LLM-as-judge endpoint for scoring).
+- ~$0-2 cloud spend if using a cloud judge model; $0 with local oMLX scoring.
+- ~45-90 min wall-clock for a full 50-Q run (depends on session-replay length and judge-model latency).
+
+**Step 1 — Download the oracle subset.**
 
 ```bash
-# Download LongMemEval oracle subset (~50 questions)
 cd ~/code && git clone https://github.com/xiaowu0162/LongMemEval.git
-cp -r LongMemEval/data ~/code/agent-prep/lab-03-5-8-two-tier/data/longmemeval/
+# Copy oracle subset into the lab's data dir
+mkdir -p ~/code/agent-prep/lab-03-5-8-two-tier/data/longmemeval
+cp LongMemEval/data/longmemeval_oracle.json \
+   ~/code/agent-prep/lab-03-5-8-two-tier/data/longmemeval/
+
+# Verify the file landed + inspect shape
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+uv run python -c "
+import json
+data = json.load(open('data/longmemeval/longmemeval_oracle.json'))
+print(f'Total questions: {len(data)}')
+print(f'First question keys: {list(data[0].keys())}')
+print(f'First question: {data[0][\"question\"][:120]}')
+"
 ```
 
-Re-run the two-tier system against this set. EverCore's published score is **LongMemEval 83%**. A from-scratch two-tier built in one lab day shouldn't beat this — but matching ≥70% would be a strong signal. If you trail by >30 percentage points, the consolidation pipeline's summarizer is the most likely culprit (under-summarizing → loss of detail vs over-summarizing → loss of nuance).
+Expected output: `Total questions: ~50` (oracle subset; exact count varies by repo version), keys include `question_id`, `question`, `answer`, `haystack_sessions` (list of past conversations the memory system should have ingested), `answer_session_ids` (the specific sessions containing the answer evidence).
+
+**Step 2 — Add a runner script `scripts/run_longmemeval_oracle.py`.**
+
+The runner does three things per question: (a) feed `haystack_sessions` through the two-tier consolidation pipeline (so the memory system has seen the relevant facts), (b) query the memory + compose an LLM answer using `query_context()`, (c) score the answer against gold via LLM-as-judge.
+
+```python
+"""LongMemEval oracle eval runner — two-tier memory architecture.
+
+Replay haystack sessions into the consolidation pipeline, query the
+resulting memory, score the answer against the oracle gold via
+LLM-as-judge. Aggregate accuracy + per-question pass/fail.
+
+Run: uv run python scripts/run_longmemeval_oracle.py \\
+        --limit 50 --campaign longmemeval-oracle-2026-05-19
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+
+from openai import OpenAI
+
+from src.tiered_memory import TieredMemory   # or tiered_memory_qdrant
+from src.consolidation import consolidate
+
+
+JUDGE_PROMPT = """You are an evaluation judge. Decide if the agent's answer
+substantively matches the gold answer. Output exactly one word: CORRECT
+or INCORRECT.
+
+Question: {question}
+Gold answer: {gold}
+Agent answer: {answer}
+
+Rules:
+- Paraphrase OK; exact wording not required.
+- Missing details = INCORRECT.
+- Extra correct details OK.
+- Hallucinated wrong details = INCORRECT.
+Output: CORRECT or INCORRECT"""
+
+
+async def run_one_question(tm: TieredMemory, q: dict, llm: OpenAI, judge_model: str) -> dict:
+    """Process one LongMemEval question end-to-end. Returns scored result."""
+    qid = q.get("question_id") or q["question"][:32]
+    question = q["question"]
+    gold = q["answer"]
+    sessions = q.get("haystack_sessions", [])
+
+    # (a) Replay all haystack sessions into the consolidation pipeline.
+    #     Each session becomes one quest; complete_task carries the
+    #     session content as the report.
+    t0 = time.perf_counter()
+    for i, session in enumerate(sessions):
+        # Serialize session messages into a single report
+        report = "\\n".join(
+            f"{m['role']}: {m['content']}"
+            for m in (session if isinstance(session, list) else session.get("messages", []))
+        )
+        quest_id = await tm.post_task(
+            subject=f"{qid}-session-{i}",
+            spec=report[:200],
+            campaign=q.get("campaign") or "longmemeval",
+        )
+        claim = await tm.claim_task(quest_id)
+        if claim["won"]:
+            await tm.complete_task(quest_id, report=report)
+    ingest_s = time.perf_counter() - t0
+
+    # (b) Run the consolidation batch to lift sessions → semantic memory.
+    t1 = time.perf_counter()
+    result = await consolidate(tm, use_atomisation=True, promotion_threshold=0.5)
+    consolidate_s = time.perf_counter() - t1
+
+    # (c) Query memory + compose answer.
+    t2 = time.perf_counter()
+    candidates = tm.query_context(question, k=8, min_confidence=0.5)
+    if not candidates:
+        agent_answer = "I don't have information about that."
+    else:
+        ctx = "\\n".join(f"- {c['content']}" for c in candidates[:8])
+        resp = llm.chat.completions.create(
+            model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
+            messages=[
+                {"role": "system",
+                 "content": "Answer the question using ONLY the context below. "
+                            "If the context does not contain the answer, say so."},
+                {"role": "user",
+                 "content": f"Context:\\n{ctx}\\n\\nQuestion: {question}"},
+            ],
+            temperature=0.0,
+            max_tokens=300,
+        )
+        agent_answer = (resp.choices[0].message.content or "").strip()
+    answer_s = time.perf_counter() - t2
+
+    # (d) Score answer via LLM-as-judge.
+    judge_resp = llm.chat.completions.create(
+        model=judge_model,
+        messages=[
+            {"role": "user",
+             "content": JUDGE_PROMPT.format(
+                 question=question, gold=gold, answer=agent_answer
+             )},
+        ],
+        temperature=0.0,
+        max_tokens=10,
+    )
+    verdict = (judge_resp.choices[0].message.content or "").strip().upper()
+    correct = verdict.startswith("CORRECT")
+
+    return {
+        "question_id": qid,
+        "question": question,
+        "gold": gold,
+        "agent_answer": agent_answer,
+        "verdict": verdict,
+        "correct": correct,
+        "facts_imprinted": result.facts_imprinted,
+        "scrolls_demoted": result.scrolls_demoted,
+        "candidates_returned": len(candidates),
+        "ingest_s": round(ingest_s, 2),
+        "consolidate_s": round(consolidate_s, 2),
+        "answer_s": round(answer_s, 2),
+    }
+
+
+async def main(limit: int, campaign: str, out_path: Path) -> None:
+    data_path = Path("data/longmemeval/longmemeval_oracle.json")
+    questions = json.loads(data_path.read_text())[:limit]
+
+    llm = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
+    judge_model = os.getenv("MODEL_JUDGE", "gpt-oss-20b-MXFP4-Q8")
+
+    async with TieredMemory(agent_id=f"longmemeval-{campaign}") as tm:
+        results = []
+        for i, q in enumerate(questions, 1):
+            print(f"[{i}/{len(questions)}] {q.get('question_id', q['question'][:40])}...", flush=True)
+            try:
+                r = await run_one_question(tm, q, llm, judge_model)
+                results.append(r)
+                print(f"  → {r['verdict']} (ingest {r['ingest_s']}s + cons {r['consolidate_s']}s + ans {r['answer_s']}s)")
+            except Exception as e:                                       # noqa: BLE001
+                print(f"  → ERROR: {type(e).__name__}: {e}")
+                results.append({"question_id": q.get("question_id"), "error": str(e), "correct": False})
+
+    n_correct = sum(1 for r in results if r.get("correct"))
+    n_total = len(results)
+    n_err = sum(1 for r in results if r.get("error"))
+    accuracy = n_correct / n_total if n_total else 0.0
+
+    summary = {
+        "campaign": campaign,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_questions": n_total,
+        "correct": n_correct,
+        "errors": n_err,
+        "accuracy": round(accuracy, 4),
+        "evercore_published": 0.83,
+        "delta_vs_evercore": round(accuracy - 0.83, 4),
+        "per_question": results,
+    }
+    out_path.write_text(json.dumps(summary, indent=2))
+    print(f"\\nFinal: {n_correct}/{n_total} = {accuracy:.1%} (errors: {n_err}). EverCore baseline: 83%. Delta: {summary['delta_vs_evercore']:+.1%}.")
+    print(f"Wrote {out_path}")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--campaign", type=str, default="longmemeval-oracle")
+    p.add_argument("--out", type=Path, default=Path("results/longmemeval_oracle.json"))
+    args = p.parse_args()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    asyncio.run(main(args.limit, args.campaign, args.out))
+```
+
+**Step 3 — Run the eval.**
+
+```bash
+# From lab root
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+
+# Smoke test on 3 questions first (verifies env + pipeline before paying for full run)
+uv run python scripts/run_longmemeval_oracle.py \
+    --limit 3 \
+    --campaign longmemeval-smoke-$(date +%Y%m%d) \
+    --out results/longmemeval_smoke.json
+
+# Inspect smoke result
+uv run python -c "
+import json
+r = json.load(open('results/longmemeval_smoke.json'))
+print(f\"Smoke: {r['correct']}/{r['total_questions']} = {r['accuracy']:.1%}\")
+for q in r['per_question']:
+    print(f\"  {q.get('verdict', 'ERROR')}: {q['question'][:80]}\")
+"
+
+# Full 50-Q run if smoke looks reasonable
+uv run python scripts/run_longmemeval_oracle.py \
+    --limit 50 \
+    --campaign longmemeval-oracle-$(date +%Y%m%d) \
+    --out results/longmemeval_oracle.json
+```
+
+Expected wall-clock: ~45-90 min for full 50-Q run. Per-question: ~1-2 min for haystack replay, ~10-20s for consolidate atomisation+imprint, ~5-10s for query + answer compose + judge.
+
+**Step 4 — Inspect results + interpret.**
+
+```bash
+# Quick aggregate readout
+uv run python -c "
+import json
+r = json.load(open('results/longmemeval_oracle.json'))
+print(f\"Accuracy: {r['accuracy']:.1%} ({r['correct']}/{r['total_questions']})\")
+print(f\"EverCore baseline: {r['evercore_published']:.1%}\")
+print(f\"Delta: {r['delta_vs_evercore']:+.1%}\")
+print(f\"Errors: {r['errors']}\")
+
+# Failure-mode breakdown
+incorrect = [q for q in r['per_question'] if not q.get('correct') and not q.get('error')]
+print(f'\\nIncorrect breakdown:')
+print(f\"  No candidates returned: {sum(1 for q in incorrect if q['candidates_returned'] == 0)}\")
+print(f\"  Candidates returned but wrong answer: {sum(1 for q in incorrect if q['candidates_returned'] > 0)}\")
+"
+```
+
+**Step 5 — Update RESULTS.md.**
+
+```markdown
+## LongMemEval oracle subset — YYYY-MM-DD
+
+- Questions: 50 (oracle subset, xiaowu0162/LongMemEval@<sha>)
+- Accuracy: NN.N% (correct/total)
+- EverCore published baseline: 83.0%
+- Delta: +X.X% / -X.X%
+- Wall-clock: NNN min
+- Cost: $N.NN (judge model: <model>)
+
+### Failure breakdown
+- No candidates retrieved: N (memory consolidation missed the relevant facts)
+- Candidates retrieved but wrong answer: N (composer LLM failed to ground in context)
+- Errors / timeouts: N
+
+### Interpretation
+- <Concrete observation, e.g. "Trail by 20% — consolidation summarizer under-extracts on multi-turn user-preference questions">
+- <Action, e.g. "Tighten ATOMIZE_PROMPT type-tagging; rerun on 10-Q sample to verify delta>
+```
+
+**Interpreting the delta vs EverCore's 83%:**
+
+- **≥70% (within 13 percentage points):** Strong signal. The two-tier architecture matches industry-grade memory on its hardest benchmark. Interview gold: "I built a from-scratch two-tier and scored XX% on LongMemEval oracle vs EverCore's published 83% — the gap was concentrated on multi-turn user-preference questions where my summarizer under-extracted; tightening the atomisation prompt closed the gap to <5%."
+- **50-70%:** Defensible. Names a specific weak spot. Most likely culprit: the consolidation summarizer is too aggressive (loses detail) OR atomisation type-tags are mis-categorising user-preference statements as `observation` (filtered out by `type_filter=['fact']` at query time).
+- **<50%:** Probably a pipeline bug, not a model-quality issue. Check (a) all haystack sessions actually consolidated (`facts_imprinted > 0` for every question), (b) `query_context()` returns candidates (`candidates_returned > 0` for failing Qs), (c) judge model isn't being too strict on paraphrase.
+
+**LongMemEval-specific gotchas:**
+
+- **Haystack session order matters for some question categories.** Single-session questions (one conversation contains the answer) score higher than multi-session-reasoning questions. Aggregate accuracy hides this asymmetry — break out per-category in `RESULTS.md` if your delta is large.
+- **The judge model matters.** A weak local judge model (gpt-oss-20b) misjudges paraphrase frequency, inflating INCORRECT counts. Re-running the judge step with Claude / GPT-4 against your saved per-question results gives a cleaner accuracy number for the interview narrative (cost: ~$0.20 on Claude 4.6 Haiku for 50 questions × 2 sentences each).
+- **Time budget: consolidation dominates.** ~70% of per-question wall is consolidation atomisation (one LLM call per scroll × N scrolls). Use `use_atomisation=False` for a faster pass if you're iterating on the query/answer side; switch back ON before final measurement run.
 
 `★ Insight ─────────────────────────────────────`
 - **The benchmark numbers are the architecture's defense.** Anyone can claim "two-tier is better"; the differential on a 15-Q probe is the proof. Without these numbers, the lab is a tutorial; with them, it's a measurement-driven architecture report.
