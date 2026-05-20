@@ -2913,6 +2913,116 @@ In all six: the conversation IS the data. EverCore's pipeline does work (boundar
 
 Route at write-time by data shape: facts → Qdrant; dialogues → EverCore. Same agent, two semantic backends behind a router. This is the topology multi-modal production agent systems actually ship.
 
+### Production runbook — refined atomisation router (synthesizing §3.x + §5.3.1-5.3.4 + industry survey)
+
+The ablation runs in §5.3 produced four mechanical invariants that go beyond "tag at write site and hope" (the layer-1-only pattern most production systems on the market ship today — Mem0, Zep, Letta, Synap, OrchStack, Memori, RetainDB all default to this). This subsection consolidates the full architecture as a deployable runbook.
+
+#### Architecture: three-layer router + four invariants + deployment gate
+
+```text
+WRITE PATH ─────────────────────────────────────────
+  imprint(content, metadata={"speaker": role, ...})
+    │
+    ├─ Layer 1: declarative tag check (Mem0/Zep/Letta pattern)
+    │     metadata["ingest_source"] in {conversation, task_scroll,
+    │       log_stream, user_profile} → route by tag → done
+    │
+    ├─ Layer 1.5: speaker-role auto-tag (CLAIV pattern)
+    │     speaker=user → preferences extractor (typed schema)
+    │     speaker=assistant → commitments extractor (audit log)
+    │     speaker=system → rules extractor (durable, write-time)
+    │     speaker=tool → typed outputs (structured schema, write-time)
+    │
+    ├─ Layer 2: schema-shape classifier (cheap heuristic)
+    │     features: turn markers, JSON keys, timestamp regularity,
+    │                inter-record similarity, token entropy
+    │     confidence > 0.85 → route → done
+    │
+    ├─ Layer 3: default to READ-time atomise (conservative)
+    │     rationale: late-binding is reversible (re-atomise later);
+    │                early-binding destroys raw signal irreversibly
+    │
+    └─ INVARIANTS (none optional; each measured cost shown):
+       (a) ALWAYS preserve raw alongside derived          [industry]
+       (b) ENFORCE K_min ≥ 8 triples or DROP derived      [§5.3.4: −35pts if violated]
+       (c) NEVER position derived facts above raw         [§5.3.3 v5/v7: −30pts if violated]
+       (d) DEPLOY only after A/B beats raw-only baseline  [calibration gate]
+
+READ PATH ──────────────────────────────────────────
+  retrieve from raw_store + fact_store (parallel)
+    │
+    ├─ if facts_returned < K_min → DROP facts, use raw only
+    ├─ if facts_returned ≥ K_min → compose with both:
+    │     prompt order:
+    │       1. Question
+    │       2. Raw context (FIRST — anchoring weight protection)
+    │       3. Derived facts (LAST — neutral framing only)
+    │
+    └─ MONITOR: per-fact provenance + post-hoc query-pattern adaptation
+                track which facts anchor wrong answers in production
+
+DEPLOYMENT GATE ────────────────────────────────────
+  Before shipping any new extractor (write-time OR read-time):
+    A: composer(question, raw)              → answer_A
+    B: composer(question, raw + extractor(raw)) → answer_B
+    REQUIRE: accuracy(B) ≥ accuracy(A) + 3pts on held-out eval
+    REJECT if accuracy(B) ≤ accuracy(A) — the extractor poisons, not helps
+```
+
+#### Invariant provenance — every rule is paid-for
+
+| # | Invariant | Source (measured) | Cost if violated |
+|---|-----------|-------------------|------------------|
+| (a) | Preserve raw alongside derived | Industry survey (Mem0/Zep/Letta/Governed Memory) + BCJ Entry 16 (§3.x destructive consolidation) | Unrecoverable signal loss; late-time fixes impossible |
+| (b) | K_min ≥ 8 minimum-volume floor | §5.3.4 phase transition (1 triple vs 14-57 triples) + BCJ Entry 18 | **−30 to −35pts** uniform across capability range |
+| (c) | Raw context positioned FIRST | §5.3.3 v5/v7 ablation (constrained K=5 + keep-raw + position-tested) | Contributes to (b)'s catastrophic regression |
+| (d) | A/B deployment calibration gate | §5.3.4 implication (extractor accuracy < consumer trust → poison) | Catastrophic, unbounded cap on regression |
+
+#### Calibration gate as the highest-ROI add
+
+Most production memory systems skip step (d) because they assume the extractor is a strict improvement over raw. The empirical evidence in §5.3 proves that assumption can be wrong by **30pts**. A 4-line mechanical check before deployment catches this:
+
+```python
+def gate_extractor_deployment(extractor, eval_set, threshold=3):
+    """Mechanical pre-deploy check. Returns True if extractor strictly
+    improves composer accuracy by >= threshold pts."""
+    a = score(eval_set, lambda q: compose(q, retrieve_raw(q)))
+    b = score(eval_set, lambda q: compose(q, retrieve_raw(q) + extractor(retrieve_raw(q))))
+    if b < a + threshold:
+        return False  # do NOT ship — extractor poisons
+    return True
+```
+
+Any extractor that doesn't beat raw-only by ≥3pts on representative data is REJECTED, not shipped. This single gate would have caught the constrained-atomise variant before any of v4/v5/v7/v9 reached the eval.
+
+#### Per-tier policy matrix
+
+| Data shape | Lifecycle | Tier | Extractor | K_min | Calibration gate |
+|---|---|---|---|---|---|
+| Structured durable facts (user prefs, ACID records) | Write-time | guild (operational) | typed schema | n/a (schema-bounded) | Yes — schema consistency check |
+| Conversational episodic (sessions, dialogue, free-text events) | Read-time | Qdrant (semantic) | unconstrained atomise | ≥8 triples | Yes — A/B vs raw-only |
+| Log streams (telemetry, audit events) | Write-time | typed index | per-source schema | n/a | Yes — schema validation |
+| User profiles (preferences, settings) | Write-time | guild + dedicated profile table | typed extractor | n/a | Yes — schema + diff check |
+
+#### Operating-point recommendations (measured on M5 Pro 4-bit MLX, N=20 oracle subset)
+
+| Operating point | Configuration | Acc | Wall (20-Q) | Use when |
+|---|---|---|---|---|
+| **Cheap best-Pareto** | Commit-biased prompt only, no atomise | 60-70% | ~6-8 min | latency-critical inference |
+| **Best accuracy** | Unconstrained read-time atomise + keep raw | 65-75% | ~35-48 min | offline batch / quality-critical |
+| **Avoid** | Constrained K<8 atomise (any variant) | 25-60% | varies | NEVER ship |
+
+#### Foreshadowing — open production direction
+
+Automatic K_min calibration per-extractor is the obvious next step: instead of fixing K_min=8, learn it per-extractor by tracking (volume × downstream accuracy) curves and finding the inflection point. The §5.3.4 phase transition is real and measurable; tuning it from data instead of hardcoding is publishable.
+
+`★ Insight ─────────────────────────────────────`
+- **The runbook is mechanical, not aspirational.** Each invariant can be checked at deployment time without human judgment. K_min is a count; the A/B gate is an inequality; position is a prompt-template rule; provenance is a logging requirement. This is the senior-engineering signal — invariants enforced by construction, not by code review discipline.
+- **The runbook directly contradicts the dominant production memory design pattern.** "Let the extractor pick the K most relevant facts" appears frequently in production memory write-ups; the §5.3 empirical evidence shows this is unsafe at any model size when extractor accuracy is not near-perfect. Ship volume buffering OR ship raw-only — the middle ground destroys accuracy.
+- **The cross-stage symmetry is the deepest pattern.** Same authority-weight failure mode at WRITE time (BCJ Entry 16: SUMMARIZE_PROMPT emits 1-3 facts that anchor retrieval) and READ time (BCJ Entry 18: constrained atomise emits 1 triple that anchors composer). Once you see it at both stages, you see it everywhere — RAG re-rankers, embedding-time chunking, write-time summarisation, schema-on-write databases. The runbook is a memory-specific instantiation of a general pipeline-design discipline.
+- **Pareto note**: in this lab's measurement window, the cheap operating point (commit prompt only, no atomise) is within 5pts of the best operating point (Opus + unconstrained atomise) at 1/6 the wall-clock cost. For production agents whose latency budget is tight, dropping atomise entirely and relying on commit-biased prompting + raw retrieval is the rational choice. Atomise pays off only when the latency budget can absorb 5-10x slowdown for ~5pts accuracy.
+`─────────────────────────────────────────────────`
+
 ### What EverCore's pipeline ACTUALLY does (the value you pay 5x latency for)
 
 | Capability | What it gives you | Cost without EverCore (DIY) |
