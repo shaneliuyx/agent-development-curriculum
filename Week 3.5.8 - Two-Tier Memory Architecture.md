@@ -2573,6 +2573,8 @@ Measured impact of the swap: 20-Q accuracy went **0/20 (atomisation + quality-ga
 
 #### 5.3.2 Six-model accuracy + wall-clock matrix (20-Q oracle slice, measured 2026-05-19)
 
+> **⚠️ SUPERSEDED (2026-05-20).** The matrix below was measured on a contaminated Qdrant collection — a reused `longmemeval-{qid}` namespace accumulated cross-run residue and scrambled the numbers in every direction (one model off by +40pts). The corrected clean matrix, and the five harness bugs that produced the error, are in **[[Week 3.5.8 - Two-Tier Memory Architecture#Measurement-harness discipline — five bugs that scrambled the §5.3.2 matrix (diagnosed 2026-05-20)|Production Considerations → Measurement-harness discipline]]**. Read that, not the table below. The table is kept only as the worked example the discipline section dissects.
+
 > **Slice caveat.** The first 20 questions of `longmemeval_oracle.json` are all `temporal-reasoning`. This is a sub-benchmark, not full LongMemEval. Stratified N≥100 sampling across the 5 question-types is the next-rung measurement.
 > **Noise floor.** N=20 with quantized 4-bit inference exhibits ±5pt stochastic drift at temp=0 (MLX KV-cache + fp4 rounding non-determinism). Differences ≥10pts are signal; <5pts are at the noise edge.
 
@@ -3074,6 +3076,61 @@ Before shipping any atomisation / extraction pipeline:
 - [ ] **Default to read-time atomise** for conversational data — late-binding is reversible, early-binding destroys raw signal irreversibly.
 - [ ] **Match accuracy claims to instrument resolution.** N=5 has 20pt granularity; do not claim a +3pt win on it. Use non-regression claims when the true effect is below the noise floor.
 - [ ] **Make the verification harness exit non-zero on any failed claim** so CI can gate on it.
+
+#### Measurement-harness discipline — five bugs that scrambled the §5.3.2 matrix (diagnosed 2026-05-20)
+
+The original §5.3.2 six-model matrix was wrong. Not "noisy" — **wrong**, in every direction at once. A clean re-run with five harness fixes produced materially different numbers. This subsection records the bugs and the disciplines that catch them, because *the eval harness is itself production code* — every bug here is one a real eval/benchmark pipeline can ship.
+
+##### The clean matrix (RUN_ID isolation + max_tokens compose=4000/judge=1000 + verdict-label parser, measured 2026-05-20)
+
+| Rank | Model | Clean acc | Duration | Type | Old (confounded) | Error |
+|---|---|---|---|---|---|---|
+| 🥇 | Qwen3.5-27B-Opus-distill | **80%** | 16m 34s | dense | 70% | +10 |
+| 🥈 | Qwen3.5-35B-A3B-Opus-distill | **65%** | 3m 47s | MoE (A3B) | 25% | +40 |
+| 🥉 | gemma-4-26B-A4B | **60%** | 1m 17s | MoE (A4B) | 65% | −5 |
+| 4 | Qwen3.6-35B-A3B-nvfp4 | **55%** | 1m 13s | MoE (A3B) | 55% | 0 |
+| 5 | Qwen3.6-27B-4bit | **50%** | 3m 20s | dense | 60% | −10 |
+
+EverCore published baseline 83%. Best local: Qwen-27B-Opus **80% — only −3pts**, not the −13pts the confounded matrix claimed. Opus-MoE confirmed across **three** independent clean runs (65/65/65 — and a fourth at 70 that was the noise-floor high). Models absent from disk (`Qwen3.6-35B-A3B-UD-MLX`, `DeepSeek-R1-Distill-32B`) could not be re-verified; their old numbers are dropped.
+
+##### Bug 1 — cross-run store residue (the matrix-scrambler)
+
+The runner set `tm.user_id = f"longmemeval-{qid}"` with **no per-run isolation**. Qdrant persists between invocations, so every eval run this session imprinted into the *same* per-qid namespace — 7+ runs accumulated as duplicate points. `k=8` retrieval then saturated on residue: a probe on a fresh namespace returned the haystacks' true 2-3 sessions, while the contaminated eval returned 8 for *every* question.
+
+The damage was not uniform. Duplicate context is the *same content, more of it*. A dense 27B tolerates the bloat (and the redundant correct signal can even *help* a weak model — Qwen3.6-27B 60→50 when cleaned). A 3B-active MoE *drowns* in 32K chars of mostly-duplicated context and abstains on all of it (Opus-MoE 25→65 when cleaned). **Same bug, opposite sign by architecture — which is why it scrambled the ranking instead of shifting it.**
+Fix: `RUN_ID = str(int(time.time()))` at import; `user_id = f"longmemeval-{RUN_ID}-{qid}"`. Every run gets a disjoint namespace. (Identical to the MVP's `(run, mode, question)` isolation and to BCJ Entry 14 — this is the *third* recurrence of cross-test residue in this chapter's lab. It keeps coming back because a persistent store is shared mutable state and the default namespace is too coarse.)
+
+##### Bug 2 — silent compose truncation
+
+`max_tokens=600` on the compose call silently truncated reasoning-distilled models mid-CoT: the model never emitted `<answer>`, the parser fell back to the last line (CoT prose), and a *correct* answer scored INCORRECT. The bug is invisible without instrumentation — the output looks like a normal (wrong) answer.
+Fix: capture `finish_reason`; a `length` finish sets `compose_truncated=True`, surfaces per-question (`[!] compose TRUNCATED`) and in the run summary, and flags the accuracy as a lower bound. Budget raised 600→1500→2000→4000 as evidence (each `finish_reason=length` observation) demanded.
+
+##### Bug 3 — silent judge truncation
+
+The same bug, one call later. `max_tokens=400` on the judge truncated a *verbose self-judging* model (an Opus-distilled model judging its own answers writes multi-step `**Analysis:** 1... 2... 3. Verification:` prose) before it reached the verdict word — 2/20 verdicts came back UNKNOWN, scored as wrong. Lesson: **when you raise a token cap, raise it everywhere the same model class is used.** Compose and judge are different calls with different budgets; fixing one is not fixing the bug. Fix: judge 400→1000, `judge_truncated` flag.
+
+##### Bug 4 — verdict-vs-prose parser collision
+
+A whole-text `rfind("INCORRECT")` scan flips a verdict when the judge emits `**Verdict: CORRECT**` *then* reasoning prose containing the ordinary word "incorrect" ("no hallucinated or incorrect information"). The rfind grabs the prose word.
+Fix: two-tier parser — Tier 1 prefers an explicit labeled verdict (`re.search(r"verdict\s*[:\-]?\s*\**\s*(INCORRECT|CORRECT)\b", ...)`); Tier 2 falls back to the rfind scan only when no label exists. A labeled verdict is unambiguous wherever it sits in the text.
+
+##### Bug 5 — no client timeout → a transient hang kills the whole job
+
+The `OpenAI` client had no `timeout`. When oMLX auto-evicted a model mid-request (a transient `KeyError` in its server log), the compose HTTP call hung *forever* — a 5-model sequential matrix run deadlocked on question 1 of model 1, silent, holding the slot.
+Fix: `OpenAI(..., timeout=300.0, max_retries=2)`. A hang now raises after 300s, the per-question `try/except` logs it as an error, and the run proceeds. **A hang is worse than a crash** — a crash has an exit code; a hang is invisible. Any long batch job against a local server needs an explicit client timeout.
+
+##### Non-bug — the runaway-CoT loop
+
+One Opus-MoE compose call truncated at *every* budget tested (600→4000). The model loops on hard temporal arithmetic — "Wait, let me recalculate... Actually I need to be more precise... I'm verifying..." — circular self-checking that never converges. **A token cap cannot fix a non-terminating generation**; raising `max_tokens` only moves the truncation point. The real fix is generation control (repetition penalty, stop sequence), not budget. Left as 1/20 flagged truncation — accuracy held at 65% regardless.
+
+##### The disciplines (distilled)
+
+- **Isolate per-run namespaces in any persistent store** a benchmark touches. The default per-entity namespace is too coarse; add a `RUN_ID`. Unstable run-over-run numbers on identical inputs = residue, not model nondeterminism.
+- **Instrument `finish_reason` on every LLM call.** Treat `length` as a run-invalidating flag, never a silent result. Truncation corrupts in both directions — lost answers AND false positives from truncated prose.
+- **Raise token budgets by evidence, not by symmetry.** Each compose bump followed an observed truncation; the judge stayed at 1000 because it showed zero truncations. Bigger `max_tokens` widens the worst-case latency ceiling — pay it only when the data says to.
+- **Prefer a labeled-field parser over a whole-text scan.** Reasoning models emit prose that contains your sentinel words as ordinary language. A `Verdict:` label is unambiguous; an `rfind` is not.
+- **Give every client an explicit timeout.** A local inference server *will* hiccup; without a timeout one hiccup deadlocks the batch.
+- **A benchmark on shared mutable state is not a measurement.** The whole §5.3.2 matrix was invalidated by one un-isolated namespace. Treat the eval harness with the same rigor as the system under test — it *is* production code.
 
 ### What EverCore's pipeline ACTUALLY does (the value you pay 5x latency for)
 
