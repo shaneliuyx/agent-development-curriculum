@@ -3023,6 +3023,58 @@ Automatic K_min calibration per-extractor is the obvious next step: instead of f
 - **Pareto note**: in this lab's measurement window, the cheap operating point (commit prompt only, no atomise) is within 5pts of the best operating point (Opus + unconstrained atomise) at 1/6 the wall-clock cost. For production agents whose latency budget is tight, dropping atomise entirely and relying on commit-biased prompting + raw retrieval is the rational choice. Atomise pays off only when the latency budget can absorb 5-10x slowdown for ~5pts accuracy.
 `─────────────────────────────────────────────────`
 
+#### Runbook verification — the MVP that proves it (measured 2026-05-20)
+
+The runbook above is prose until something runs it. `lab-03-5-8-two-tier/scripts/run_production_mvp.py` + `src/production_router.py` are a runnable verification harness — they exercise every invariant and exit non-zero if any regresses. CI-ready.
+
+**Layer 1 is deliberately excluded.** Declarative tags require pre-existing metadata that real ingest streams do not carry. The MVP proves the architecture works *without* them — Layer 1.5 (speaker-role auto-tag) + Layer 2 (schema-shape classifier) auto-classify with zero human input. Layer 1 is an optimisation when tags happen to exist, not a dependency.
+
+##### The four verification claims
+
+| Claim | What it tests | Mechanism | Result (5-Q smoke, Opus) |
+|---|---|---|---|
+| **C1 — classifier** | Auto-classifier tags conversational sessions without human tags | Feed each session to `classify_workload()`; count `CONVERSATION` tags | **11/11 = 100%** — routing works tag-free |
+| **C2 — K_min floor** | Volume-floor guardrail discards under-volume extractor output | Mechanical (no LLM): `safe_atomise()` on a 15-triple "good" and a 1-triple "bad" fake extractor, `K_min=8` | good passes; **bad → empty triples + `dropped_below_k_min=True`** |
+| **C3 — deployment gate** | A/B gate rejects a poison extractor before production | Run 5-Q raw-only vs constrained-1-triple extractor; feed both to `deployment_gate()` | bad scored **−40pts**; gate `ship=False` — **rejected** |
+| **C4 — non-regression** | Production-mode with all guardrails does not hurt accuracy | Run 5-Q baseline (raw-only) vs production-mode (classify → atomise → K_min → position) | baseline 80% = production 80%, **Δ=0 ≥ −3pt floor** |
+
+All four PASS. `run_production_mvp.py --limit N` exits 0 only if every claim holds.
+
+##### Why C4 tests non-regression, not improvement
+
+C4's claim is "production-mode does not regress" (Δ ≥ −3pts), NOT "production beats baseline by +3pts". The honest reason: §5.3.2 measured atomise's real lift at **+5pts**, which sits AT the ±5pt noise floor. On N=5, one question = 20 points of granularity — a +5pt effect is invisible at that resolution. C4 cannot honestly claim improvement; it CAN verify the four guardrails do not *break* anything. Δ=0 proves the pipeline is safe to run — no catastrophic anchoring collapse leaked through. **Match the claim to what the instrument can actually measure** — claiming a +3pt win on an instrument with 20pt granularity is measurement theatre.
+
+##### Bring-up bug trail — the harness debugged itself
+
+The MVP took four smoke iterations (v1→v4) to reach all-pass. The two bugs it caught are themselves best-practice lessons:
+
+| Bug | Symptom | Root cause | Fix |
+|---|---|---|---|
+| Classifier too strict | C1 v1: 1/11 sessions tagged conversation (9%) | `turn_density` (markers ÷ lines) broke on multi-line message *content* — one `user:` marker but 50 content lines → density 0.02 ≪ 0.15 threshold | Count **distinct speakers** (≥2 → conversation), not line-fraction |
+| Namespace collision | C3/C4 v2: ±40pt swings run-to-run on identical inputs | baseline + production pipelines ran back-to-back on one `TieredMemory` with the same per-question `user_id` → second run **double-imprinted** the sessions (BCJ Entry 14 recurrence) | Per-`(run, mode, question)` namespace: `mvp-{RUN_ID}-{mode}-{qid}` |
+
+The ±40pt swing in v2 was the contamination bug *screaming* — far beyond the ±5pt noise floor. A verification harness whose own numbers are unstable is telling you something is wrong before you ever read the claims.
+
+`★ Insight ─────────────────────────────────────`
+- **Separate mechanical tests from live tests — different failure → different debugging lane.** C2 needs no LLM: it is a pure unit test of the guardrail logic, runs in milliseconds, fully deterministic. C3/C4 are integration tests — real LLM, real Qdrant, subject to the noise floor. If C2 fails, the bug is in your logic. If only C3/C4 fail, suspect the model or measurement noise. Mixing the two into one test makes every failure ambiguous.
+- **C2 and C3 are the load-bearing claims; C1 and C4 are guards on the guards.** C2 proves the guardrail logic is correct; C3 proves it catches a real poison extractor end-to-end. Together they verify the system blocks bad extractors. C1 proves routing needs no human tags; C4 proves the safe path stays safe. A reviewer who only has time for two claims should read C2 + C3.
+- **A verification harness that catches its own implementation bugs is worth more than one that passes first try.** The v1→v4 trail (classifier bug, namespace collision) is committed alongside the passing v4 — a reader sees not just the working MVP but *how the harness exposed its own errors*. Instability in the harness's own numbers (the ±40pt v2 swing) is a first-class signal, not noise to average away.
+- **Unstable verification numbers are a bug report, not a measurement.** When the SAME inputs produce ±40pt swings, do not reach for "average more runs" — reach for "what state is leaking between runs". Cross-test residue (BCJ Entry 14) is the canonical culprit in stateful-store testing; namespace isolation per `(run, mode, question)` is the canonical fix.
+`─────────────────────────────────────────────────`
+
+##### Production best-practice checklist (distilled from the MVP)
+
+Before shipping any atomisation / extraction pipeline:
+
+- [ ] **Auto-classify, do not require tags.** Speaker-role + schema-shape heuristics tag conversational data at ~100% without human metadata. Treat declarative tags as an optional fast-path, never a dependency.
+- [ ] **Enforce `K_min ≥ 8` mechanically.** If an extractor returns fewer than `K_min` items, discard its output and fall back to raw. This is a `len()` check, not a tuning knob.
+- [ ] **Gate every extractor with an A/B deploy check.** `composer(raw + facts)` must beat `composer(raw)` by ≥ 3pts on a held-out set, or the extractor does not ship. Four lines of code; catches the −40pt disaster before production.
+- [ ] **Position raw context FIRST in composer prompts**, derived facts LAST, neutral framing. Composers anchor on early structured content.
+- [ ] **Isolate state per `(run, mode, entity)` in any test harness** touching a persistent store. Unstable verification numbers usually mean cross-test residue, not model nondeterminism.
+- [ ] **Default to read-time atomise** for conversational data — late-binding is reversible, early-binding destroys raw signal irreversibly.
+- [ ] **Match accuracy claims to instrument resolution.** N=5 has 20pt granularity; do not claim a +3pt win on it. Use non-regression claims when the true effect is below the noise floor.
+- [ ] **Make the verification harness exit non-zero on any failed claim** so CI can gate on it.
+
 ### What EverCore's pipeline ACTUALLY does (the value you pay 5x latency for)
 
 | Capability | What it gives you | Cost without EverCore (DIY) |
