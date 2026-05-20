@@ -3106,6 +3106,28 @@ Both `scripts/run_longmemeval_oracle.py` (the §5.3.2 accuracy eval) and `script
 | `--campaign STR` | `run_longmemeval_oracle.py` | Campaign tag stored in the results JSON. | `longmemeval-oracle` |
 | `--out PATH` | `run_production_mvp.py` | Where to write the 4-claim verification report JSON. | `results/production_mvp.json` |
 
+##### Prerequisite for the frontier-model cases — the local proxy
+
+Cases 3-5 below point `COMPOSE_BASE_URL` at `http://localhost:8317` — a **local proxy** that relays OpenAI/Anthropic-format HTTP requests to a Claude subscription, so the eval can use a frontier model (`claude-opus-4-7`) without an API key. The proxy used here is **[vibeproxy](https://github.com/automazeio/vibeproxy)** (`automazeio/vibeproxy`).
+
+Bring-up (one-time, before any Case 3-5 run):
+1. Install + start vibeproxy per its README; it listens on `localhost:8317`.
+2. Verify it answers — a healthy proxy returns a spec-compliant completion:
+   ```bash
+   curl -sS http://localhost:8317/v1/chat/completions \
+     -H 'content-type: application/json' -H 'authorization: Bearer dummy' \
+     -d '{"model":"claude-opus-4-7","max_tokens":16,"messages":[{"role":"user","content":"Reply: PONG"}]}'
+   ```
+   Expect `"content":"PONG"` in an OpenAI-shaped `chat.completion` envelope.
+
+Notes:
+- vibeproxy exposes **both** `/v1/chat/completions` (OpenAI-format) and `/v1/messages` (Anthropic-format); the eval uses the OpenAI-format path via the `openai` SDK.
+- It does **not** serve `/v1/embeddings` — that is why `OMLX_BASE_URL` (oMLX, embeddings) and `COMPOSE_BASE_URL` (proxy, generation) must stay split.
+- The `api_key` is a placeholder (`dummy`) — the proxy handles real auth server-side against the Claude subscription. **Keep port 8317 bound to localhost**; it is an unauthenticated relay.
+- Thinking-model IDs (e.g. `claude-opus-4-7-thinking-10000`) resolve through the proxy with the thinking-budget suffix stripped; pair with `DISABLE_TEMPERATURE=1`.
+
+The core two-tier lab (Phases 1-9) does **not** need the proxy — it is only for the optional §5.3 frontier-model comparison. Local-only readers skip Cases 3-5 and run Cases 1-2.
+
 ##### CLI per case
 
 All commands run from `lab-03-5-8-two-tier/`. The `set -a; source ../.env; set +a` prefix loads `OMLX_BASE_URL` / `OMLX_API_KEY` from the lab `.env`; the inline vars override per case.
