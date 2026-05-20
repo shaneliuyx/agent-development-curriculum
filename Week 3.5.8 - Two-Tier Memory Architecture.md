@@ -1,7 +1,7 @@
 ---
 title: Week 3.5.8 — Two-Tier Memory Architecture (guild + EverCore)
 created: 2026-05-11
-updated: 2026-05-20
+updated: 2026-05-21
 tags:
   - agent
   - memory
@@ -2764,6 +2764,69 @@ The same phase transition explains §3.x's WRITE-time failure (BCJ Entry 16):
 - **The K_min floor is a mechanical gate, not a tuning knob.** It can be checked at deployment time by ablation: if the extractor cannot reliably emit ≥ K_min triples on representative data, do not ship it. A/B test the deployed extractor against raw-only retrieval; if composer(raw + facts) ≤ composer(raw alone), the extractor is poisoning, not helping. Most production memory systems skip this calibration step; our measurements show why it's load-bearing.
 - **The Bayesian framing maps to a well-known result in ensemble learning**: model averaging dominates single-model selection when individual models have correlated errors (which they do — extractors share training distributions). The same math that makes random forests beat single decision trees makes 14-triple atomise beat 1-triple atomise. The lab number is a manifestation of a fundamental property of error averaging.
 - **Practical recommendation for §3.x revision**: instead of a single compressed summary, the chapter's consolidation pipeline should emit MANY atomic facts per scroll (the §3.2.1 atomise primitive already does this, but it's gated by SUMMARIZE_PROMPT first — fix the cascade order). Move atomise before summarize OR drop summarize entirely. This is the cleanest write-time analog of the §5.3.4 volume-floor rule.
+`─────────────────────────────────────────────────`
+
+---
+
+#### 5.3.5 Commit vs hedge — LongMemEval's commitment bias (N=100 judge-controlled, measured 2026-05-21)
+
+Scaling the head-to-head from N=20 (pure temporal-reasoning) to **N=100** (60 temporal + 40 multi-session) produced a result that, at first glance, looks impossible — and the explanation is the most interview-valuable finding in §5.3.
+
+##### The measurement
+
+N=100, judge held constant (a single fixed `claude-opus-4-7` judge across all answer-sets — see "the judge confound" below):
+
+| Compose model | no-atomise | + read-time atomise |
+|---|---|---|
+| Qwen3.5-27B-Claude-Opus-distill (4-bit, local MLX) | **77%** | 76% |
+| Claude Opus 4.7 (full precision, via proxy) | **68%** | 69% |
+
+A **4-bit 27B distillation out-scores full-precision Claude Opus 4.7 by 9 points.** That should trigger suspicion, not celebration — a result that surprising is usually an instrument fault. Two were ruled out before the number was trusted; the third explanation is real.
+
+##### Ruled out (1) — the judge confound
+
+The eval runner defaults `MODEL_JUDGE` to the compose model, so each model was originally grading its *own* answers. A stricter judge would mark its own model down harder, faking a gap. **Test**: re-judge all four answer-sets with one fixed judge (`claude-opus-4-7`). Result: every number moved ≤1 point. The judge is **not** the confound — the gap is real under a controlled judge.
+
+##### Ruled out (2) — the parser
+
+Opus 4.7 is an extended-thinking model; a plausible bug is the `<answer>...</answer>` extractor grabbing a chain-of-thought fragment instead of the real answer. **Test**: categorise Opus 4.7's 32 wrong answers. Result: 0 empty, 0 sentinel, 1 CoT-leak, 4 explicit abstentions — **27 of 32 are genuine, well-formed answers.** The parser is fine.
+
+##### The real cause — commit vs hedge
+
+The 27 genuine-but-wrong answers share one shape. Examples:
+
+| Question | Gold | Opus 4.7's answer |
+|---|---|---|
+| Years working before NovaTech? | 4 years and 9 months | "You mentioned 9 years professionally, but the context doesn't specify when you started at NovaTech, so I can't calculate the gap." |
+| Which shoes did I clean last month? | white Adidas sneakers | "You didn't mention cleaning shoes last month — you mentioned wearing Converse sneakers." |
+| Thermostat or mesh network set up first? | Smart thermostat | "You mentioned the thermostat first, but the context doesn't clearly confirm the setup order." |
+
+Two answering styles are in play:
+
+- **Commit** — give a definite, specific answer even when not fully certain: *"The smart thermostat."*
+- **Hedge** — give a careful, qualified answer that flags uncertainty: *"You mentioned the thermostat first, but I can't confirm the setup order."*
+
+LongMemEval's judge checks one thing: does the answer match the **concrete** gold string? A hedge almost never matches a concrete gold. The scoring asymmetry that follows:
+
+| Situation | Commit | Hedge |
+|---|---|---|
+| Answer **is** in context (buried, needs reasoning) | often **CORRECT** — extracted | **INCORRECT** — never stated |
+| Answer **genuinely not** in context | INCORRECT — guessed wrong | INCORRECT — said "can't tell" |
+
+**Committing never scores worse than hedging, and scores better whenever the answer was derivable.** A model that always commits therefore dominates a model that hedges — on this eval.
+
+##### Why Opus 4.7 hedges and the distillation commits
+
+`COMPOSE_SYSTEM` explicitly instructs the model to commit ("default to answering, pick the best-supported answer, don't hedge"). The Qwen distillation — smaller, instruction-following — obeys literally. Opus 4.7 is capable enough to genuinely assess *"is this answer actually supported by what I retrieved?"*, and when it judges the context insufficient it **overrides the prompt and hedges**, because hedging is the honest response. It is, in effect, too well-calibrated to follow "always commit" blindly.
+
+The irony: `Qwen3.5-27B-Claude-Opus-Distilled` — distilled *from* Claude Opus — commits more readily than real Opus 4.7. The distillation plus the commit-first prompt trained the small model to commit; the full model resists.
+
+`★ Insight ─────────────────────────────────────`
+- **The technical term is calibration.** A well-calibrated model's confidence matches its accuracy — confident when right, uncertain when it might be wrong. Opus 4.7 is *better* calibrated: it hedges precisely when the retrieved context genuinely does not support a confident answer. **LongMemEval punishes good calibration** — it scores an honest "I'm not sure" identically to a confident wrong guess.
+- **The benchmark cannot distinguish knowledge from luck.** A model that *knows* the answer and a model that *guesses and gets lucky* both score CORRECT; a model that correctly recognises its own uncertainty scores INCORRECT. That is a benchmark-design flaw — a **commitment bias** baked into LongMemEval oracle.
+- **In production the preference often flips.** A hedging model will not confidently hallucinate "white Adidas sneakers" when the user never said that — exactly the behaviour you want in a real assistant. The 77-vs-68 gap measures *fit to this eval's commitment bias*, NOT which model is safer to ship. The distillation wins the benchmark; Opus 4.7 is arguably the better production choice.
+- **Interview-grade framing**: "A 4-bit local model beat frontier Opus on my LongMemEval run — and the reason is the benchmark, not the model. LongMemEval scores a confident wrong guess and an honest abstention identically, so it structurally rewards commitment. Opus 4.7 hedges when the context is genuinely ambiguous, which is correct behaviour and which the eval punishes. The lesson: a benchmark number is only as trustworthy as the behaviour it rewards — always check what your eval is actually selecting for."
+- **The general rule**: when a measured result is surprising, suspect the instrument before believing the finding. Three instrument faults were checked in this lab before the result was trusted — cross-test Qdrant residue (fixed with `RUN_ID` namespaces), transient proxy errors (fixed with retries), and the judge confound (disproved by re-judging). The commitment bias survived all three checks, so it is real.
 `─────────────────────────────────────────────────`
 
 ---
