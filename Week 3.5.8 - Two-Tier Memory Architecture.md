@@ -3037,10 +3037,12 @@ The runbook above is prose until something runs it. `lab-03-5-8-two-tier/scripts
 |---|---|---|---|
 | **C1 — classifier** | Auto-classifier tags conversational sessions without human tags | Feed each session to `classify_workload()`; count `CONVERSATION` tags | **11/11 = 100%** — routing works tag-free |
 | **C2 — K_min floor** | Volume-floor guardrail discards under-volume extractor output | Mechanical (no LLM): `safe_atomise()` on a 15-triple "good" and a 1-triple "bad" fake extractor, `K_min=8` | good passes; **bad → empty triples + `dropped_below_k_min=True`** |
-| **C3 — deployment gate** | A/B gate rejects a poison extractor before production | Run 5-Q raw-only vs constrained-1-triple extractor; feed both to `deployment_gate()` | bad scored **−40pts**; gate `ship=False` — **rejected** |
-| **C4 — non-regression** | Production-mode with all guardrails does not hurt accuracy | Run 5-Q baseline (raw-only) vs production-mode (classify → atomise → K_min → position) | baseline 80% = production 80%, **Δ=0 ≥ −3pt floor** |
+| **C3 — deployment gate** | A/B gate rejects a poison extractor before production | Run raw-only vs a **fixed-garbage extractor** (10 hard-coded nonsense triples — model-independent); feed both to `deployment_gate()` | garbage cannot beat raw on any model → gate `ship=False` — **rejected** |
+| **C4 — non-regression** | Production-mode with all guardrails does not hurt accuracy | Run baseline (raw-only) vs production-mode (classify → atomise → K_min → position) | Δ ≥ −3pt floor — **does not regress** |
 
 All four PASS. `run_production_mvp.py --limit N` exits 0 only if every claim holds.
+
+> **C3 fixture evolved (2026-05-20).** The first C3 used an LLM-constrained 1-triple extractor — known to cost −30 to −35pts on 4-bit models (§5.3.3 v5/v7). But on full-precision **Opus 4.7** that same extractor produced a *good* single fact and scored **+20pts**, so the gate correctly shipped it and C3 "failed". The anchoring-bias collapse it relied on is a 4-bit-quantization artifact, not model-independent. The fix: a **fixed-garbage extractor** (`make_broken_atomiser()` — 10 hard-coded nonsense triples like `user | home planet | Mars`). Garbage carries zero signal, so it can never legitimately beat raw retrieval by the +3pt gate threshold on *any* model. **Property-based negative fixtures survive model swaps; symptom-based ones rot.**
 
 ##### Why C4 tests non-regression, not improvement
 
@@ -3076,6 +3078,99 @@ Before shipping any atomisation / extraction pipeline:
 - [ ] **Default to read-time atomise** for conversational data — late-binding is reversible, early-binding destroys raw signal irreversibly.
 - [ ] **Match accuracy claims to instrument resolution.** N=5 has 20pt granularity; do not claim a +3pt win on it. Use non-regression claims when the true effect is below the noise floor.
 - [ ] **Make the verification harness exit non-zero on any failed claim** so CI can gate on it.
+
+#### Running the eval + MVP — environment variables + CLI reference
+
+Both `scripts/run_longmemeval_oracle.py` (the §5.3.2 accuracy eval) and `scripts/run_production_mvp.py` (the runbook verification harness) are driven entirely by environment variables — no code edits to swap models or endpoints.
+
+##### Environment variables
+
+| Variable | Consumed by | Purpose | Example |
+|---|---|---|---|
+| `OMLX_BASE_URL` | TieredMemory embeddings **+** compose/judge fallback | Endpoint for the embedding model (bge-m3). MUST expose `/v1/embeddings`. | `http://127.0.0.1:8000/v1` (oMLX) |
+| `OMLX_API_KEY` | same | API key for the embedding endpoint. | `dummy` for local oMLX |
+| `COMPOSE_BASE_URL` | compose + judge + atomise | Endpoint for generation. When set, compose/judge run here instead of `OMLX_BASE_URL` — lets a generation-only proxy (no `/v1/embeddings`) serve compose while embeddings stay on oMLX. Unset → falls back to `OMLX_BASE_URL`. | `http://localhost:8317/v1` (Anthropic proxy) |
+| `COMPOSE_API_KEY` | same | API key for the compose endpoint. Falls back to `OMLX_API_KEY`. | `dummy` |
+| `MODEL_HAIKU` | compose + atomise | Model ID for the answer composer + read-time atomiser. | `claude-opus-4-7` or `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` |
+| `MODEL_JUDGE` | judge | Model ID for the LLM-as-judge scorer. Defaults to `MODEL_HAIKU` if unset. | `claude-opus-4-7` |
+| `MODEL_EMBED` | TieredMemory | Embedding model ID. | `bge-m3-mlx-fp16` (default) |
+| `DISABLE_TEMPERATURE` | all chat calls | Set to `1` for extended-thinking models (Opus 4.7) that **deprecate** `temperature` and return HTTP 400 if it is passed. Local 4-bit models leave this unset (they want `temperature=0.0`). | `1` for thinking models |
+| `ATOMISE_AT_READ` | runner only | Set to `1` to enable the read-time atomisation stage (unconstrained — emits 14-57 triples). Unset → no atomise, raw retrieval only. | `1` |
+
+##### Script parameters
+
+| Flag | Script | Purpose | Default |
+|---|---|---|---|
+| `--limit N` | both | Number of oracle questions to run. | runner 50 / MVP 10 |
+| `--out PATH` | `run_longmemeval_oracle.py` | Where to write the results JSON. | `results/longmemeval_oracle.json` |
+| `--campaign STR` | `run_longmemeval_oracle.py` | Campaign tag stored in the results JSON. | `longmemeval-oracle` |
+| `--out PATH` | `run_production_mvp.py` | Where to write the 4-claim verification report JSON. | `results/production_mvp.json` |
+
+##### CLI per case
+
+All commands run from `lab-03-5-8-two-tier/`. The `set -a; source ../.env; set +a` prefix loads `OMLX_BASE_URL` / `OMLX_API_KEY` from the lab `.env`; the inline vars override per case.
+
+**Case 1 — §5.3.2 accuracy eval, local 4-bit model, no atomise:**
+```bash
+set -a && source ../.env && set +a && \
+MODEL_HAIKU=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit \
+MODEL_JUDGE=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit \
+uv run python scripts/run_longmemeval_oracle.py --limit 20 \
+  --out results/longmemeval_qwen_distill.json
+```
+
+**Case 2 — same eval, local model, with read-time atomise:**
+```bash
+set -a && source ../.env && set +a && \
+ATOMISE_AT_READ=1 \
+MODEL_HAIKU=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit \
+MODEL_JUDGE=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit \
+uv run python scripts/run_longmemeval_oracle.py --limit 20 \
+  --out results/longmemeval_qwen_distill_atomise.json
+```
+
+**Case 3 — eval against a remote Anthropic-proxy model (Opus 4.7), no atomise:**
+```bash
+set -a && source ../.env && set +a && \
+COMPOSE_BASE_URL=http://localhost:8317/v1 COMPOSE_API_KEY=dummy \
+MODEL_HAIKU=claude-opus-4-7 MODEL_JUDGE=claude-opus-4-7 \
+DISABLE_TEMPERATURE=1 \
+uv run python scripts/run_longmemeval_oracle.py --limit 20 \
+  --out results/longmemeval_opus47proxy.json
+```
+> Embeddings still hit `OMLX_BASE_URL` (oMLX, port 8000); only compose/judge go to the proxy. `DISABLE_TEMPERATURE=1` is mandatory — Opus 4.7 thinking rejects `temperature`.
+
+**Case 4 — eval against the proxy model, with read-time atomise:** add `ATOMISE_AT_READ=1` to Case 3.
+
+**Case 5 — runbook MVP verification, proxy model, N=20:**
+```bash
+set -a && source ../.env && set +a && \
+COMPOSE_BASE_URL=http://localhost:8317/v1 COMPOSE_API_KEY=dummy \
+MODEL_HAIKU=claude-opus-4-7 MODEL_JUDGE=claude-opus-4-7 \
+DISABLE_TEMPERATURE=1 \
+uv run python scripts/run_production_mvp.py --limit 20 \
+  --out results/production_mvp_opus47proxy_n20.json
+```
+
+##### Measured results — Opus 4.7 proxy vs Qwen-Opus-distill-4bit (2026-05-20)
+
+Both models run through the *same* `run_longmemeval_oracle.py` harness, N=20 oracle subset — apples-to-apples:
+
+| Config | Qwen3.5-27B-Opus-distill-4bit | Opus 4.7 (proxy) |
+|---|---|---|
+| no atomise | 70% | **75%** |
+| + read-time atomise | **75%** | 70% |
+| wall-clock / question | ~25s | ~4.5s |
+| cost | $0 (local MLX) | paid API |
+
+Runbook MVP (`run_production_mvp.py`, N=20, Opus 4.7 proxy): **all 4 claims PASS** — C1 classifier 48/48 (100%), C2 K_min floor mechanical, C3 deployment gate rejects the garbage extractor, C4 production-mode 75% vs baseline 65% (**+10pts**, clears the −3pt non-regression floor).
+
+`★ Insight ─────────────────────────────────────`
+- **Atomise has OPPOSITE sign on the two models.** +5pts on the 4-bit distill (70→75), −5pts on full-precision Opus 4.7 (75→70). Both deltas sit at the ±5pt noise floor, but the flip is mechanistically sensible: read-time atomise pre-digests multi-hop reasoning into triples — a scaffold a weak 4-bit model leans on, dead-weight (and a vector for extraction error) for a strong model that already reasons over raw context. **Atomise is a crutch: it helps the weak and mildly hampers the strong.** This refines §5.3.3's "+5pt uniform across capability" — that uniformity held only because both models measured there were 4-bit quantized.
+- **Peak accuracy is a TIE — both cap at 75% on this 20-Q temporal slice.** Opus 4.7's real advantage is not a higher ceiling; it is reaching the ceiling with a *simpler, ~5x-faster pipeline* (no atomise stage, ~4.5s/q vs ~25s/q). The atomise stage the 4-bit distill needs to hit 75% is exactly the stage that costs Opus 4.7 5pts.
+- **The MVP's C4 reads +10pts where the eval reads −5pts for the same model + same atomise.** Not a contradiction — different harnesses. The MVP's "production-mode" bundles auto-classification + position discipline + K_min on top of atomise, and its "baseline" is a different code path than the eval's no-atomise run. Cross-harness numbers never compare directly — a discipline the §5.3.2-matrix contamination episode already taught.
+- **Three independent env assumptions surfaced only when the model changed**: the proxy has no `/v1/embeddings` (→ `COMPOSE_BASE_URL` split), Opus 4.7 deprecates `temperature` (→ `DISABLE_TEMPERATURE`), and remote APIs throw transient 5xx (→ `max_retries=6`). A model swap is the cheapest integration test for latent single-endpoint / single-vendor assumptions.
+`─────────────────────────────────────────────────`
 
 #### Measurement-harness discipline — five bugs that scrambled the §5.3.2 matrix (diagnosed 2026-05-20)
 
