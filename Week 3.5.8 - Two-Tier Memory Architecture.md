@@ -2780,8 +2780,9 @@ N=100, judge held constant (a single fixed `claude-opus-4-7` judge across all an
 |---|---|---|
 | Qwen3.5-27B-Claude-Opus-distill (4-bit, local MLX) | **77%** | 76% |
 | Claude Opus 4.7 (full precision, via proxy) | **68%** | 69% |
+| Claude Sonnet 4.6 (via proxy) | **60%** | — |
 
-A **4-bit 27B distillation out-scores full-precision Claude Opus 4.7 by 9 points.** That should trigger suspicion, not celebration — a result that surprising is usually an instrument fault. Two were ruled out before the number was trusted; the third explanation is real.
+A **4-bit 27B distillation out-scores full-precision Claude Opus 4.7 by 9 points — and Claude Sonnet 4.6 by 17.** That should trigger suspicion, not celebration — a result that surprising is usually an instrument fault. Two were ruled out before the number was trusted; the third explanation is real.
 
 ##### Ruled out (1) — the judge confound
 
@@ -2820,6 +2821,12 @@ LongMemEval's judge checks one thing: does the answer match the **concrete** gol
 `COMPOSE_SYSTEM` explicitly instructs the model to commit ("default to answering, pick the best-supported answer, don't hedge"). The Qwen distillation — smaller, instruction-following — obeys literally. Opus 4.7 is capable enough to genuinely assess *"is this answer actually supported by what I retrieved?"*, and when it judges the context insufficient it **overrides the prompt and hedges**, because hedging is the honest response. It is, in effect, too well-calibrated to follow "always commit" blindly.
 
 The irony: `Qwen3.5-27B-Claude-Opus-Distilled` — distilled *from* Claude Opus — commits more readily than real Opus 4.7. The distillation plus the commit-first prompt trained the small model to commit; the full model resists.
+
+##### Sonnet 4.6 confirms it — hedging is a Claude-family trait
+
+A natural test: is the hedging Opus-4.7-specific, or shared across the Claude family? **Claude Sonnet 4.6, same harness, same fixed judge: 60%** — lower still. Diagnosis of its 40 wrong answers: 34 genuine hedge-style non-commitments, 4 explicit abstentions, 0 empty, 0 CoT-leak, and **2 proxy-contamination misfires** (the relay proxy injects a Claude Code system prompt; on 2/100 questions Sonnet snapped to that persona and answered *"I'm Claude Code, an AI assistant"* instead of doing the eval task — Opus 4.7 did this 0 times). Contamination-corrected, Sonnet ≈ 62%.
+
+Both frontier Claude models hedge; neither is moved by the commit-first prompt. The commit-trained 4-bit distillation tops all three. **Hedging is a Claude-family calibration trait, not an Opus-4.7 quirk** — and the commitment-bias gap is therefore systematic, not a one-model artifact.
 
 `★ Insight ─────────────────────────────────────`
 - **The technical term is calibration.** A well-calibrated model's confidence matches its accuracy — confident when right, uncertain when it might be wrong. Opus 4.7 is *better* calibrated: it hedges precisely when the retrieved context genuinely does not support a confident answer. **LongMemEval punishes good calibration** — it scores an honest "I'm not sure" identically to a confident wrong guess.
