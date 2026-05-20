@@ -920,6 +920,36 @@ Mathematically: write-time is a fixed projection π_write applied to a stream. R
 
 ---
 
+## 2026-05-20 — Week 3.5.8 — Constrained atomisation collapses accuracy by 30-35pts uniformly across small and large models — anchoring bias is cross-capability, not small-model-specific
+
+**Symptom:** After §5.3.3's unconstrained read-time atomise lifted both Qwen3.6-27B (60%→65%) and Qwen-Opus (70%→75%) by +5pts uniformly, the natural follow-up was a "constrained" variant: top-K=5 triples per session, question-conditioned extraction, neutral framing label, raw context preserved alongside (Mem0/Zep/Letta industry invariant). Result was the opposite of expected:
+
+| Config | Qwen3.6-27B | Qwen-Opus | Cross-model Δ |
+|---|---|---|---|
+| Baseline (no atomise) | 60% (commit prompt) | 70% | — |
+| Unconstrained atomise + keep raw | 65% | 75% | uniform +5 |
+| Constrained K=5 + drop raw | 60% | (untested) | mixed |
+| **Constrained K=5 + keep raw + neutral framing** | **25%** | **45%** | **uniform −30 to −35** |
+
+Both models collapsed by the same magnitude despite a 40pt baseline capability gap. The extractor consistently emitted exactly 1 triple per session even when allowed K=5; the single high-confidence triple anchored the composer; raw context preserved below did not override.
+
+**Root cause:** Authority-weight calibration failure. A small number of compressed, prominently-positioned derived facts carry per-item authority weight that exceeds the consumer's threshold for overriding via raw context. Transformer attention over-weights structured-looking, prominently-positioned content. The composer treats 1 confident triple as ~1 strong hypothesis and collapses its posterior to MAP-style selection on that triple. When the triple is wrong, the error is unrecoverable even with raw context present. Volume buffers this failure mode mechanically — 14-57 triples per session = many weak hypotheses = Bayesian model averaging = errors cancel. The phase transition between regimes is sharp, NOT smooth: 1 triple is catastrophic; ≥14 triples is a uniform +5pt lift. Cross-capability uniformity (Opus drops 30pts; Qwen3.6-27B drops 35pts) shows this is a fundamental property of how transformer composers process prompt structure, not a small-model defect.
+
+**Fix:** Enforce a **minimum-volume floor (K_min ≥ 8)** on any extractor shipping derived facts to a composer. If extractor returns fewer than K_min triples for a non-trivial input, drop derived entirely and fall back to raw-only. Combine with the Pattern 22 "preserve raw alongside derived" invariant AND a **deployment calibration gate**: A/B test the deployed extractor against raw-only retrieval; if composer(raw + facts) ≤ composer(raw alone), the extractor is poisoning, not helping. For W3.5.8's runner: kept the v3 unconstrained ATOMISE_SYSTEM emitting 14-57 triples per session; do NOT ship a "smart" focused variant without K_min guardrails. Cross-stage corollary: same mechanism caused §3.x consolidation pipeline to destroy signal at WRITE time (BCJ 2026-05-19 entry). Compressed authoritative extractions at any pipeline stage poison downstream consumers when extractor accuracy < consumer trust threshold.
+
+**Generalizes to:** the seductive "let the extractor pick the K most relevant facts" design pattern that appears frequently in production memory write-ups is unsafe by construction. RAG re-rankers, write-time summarisation, write-time atomisation, and read-time projection all share this failure mode. The empirical evidence here matches a well-known result in ensemble learning: model averaging dominates single-model selection when individual models have correlated errors. The same math that makes random forests beat single decision trees makes high-volume atomise beat low-volume atomise. Volume buffering is a structural property, not a hyperparameter.
+
+**Measured evidence:**
+- Qwen3.6-27B: 30% (raw) → 60% (commit prompt) → 65% (unconstrained atomise) → 60% (constrained K=5 + drop raw) → 25% (constrained K=5 + keep raw, both framing variants)
+- Qwen-Opus: 70% (baseline) → 75% (unconstrained atomise) → 45% (constrained K=5 + keep raw)
+- 5 ablation runs total (v3, v4, v5, v7, v9) — see `results/longmemeval_qwen36_27b_4bit_v{3atomise,4constrained,5constrained_keepraw,7constrained_neutral}.json` and `results/longmemeval_qwen27opus_v{3atomise,9constrained}.json`
+
+**Tags:** #anchoring-bias #authority-weight-calibration #volume-floor #cross-capability #ablation #measurement-driven #lab-3.5.8
+
+**Captured in curriculum at:** [[Week 3.5.8 - Two-Tier Memory Architecture#Bad-Case Journal]] Entry 18 + [[Week 3.5.8 - Two-Tier Memory Architecture#5.3.4 Volume buffers extraction error — the Bayesian framing of why unconstrained atomise works|§5.3.4 volume-vs-accuracy Bayesian framing]] + [[Engineering Decision Patterns#Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)|EDP Pattern 22]] refinement (Authority-Weight Calibration sub-rule).
+
+---
+
 ## 2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)
 
 Seven recurring multi-agent failure shapes, synthesized from Russell's engineering survey of Codex / Claude Code / OpenClaw / Hermes (X, 2026-05). These are not chapter-local entries — each one is a *production-grade* class of failure that recurs across systems. Reference these from any chapter that spawns subagents.

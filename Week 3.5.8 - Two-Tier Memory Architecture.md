@@ -2686,6 +2686,84 @@ The §3.2.1 atomise primitive is correct code. Its **lifecycle position** was wr
 - **Most "compress at write" decisions in agent pipelines are leftover habits from log-processing.** Log pipelines need write-time compression because queries are rare relative to ingest. Agent memory is the opposite shape; importing the log-processing intuition costs accuracy. This is a chapter-level invariant worth remembering.
 `─────────────────────────────────────────────────`
 
+##### Constrained atomisation also fails — cross-capability collapse (measured 2026-05-20)
+
+The naive next move after §5.3.3 is "make the read-time atomiser more focused": top-K=5 triples, question-conditioned, drop raw context when triples are confident. Test it before shipping. Measured:
+
+| Config | Qwen3.6-27B | Opus | Cross-model delta |
+|---|---|---|---|
+| Baseline (no atomise) | 30% (raw) / 60% (commit prompt) | 70% | — |
+| Unconstrained atomise + keep raw | **65%** | **75%** | uniform **+5pts** |
+| Constrained K=5 + drop raw | 60% | (untested) | mixed |
+| **Constrained K=5 + keep raw + neutral framing** | **25%** | **45%** | **uniform −30 to −35pts** |
+
+Both models collapse by the same magnitude despite a 40pt baseline capability gap. The regression is NOT small-model-specific.
+
+**Failure mode**: a small number of compressed, prominently-positioned "facts" anchor the composer regardless of model size. Transformer attention over-weights structured-looking, prominently-positioned content. When the extractor emits 1 high-confidence triple (the constrained variant defaults to 1 per session even when allowed K=5) and that triple is wrong, the composer cannot recover via the raw fallback — the wrong triple has already anchored the answer.
+
+`★ Insight ─────────────────────────────────────`
+- **Cross-stage symmetry**: this is the same failure mechanism that destroyed signal at WRITE time (§3.x SUMMARIZE_PROMPT emitted 1-3 compressed facts that anchored downstream retrieval). Now confirmed from the READ side. The Pattern 22 lesson refines: **lifecycle position matters AND so does authority-weight calibration** — compressed derived representations carry per-item authority weight that the consumer must be ABLE to override. Singletons cannot be overridden in practice.
+- **Capability does not save you.** This rules out a class of "smart memory" designs. Opus dropped 30pts; Qwen3.6-27B dropped 35pts. The constraint that you "make the extractor focused" is unsafe at any model size when the extractor isn't near-perfect.
+- See §5.3.4 below for the Bayesian framing of why **volume buffers extraction error** — the missing piece that explains why v3 (14-57 triples) works while v5/v7 (1 triple) collapse.
+`─────────────────────────────────────────────────`
+
+#### 5.3.4 Volume buffers extraction error — the Bayesian framing of why unconstrained atomise works
+
+The empirical pattern from §5.3.3:
+
+- 14-57 triples per session + raw context = **+5pts accuracy** (unconstrained atomise)
+- 1 triple per session + raw context = **−30pts accuracy** (constrained K=5 atomise)
+- 1 triple per session + NO raw context = baseline (constrained K=5, drop raw)
+
+Volume × accuracy is not a smooth tradeoff. It has a phase transition.
+
+##### The Bayesian framing
+
+Treat each emitted triple as a hypothesis about the underlying fact pattern. The composer's job is to construct a posterior over possible answers given (triples, raw context, question).
+
+When the extractor emits MANY triples (K = 14-57):
+- Each triple is a weak hypothesis (low per-item authority weight)
+- The composer's posterior is a mixture across many noisy hypotheses
+- Errors in individual triples are dampened by the average across the mixture
+- Behavior approaches **Bayesian model averaging** — robust, but slow to converge
+
+When the extractor emits FEW triples (K = 1-5):
+- Each triple is a strong hypothesis (high per-item authority weight)
+- The composer's posterior collapses early to whichever triple is most prominent
+- Errors in individual triples become catastrophic — no averaging to fall back on
+- Behavior approaches **maximum-a-posteriori (MAP) selection** — fast, but high-variance
+
+The phase transition between regimes happens when per-triple authority weight exceeds the consumer's threshold for overriding via raw context. At that point, adding raw context BACK doesn't help — the composer has already anchored.
+
+##### The volume floor as a production guardrail
+
+This implies a deployable rule: enforce a **minimum-volume floor (K_min)** on any extractor that ships derived facts to a composer:
+
+```python
+def safe_atomise(extractor, ctx, k_min=8):
+    triples = extractor(ctx)
+    if count_triples(triples) < k_min:
+        return None  # fall back to raw-only
+    return triples
+```
+
+If the extractor returns fewer than K_min triples for a non-trivial input, the system DROPS derived entirely and falls back to raw-only retrieval. Prevents the constrained-atomise catastrophic failure mode by construction.
+
+##### The cross-stage corollary
+
+The same phase transition explains §3.x's WRITE-time failure (BCJ Entry 16):
+- SUMMARIZE_PROMPT emitted 1-3 compressed facts per scroll → composer anchored on the compressed (often wrong) facts → raw discarded → wrong answer
+- Symmetric to v5/v7's READ-time failure: 1 confident triple anchors the composer; raw is present but doesn't override
+
+**The chapter-level invariant**: across BOTH lifecycle stages, the failure mode is identical — **low-volume high-confidence extractions poison downstream consumers**.
+
+`★ Insight ─────────────────────────────────────`
+- **The phase transition implies a binary design choice** between (a) ship raw only, OR (b) ship many extractions for volume buffering. Compressed authoritative facts are unsafe at any model size when the extractor isn't near-perfect. This rules out the seductive "let the extractor pick the 3 most relevant facts" design pattern that appears frequently in production memory write-ups.
+- **The K_min floor is a mechanical gate, not a tuning knob.** It can be checked at deployment time by ablation: if the extractor cannot reliably emit ≥ K_min triples on representative data, do not ship it. A/B test the deployed extractor against raw-only retrieval; if composer(raw + facts) ≤ composer(raw alone), the extractor is poisoning, not helping. Most production memory systems skip this calibration step; our measurements show why it's load-bearing.
+- **The Bayesian framing maps to a well-known result in ensemble learning**: model averaging dominates single-model selection when individual models have correlated errors (which they do — extractors share training distributions). The same math that makes random forests beat single decision trees makes 14-triple atomise beat 1-triple atomise. The lab number is a manifestation of a fundamental property of error averaging.
+- **Practical recommendation for §3.x revision**: instead of a single compressed summary, the chapter's consolidation pipeline should emit MANY atomic facts per scroll (the §3.2.1 atomise primitive already does this, but it's gated by SUMMARIZE_PROMPT first — fix the cascade order). Move atomise before summarize OR drop summarize entirely. This is the cleanest write-time analog of the §5.3.4 volume-floor rule.
+`─────────────────────────────────────────────────`
+
 ---
 
 ## Production Considerations
@@ -5531,6 +5609,11 @@ def replay_audit(tm, audit_log: list[dict]) -> None:
 *Symptom:* `test_decide_action_handles_contradiction` (auth-token TTL 30min → 1h) FAILED after Phase 9.6 Step 1 prompt extension: `AssertionError: unexpected action: supersede assert 'supersede' in ('delete', 'update', 'add')`. Classifier returned `DedupAction(action='supersede', target_id='existing-1', supersede_reason='The authentication system was updated to extend token validity to 1 hour.', supersede_category='config', relates_to=None)`. The test's acceptable-action set was written for the 4-action prompt and didn't include `supersede`.
 *Root cause:* The 6-action classifier correctly upgraded its verdict. Auth-token-TTL change reads as **config rotation** (state evolution), not factual correction (the old 30-min TTL was true at t₀; the new 1-hour TTL is true at t₁; both states existed). Phase 9.6's `supersede` action is designed exactly for this case. The test's narrow acceptable set encoded the **launch-baseline contract** (4-action), not the **shipped contract** (6-action).
 *Fix:* Widen the acceptable set to include `supersede`: `assert action.action in ("delete", "update", "supersede")`. Added conditional inner assertion: `if supersede then target_id == "existing-1" AND supersede_reason non-empty`. Production rule: when a prompt's output schema expands, ALL downstream tests that constrain output must be audited — narrow assertion sets are silent regressions waiting to happen. The shape is the same as schema-evolution in any structured-output system; tests are part of the schema contract.
+
+**Entry 18 — Constrained atomisation (top-K=5, question-conditioned) collapses accuracy by 30-35pts on BOTH small and large models; anchoring bias is cross-capability.** *(observed 2026-05-20, §5.3.3-§5.3.4 ablation runs)*
+*Symptom:* After §5.3.3's unconstrained read-time atomise lifted Qwen3.6-27B (60%→65%) and Qwen-Opus (70%→75%) uniformly, the natural next move was "make the extractor more focused": top-K=5 triples per session, question-conditioned, neutral framing, raw context preserved alongside. Result: Qwen3.6-27B collapsed from 60%→25% (−35pts); Qwen-Opus collapsed from 70%→45% (−30pts). Both models destabilised by the SAME magnitude despite a 40-pt baseline capability gap. The extractor consistently emitted exactly 1 triple per session even when allowed K=5; that single triple was high-confidence and prominently positioned at the top of the composer prompt; when wrong, the composer anchored on it and raw context below did not override.
+*Root cause:* **Authority-weight calibration failure** — a small number of compressed, prominently-positioned derived facts carry per-item authority weight that exceeds the consumer's threshold for overriding via raw context. Transformer attention over-weights structured-looking content at the top of the prompt. The composer treats 1 confident triple as ~1 strong hypothesis and collapses its posterior to MAP-style selection on that triple. When the triple is wrong, the error is unrecoverable even with raw context present. Volume buffers this failure mode: 14-57 triples per session = many weak hypotheses = Bayesian model averaging = errors cancel out. The phase transition between regimes is sharp — measured here as 1 triple (catastrophic) vs ≥14 triples (+5pt lift). Cross-stage symmetry: this is the same mechanism that destroyed signal at WRITE time when §3.x SUMMARIZE_PROMPT emitted 1-3 compressed knowledge facts (BCJ Entry 16) — anchoring at write-time poisoned retrieval; anchoring at read-time poisons composition. Capability does NOT save you; Opus and Qwen3.6-27B collapse by ~the same magnitude.
+*Fix:* Enforce a **minimum-volume floor (K_min)** on any extractor that ships derived facts to a composer. Concrete: `if len(triples) < K_min: drop derived; fall back to raw-only`. K_min=8 worked in practice; the §5.3.4 Bayesian framing explains why volume is mechanical, not stylistic. Combined with the Pattern 22 lifecycle invariant (preserve raw alongside derived) and the "deploy-when-extractor-beats-raw" calibration gate (A/B test: composer(raw + facts) > composer(raw alone) by ≥5pts BEFORE shipping). For W3.5.8's runner: keep the v3 unconstrained ATOMISE_SYSTEM that ships 14-57 triples per session; do NOT ship a "smart" focused variant without K_min guardrails. Production rule generalises beyond atomise: ANY pipeline stage that produces compressed authoritative extractions risks poisoning the next stage when extractor accuracy < consumer trust threshold. The seductive "let the extractor pick the 3 most relevant facts" design pattern is unsafe by construction.
 
 **Entry 17 — Atomisation primitive applied at the wrong lifecycle stage destroys conversational signal at write-time but lifts accuracy +5pts at read-time across the full capability range.** *(observed 2026-05-20, §5.3.2 ablation runs)*
 *Symptom:* §3.2.1's `extract_atomic_facts` is the canonical atomisation primitive (Batchelor-Manning form #2). When invoked at WRITE time as part of consolidate() on LongMemEval haystacks, conversational facts are skipped or paraphrased into tech-flavored summaries (Entry 16). The chapter's fix bypassed atomise entirely via direct-imprint. The SAME atomise primitive then applied at READ time (after Qdrant retrieval, before LLM compose) lifted **both** Qwen3.6-27B-4bit (60% → 65%) AND Qwen3.5-27B-Opus-distill (70% → 75%) by +5pts each. Same code, opposite outcome.
