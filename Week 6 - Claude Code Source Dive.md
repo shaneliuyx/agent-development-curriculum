@@ -1,7 +1,7 @@
 ---
 title: "Week 6 — Claude Code Source Dive"
 created: 2026-04-23
-updated: 2026-05-03
+updated: 2026-05-21
 tags: [agent, curriculum, week-6, claude-code, architecture, runbook]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-06-claude-code-map"
@@ -1624,6 +1624,7 @@ When you finish W6, you should be able to take any Claude Code mechanism (subage
 - **claudefa.st (2026).** *Source Leak: Everything Found.* PROACTIVE/KAIROS feature flags; 5-layer compaction pipeline.
 - **shareAI-lab/learn-claude-code (2026).** GitHub. 12-session reverse-engineering. Source of harness-vs-intelligence framing.
 - **Pi Agent (Zechner, 2026).** GitHub. Minimalist counterpoint — 4 tools, no MCP, shortest system prompt.
+- **AgentWay (2026).** *Harness Engineering: A Design Guide to Claude Code* (Book 1 of "harness-books"). github.com/wquguru/harness-books · harness-books.agentway.dev. The conceptual scaffold of this chapter's Theory Primer is drawn from this book: the "harness engineering" centerpiece framing (ch.1), "Query Loop as the agent's heartbeat" (ch.3), prompt-as-control-plane (ch.2), and "context governance / 上下文治理 as a budget regime" (ch.5) — Concept 3 of the primer carries the book's Chinese term 上下文治理 verbatim. Primary structural source for §Theory Primer.
 
 ---
 
