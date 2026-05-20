@@ -40,6 +40,8 @@ By the end, you will own three artifacts: a one-page architecture cheat sheet yo
 
 > **Why this matters:** Every prior week taught you *pieces* — loops, tools, memory, tracing. This week is where all of it is grounded in a single shipped production agent and a published book-length teardown of that agent. The curriculum has been claiming "the hard problem is the infrastructure, not the loop" for six weeks. Here is where that claim stops being an assertion and becomes a rigorously citeable architectural reading. Read this primer slowly. It is the philosophical spine of the whole course.
 
+> **Source attribution.** The "book-length teardown" above is *Harness Engineering: A Design Guide to Claude Code* (AgentWay, 2026 — Book 1 of **harness-books**, github.com/wquguru/harness-books). This primer's organizing framework is drawn from it: the **harness-engineering** centerpiece framing, **Concept 2** ("Query Loop as the agent's heartbeat"), **Concept 3** ("context governance / 上下文治理 as a budget regime" — the Chinese term is the book's), **Concept 4** (prompt as control plane), and **Concept 5** (tools/permissions/interrupts). The book supplies the framework; this chapter applies it to the leaked Claude Code source and the five teardown sources read in Phase 1. See §References.
+
 ### Concept 1 — The 1.6% / 98.4% split: a production agent is mostly infrastructure, not AI
 
 Chapter 1 of *Harness Engineering Book 1* is titled **「为什么需要 Harness Engineering」** (Why We Need Harness Engineering). Its opening move is to reject the word "agent" as marketing:
