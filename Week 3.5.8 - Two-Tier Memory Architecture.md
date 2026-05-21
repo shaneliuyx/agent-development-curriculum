@@ -3126,7 +3126,11 @@ ship      = delta_pts >= threshold_pts                  # threshold_pts = 3.0
 
 #### Operating-point recommendations (measured on M5 Pro 4-bit MLX, N=20 oracle subset)
 
-> **What "commit-biased prompt" means.** It is a one-paragraph change to the *composer* system prompt (`COMPOSE_SYSTEM`), nothing else — no model change, no retrieval change. The default composer instruction is abstention-first: *"if the context lacks the answer, say you don't know."* The commit-biased version replaces that with commit-first: *"default to answering; pick the best-supported answer; abstain only when the retrieved context is unrelated to the question's topic."* Measured effect on the oracle subset: **+30pts on a capability-limited model** (Qwen3.6-27B) and **+0pts on an already-committing model** (Qwen-Opus distill) — it raises the *floor*, it does not raise the *ceiling*. Cost: ~1.5× latency from slightly longer reasoning. Mechanism, and the important caveat that this lever works *because LongMemEval structurally rewards commitment* (so it is an eval-aware tuning knob, not a universal accuracy win), are in [[#5.3.5 Commit vs hedge — LongMemEval's commitment bias (N=100 judge-controlled, measured 2026-05-21)|§5.3.5]].
+> **What "commit-biased prompt" means.** It is a one-paragraph change to the *composer* system prompt (`COMPOSE_SYSTEM`), nothing else — no model change, no retrieval change. The default composer instruction is abstention-first: *"if the context lacks the answer, say you don't know."* The commit-biased version replaces that with commit-first: *"default to answering; pick the best-supported answer; abstain only when the retrieved context is unrelated to the question's topic."*
+>
+> **Why it lifts the floor.** A capability-limited model often *has* the right facts in its retrieved context but still emits `NO_ANSWER_IN_CONTEXT` — it abstains out of caution. §5.3 measured this directly: of 8 questions only the strong model answered correctly, **7/8 were the small model abstaining** despite Qdrant having surfaced the correct candidates. That abstention is **prompt-induced, not capability-induced** — the model was told it *may* abstain, so it does. Removing the abstention escape hatch recovers those answers: **+30pts on Qwen3.6-27B**. A model that already commits (Qwen-Opus distill) has nothing to recover — **+0pts**. So commit-bias raises the *floor*, never the *ceiling*. Cost: ~1.5× latency from slightly longer reasoning.
+>
+> **The caveat — eval-aware knob, not a free win.** Commit-bias helps *because LongMemEval scores a confident wrong guess and an honest abstention identically* — the eval structurally rewards commitment. On a downstream task that penalises confident-wrong answers (most production settings do), forcing commitment trades calibration for benchmark score. Use it when your eval rewards commitment; do not cargo-cult it elsewhere. Full mechanism and the family-wide hedging analysis are in [[#5.3.5 Commit vs hedge — LongMemEval's commitment bias (N=100 judge-controlled, measured 2026-05-21)|§5.3.5]].
 
 | Operating point | Configuration | Acc | Wall (20-Q) | Use when |
 |---|---|---|---|---|
@@ -3163,6 +3167,23 @@ The runbook above is prose until something runs it. `lab-03-5-8-two-tier/scripts
 All four PASS. `run_production_mvp.py --limit N` exits 0 only if every claim holds.
 
 > **C3 fixture evolved (2026-05-20).** The first C3 used an LLM-constrained 1-triple extractor — known to cost −30 to −35pts on 4-bit models (§5.3.3 v5/v7). But on full-precision **Opus 4.7** that same extractor produced a *good* single fact and scored **+20pts**, so the gate correctly shipped it and C3 "failed". The anchoring-bias collapse it relied on is a 4-bit-quantization artifact, not model-independent. The fix: a **fixed-garbage extractor** (`make_broken_atomiser()` — 10 hard-coded nonsense triples like `user | home planet | Mars`). Garbage carries zero signal, so it can never legitimately beat raw retrieval by the +3pt gate threshold on *any* model. **Property-based negative fixtures survive model swaps; symptom-based ones rot.**
+
+##### Why C3 uses a deliberately broken extractor — and why that is not "skipping C3"
+
+A reasonable misreading: *if C3 feeds garbage, did the MVP never test a real extractor?* No — C3 was not skipped, and the garbage extractor is C3's test input **by design**.
+
+C3 verifies the **deployment gate**, not an extractor. The gate is a decision function — `ship` / `no-ship`. To prove a gate works you must hand it something it *should* reject and confirm it does. It is a smoke-detector test: you need smoke, not clean air. Feed C3 a *good* extractor and the gate returns `ship=True`, which proves nothing about its reject path — the path that actually protects production. Feed it guaranteed-bad input and the gate must return `ship=False`. That is why C3's pass condition is literally `pass = not gate.ship` — **C3 passes precisely when the gate refuses to ship.**
+
+The real extractor is exercised — in **C4**. The four claims isolate four different mechanisms, and only one of them is the gate:
+
+| Claim | Mechanism under test | Extractor used |
+|---|---|---|
+| C1 | Layer 2 classifier | none — regex only |
+| C2 | `safe_atomise` K_min floor | synthetic good (15-triple) + bad (1-triple) — no LLM |
+| C3 | `deployment_gate` **reject path** | fixed garbage — must be rejected |
+| C4 | production mode, end-to-end | **real `make_unconstrained_atomiser`** — 75% vs 65% baseline |
+
+So the real extractor ran (C4, +10pts over baseline) and a guaranteed-bad extractor ran (C3, correctly rejected). C3 and C4 are complementary, not redundant: C3 proves the gate blocks poison, C4 proves a genuine extractor clears that same +3pt gate. Skip either and the runbook's invariant (d) — "deploy only after A/B beats raw-only baseline" — is only half-verified.
 
 ##### Why C4 tests non-regression, not improvement
 
