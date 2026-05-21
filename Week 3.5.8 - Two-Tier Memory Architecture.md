@@ -2751,6 +2751,8 @@ def safe_atomise(extractor, ctx, k_min=8):
 
 If the extractor returns fewer than K_min triples for a non-trivial input, the system DROPS derived entirely and falls back to raw-only retrieval. Prevents the constrained-atomise catastrophic failure mode by construction.
 
+> **Why `K_min = 8`, and the honest gap in this number.** `8` is a hand-picked conservative constant, **not a measured inflection point**. The §5.3.3–§5.3.4 ablations sampled only two volume regimes — **1 triple** (catastrophic, −30 to −35pts) and **14–57 triples** (safe, +5pt lift). Nothing was measured *between* 1 and 14. So the true phase-transition boundary lies somewhere in the interval `(1, 14]`, and its exact location is unknown. `8` was chosen as a deliberately safe value inside that unmeasured gap: clearly above the 1-triple collapse regime, comfortably below the proven-safe ≥14 band. It is an engineering guess with margin on both sides, not a data-derived threshold. Pinning the real inflection point would need a fine-grained sweep (volume = 2, 4, 6, 8, 10, 12 …) plotting downstream accuracy — that sweep is the [[#Foreshadowing — open production direction|Foreshadowing]] direction, where K_min becomes learned per-extractor instead of a fixed `8`.
+
 ##### The cross-stage corollary
 
 The same phase transition explains §3.x's WRITE-time failure (BCJ Entry 16):
