@@ -1,7 +1,7 @@
 ---
 title: Week 7.3 — Production LLM Infrastructure
 created: 2026-05-12
-updated: 2026-05-12
+updated: 2026-05-21
 tags:
   - agent
   - production-infra
@@ -610,6 +610,16 @@ class HumanHandoff:
 The gateway middleware emits a `HumanHandoff` event onto a structured queue (Redis stream / SQS / a database table) instead of returning a generic `5xx` to the caller. Downstream consumer (oncall dashboard / Slack bot / internal review tool) picks it up, surfaces it to a human, captures the `user_input_required` response, and the gateway resumes with the human-supplied input. The discipline rule: **never let "ask a human" be unstructured.** Free-text alerts to oncall do not roll up; structured handoff events do.
 
 This converts the binary "circuit open → degraded service" into a graded "circuit open → human-resumable workflow" terminal state, and it composes with the cost-attribution metadata from Phase 4 (`metadata.handoff_type` becomes a billable dimension, so the team sees which features generate the most human-review load).
+
+**Identity propagation — the "works locally, fails in cloud" failure class (added 2026-05-21).** The most common production-deployment failure for an agent is not a bug in the agent — it is an authentication-context mismatch. Locally, the agent runs under the developer's interactive credentials (`az login`, `gcloud auth`, a personal API key with broad scopes). In the cloud it runs under a **machine identity** — an Azure Managed Identity, a GCP service account, an AWS IAM role — with a different, usually narrower, set of permissions. A tool call that succeeds on the laptop fails in the deployed service with an opaque error (the canonical observed case: an Azure agent failing with `tool_user_error` invoking a downstream search service from App Service under a System-Assigned Managed Identity, while working fine locally under `az login`). The agent code is identical; only the identity differs.
+
+This is a first-class Forward Deployed Engineer concern — the FDE skill stack names "identity propagation" and "secrets management" explicitly, because the FDE is the person who deploys into the customer's cloud where the machine identity is not the one they tested with. Three discipline rules:
+
+1. **Test under the deployment identity, not your own.** Before shipping, run the agent locally but assume the machine identity (`az login --identity`, service-account impersonation, `aws sts assume-role`). A pass under your personal creds proves nothing about production.
+2. **Make auth failures legible.** Wrap every tool's auth path so a permission error returns "tool X failed: identity `<principal>` lacks scope `<scope>`" instead of a raw `tool_user_error`. An opaque auth failure is indistinguishable from a logic bug and burns hours.
+3. **Enumerate the scope surface up front.** Every external tool the agent calls needs its required scope written down and granted to the machine identity before deploy — not discovered one `403` at a time in the customer's environment.
+
+The gateway helps here: route every tool's outbound auth through one identity-aware layer so the scope surface is visible in one place, not scattered across tool implementations.
 
 ---
 

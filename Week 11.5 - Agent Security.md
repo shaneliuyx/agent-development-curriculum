@@ -1,7 +1,7 @@
 ---
 title: Week 11.5 - Agent Security
 created: 2026-04-30
-updated: 2026-05-14
+updated: 2026-05-21
 tags:
   - agent
   - security
@@ -602,6 +602,23 @@ if __name__ == "__main__":
 - **2-repo convergence (PAI + AutoGPT)**: PAI's `containment-zones.ts` proves the pattern works in personal AI infra; AutoGPT's `executor/scheduler.py` proves the trigger-surface concern is real in multi-tenant production. Independent designs, same conclusion.
 - **Prompt-vs-hook layer distinction**: prompt-level "do not read ~/.ssh" is advisory; hook-level `ContainmentGuard.check` is structural. The model can be jailbroken — the hook cannot be jailbroken without code access.
 - **Trigger surface is a separate auth boundary**: the agent loop's threat model is incomplete if it only models the LLM↔tool boundary and ignores how the loop got started in the first place. Cron, webhook, and manual all require distinct auth treatment.
+`─────────────────────────────────────────────────`
+
+---
+
+## §11.5.Z Governance and Liability — who answers when the agent acts wrong
+
+Everything above this point is **security**: stopping an adversary from making the agent do something harmful. **Governance** is the adjacent, distinct question: when the agent — un-attacked, working exactly as built — takes a wrong action, who is accountable? Practitioners are actively worried about this; the question "AI Agent Governance and Liability?" drew a 91-comment thread on r/AI_Agents in May 2026. An FDE deploying into a customer's regulated workflow cannot ship without answering it, so it belongs in the threat model even though it is not a threat.
+
+Three governance primitives, each a deliberate design decision before go-live:
+
+1. **Authority ceiling.** Write down, explicitly, what the agent may do unilaterally versus what requires human sign-off. A read query needs no ceiling; a `terraform apply`, a payment, a customer-facing message, a production write — each needs an explicit "agent proposes, human confirms" gate. The ceiling is a code path (like the Defense 1 allowlist), not a prompt instruction. The W12 capstone's "rollback/scale — confirm required" output is an authority ceiling in miniature.
+2. **The audit trail is the liability record.** Every state-changing action must be attributable to a triple: `(agent identity, trigger source, human approver - if any)`. This is the §11.5.Y trigger-surface concern extended for accountability: when an action is later questioned, the audit log must answer "what ran this, on whose authority?" without reconstruction. An append-only log is the cheapest insurance an agent deployment can carry.
+3. **The accountability chain.** "The model did it" is not a defense. The deploying organisation owns the agent's actions the same way it owns a buggy deploy script's actions. Governance makes that ownership legible: a named owner per deployed agent, a defined escalation path, and a review cadence for the agent's decisions — not just its uptime.
+
+`★ Insight ─────────────────────────────────────`
+- **Security and governance fail differently and need different controls.** Security fails when an adversary gets in - the fix is a boundary the attacker cannot cross. Governance fails when the agent does exactly what it was built to do and that turns out to be wrong, unauthorised, or unaccountable - the fix is an authority ceiling plus an audit trail, not a stronger boundary. A threat model that only covers adversaries is half a threat model.
+- **For the FDE, governance is a scoping conversation, not an afterthought.** "What may this agent do without a human, and who is liable for what it does?" is a question to settle in the W12 FDE Delivery Mode intake brief - before the build, with the stakeholder - because the answer changes the architecture (where the confirm-gates go). Discovering it after deployment in a customer's compliance workflow is the expensive way to learn it.
 `─────────────────────────────────────────────────`
 
 ---

@@ -22,6 +22,8 @@ By May 2026 the FDE became the most-hired engineering role in AI. Job listings s
 
 This curriculum was written before "FDE" was a common title, but it already teaches every technical skill the role requires. This note makes the path explicit so the reader does not have to reverse-engineer it.
 
+> **External credential (optional).** GitHub launched **GH-600 "Agentic AI Developer"** (beta) in May 2026 - the first vendor-neutral certification for supervising autonomous agents across coding, automation, and production systems. It is not required and not a substitute for the measured-engineering portfolio this curriculum builds, but it is a low-cost recognised signal if FDE roles are the explicit target. Treat it as a portfolio add-on, not a prerequisite.
+
 ## What a Forward Deployed Engineer is
 
 An FDE is an engineer **embedded inside the customer's organization** who ships production AI code in that customer's real environment. The role lives in the gap between *"our AI product works in the demo"* and *"our AI product is live inside Acme Corp's compliance workflow."* It sits at the intersection of three disciplines:

@@ -1,7 +1,7 @@
 ---
 title: Week 0.3 — Agent History and Foundational Narrative
 created: 2026-05-19
-updated: 2026-05-19
+updated: 2026-05-21
 tags:
   - agent
   - history
@@ -122,6 +122,12 @@ The 2026 frontier is **hybrid**: LLM agent at the orchestrator layer + Era 2-4 p
 3. **Decision-making over a state space** — system chooses which action to take based on observed state; not a fixed script. A workflow with hardcoded branches is not an agent; a workflow where the LLM picks the branch is.
 
 A function call has none of the three. A chatbot has #1 (kind of) but not #2 or #3. An n8n workflow has #2 but not #3. A ReAct agent has all three. Claude Code has all three plus parallelism + skills + sub-agents.
+
+### Agentwashing — the 2026 counter-test
+
+By 2026 "AI agent" became a marketing label applied to almost anything. MIT Technology Review named the pattern **agentwashing**: calling a system an autonomous agent when it is really a scripted automation with better branding - "ChatGPT connected to a workflow." The 3-property definition is the test that cuts through it. Run any product claiming to be an agent against the three properties; an agentwashed system fails #3 (decision-making over a state space) - its branches are hardcoded, the LLM only fills text into a fixed pipeline.
+
+The practitioner framing, from the discourse: a real agent "handles context, memory, tools, decision-making, failures, retries, and unpredictable environments"; an agentwashed one generates text inside a deterministic script. This matters for an FDE specifically - a customer who bought an "agent" often bought an agentwashed workflow, and naming the gap honestly (then scoping the real build) is part of the job. **Interview soundbite:** "I screen for agentwashing with one question - does the LLM choose the next action, or does it just fill text into a branch a human already wrote? Only the first is an agent."
 
 ## Architecture Diagram — The Lineage
 
