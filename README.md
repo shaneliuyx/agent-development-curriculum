@@ -59,6 +59,8 @@ Week 12 — Capstone and Mocks
 
 > **Interview-prep spine:** see [[Interview Question Index]] for question → chapter → measured-anchor lookups. Use it as the pre-interview review entry point.
 
+> **FDE career track:** see [[FDE Track - Forward Deployed Engineer Path]] — an overlay note that maps every week above onto the Forward Deployed Engineer skill stack (agentic orchestration, evals and guardrails, production deployment, MCP integration, customer context) and gives a compressed FDE reading path. Read it if you are targeting Forward Deployed Engineer roles specifically. The customer-context gap it identifies is closed by Week 12's FDE Delivery Mode.
+
 ## How this maps to the Akshay 6-area hiring rubric (2026)
 
 | Area | Where covered |

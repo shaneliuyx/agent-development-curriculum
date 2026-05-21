@@ -7,7 +7,7 @@ time_estimate: "12–15 hours"
 prerequisites: "Weeks 1–11 complete. lab-07, lab-08, lab-09 repos exist locally. Phoenix running. At least one RESULTS.md per lab."
 week: 12
 phase: 4
-updated: 2026-05-03
+updated: 2026-05-21
 audience: "Cloud infrastructure engineer (3 yrs), ready to make their agent work visible and apply for roles"
 stack: "MacBook M5 Pro; GitHub; cloud VCS (private repo shadowing); Miro for architecture diagrams; screen recording software"
 ---
@@ -390,6 +390,90 @@ The stack: Qwen3.6-35B-A3B-nvfp4 via oMLX as the agent backbone (strongest open 
 > **Interview angle:** "I built this because SRE teams are the most underserved audience for agent tooling. They already have rich structured observability data — Kubernetes API, Prometheus, distributed traces, Terraform plan JSON — that an agent can reason over deterministically. Most LLM engineers don't know this infrastructure exists, let alone how to query it. I do, because I ran it for three years."
 
 > **Job-hunt reality:** Capstone C targets the broadest set of agent roles while using the narrowest and most defensible background. That asymmetry is exactly what you want. Your infra experience is not a pivot story — it is a superpower story.
+
+---
+
+## FDE Delivery Mode - run the capstone as a forward-deployed engagement
+
+> **Optional overlay. Read this if you are targeting Forward Deployed Engineer roles** (see [[FDE Track - Forward Deployed Engineer Path]]). FDE Delivery Mode does NOT change the technical build - you still build the capstone you picked in Phase 1. It wraps that build in a customer-engagement simulation, and it closes the one structural gap a self-directed curriculum cannot close by default.
+
+**Why this exists.** Every other week of this curriculum teaches an FDE technical skill - retrieval, agents, MCP, evals, observability, deployment. The one skill labs cannot teach is **customer context**, because a lab is built for yourself, not delivered to a stakeholder. The FDE research is blunt about this: the only way to acquire customer context is to ship something to a customer, and internal stakeholders count. FDE Delivery Mode is how the capstone produces that evidence.
+
+**The interview-sentence delta.** Without this mode, your capstone story is *"I built an infra-aware SRE agent."* With it, the story is *"I delivered an infra-aware SRE agent to a stakeholder, scoped it against their SLA, handed it off with an operator runbook, and iterated once on their feedback."* The first sentence is what every candidate says. The second is what an FDE interviewer is listening for - it is the consulting half of the role, and most candidates have zero evidence for it.
+
+### Who is the "customer"
+
+In priority order:
+
+1. **A real person** - an ex-colleague still in SRE/ops, a friend running infrastructure, anyone who genuinely operates the kind of system your capstone targets. Real beats simulated every time; a real stakeholder files real, surprising feedback.
+2. **A defined persona** - if no real stakeholder is available, write the customer down explicitly: name, role, team, the system they own, their actual pain. A persona you committed to paper behaves like a constraint; a vague "the user" does not.
+
+Either way, the customer is fixed before the build and does not move to fit the build.
+
+### The five FDE Delivery Mode deliverables
+
+The technical build is deliverable 3 and is unchanged. The other four are the FDE wrapper.
+
+**1. Stakeholder intake brief** (`delivery/01-intake.md`) - half a page, in the customer's words, not yours.
+
+```markdown
+# Intake - {Capstone name}
+Stakeholder: {name / persona} - {role}, {team}
+System they own: {what they run in production}
+The problem, in their words: "{quote or close paraphrase of the actual pain}"
+What "fixed" looks like to them: {their success criterion, not yours}
+Constraints they named: {latency / data-access / compliance / on-call limits}
+What they explicitly do NOT want: {scope they ruled out}
+```
+
+**2. Scoping doc + SLA** (`delivery/02-scope.md`) - the engineering translation of the intake. This is the business-translation artifact.
+
+```markdown
+# Scope - {Capstone name}
+In scope: {3-5 concrete capabilities}
+Out of scope (v1): {what you are deliberately not building, and why}
+Success metric: {one measurable number - e.g. "resolves 70%+ of the 40-question test set"}
+SLA: {latency target p95, availability assumption, failure behaviour}
+Risks + mitigations: {2-3 named risks, each with a mitigation}
+Handoff definition: {what "done and delivered" means}
+```
+
+**3. The build** - your Phase 1 capstone, exactly as specified. No change.
+
+**4. Handoff README** (`delivery/03-handoff.md`) - operator-facing, NOT portfolio-facing. The portfolio README sells; the handoff README lets a stranger run and trust the system.
+
+```markdown
+# Handoff - {Capstone name}
+Run it: {exact commands}
+What it does on each query: {the loop, in 3-4 sentences}
+How to read the output: {how to interpret a root-cause + proposed-action response}
+Known limits: {where it abstains, where it can be wrong}
+When NOT to trust it: {failure modes the operator must know}
+Escalation: {what to do when the agent is unsure}
+Rollback: {how to undo any action it proposes}
+```
+
+**5. Feedback-iteration cycle** (`delivery/04-feedback.md`) - one round, mandatory.
+
+The stakeholder uses the system against their real (or persona-realistic) questions and files issues. You triage, fix at least the highest-severity one, and record the before/after. Log it:
+
+```markdown
+# Feedback round 1 - {date}
+Issues filed: {list, severity-tagged}
+Fixed this round: {what changed, with the commit}
+Deferred (v2): {what you scoped out, and why}
+Measured delta: {the metric before vs after the fix}
+```
+
+### How FDE Delivery Mode changes the portfolio artifact
+
+The capstone repo gains a `delivery/` directory with the four wrapper docs. The portfolio README gains one section - "Delivered as a forward-deployed engagement" - that links the intake, scope, handoff, and feedback docs. That section is the proof of the consulting half: a hiring manager sees not just a built system but a *delivered* one, scoped against a stated SLA and iterated on real feedback.
+
+`★ Insight ─────────────────────────────────────`
+- **FDE Delivery Mode is process, not code.** It adds zero lines to the agent. It adds four short documents and one feedback cycle. The cost is roughly half a day; the return is the single hardest-to-fake half of the FDE role made visible. Highest evidence-per-hour artifact in the capstone.
+- **The handoff README is the tell.** A portfolio README is written to impress a reviewer; a handoff README is written so a stranger can operate the system without you in the room. Writing the second one proves you think about the operator, not just the demo - which is exactly the FDE mindset. Most candidates only ever write the first.
+- **One real feedback issue beats ten imagined ones.** The point of deliverable 5 is the surprise: a real stakeholder asks something you did not design for, and the before/after delta on that issue is a concrete, defensible interview anecdote. A self-graded "I think it works" is not.
+`─────────────────────────────────────────────────`
 
 ---
 
@@ -1536,7 +1620,7 @@ The work is not.
 
 - **Builds on:** ALL prior weeks (W0-W11.7) — every lab, RESULTS.md, bad-case entry, mock-prep recording made during W1-W11.7 is consumed here. W8 schema-reliability benchmark is direct source for public write-up. W11 system design recordings are direct prep for system design rounds. [[Week 11.7 - Take-Home Dress Rehearsal]] (`lab-11-7-takehome-rehearsal`) is the canonical project-defense lab — pick it as one of the 30 mock-interview deep-dive subjects in Phase 4.
 - **Distinguish from:** generic ML interview prep — agent interviews center on system design (eval methodology, tool reliability, context management, observability) rather than modeling (training, loss functions, hyperparameters). Six Appendix A categories map to production agent concerns, not academic ML.
-- **Connects to:** `Bad-Case Journal.md` — best entry becomes Card 4 in Lock-In Anki set + behavioral answer to "production failure" question. `Engineering Decision Patterns.md` — use both during mock prep; pattern library supplies tradeoffs section of every system design answer.
+- **Connects to:** `Bad-Case Journal.md` — best entry becomes Card 4 in Lock-In Anki set + behavioral answer to "production failure" question. `Engineering Decision Patterns.md` — use both during mock prep; pattern library supplies tradeoffs section of every system design answer. [[FDE Track - Forward Deployed Engineer Path]] — readers targeting Forward Deployed Engineer roles run this capstone in **FDE Delivery Mode** (see the section above Phase 2); the FDE Track overlay maps every curriculum week onto the FDE skill stack and routes here to close the customer-context gap.
 - **Foreshadows:** post-curriculum — first 30/60/90-day plan in `RESULTS.md` is operational roadmap for the new role. Open-source contribution to Outlines, Instructor, Phoenix, Qdrant, or LangGraph is recommended next public artifact. Teaching (internal tech talk, second post at 6 months) is the final proof of mastery.
 - **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
   - **W10**: Framework Shootout — comparative analysis is direct system-design interview material
