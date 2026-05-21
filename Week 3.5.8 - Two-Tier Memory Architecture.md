@@ -3005,10 +3005,11 @@ WRITE PATH ───────────────────────
     │     speaker=system → rules extractor (durable, write-time)
     │     speaker=tool → typed outputs (structured schema, write-time)
     │
-    ├─ Layer 2: schema-shape classifier (cheap heuristic)
-    │     features: turn markers, JSON keys, timestamp regularity,
-    │                inter-record similarity, token entropy
-    │     confidence > 0.85 → route → done
+    ├─ Layer 2: schema-shape classifier (regex heuristic, no LLM)
+    │     5 features: distinct-speaker count, JSON-key density,
+    │                 timestamp density, avg line length, line count
+    │     3 conjunction rules; route only if confidence >= 0.85
+    │     (see "Layer 2 — what the classifier inspects" below)
     │
     ├─ Layer 3: default to READ-time atomise (conservative)
     │     rationale: late-binding is reversible (re-atomise later);
@@ -3041,6 +3042,31 @@ DEPLOYMENT GATE ─────────────────────�
     REJECT if accuracy(B) ≤ accuracy(A) — the extractor poisons, not helps
 ```
 
+#### Layer 2 — what the schema-shape classifier inspects
+
+Layer 2 is the auto-classification fallback for any record Layer 1.5 could not tag from a speaker role. It must be **cheap and deterministic** — every `imprint()` call hits it on the write path, so an LLM call here would put a network round-trip and a per-token cost on *every memory write*. So the classifier is pure regex + arithmetic: three compiled patterns, five derived features, three decision rules. No model, no API. (`classify_workload`, `production_router.py:71`.)
+
+**The five features.** Each is a *density* (count ÷ line count), not a raw count, so the verdict is length-invariant — a 5-line snippet and a 500-line file with the same shape score the same:
+
+| Feature | Regex / measure | What it detects |
+|---|---|---|
+| Distinct-speaker count | `^\s*(user\|assistant\|system\|tool)\s*:` | dialogue — two-party turn-taking |
+| JSON-key density | `"\w+"\s*:\s*[...]` per line | structured payload — config, record, event |
+| Timestamp density | ISO-8601 `\d{4}-\d{2}-\d{2}...` per line | time-series — telemetry / audit stream |
+| Avg line length | mean chars per line | uniform short lines = machine-emitted log |
+| Line count | `len(splitlines())` | the denominator that makes the densities scale-free |
+
+**Why distinct-speaker *count*, not turn-marker density.** An earlier version routed on `turn_density >= 0.15` and broke on conversations whose message bodies span 10–50 lines per turn — one turn marker, many content lines, so density collapsed below threshold and real dialogue scored as `UNKNOWN`. The fix counts **distinct speakers**: a dialogue needs ≥2 participants regardless of how verbose each turn is. Counting *what kind* of thing is present beats counting *how often* a token appears.
+
+**Three decision rules, each a conjunction.** A single signal is too noisy to route on — JSON keys appear in config files, timestamps appear inside dialogue ("let's meet 2026-05-21"), short uniform lines appear in poetry. So the log-stream rule fires only when three signals **agree**:
+
+- Rule 1 — ≥2 distinct speakers → `CONVERSATION`, confidence `0.9` (one speaker + markers → `0.8`)
+- Rule 2 — JSON density ≥0.5 **and** timestamp density ≥0.5 **and** avg line <200 → `LOG_STREAM`, `0.9`
+- Rule 3 — JSON density ≥0.7 **and** timestamp density <0.2 → `STRUCTURED_RECORD`, `0.85`
+- Fall-through → `UNKNOWN`, confidence `0.4` → Layer 3
+
+**Why the 0.85 gate, and why it is asymmetric.** The router commits to a tier only when `confidence >= 0.85`; anything lower drops to Layer 3's read-time-atomise default. The threshold is conservative on purpose, because the two error directions cost very differently. A **false negative** — a real log stream scored `0.4` and sent to Layer 3 — only gets read-time atomise, which is late-binding and fully reversible: re-atomise it correctly later, the raw is still there. A **false positive** — conversational data misrouted to a write-time typed schema — early-binds the record and **destroys the raw signal**, violating invariant (a) irrecoverably. So the classifier is tuned to emit `UNKNOWN` whenever unsure rather than guess. `0.85` is the floor at which a rule's conjunction is strong enough that the early-binding risk is acceptable; every rule that early-binds (2 and 3) is pinned at or above it, and the only sub-threshold verdicts (`UNKNOWN` 0.4, single-speaker 0.8) route to the reversible path.
+
 #### Invariant provenance — every rule is paid-for
 
 | # | Invariant | Source (measured) | Cost if violated |
@@ -3066,6 +3092,28 @@ def gate_extractor_deployment(extractor, eval_set, threshold=3):
 ```
 
 Any extractor that doesn't beat raw-only by ≥3pts on representative data is REJECTED, not shipped. This single gate would have caught the constrained-atomise variant before any of v4/v5/v7/v9 reached the eval.
+
+##### What the three primitives actually compute
+
+The pseudocode uses three helpers — `extractor`, `compose`, `score`. None returns quite what its name suggests at a glance, so here is each one with its input and output type, mapped to the shipped code in `production_router.py` / `run_production_mvp.py`.
+
+**`extractor(raw)` → `list[str]`.** The extractor (the atomiser) takes the raw retrieved context as one string and returns a **list of triple strings**, each shaped `"subject | attribute | value"` — e.g. `"user | allergy | shellfish"`. The unconstrained atomiser (`make_unconstrained_atomiser`) produces this with a single LLM call: feed the context under `ATOMISE_SYSTEM`, split the reply on newlines. Output volume is *not* fixed — 14–57 triples per session in the §5.3 runs. It returns text, never a number and never a self-assessment; the extractor has no idea whether its own triples are any good. That blindness is exactly why the gate has to exist downstream.
+
+**`compose(question, context)` → `str`.** The composer is the answering LLM. Input: the question plus a context blob. Output: **one free-text answer string** — e.g. `"You are allergic to shellfish."`. It is one LLM call (`COMPOSE_SYSTEM`, `max_tokens=600`), cleaned by `_extract_answer`. Two things the pseudocode hides:
+
+- `compose` returns an *answer*, not a verdict and not a score. Whether that answer is correct is decided in the next step.
+- The `+` in `retrieve_raw(q) + extractor(retrieve_raw(q))` is not naive concatenation. The shipped `build_composer_prompt` places **raw context FIRST, triples LAST** under a neutral `Atomic facts (structured):` header — invariant (c). Assembling the prompt in the other order is itself a −30pt regression (§5.3.3 v5/v7), so the `+` is order-disciplined, not commutative.
+
+**`score(eval_set, pipeline)` → `float` in [0, 1].** This is accuracy, computed by an LLM-as-judge loop — not a string match. For each question: run the pipeline → get an answer → call a judge model with `(question, gold, answer)` → the judge replies `CORRECT` / `INCORRECT` → `_parse_verdict` reduces its reply to one token → count the `CORRECT`s. `score = n_correct / n_questions`. So `a` and `b` in the pseudocode are two accuracies measured on the *same* held-out eval set; the only difference is whether the extractor's triples were present in the composer's context.
+
+**The comparison, in real units.** The pseudocode writes `b < a + threshold` with `threshold=3`, which quietly mixes a fraction (`a`, `b` ∈ [0, 1]) with a points value. The shipped `deployment_gate` does the unit conversion explicitly:
+
+```python
+delta_pts = (raw_plus_facts_acc - raw_only_acc) * 100   # fraction → percentage points
+ship      = delta_pts >= threshold_pts                  # threshold_pts = 3.0
+```
+
+`ship=True` only if adding the extractor's triples lifts judged accuracy by **≥3 percentage points** on held-out questions. `delta ≤ 0` means the extractor is actively poisoning the composer — reject. `0 < delta < 3` means it is not worth the extra latency and token cost — reject. This is why C3 in the MVP feeds a deliberately broken extractor (10 fixed garbage triples like `"user | home planet | Mars"`): garbage carries zero signal, so `delta` cannot reach +3 on any model, and the gate must return `ship=False`. C3 passes precisely when the gate correctly refuses to ship it.
 
 #### Per-tier policy matrix
 
