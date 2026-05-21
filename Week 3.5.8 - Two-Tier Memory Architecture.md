@@ -3117,6 +3117,28 @@ ship      = delta_pts >= threshold_pts                  # threshold_pts = 3.0
 
 `ship=True` only if adding the extractor's triples lifts judged accuracy by **≥3 percentage points** on held-out questions. `delta ≤ 0` means the extractor is actively poisoning the composer — reject. `0 < delta < 3` means it is not worth the extra latency and token cost — reject. This is why C3 in the MVP feeds a deliberately broken extractor (10 fixed garbage triples like `"user | home planet | Mars"`): garbage carries zero signal, so `delta` cannot reach +3 on any model, and the gate must return `ship=False`. C3 passes precisely when the gate correctly refuses to ship it.
 
+##### The gate is an offline judge, not a runtime component
+
+A common confusion: *the extractor improves answers at request time, so isn't the gate part of the request path too?* No — the **extractor** and the **gate** are two different objects with two different lifecycles.
+
+| Object | What it is | When it runs |
+|---|---|---|
+| **Extractor** (atomiser) | produces triples, adds them to the composer's context | **runtime — every request**, *if* it passed the gate |
+| **Deployment gate** | A/B judge that returns `ship` / `no-ship` | **offline — once**, before the extractor is admitted |
+
+The extractor *is* in the runtime pipeline: per request, `retrieve raw → extractor → safe_atomise → compose`. That per-request extraction is what lifted C4 to 75% vs 65%. The gate is a **different thing** — the judge, not the judged. It is the one-time admission check that decides whether a *candidate* extractor earns a place in that runtime pipeline.
+
+**The deploy flow.** Before any extractor reaches production:
+
+1. Design a candidate extractor.
+2. **Gate it** — A/B offline on a held-out eval: is `accuracy(raw + extractor) ≥ accuracy(raw) + 3pts`?
+3. **Pass** → extractor admitted into the runtime pipeline; it now runs per-request.
+4. **Fail** → extractor rejected, never ships; the pipeline stays raw-only (or keeps the previous extractor).
+
+**Why "the gate runs the extractor" does not make the gate a runtime component.** During the gate's A/B (and during C3), the extractor *is* executed — the gate must run it to score it. But that execution happens **on a held-out eval set, offline**, so the gate can measure `delta`. That is the extractor *on the test bench*, not the extractor *in production*. The extractor therefore executes in two distinct contexts: (1) inside the gate's A/B — offline, to be measured, where every candidate runs regardless of quality; (2) in the runtime pipeline — per-request, where only gate-passed extractors ever reach. C3's garbage extractor runs in context (1) only: the gate scores it, returns `no-ship`, and it never reaches context (2). The gate invoking the extractor is exactly like a CI test invoking your code — running your code does not put CI in the request path.
+
+**Re-gate on every change.** A `ship=True` verdict is bound to one specific `(extractor, eval set)` pair. Change the extractor prompt, swap the composer model, or let the production data distribution drift, and the old verdict is stale — re-run the gate. It is deliberately cheap (one offline A/B) so it can be run on every extractor change, the same way a pre-merge CI test runs on every commit.
+
 #### Per-tier policy matrix
 
 | Data shape | Lifecycle | Tier | Extractor | K_min | Calibration gate |
