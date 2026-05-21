@@ -3126,6 +3126,8 @@ ship      = delta_pts >= threshold_pts                  # threshold_pts = 3.0
 
 #### Operating-point recommendations (measured on M5 Pro 4-bit MLX, N=20 oracle subset)
 
+> **What "commit-biased prompt" means.** It is a one-paragraph change to the *composer* system prompt (`COMPOSE_SYSTEM`), nothing else — no model change, no retrieval change. The default composer instruction is abstention-first: *"if the context lacks the answer, say you don't know."* The commit-biased version replaces that with commit-first: *"default to answering; pick the best-supported answer; abstain only when the retrieved context is unrelated to the question's topic."* Measured effect on the oracle subset: **+30pts on a capability-limited model** (Qwen3.6-27B) and **+0pts on an already-committing model** (Qwen-Opus distill) — it raises the *floor*, it does not raise the *ceiling*. Cost: ~1.5× latency from slightly longer reasoning. Mechanism, and the important caveat that this lever works *because LongMemEval structurally rewards commitment* (so it is an eval-aware tuning knob, not a universal accuracy win), are in [[#5.3.5 Commit vs hedge — LongMemEval's commitment bias (N=100 judge-controlled, measured 2026-05-21)|§5.3.5]].
+
 | Operating point | Configuration | Acc | Wall (20-Q) | Use when |
 |---|---|---|---|---|
 | **Cheap best-Pareto** | Commit-biased prompt only, no atomise | 60-70% | ~6-8 min | latency-critical inference |
