@@ -4425,7 +4425,7 @@ Plus the `query_context()` filter (`is_empty: {key: superseded_by}` on default q
 
 Phase 8.1 introduced the 4-action `decide_action` / `execute_action` primitive (add / update / delete / no-op); Phase 8.6 added the 2 bitemporal actions (supersede / coexist). All 6 are state-mutating operations on the Qdrant store — and **each one is an AuditEntry the W11.8 CT pipeline + W9.3 eval rubric need to consume**. This subsection lands the typed-AuditEntry surface that §3.4 forward-referenced.
 
-Reader prerequisites grounded by now: §3.4 (AuditEntry dataclass + record_audit / read_audit_log primitives + 3-op subset for the §3.3 quality gate), §6.2 (Qdrant point UUIDs in candidate dicts), §8.1 (dedup primitive returning `DedupAction` with `target_id`), §8.6 (supersede / coexist actions + `merged_content` for update).
+Reader prerequisites grounded by now: §3.4 (AuditEntry dataclass + record_audit primitive + 3-op subset for the §3.3 quality gate), §6.2 (Qdrant point UUIDs in candidate dicts), §8.1 (dedup primitive returning `DedupAction` with `target_id`), §8.6 (supersede / coexist actions + `merged_content` for update). This §8.7 wire-in adds `read_audit_log()` (server-side user_id + operation filtering) and emits AuditEntry across all 6 mutation ops.
 
 **Full operation × field matrix (all 9 ops):** the two ID fields encode a directed edge — `target_id` is the existing point an op modifies (`None` if no prior point), `new_id` is the fresh point produced (`None` if the op doesn't write). Collapsing to one ID loses the edge; replay / CT pipelines need both ends to reconstruct supersede / coexist chains.
 
@@ -5394,20 +5394,101 @@ Audit replay reconstructs the store's state from the audit log alone. Production
 
 ```python
 # src/replay.py — reconstruct store state from audit log
-def replay_audit(tm, audit_log: list[dict]) -> None:
-    """Replay every AuditEntry against an empty TieredMemory. Idempotent
-    when applied to an empty target. NOT idempotent on a non-empty target;
-    caller is responsible for resetting state."""
+"""Replay engine for AuditEntry logs. Reconstructs the store's state by
+re-emitting every write captured in the audit log against an empty
+target TieredMemory.
+
+Idempotency contract: idempotent ONLY against an empty target. Caller
+is responsible for resetting state (drop + recreate Qdrant collection,
+or fresh EverCore Postgres schema) before invocation.
+
+Op semantics (mirrors §3.4's 9-op Literal + §8.1/§8.6 dispatch):
+  imprint              — fresh write; replay payload_summary as new fact
+  promote              — quality-gate decision metadata; the actual write
+                         is captured in the paired imprint (use_dedup=False)
+                         or in update/delete/supersede/coexist (use_dedup=True).
+                         SKIP at replay (double-write otherwise).
+  demote               — quality-gate fail; NO write occurred; SKIP.
+  update / delete      — replay payload_summary (the post-action content).
+                         The original target_id was reconciled by ordering;
+                         on an EMPTY target there's nothing to delete first.
+  supersede            — replay payload_summary + propagate `supersedes`
+                         pointer into metadata so chain traversal works.
+  coexist              — replay payload_summary + propagate `relates_to`
+                         pointer into metadata.
+  noop_duplicate       — nothing happened; SKIP.
+  compact              — offline audit-log housekeeping; SKIP at replay.
+  <unknown>            — log warning + SKIP (forward-compat; non-zero
+                         unknown count on replay = code stale vs log).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
+
+
+class TieredMemoryLike(Protocol):
+    """Structural subtype of both EverCore + Qdrant TieredMemory variants
+    (same shape as §8.1's Protocol). Replay only needs imprint()."""
+    def imprint(self, content: str,
+                metadata: dict[str, Any] | None = None) -> str: ...
+
+
+_OPS_REPLAY_AS_IMPRINT = {"imprint", "update", "delete", "supersede", "coexist"}
+_OPS_SKIP = {"promote", "demote", "noop_duplicate", "compact"}
+
+
+def replay_audit(tm: TieredMemoryLike, audit_log: list[dict]) -> dict[str, int]:
+    """Replay every AuditEntry against tm. Returns per-bucket counts so
+    tests can assert replay completion + surface forward-compat drift.
+
+    Returns: {"replayed": int, "skipped": int, "unknown": int}
+    Non-zero `unknown` on a clean replay means the log contains an op
+    this code doesn't recognise — bump _OPS_REPLAY_AS_IMPRINT/_OPS_SKIP."""
+    counts = {"replayed": 0, "skipped": 0, "unknown": 0}
     for entry in audit_log:
-        op = entry["operation"]
-        if op == "imprint":
-            tm.imprint(content=entry["payload_summary"], metadata=entry.get("metadata", {}))
-        elif op in {"supersede", "update", "coexist", "delete"}:
-            # Reconstruct the action sequence; depends on Phase 8 / 9.6
-            pass  # see lab repo for full impl
-        elif op == "noop_duplicate":
-            continue  # nothing to replay
+        op = entry.get("operation")
+        if op in _OPS_SKIP:
+            counts["skipped"] += 1
+            continue
+        if op not in _OPS_REPLAY_AS_IMPRINT:
+            logger.warning(
+                "replay_audit: unknown operation %r in entry %s",
+                op, entry.get("id"),
+            )
+            counts["unknown"] += 1
+            continue
+        # Build metadata: start from entry's metadata, overlay supersede/coexist
+        # pointers so downstream chain-walks still resolve after replay.
+        meta = dict(entry.get("metadata") or {})
+        if op == "supersede" and entry.get("target_id"):
+            meta.setdefault("supersedes", entry["target_id"])
+        elif op == "coexist" and entry.get("target_id"):
+            meta.setdefault("relates_to", entry["target_id"])
+        tm.imprint(content=entry["payload_summary"], metadata=meta)
+        counts["replayed"] += 1
+    return counts
 ```
+
+**Walkthrough:**
+
+**Block 1 — Two op sets, no per-op branches.** Original sketch had if/elif per operation; the production shape factors the 9 ops into two sets (`_OPS_REPLAY_AS_IMPRINT`, `_OPS_SKIP`) plus an unknown-fallthrough. Why: 5 of the 6 write ops (imprint/update/delete/supersede/coexist) collapse to "emit `payload_summary` as a fresh imprint" because the audit log already encodes the post-action content. The remaining differences (supersede/coexist need pointer metadata) are 2 small overlays, not 2 full branches. Frozen-set membership beats nested if-chains for both readability and forward-compat (adding a 10th op is one line, not one branch).
+
+**Block 2 — `promote` SKIP is the load-bearing decision.** §3.4 emits BOTH `imprint` + `promote` when the quality gate passes on a use_dedup=False path. Replaying both would double-write. The contract: `promote`'s `new_id` is the same UUID as the paired `imprint`'s — it's a decision-record, not a write-record. Replay treats writes as canonical; decisions as metadata. Symmetric: `demote` is recorded but no write happened, so it's also a skip. The audit log is denormalized for read-time analysis (every decision is queryable); replay re-normalizes by collapsing to the writes that actually moved store state.
+
+**Block 3 — `supersede` + `coexist` pointer overlay.** When replaying these ops, the audit's `target_id` is the prior point that's now being superseded-by or coexisting-with. On an empty target, that prior point doesn't exist — but downstream consumers (W11.8 CT pipeline, cross-backend export) will walk the resulting `supersedes` / `relates_to` metadata edges to reconstruct chains. So we PRESERVE the pointer in metadata even though the target doesn't exist mid-replay. After replay completes, the chain is dangling-pointer-traversable; subsequent ops in the log will land their own `target_id` values and the graph fills in. `setdefault` (not `[...] = `) so caller-provided `metadata.supersedes` isn't clobbered if present.
+
+**Block 4 — `unknown` counter is a forward-compat canary.** Any op not in either set logs a warning + bumps the unknown count. Non-zero on a normal replay = the log contains an op this code doesn't recognise (likely added in a chapter increment after this code was written). Test assertions check `counts["unknown"] == 0`; CI catches drift immediately when a new op lands in `AuditOperation` without a corresponding replay branch.
+
+**Result** *(projected from §3.4's measured 85-entry quest batch table; actual replay run TBD)*: expected bucketing on the canonical 85-entry batch — 47 replayed (imprint + dedup-ops counted together in §3.4's table) + 38 skipped (promote in this batch; demote/noop_duplicate happen to be 0) + 0 unknown. Estimated wall: ~7-12s on M5 Pro (47 sequential imprints × ~150ms Qdrant POST each); not measured. When the replay test ships, replace this projection with the actual `counts` dict + wall.
+
+`★ Insight ─────────────────────────────────────`
+- **The factoring into 2 sets + unknown bucket is the production shape.** Naive replay = N branches for N ops, scales linearly with ops. This shape = 2 frozen sets + 2-line metadata overlay + 1 fallthrough, scales as O(1) regardless of op count. Adding a 10th op = one set insertion, not one elif. This is the same pattern as W4 ReAct's tool-dispatch (registry + lookup, not per-tool branches).
+- **The `promote`/`demote` skip is invisible to any test that just counts writes.** Replay produces the same final store state as the original sequence DID — but if you assert "all 85 audit entries triggered an imprint", you've conflated decision-records with write-records. The 3-field BCJ entry shape (symptom / root cause / fix) for this kind of bug would be: *symptom: replay produces 2× the expected point count; root cause: promote treated as write; fix: SKIP promote, it's a decision metadata-record paired with an imprint*.
+- **Returning counts dict (not None) lets the test do `assert counts == {"replayed": 47, "skipped": 38, "unknown": 0}` in one line.** Original `-> None` signature forced the test to read the resulting Qdrant collection size + audit log separately to verify completion. Returning the counter is the W2.7 + W3.5.8 §8.7 convention: every consolidating function returns a structured counter so callers can assert without external state.
+`─────────────────────────────────────────────────`
 
 ### 9.4 Lab deliverables
 
