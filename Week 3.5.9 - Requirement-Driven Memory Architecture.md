@@ -158,6 +158,7 @@ Senior engineers do (2). Junior engineers do (1). The lab teaches (2) by measuri
 ### 3.1 Router-based hybrid (Phase 4 target)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   Q["Incoming question"] --> R["Question Classifier<br/>rule-based regex<br/>OR small LLM call"]
   R -->|multi-session<br/>knowledge-update<br/>single-session-user| A1["1-tier atomic-fact store<br/>per-message extraction<br/>multi-signal retrieval"]
@@ -176,6 +177,7 @@ flowchart TD
 ### 3.2 Three-class comparison
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   subgraph C1["Class 1 — 1-tier"]
     direction TB
@@ -205,6 +207,7 @@ flowchart LR
 ### 3.3 Three-tier topology (Phase 5-9 target — extends W3.5.8's two-tier with HyperMem L3)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
     A1[Python Agent A]
     A2[Python Agent B]
@@ -246,6 +249,7 @@ flowchart LR
 ### 3.4 Five-backend benchmark flow (Phase 8 target — extends the §4 Phase 5 comparison with three-tier)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
     LME[LongMemEval oracle subset 50 Qs]
 
@@ -282,6 +286,7 @@ flowchart TD
 **Setup.** Reuse `data/longmemeval_slice_w358.json` (W3.5.8 §7.7's slice — 20 Q across `multi-session` + `knowledge-update`). Extend `scripts/build_slice.py` to cover all six LongMemEval question types — add the missing four axes (`single-session-user`, `single-session-assistant`, `single-session-preference`, `temporal-reasoning`) plus the `_abs` (abstention) overlay, capped at 4 Q each for a balanced ~24 Q slice. Slice generation wall remains <1 s (deterministic single-pass filter).
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   Q["LongMemEval question instance<br/>(machine-readable shape from §2.2)"] --> T["question_type<br/>(7 distinct labels)"]
   T --> P1["Inspect the question text<br/>What does the user ASK?"]
@@ -352,6 +357,7 @@ The 7-row requirement matrix above is the chapter's load-bearing analytical arti
 **Setup.** No tooling. Phase 1's requirement matrix + §2.4's class-capability matrix is the input.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   R["Phase 1 output:<br/>7-row requirement matrix"] --> J["Joint analysis vs<br/>§2.4 class-capability matrix"]
   J --> A1{"Per-axis winner<br/>determinable?"}
@@ -448,6 +454,7 @@ Mem0's Python SDK exposes:
 This is a DIFFERENT shape from W3.5.8's `TieredMemory.imprint(content) / query_context(query)`. We need an adapter to make the eval driver agnostic to the backend.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   D["run_longmemeval_slice.py<br/>(eval driver, expects TieredMemory-like)"] --> A["src/mem0_backend_adapter.py<br/>thin wrapper"]
   A --> M0["Mem0 Memory()<br/>add() / search() / get_all()"]
@@ -616,6 +623,7 @@ This phase's `Result` section will populate after the actual run lands. The slot
 - `src/router_memory.py` (~150 LOC) — question classifier + dispatch to atomic-fact or 2-tier backend. Same `imprint(content) / query_context(query)` interface so the eval driver accepts `--backend hybrid` with no further refactoring.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   Q["incoming message (scroll text)"] --> R["RouterMemory.imprint"]
   R --> AF["AtomicFactMemory.imprint<br/>(every message imprinted via 1-tier path<br/>— the WRITE side is always 1-tier;<br/>routing happens at READ side)"]
@@ -908,6 +916,7 @@ uv run python scripts/aggregate_results.py --backends qdrant,evercore,mem0,atomi
 ```
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   S["data/longmemeval_slice_w358.json<br/>(reuse W3.5.8 §7.7 slice — STABLE TEST CONTRACT)"] --> D["run_longmemeval_slice.py<br/>(eval driver — 5 dispatched runs)"]
   D -->|--backend qdrant| R1["results_qdrant.jsonl"]
@@ -1100,6 +1109,7 @@ services:
 ```
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   A["docker-compose up hypermem"] --> B["HyperMem HTTP service<br/>localhost:1996"]
   B --> C["POST /api/v1/edges<br/>typed hyperedge create"]
@@ -1208,6 +1218,7 @@ class ThreeTierMemory(TieredMemory):
 ```
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   C["Caller<br/>(eval driver / agent)"] --> Q1{"query type?"}
   Q1 -->|"single-attribute<br/>(short, semantic)"| QC["query_context<br/>(parent TieredMemory<br/>routes L2)"]
@@ -1324,6 +1335,7 @@ def consolidate_with_l3(
 ```
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   S["closed scroll<br/>(from guild quest)"] --> C["consolidate_with_l3()"]
   C --> L2P["L2 path:<br/>summarize_scroll → imprint (EverCore/Qdrant)<br/>(unchanged from W3.5.8)"]
@@ -1380,6 +1392,7 @@ uv run python scripts/aggregate_results.py \
 ```
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   S["data/longmemeval_slice_w358.json<br/>(stable test contract — same as Phase 5)"] --> D["run_longmemeval_slice.py<br/>(6 sequential runs)"]
   D -->|--backend qdrant| R1["results_qdrant.jsonl<br/>(W3.5.8 baseline)"]

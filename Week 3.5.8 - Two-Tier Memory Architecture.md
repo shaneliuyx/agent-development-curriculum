@@ -109,6 +109,7 @@ Two-tier should beat each single-tier by ≥20% on the AGGREGATE while approxima
 ### Diagram 1 — The Two-Tier Architecture (steady state)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
     A1[Python Agent A]
     A2[Python Agent B]
@@ -154,6 +155,7 @@ flowchart LR
 ### Diagram 2 — Cross-Session Cross-Agent Flow (the differentiator)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 sequenceDiagram
   participant A as Agent A session 1
   participant G as guild
@@ -1135,12 +1137,13 @@ def extract_atomic_facts(scroll_text: str) -> list[dict]:
 Five tests covering Batchelor-Manning form #2 (atomisation) + form #5/6 (confidence-at-read + type tagging). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
 
 ```mermaid
-flowchart TD
-  A["test_atomisation.py<br/>5 tests"] --> T1["test 1: extract_atomic_facts<br/>multi-fact scroll -> >= 2 atoms<br/>+ type ∈ valid set + 0 ≤ conf ≤ 1"]
-  A --> T2["test 2: empty input<br/>extract returns list (may be empty)"]
-  A --> T3["test 3: consolidate(use_atomisation=True)<br/>facts_imprinted >= 2 on multi-fact scroll<br/>(asserts atomisation didn't collapse to 1)"]
-  A --> T4["test 4: query_context(type_filter=['fact'])<br/>excludes observation + tool_result"]
-  A --> T5["test 5: query_context(min_confidence=0.8)<br/>excludes quality_score < 0.8"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+  A["test_atomisation.py<br/>5 tests"] --> T1["test 1: extract_atomic_facts<br/>multi-fact scroll → ≥ 2 atoms<br/>+ type ∈ valid set<br/>+ 0 ≤ conf ≤ 1"]
+  A --> T2["test 2: empty input<br/>extract returns list<br/>(may be empty)"]
+  A --> T3["test 3: consolidate<br/>(use_atomisation=True)<br/>facts_imprinted ≥ 2<br/>on multi-fact scroll"]
+  A --> T4["test 4: query_context<br/>type_filter=['fact']<br/>excludes observation<br/>+ tool_result"]
+  A --> T5["test 5: query_context<br/>min_confidence=0.8<br/>excludes<br/>quality_score < 0.8"]
 ```
 
 **Code:**
@@ -1281,6 +1284,7 @@ So the mermaid below shows the per-scroll flow *inside* `consolidate()`, NOT a s
 **Architecture mermaid (per-scroll flow inside `consolidate()`):**
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
     SCR["Closed scroll<br/>(input to one iteration)"]
     SUM["LLM summarize<br/>(consolidation.py)"]
@@ -1619,15 +1623,16 @@ The `Optional — wire quality-gate promote / demote audits in src/consolidation
 The gate fires at TWO sites inside `consolidate()` — per-atom (atomisation path, ~line 334 of `src/consolidation.py`) and per-summary (legacy path, ~line 386). Both must emit identically-shaped audits; otherwise replay code drifts. Architecture below; complete drop-in code after.
 
 ```mermaid
-flowchart TD
-    A[atom or summary] --> B{promotion_threshold set?}
-    B -- No --> F[imprint emits its own audit]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+    A[atom or summary] --> B{promotion_threshold<br/>set?}
+    B -- No --> F[imprint emits<br/>its own audit]
     B -- Yes --> C[compute score]
-    C --> D{"score &ge; threshold?"}
-    D -- No --> E[record_audit demote<br/>target_id=null new_id=null<br/>SKIP imprint]
+    C --> D{"score ≥ threshold?"}
+    D -- No --> E[record_audit demote<br/>target_id=null<br/>new_id=null<br/>SKIP imprint]
     D -- Yes --> G["imprint<br/>(or §8.7 dedup primitive)"]
-    G --> H[record_audit promote<br/>target_id=null new_id=&lt;new UUID or null&gt;]
-    H --> I[chain via metadata.quest_id<br/>for replay/CT pipeline]
+    G --> H[record_audit promote<br/>target_id=null<br/>new_id=&lt;UUID or null&gt;]
+    H --> I[chain via<br/>metadata.quest_id<br/>for replay/CT pipeline]
 ```
 
 **Code (complete runnable patch — applies to the existing `src/consolidation.py`):**
@@ -3032,6 +3037,7 @@ Re-run. The rest of the demo — `post_task`, `claim_task`, `complete_task`, `co
 Four tests parallel to `test_consolidation.py` but importing the Qdrant variant. Proves the §2.1 "wrapper IS the architecture" claim: change one import → consolidation pipeline + dedup state + test contract all unchanged. Different backend, same surface.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   A["test_consolidation_qdrant.py<br/>4 tests"] --> T1["test 1: imprints completed scrolls<br/>(parallel to EverCore variant)"]
   A --> T2["test 2: idempotent on second run<br/>(SQLite quest_id dedup still works)"]
@@ -3164,14 +3170,15 @@ The goal is pedagogical honesty: a reader who only sees Phase 6 might conclude "
 Replace the "agent autonomously executes tasks" loop with an "AI assistant talks to a user about deployments" scenario. The user asks questions, the assistant answers, both contribute knowledge. EverCore's pipeline now sees the data shape it was built for. Three dialogues — Alice (API rollout planning), Bob (auth token rotation), Carol (incident response process) — each 8-10 turns. Each dialogue POST → flush per BCJ Entry 13 (empirical correction; boundary detector still under-fires at lab scale even on Bucket-1 data).
 
 ```mermaid
-flowchart TD
-  A["DIALOGUES list:<br/>3 users × 8-10 turns each"] --> B["imprint_dialogue(d):<br/>build messages with<br/>ts + role + content"]
-  B --> C["POST /api/v1/memories<br/>(user_id, session_id, messages)"]
-  C --> D["status=accumulated<br/>(BCJ Entry 13: boundary<br/>detector under-fires at scale)"]
-  D --> E["POST /api/v1/memories/flush<br/>(same session_id)"]
-  E --> F["force memcell extraction<br/>+ atomic_facts + profile"]
-  F --> G["sleep 60s for async pipeline"]
-  G --> H["GET episodic_memory per user<br/>SEARCH per-user per-query<br/>GET profile per user"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+  A["DIALOGUES list:<br/>3 users<br/>× 8-10 turns each"] --> B["imprint_dialogue(d)<br/>build messages<br/>ts + role + content"]
+  B --> C["POST /api/v1/memories<br/>user_id, session_id,<br/>messages"]
+  C --> D["status=accumulated<br/>BCJ Entry 13:<br/>boundary detector<br/>under-fires at scale"]
+  D --> E["POST<br/>/api/v1/memories/flush<br/>same session_id"]
+  E --> F["force memcell<br/>extraction<br/>+ atomic_facts<br/>+ profile"]
+  F --> G["sleep 60s<br/>for async pipeline"]
+  G --> H["GET episodic_memory<br/>per user<br/>SEARCH per-user<br/>per-query<br/>GET profile per user"]
 ```
 
 **Code:**
@@ -3352,6 +3359,7 @@ All four deliverables shipped against live oMLX + EverCore on M5 Pro:
 `src/demo_phase8_compare.py` imprints THE SAME 3 dialogues into BOTH backends and runs the same 3 queries against each. It is the load-bearing measurement for the "EverCore earns its cost on Bucket-1" thesis.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   A["DIALOGUES corpus<br/>(3 users × 8-10 turns)"] --> B["EverCore path:<br/>imprint_dialogue() per user<br/>POST + flush<br/>~67-189s wall"]
   A --> C["Qdrant path:<br/>imprint() per turn<br/>10 turns × ~150ms<br/>~1.5s wall total"]
@@ -3468,15 +3476,16 @@ if __name__ == "__main__":
 Four slow tests (`pytestmark = pytest.mark.slow`) validating that EverCore's extraction pipeline produces the deliverables Phase 7 advertises: episodes, non-empty summaries, profiles, and imprint walls in the expected band.
 
 ```mermaid
-flowchart TD
-  A["module-scope fixture<br/>imprinted_dialogues"] --> B["uuid suffix per run"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+  A["module-scope<br/>fixture<br/>imprinted_dialogues"] --> B["uuid suffix<br/>per run"]
   B --> C["imprint_dialogue × 3<br/>(POST + flush)"]
   C --> D["sleep 60s<br/>(async extraction)"]
-  D --> E["share fixture across 4 tests"]
-  E --> T1["test 1: ≥1 episode per user"]
-  E --> T2["test 2: non-empty summary"]
-  E --> T3["test 3: ≥1 profile across users"]
-  E --> T4["test 4: wall in 30-600s band"]
+  D --> E["share fixture<br/>across 4 tests"]
+  E --> T1["test 1<br/>≥1 episode per user"]
+  E --> T2["test 2<br/>non-empty summary"]
+  E --> T3["test 3<br/>≥1 profile<br/>across users"]
+  E --> T4["test 4<br/>wall in 30-600s band"]
 ```
 
 **Code:**
@@ -3635,13 +3644,14 @@ W3.5.8's current consolidate() does EXACT-match dedup on QUEST-ID only (BCJ Entr
 > Forward note: this is the **Phase 8 launch baseline** (committed `bf1d091`, 4-action prompt). The shipped 2026-05-15 classifier is the 6-action variant in §8.6 (supersede + coexist added). Read this section to understand the original write-time investment shape, then jump to §8.6 for what the bitemporal extension adds.
 
 ```mermaid
-flowchart TD
-  A["consolidate(use_dedup=True)<br/>per atomic fact"] --> B["tm.query_context(fact, k=5)<br/>~150ms (Qdrant embed + search)"]
-  B --> C["decide_action(fact, candidates)<br/>~2-3s LLM call"]
-  C --> D["DedupAction(action,<br/>target_id, merged_content)"]
-  D --> E["execute_action(tm, action, fact, meta)"]
-  E --> F["counts dict<br/>{imprinted, updated, deleted, noop}"]
-  F --> G["consolidate aggregates<br/>into ConsolidationResult"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+  A["consolidate<br/>use_dedup=True"] -->|per fact| B["query_context<br/>k=5"]
+  B -->|"~150ms<br/>(embed+search)"| C["decide_action<br/>fact, candidates"]
+  C -->|"~2-3s<br/>LLM call"| D["DedupAction<br/>action, target_id,<br/>merged_content"]
+  D --> E["execute_action<br/>tm, action,<br/>fact, meta"]
+  E --> F["counts dict<br/>{imprinted, updated,<br/>deleted, noop}"]
+  F --> G["aggregate to<br/>Consolidation<br/>Result"]
 ```
 
 **Code:**
@@ -3817,6 +3827,7 @@ def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
 ### 8.2 Integration with consolidate() — IMPLEMENTED
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   A["consolidate(tm, max_batch=N,<br/>campaign=C,<br/>use_atomisation=True,<br/>use_dedup=True)"] --> B["fetch closed scrolls<br/>(skip imprinted_before)"]
   B --> C["per scroll:<br/>extract_atomic_facts(scroll)"]
@@ -3945,17 +3956,18 @@ Three load-bearing claims this extension makes:
 #### Bundle A — Prompt + DedupAction extension (`src/dedup_synthesis.py`)
 
 ```mermaid
-flowchart TD
-  A["new_fact + tm.query_context(top_k=5)"] --> B{"candidates empty?"}
-  B -- yes --> C["return DedupAction(action=add)<br/>no LLM call"]
-  B -- no --> D["render candidates<br/>with id + timestamp + score + content"]
-  D --> E["DEDUP_PROMPT.format<br/>now=datetime.now(UTC).isoformat()"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
+flowchart LR
+  A["new_fact +<br/>tm.query_context<br/>top_k=5"] --> B{"candidates<br/>empty?"}
+  B -- yes --> C["DedupAction<br/>action=add<br/>no LLM call"]
+  B -- no --> D["render candidates<br/>id + timestamp<br/>+ score + content"]
+  D --> E["DEDUP_PROMPT.format<br/>now=datetime.now(UTC)"]
   E --> F["LLM classify<br/>6 actions"]
   F --> G{"json.loads"}
-  G -- fail --> H["fallback DedupAction(action=add)"]
-  G -- ok --> I{"action in _VALID_ACTIONS?"}
+  G -- fail --> H["fallback<br/>DedupAction<br/>action=add"]
+  G -- ok --> I{"action in<br/>_VALID_ACTIONS?"}
   I -- no --> H
-  I -- yes --> J["DedupAction(action,<br/>target_id, merged_content,<br/>supersede_reason, supersede_category,<br/>relates_to)"]
+  I -- yes --> J["DedupAction<br/>action, target_id,<br/>merged_content,<br/>supersede_reason,<br/>supersede_category,<br/>relates_to"]
 ```
 
 **Code:**
@@ -4131,6 +4143,7 @@ def decide_action(new_fact: str, candidates: list[dict]) -> DedupAction:
 #### Bundle B — Executor dispatch + counter aggregation (`src/dedup_synthesis.py` + `src/consolidation.py`)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   A["DedupAction from decide_action"] --> B{"action?"}
   B -- no-op --> N["counts.noop++"]
@@ -4274,6 +4287,7 @@ Measured 2026-05-15 against live Qdrant + oMLX (5/5 dedup-suite tests pass in 76
 #### Bundle C — Timestamp injection (`src/tiered_memory_qdrant.py`) + probe test (`tests/test_dedup_synthesis.py`)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   A["imprint(content, metadata=None)"] --> B["embed via oMLX bge-m3"]
   B --> C["build payload:<br/>user_id, agent_id, content,<br/>**timestamp=datetime.now(UTC).isoformat()**"]
@@ -5095,6 +5109,7 @@ Production deployment of this pattern:
 Five tests covering the full 6-action classifier + the end-to-end `consolidate(use_dedup=True)` integration. 4 tests hit live oMLX; 1 short-circuits before LLM call.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TD
   A["test_dedup_synthesis.py<br/>5 tests, 5/5 PASS in 76.5s"] --> T1
   A --> T2
@@ -5280,6 +5295,7 @@ Curriculum coverage gap: W3.5.5 + W3.5.8 expose memory as MCP tools (via `guild`
 ### 9.1 The multi-client portability matrix
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
   SERVER["TieredMemory MCP server<br/>(guild + Qdrant + EverCore)"] --> M["MCP tool registry:<br/>memory_store / memory_query /<br/>memory_supersede / memory_export /<br/>memory_import / audit_replay"]
   M --> C1["Claude Code"]
@@ -5538,6 +5554,7 @@ This lab's two-tier architecture is operational + semantic. EverOS ships a THIRD
 **The three-tier shape**:
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart LR
     A[Agents]
     A -->|claim/scroll| L1[L1 Operational guild]
@@ -5664,6 +5681,7 @@ Distilled from the 2026-05-19 §5.3 LongMemEval measurement (which surfaced that
 Before picking a semantic backend, answer these three questions about your input shape. The answer tells you which bucket you're in and which backend earns its cost.
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'42px'}}}%%
 flowchart TB
     Q1{"Inputs are<br/>multi-turn<br/>conversations?"}
     Q2{"Need atomic-fact<br/>granularity in<br/>retrieval?"}
