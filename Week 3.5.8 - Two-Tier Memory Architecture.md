@@ -5325,6 +5325,143 @@ flowchart TD
 4. **Export** — `memory_export()` returns versioned JSONL bundle; verify schema matches the supportedVersions union.
 5. **Import** — round-trip: export → wipe collection → import → re-query; verify content survives.
 
+### 9.1.1 The 5-tool surface — `src/memory_tools.py`
+
+The 5 tasks above each call one tool. This section ships those tools as plain Python functions; production deployment wraps each as an MCP tool via `@mcp.tool` decorator or exposes them over HTTP/CLI. The Python contract IS the load-bearing thing — transport is interchangeable. Why ship the Python layer separately from the MCP server scaffolding: MCP server bring-up is W6.7's territory (Agent Skills); here we want the readable shape of the 5-tool contract without the MCP SDK boilerplate.
+
+```python
+# src/memory_tools.py — 5-tool client-facing surface
+"""The §9.1 portability matrix's 5-tool contract (+ audit_replay), as
+plain Python functions. Each tool wraps a TieredMemory primitive AND
+emits the right AuditEntry shape, so §9's test matrix assertions
+("verify the audit log records X") hold.
+
+Production deployment (out of scope for this chapter):
+  - Wrap each function as an MCP tool via @mcp.tool decorator (W6.7)
+  - OR expose via HTTP / CLI / direct import — transport is orthogonal.
+
+Audit emission policy: writes emit AuditEntry; reads do NOT (asymmetric
+by design — auditing every read would explode the log without info gain,
+same as Kafka append-only convention)."""
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from src.audit import AuditEntry, read_audit_log, record_audit
+from src.dedup_synthesis import _qdrant_delete           # §8.1 primitive
+from src.portability import export as _portability_export
+from src.portability import import_ as _portability_import
+from src.replay import replay_audit
+from src.tiered_memory import TieredMemory
+
+
+def _summary(content: str, n: int = 120) -> str:
+    """First n chars; mirrors §3.4 AuditEntry.payload_summary convention."""
+    return content[:n]
+
+
+# ─── Task 1: Store ────────────────────────────────────────────────────────
+def memory_store(tm: TieredMemory, *, content: str, type: str = "fact",
+                 tags: list[str] | None = None, user_id: str,
+                 agent_id: str = "") -> str:
+    """Write a single memory + emit `imprint` AuditEntry. Returns the
+    new point's UUID."""
+    metadata: dict[str, Any] = {"type": type, "tags": tags or []}
+    new_id = tm.imprint(content=content, metadata=metadata)
+    record_audit(AuditEntry(
+        operation="imprint",
+        actor_agent_id=agent_id,
+        user_id=user_id,
+        new_id=new_id,
+        payload_summary=_summary(content),
+        metadata=metadata,
+    ))
+    return new_id
+
+
+# ─── Task 2: Query ────────────────────────────────────────────────────────
+def memory_query(tm: TieredMemory, *, query: str, k: int = 5,
+                 user_id: str = "") -> list[dict]:
+    """Retrieve up to k memories ranked by relevance. No audit emission
+    (reads don't mutate state)."""
+    return tm.query_context(query=query, top_k=k)
+
+
+# ─── Task 3: Supersede ────────────────────────────────────────────────────
+def memory_supersede(tm: TieredMemory, *, old_id: str, new_content: str,
+                     reason: str, user_id: str, agent_id: str = "") -> str:
+    """Mark `old_id` superseded by a fresh imprint. §8.6 Step 1+2 shape
+    (hard-delete + supersedes-pointer + supersede AuditEntry). Step 3
+    soft-delete swap is contract-free — same call site, different
+    `_qdrant_delete` impl."""
+    _qdrant_delete(tm, [old_id])
+    metadata = {
+        "supersedes": old_id,
+        "supersede_reason": reason,
+        "fact_kind": "state_evolution",
+    }
+    new_id = tm.imprint(content=new_content, metadata=metadata)
+    record_audit(AuditEntry(
+        operation="supersede",
+        actor_agent_id=agent_id,
+        user_id=user_id,
+        target_id=old_id,
+        new_id=new_id,
+        payload_summary=_summary(new_content),
+        metadata=metadata,
+    ))
+    return new_id
+
+
+# ─── Task 4: Export ───────────────────────────────────────────────────────
+def memory_export(tm: TieredMemory, *, user_id: str,
+                  out_path: Path) -> dict[str, Any]:
+    """Snapshot user's memories + audit log to disk. Returns the
+    ExportData fields as a dict so JSON-only transports (MCP/HTTP) can
+    serialise without dataclass support."""
+    bundle = _portability_export(tm, user_id=user_id, out_path=out_path)
+    return asdict(bundle)
+
+
+# ─── Task 5: Import ───────────────────────────────────────────────────────
+def memory_import(tm: TieredMemory, *, in_path: Path) -> dict[str, Any]:
+    """Rehydrate tm from a bundle on disk. Returns version + migration
+    path + replay counts (see §9.2's `import_` for the contract)."""
+    return _portability_import(tm, in_path)
+
+
+# ─── Bonus tool: audit_replay (mentioned in §9.1 diagram) ────────────────
+def audit_replay(tm: TieredMemory, *,
+                 user_id: str | None = None) -> dict[str, int]:
+    """Re-emit all audit-log writes against tm. Read filter optional
+    (user_id) — without it, replays the whole log. Returns the §9.3
+    counts dict {replayed, skipped, unknown}."""
+    log = read_audit_log(user_id=user_id) if user_id else read_audit_log()
+    return replay_audit(tm, log)
+```
+
+**Walkthrough:**
+
+**Block 1 — Each tool's contract = "wrap one primitive + emit the right AuditEntry".** This is what makes §9's test matrix assertable. The naive implementation would be `def memory_store(tm, content, ...): return tm.imprint(content)` — but then the test "verify audit log records `imprint`" would fail because no AuditEntry was emitted. Each tool explicitly calls `record_audit(...)` with the right `operation` + `target_id` / `new_id` fields per §3.4's matrix. The audit emission IS the contract; the primitive call is incidental.
+
+**Block 2 — `memory_query` deliberately emits no AuditEntry.** Reads don't mutate state. Auditing every read explodes the log without informational gain (same rule as Kafka or Postgres WAL — only writes are logged). If a future audit policy needs query telemetry, that's a separate `read_telemetry.py` module emitting a different record type; conflating reads into the 9-op AuditEntry enum would muddy the schema. Asymmetric audit policy is the production-grade discipline.
+
+**Block 3 — `memory_supersede` composes §8.6's supersede dispatch as a callable.** §8.6 ships the LLM-driven `decide_action` → `execute_action` path that picks `supersede` when contradictions imply state evolution. `memory_supersede` is the CALLER-explicit version: when the caller already knows the supersede relationship (e.g., user explicitly says "this replaces that"), bypass the LLM classifier and write directly. Same end state (old hard-deleted, new imprinted with `supersedes` pointer, AuditEntry recorded) but skips the ~2-3s LLM call. This is the production pattern for tool-call-driven supersedes vs scroll-stream-driven supersedes.
+
+**Block 4 — `memory_export` returns `asdict(bundle)` not the dataclass directly.** MCP tools serialise return values as JSON; dataclasses aren't natively JSON-serializable without conversion. `asdict` flattens to a plain dict the transport layer can handle. Cost: caller loses the `ExportData` type hint at the boundary. Benefit: zero per-transport adapter code. Production teams using strict typing wrap the asdict result in a separate `ExportDataDict` TypedDict for the boundary contract.
+
+**Block 5 — `audit_replay` is the diagram's 6th tool, ungrouped from the 5-task matrix.** §9.1's diagram lists `audit_replay` in the MCP tool registry but the 5-task matrix doesn't test it (the round-trip in task 5 exercises it transitively via `import_`). Shipped here for completeness because the diagram promises it. Read-then-replay shape matches the W11.8 CT-pipeline replay use case (replay against a fresh backend) without any dispatch difference from §9.3's primitive.
+
+**Result** *(projected — actual 5-task × 8-client matrix run TBD)*: each of the 5 tools is one Python call; per-task wall = matching primitive's wall (memory_store ~150ms Qdrant POST + 1 audit append, memory_query ~80ms search, memory_supersede ~300ms total, memory_export ~200ms, memory_import per §9.2 ~7-12s). Per-client integration wall is dominated by MCP serialisation overhead (~10-50ms extra round-trip vs direct Python call). When the lab repo's 5-task × 8-client matrix run completes, replace this projection with measured numbers + the per-client × per-task pass matrix per §9.4's RESULTS.md deliverable.
+
+`★ Insight ─────────────────────────────────────`
+- **The tools are Python functions, not MCP tools.** Tightest separation: ship the Python contract here, defer transport wrapping to W6.7 (Agent Skills). The 5-tool matrix is testable WITHOUT an MCP server running — call the Python functions directly from pytest, assert audit log shape, assert query results. MCP wrapper is a thin transport layer added later. Production teams who couple tool definition to transport from day 1 hit "we want a CLI / HTTP / gRPC version" requests they can't satisfy without rewriting the tool layer.
+- **Audit emission is the load-bearing contract per tool, not the primitive call.** A tool that wraps the right primitive but doesn't emit AuditEntry fails the §9 test matrix's "verify audit log records X" assertion. Make the audit explicit IN the tool wrapper, not implicit via "primitive emits audit somewhere upstream" — explicit > implicit (Zen of Python, applied to audit policy).
+- **`memory_supersede` as a caller-explicit alternative to LLM-driven `decide_action` is the W2.7 staging pattern applied to dedup.** §8.6's classifier earns its LLM cost when the supersede relationship needs inferring; `memory_supersede` skips it when the caller already knows. Same final state, two cost profiles for two call contexts. Production routing: scroll-stream → classifier; tool-call → explicit. Each contract calls the right shape.
+`─────────────────────────────────────────────────`
+
 ### 9.2 Versioned `ExportData` + `supportedVersions` set
 
 ```python
@@ -5593,6 +5730,7 @@ def replay_audit(tm: TieredMemoryLike, audit_log: list[dict]) -> dict[str, int]:
 
 ### 9.4 Lab deliverables
 
+- `src/memory_tools.py` (~120 LOC) — 5-tool client-facing surface (`memory_store` / `memory_query` / `memory_supersede` / `memory_export` / `memory_import` + `audit_replay`). Each tool wraps a TieredMemory primitive AND emits the right AuditEntry shape; transport (MCP / HTTP / direct import) is orthogonal.
 - `src/portability.py` (~150 LOC) — `ExportData` + `export()` + `import_()` + migration map.
 - `src/replay.py` (~100 LOC) — `replay_audit()` with idempotency contract.
 - `tests/test_portability_round_trip.py` — export → wipe → import → verify content survived; verify per-supersede chains preserved.
