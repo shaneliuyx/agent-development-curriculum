@@ -109,7 +109,7 @@ Two-tier should beat each single-tier by ≥20% on the AGGREGATE while approxima
 ### Diagram 1 — The Two-Tier Architecture (steady state)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'48px'}, 'flowchart':{'useMaxWidth':false}}}%%
 flowchart LR
     A1[Python Agent A]
     A2[Python Agent B]
@@ -155,7 +155,7 @@ flowchart LR
 ### Diagram 2 — Cross-Session Cross-Agent Flow (the differentiator)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 sequenceDiagram
   participant A as Agent A session 1
   participant G as guild
@@ -1137,8 +1137,8 @@ def extract_atomic_facts(scroll_text: str) -> list[dict]:
 Five tests covering Batchelor-Manning form #2 (atomisation) + form #5/6 (confidence-at-read + type tagging). These exercise `extract_atomic_facts()` directly, plus end-to-end `consolidate(use_atomisation=True)` against the Qdrant backend (deterministic write semantics; no EverCore extraction black box) so the chapter can assert EXACT fact counts.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["test_atomisation.py<br/>5 tests"] --> T1["test 1: extract_atomic_facts<br/>multi-fact scroll → ≥ 2 atoms<br/>+ type ∈ valid set<br/>+ 0 ≤ conf ≤ 1"]
   A --> T2["test 2: empty input<br/>extract returns list<br/>(may be empty)"]
   A --> T3["test 3: consolidate<br/>(use_atomisation=True)<br/>facts_imprinted ≥ 2<br/>on multi-fact scroll"]
@@ -1284,8 +1284,8 @@ So the mermaid below shows the per-scroll flow *inside* `consolidate()`, NOT a s
 **Architecture mermaid (per-scroll flow inside `consolidate()`):**
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
     SCR["Closed scroll<br/>(input to one iteration)"]
     SUM["LLM summarize<br/>(consolidation.py)"]
     QS["quality_score(...)<br/>(quality_gate.py)<br/>length + specificity<br/>+ novelty"]
@@ -1623,8 +1623,8 @@ The `Optional — wire quality-gate promote / demote audits in src/consolidation
 The gate fires at TWO sites inside `consolidate()` — per-atom (atomisation path, ~line 334 of `src/consolidation.py`) and per-summary (legacy path, ~line 386). Both must emit identically-shaped audits; otherwise replay code drifts. Architecture below; complete drop-in code after.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
     A[atom or summary] --> B{promotion_threshold<br/>set?}
     B -- No --> F[imprint emits<br/>its own audit]
     B -- Yes --> C[compute score]
@@ -3037,8 +3037,8 @@ Re-run. The rest of the demo — `post_task`, `claim_task`, `complete_task`, `co
 Four tests parallel to `test_consolidation.py` but importing the Qdrant variant. Proves the §2.1 "wrapper IS the architecture" claim: change one import → consolidation pipeline + dedup state + test contract all unchanged. Different backend, same surface.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["test_consolidation_qdrant.py<br/>4 tests"] --> T1["test 1: imprints completed scrolls<br/>(parallel to EverCore variant)"]
   A --> T2["test 2: idempotent on second run<br/>(SQLite quest_id dedup still works)"]
   A --> T3["test 3: skips low-value scrolls<br/>(summarizer SKIP gate still works)"]
@@ -3170,8 +3170,8 @@ The goal is pedagogical honesty: a reader who only sees Phase 6 might conclude "
 Replace the "agent autonomously executes tasks" loop with an "AI assistant talks to a user about deployments" scenario. The user asks questions, the assistant answers, both contribute knowledge. EverCore's pipeline now sees the data shape it was built for. Three dialogues — Alice (API rollout planning), Bob (auth token rotation), Carol (incident response process) — each 8-10 turns. Each dialogue POST → flush per BCJ Entry 13 (empirical correction; boundary detector still under-fires at lab scale even on Bucket-1 data).
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["DIALOGUES list:<br/>3 users<br/>× 8-10 turns each"] --> B["imprint_dialogue(d)<br/>build messages<br/>ts + role + content"]
   B --> C["POST /api/v1/memories<br/>user_id, session_id,<br/>messages"]
   C --> D["status=accumulated<br/>BCJ Entry 13:<br/>boundary detector<br/>under-fires at scale"]
@@ -3359,8 +3359,8 @@ All four deliverables shipped against live oMLX + EverCore on M5 Pro:
 `src/demo_phase8_compare.py` imprints THE SAME 3 dialogues into BOTH backends and runs the same 3 queries against each. It is the load-bearing measurement for the "EverCore earns its cost on Bucket-1" thesis.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["DIALOGUES corpus<br/>(3 users × 8-10 turns)"] --> B["EverCore path:<br/>imprint_dialogue() per user<br/>POST + flush<br/>~67-189s wall"]
   A --> C["Qdrant path:<br/>imprint() per turn<br/>10 turns × ~150ms<br/>~1.5s wall total"]
   B --> D["wait 60s for<br/>async extraction"]
@@ -3476,8 +3476,8 @@ if __name__ == "__main__":
 Four slow tests (`pytestmark = pytest.mark.slow`) validating that EverCore's extraction pipeline produces the deliverables Phase 7 advertises: episodes, non-empty summaries, profiles, and imprint walls in the expected band.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["module-scope<br/>fixture<br/>imprinted_dialogues"] --> B["uuid suffix<br/>per run"]
   B --> C["imprint_dialogue × 3<br/>(POST + flush)"]
   C --> D["sleep 60s<br/>(async extraction)"]
@@ -3644,8 +3644,8 @@ W3.5.8's current consolidate() does EXACT-match dedup on QUEST-ID only (BCJ Entr
 > Forward note: this is the **Phase 8 launch baseline** (committed `bf1d091`, 4-action prompt). The shipped 2026-05-15 classifier is the 6-action variant in §8.6 (supersede + coexist added). Read this section to understand the original write-time investment shape, then jump to §8.6 for what the bitemporal extension adds.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["consolidate<br/>use_dedup=True"] -->|per fact| B["query_context<br/>k=5"]
   B -->|"~150ms<br/>(embed+search)"| C["decide_action<br/>fact, candidates"]
   C -->|"~2-3s<br/>LLM call"| D["DedupAction<br/>action, target_id,<br/>merged_content"]
@@ -3827,8 +3827,8 @@ def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
 ### 8.2 Integration with consolidate() — IMPLEMENTED
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["consolidate(tm, max_batch=N,<br/>campaign=C,<br/>use_atomisation=True,<br/>use_dedup=True)"] --> B["fetch closed scrolls<br/>(skip imprinted_before)"]
   B --> C["per scroll:<br/>extract_atomic_facts(scroll)"]
   C --> D["per atom:<br/>tm.query_context(atom, k=5)"]
@@ -3956,8 +3956,8 @@ Three load-bearing claims this extension makes:
 #### Bundle A — Prompt + DedupAction extension (`src/dedup_synthesis.py`)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["new_fact +<br/>tm.query_context<br/>top_k=5"] --> B{"candidates<br/>empty?"}
   B -- yes --> C["DedupAction<br/>action=add<br/>no LLM call"]
   B -- no --> D["render candidates<br/>id + timestamp<br/>+ score + content"]
@@ -4143,8 +4143,8 @@ def decide_action(new_fact: str, candidates: list[dict]) -> DedupAction:
 #### Bundle B — Executor dispatch + counter aggregation (`src/dedup_synthesis.py` + `src/consolidation.py`)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["DedupAction from decide_action"] --> B{"action?"}
   B -- no-op --> N["counts.noop++"]
   B -- add --> AD["tm.imprint(new_fact)<br/>counts.imprinted++"]
@@ -4287,8 +4287,8 @@ Measured 2026-05-15 against live Qdrant + oMLX (5/5 dedup-suite tests pass in 76
 #### Bundle C — Timestamp injection (`src/tiered_memory_qdrant.py`) + probe test (`tests/test_dedup_synthesis.py`)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   A["imprint(content, metadata=None)"] --> B["embed via oMLX bge-m3"]
   B --> C["build payload:<br/>user_id, agent_id, content,<br/>**timestamp=datetime.now(UTC).isoformat()**"]
   C --> D{"caller metadata?"}
@@ -5109,7 +5109,7 @@ Production deployment of this pattern:
 Five tests covering the full 6-action classifier + the end-to-end `consolidate(use_dedup=True)` integration. 4 tests hit live oMLX; 1 short-circuits before LLM call.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
   A["test_dedup_synthesis.py<br/>5 tests, 5/5 PASS in 76.5s"] --> T1
   A --> T2
@@ -5295,8 +5295,8 @@ Curriculum coverage gap: W3.5.5 + W3.5.8 expose memory as MCP tools (via `guild`
 ### 9.1 The multi-client portability matrix
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
   SERVER["TieredMemory MCP server<br/>(guild + Qdrant + EverCore)"] --> M["MCP tool registry:<br/>memory_store / memory_query /<br/>memory_supersede / memory_export /<br/>memory_import / audit_replay"]
   M --> C1["Claude Code"]
   M --> C2["Cursor"]
@@ -5554,8 +5554,8 @@ This lab's two-tier architecture is operational + semantic. EverOS ships a THIRD
 **The three-tier shape**:
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
-flowchart LR
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
     A[Agents]
     A -->|claim/scroll| L1[L1 Operational guild]
     A -->|fact query| L2[L2 Semantic EverCore]
@@ -5681,7 +5681,7 @@ Distilled from the 2026-05-19 §5.3 LongMemEval measurement (which surfaced that
 Before picking a semantic backend, answer these three questions about your input shape. The answer tells you which bucket you're in and which backend earns its cost.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'64px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TB
     Q1{"Inputs are<br/>multi-turn<br/>conversations?"}
     Q2{"Need atomic-fact<br/>granularity in<br/>retrieval?"}
