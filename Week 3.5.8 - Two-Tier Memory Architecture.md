@@ -5329,46 +5329,78 @@ flowchart TD
 
 ```python
 # src/portability.py — versioned export with forward + backward compat
-from __future__ import annotations
-from dataclasses import dataclass, field, asdict
-from typing import Literal, Union
-import json
-from pathlib import Path
+"""Export + import for TieredMemory bundles. Round-trippable across
+the §9.1 multi-client portability matrix (Claude Code / Cursor / Gemini
+CLI / Codex CLI / Hermes / OpenClaw / pi / OpenCode).
 
-# When we bump the export schema, we add a new literal here AND we set
-# `supportedVersions` to include all versions we can READ (write-back is
-# always the LATEST version). Old exports remain importable; new exports
-# may not be readable by old code — that's the standard semver shape.
+Schema versioning (semver-style):
+  - CURRENT_VERSION  = the version this code WRITES.
+  - SUPPORTED_VERSIONS = the set this code can READ (always includes CURRENT).
+  - migrate_to_current(raw) walks the v_n → v_(n+1) chain to land at CURRENT.
+
+Rule: old bundles remain importable; new bundles may not be readable by
+old code. Standard write-newest / read-historical semver discipline.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+from src.audit import read_audit_log
+from src.replay import replay_audit
+
+
 ExportVersion = Literal["v1", "v2", "v3"]
 SUPPORTED_VERSIONS: set[ExportVersion] = {"v1", "v2", "v3"}
 CURRENT_VERSION: ExportVersion = "v3"
 
 
+class TieredMemoryLike(Protocol):
+    """Structural subtype of both EverCore + Qdrant TieredMemory variants.
+    Portability needs imprint (write side) + dump_all_for_user (read side)."""
+    def imprint(self, content: str,
+                metadata: dict[str, Any] | None = None) -> str: ...
+    def dump_all_for_user(self, user_id: str) -> list[dict]: ...
+
+
 @dataclass
 class ExportData:
     version: ExportVersion
-    schema_url: str         # e.g. "https://shaneliuyx/agent-prep/.../v3.json"
-    exported_at: str        # ISO 8601
+    schema_url: str              # e.g. https://.../schemas/v3.json
+    exported_at: str             # ISO 8601 UTC
     user_id: str
-    memories: list[dict]    # full Qdrant payload OR EverCore episode rows
-    audit_log: list[dict]   # all AuditEntry records (§3.4 primitive + §8.7 wire-in)
+    memories: list[dict]         # full Qdrant payload OR EverCore episode rows
+    audit_log: list[dict]        # AuditEntry records (§3.4 + §8.7 wire-in)
 
 
-def export(tm, user_id: str, out_path: Path) -> None:
-    memories = tm.dump_all_for_user(user_id)
-    audit = read_audit_log_for_user(user_id)
+def export(tm: TieredMemoryLike, user_id: str, out_path: Path) -> ExportData:
+    """Snapshot a user's memories + audit log to disk. Returns the
+    ExportData so in-process callers (round-trip tests) can assert
+    without re-reading the file."""
     bundle = ExportData(
         version=CURRENT_VERSION,
         schema_url=f"https://github.com/shaneliuyx/agent-prep/schemas/{CURRENT_VERSION}.json",
         exported_at=datetime.now(timezone.utc).isoformat(),
         user_id=user_id,
-        memories=memories,
-        audit_log=audit,
+        memories=tm.dump_all_for_user(user_id),
+        audit_log=read_audit_log(user_id=user_id),
     )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(asdict(bundle), indent=2))
+    return bundle
 
 
-def import_(tm, in_path: Path) -> None:
+def import_(tm: TieredMemoryLike, in_path: Path) -> dict[str, Any]:
+    """Read a bundle; migrate to CURRENT_VERSION if older; rehydrate tm
+    via replay_audit ONLY (audit log is the single source of truth — the
+    memories[] field is for human-readable inspection, not for import,
+    to avoid the double-write trap).
+
+    Returns: {"version_read": str, "migrated_through": list[str],
+              "replay_counts": dict[str, int]}"""
     raw = json.loads(in_path.read_text())
     v = raw.get("version")
     if v not in SUPPORTED_VERSIONS:
@@ -5376,13 +5408,82 @@ def import_(tm, in_path: Path) -> None:
             f"export version {v!r} not in supported set {SUPPORTED_VERSIONS}; "
             f"upgrade your reader OR re-export from the source"
         )
-    # Migrate per-version if needed; route to the latest internal shape
-    bundle = migrate_to_current(raw)
-    for memory in bundle["memories"]:
-        tm.imprint(content=memory["content"], metadata=memory.get("metadata"))
-    # Replay audit log to capture supersede / coexist relationships
-    replay_audit(tm, bundle["audit_log"])
+    bundle, migration_path = migrate_to_current(raw)
+    replay_counts = replay_audit(tm, bundle["audit_log"])
+    return {
+        "version_read": v,
+        "migrated_through": migration_path,
+        "replay_counts": replay_counts,
+    }
+
+
+def migrate_to_current(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Walk the version chain v_n → v_(n+1) → ... → CURRENT_VERSION.
+
+    Returns: (migrated_bundle, list_of_versions_traversed).
+    One-step-per-version: each transform is small, auditable, reversible-
+    in-spirit. An external reviewer reads one function per schema bump."""
+    path = [raw["version"]]
+    bundle = dict(raw)
+    while bundle["version"] != CURRENT_VERSION:
+        next_step = _MIGRATIONS[bundle["version"]]
+        bundle = next_step(bundle)
+        path.append(bundle["version"])
+    return bundle, path
+
+
+def _v1_to_v2(b: dict[str, Any]) -> dict[str, Any]:
+    """v1 → v2: split single `content` field into `payload_summary` +
+    `metadata.legacy_v1_content`. v1 conflated them; v2 follows §3.4's
+    AuditEntry shape (payload_summary capped at ~120 chars)."""
+    out = dict(b)
+    out["version"] = "v2"
+    for m in out["memories"]:
+        if "payload_summary" not in m and "content" in m:
+            m["payload_summary"] = m["content"][:120]
+            m.setdefault("metadata", {})["legacy_v1_content"] = m["content"]
+    return out
+
+
+def _v2_to_v3(b: dict[str, Any]) -> dict[str, Any]:
+    """v2 → v3: add `schema_url` (was previously inferable from version
+    string only); coerce legacy audit op names to §3.4's 9-op enum
+    (`upsert` → `imprint`)."""
+    out = dict(b)
+    out["version"] = "v3"
+    out.setdefault(
+        "schema_url",
+        "https://github.com/shaneliuyx/agent-prep/schemas/v3.json",
+    )
+    for entry in out.get("audit_log", []):
+        if entry.get("operation") == "upsert":  # v2-era op name
+            entry["operation"] = "imprint"
+    return out
+
+
+_MIGRATIONS = {
+    "v1": _v1_to_v2,
+    "v2": _v2_to_v3,
+}
 ```
+
+**Walkthrough:**
+
+**Block 1 — `CURRENT_VERSION` vs `SUPPORTED_VERSIONS` is the semver discipline.** `CURRENT_VERSION` is what this code WRITES; `SUPPORTED_VERSIONS` is what it can READ. The set always includes `CURRENT` and every prior version with a defined migration step. When a v4 schema lands, both constants update: `CURRENT_VERSION = "v4"` AND `SUPPORTED_VERSIONS |= {"v4"}` AND a new `_v3_to_v4` function lands in `_MIGRATIONS`. Old code reading a v4 export will reject it with a clear error ("not in supported set"); old exports remain importable by new code. This is the same shape Postgres uses for pg_dump version compatibility — read-historical, write-current.
+
+**Block 2 — `import_` deliberately ignores `bundle["memories"]`, replays from audit only.** Original stub iterated `bundle["memories"]` AND called `replay_audit(tm, bundle["audit_log"])` — but §9.3's `replay_audit` ALSO imprints (its `_OPS_REPLAY_AS_IMPRINT` set includes `imprint`). Net effect: every memory written twice, second copies orphan-pointing to dangling `target_id`s. Single source of truth: the audit log encodes every write that touched the store; replaying it reproduces store state exactly. `memories[]` survives in the bundle for human-readable inspection (jq queries, schema diffs, etc) but is not consumed at import time. Cleaner contract: write-side dumps both for transparency; read-side reconstructs from the canonical record.
+
+**Block 3 — `migrate_to_current` is a chain walker, not a switch statement.** Each `_v{n}_to_v{n+1}` function is single-purpose, ~10 LOC, addresses ONE schema delta. Walker loops until `bundle["version"] == CURRENT_VERSION`. Pros: each step is reviewable in isolation; the chain composes automatically (v1 export imported by v3 reader walks v1→v2→v3 with no special-case code); inserting a v4 step is purely additive. Cons: forward-only — there's no rollback step. Acceptable trade because the only consumer (import) always walks forward to CURRENT. If cross-version readers need backward migration, add `_v3_to_v2` etc as a second chain in `_MIGRATIONS_BACKWARD`.
+
+**Block 4 — `read_audit_log(user_id=user_id)` uses §8.7's actual signature.** Original stub called `read_audit_log_for_user(user_id)` — that function name doesn't exist in §8.7's audit module; §8.7 ships `read_audit_log(user_id=..., operation=...)` with kwarg filters. Fixed import + call site. Function-name drift between chapter sketches and the actual primitive is the kind of subtle break that crash at import-time only, not at chapter-read-time — the kind of bug that motivates per-block walkthroughs in the first place.
+
+**Result** *(projected — actual export/import round-trip TBD)*: a 47-write batch (matching §3.4's 85-entry baseline) exports to ~50KB JSON (audit_log dominates; memories[] is mostly metadata redundancy with audit's payload_summary). Round-trip wall: export ~200ms (dump_all + audit query) + import ~7-12s (replay_audit dominates per §9.3). Migration v1→v3 on the same bundle: <50ms (pure dict transforms, no I/O). When the lab repo's round-trip test ships, replace this projection with measured numbers.
+
+`★ Insight ─────────────────────────────────────`
+- **Single-source-of-truth for replay is the load-bearing design choice.** Naive bundle import treats `memories[]` AND `audit_log[]` as parallel write inputs → double-write. The fix is one architectural pivot: audit log is the canonical record of EVERY write; memories[] is just a cached view for human readers. Once you accept that, `import_` becomes "validate version + migrate + replay" and the double-write bug becomes structurally impossible. Same shape as Kafka log-as-source-of-truth pattern.
+- **The migration chain is the Karpathy-wiki Paradigm 7 pattern applied to data schemas.** Each `_v_n_to_v_{n+1}` is "structural metadata at write time": the writer captures what's changing; the reader composes those small declarative transforms without hand-coding cross-version paths. Inserting v4 is one function + one dict entry — no rewrites elsewhere. Production teams who try to write monolithic `migrate(raw)` switch-on-version functions hit O(N²) maintenance cost as versions accumulate; the chain is O(N).
+- **`Protocol`-typed `tm` makes `export` + `import_` work for both backends without inheritance.** Same shape as §8.1's `TieredMemoryLike` in the dedup module — structural subtyping decouples portability from concrete TieredMemory vs TieredMemory-Qdrant classes. Production teams adding a 3rd backend (e.g., Weaviate variant) implement two methods, not subclass anything. The Protocol IS the contract.
+`─────────────────────────────────────────────────`
 
 ### 9.3 The `replay_audit` primitive
 
