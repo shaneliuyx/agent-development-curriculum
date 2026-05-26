@@ -5063,24 +5063,79 @@ def test_read_audit_log_filters_by_operation(audit_log_path: Path):
 
 @pytest.mark.asyncio
 async def test_execute_action_emits_audit_per_branch(audit_log_path: Path):
-    """Each execute_action branch (no-op / add / supersede / coexist /
-    delete / update) should produce exactly one AuditEntry."""
-    async with TieredMemory(agent_id=f"audit_test_{uuid.uuid4().hex[:6]}") as tm:
-        # 1. ADD branch (no target_id; classifier picked add)
-        execute_action(tm, DedupAction(action="add"), "new fact about Terraform")
-        # 2. NO-OP branch
-        execute_action(tm, DedupAction(action="no-op", target_id="existing-x"),
-                       "duplicate fact")
-        # 3. SUPERSEDE branch — needs a real target_id in Qdrant; for unit
-        #    test scope, mock target_id (delete will fail but we only check
-        #    audit log writes BEFORE delete; in integration test use real
-        #    target_id)
-        # ... see lab repo for the full integration variant
+    """Each of the 6 execute_action branches (add / no-op / supersede /
+    coexist / delete / update) produces an AuditEntry with the matching
+    `operation` value.
+
+    Seeds 4 real Qdrant points up-front so supersede / coexist / delete /
+    update have valid target_ids; ADD + NO-OP need no real target. Uses
+    a uuid-suffixed agent_id to isolate from concurrent test runs (§7.5
+    per-run namespacing pattern)."""
+    agent = f"audit_test_{uuid.uuid4().hex[:6]}"
+    async with TieredMemory(agent_id=agent, user_id="audit_test_user") as tm:
+        # Seed: 4 distinct points to consume across 4 branches that need a target.
+        seed_supersede = tm.imprint(content="seed: users prefer React (2024-01)")
+        seed_coexist   = tm.imprint(content="seed: web auth tokens expire 30m")
+        seed_delete    = tm.imprint(content="seed: hallucinated fact to scrub")
+        seed_update    = tm.imprint(content="seed: API rate limit 100 (no unit)")
+
+        # Branch 1 — ADD (no target_id; emits `imprint` op)
+        execute_action(tm, DedupAction(action="add"),
+                       "new fact: Terraform supports OpenTofu providers")
+
+        # Branch 2 — NO-OP (emits `noop_duplicate` op)
+        execute_action(tm, DedupAction(action="no-op", target_id=seed_supersede),
+                       "duplicate-of-seed fact")
+
+        # Branch 3 — SUPERSEDE (consumes seed_supersede; emits `supersede` op)
+        execute_action(tm, DedupAction(action="supersede",
+                                       target_id=seed_supersede,
+                                       supersede_reason="preference shifted",
+                                       supersede_category="preference"),
+                       "users now prefer Svelte (2026-05)")
+
+        # Branch 4 — COEXIST (uses `relates_to`; emits `coexist` op)
+        execute_action(tm, DedupAction(action="coexist",
+                                       relates_to=seed_coexist),
+                       "API keys never expire (M2M scope — orthogonal to web)")
+
+        # Branch 5 — DELETE (consumes seed_delete; emits `delete` op)
+        execute_action(tm, DedupAction(action="delete", target_id=seed_delete),
+                       "factually correct replacement")
+
+        # Branch 6 — UPDATE (consumes seed_update; emits `update` op)
+        execute_action(tm, DedupAction(action="update",
+                                       target_id=seed_update,
+                                       merged_content="API rate limit 100/min per IP"),
+                       "API rate limit 100/min per IP")
 
     entries = read_audit_log()
     operations = [e["operation"] for e in entries]
-    assert "imprint" in operations
-    assert "noop_duplicate" in operations
+
+    # 6 mutation ops + 4 seed imprints = 10+ entries (seeds emit imprint via
+    # the tm.imprint -> AuditEntry path that ships with the Qdrant variant
+    # OR not, depending on the variant; minimum 6 from execute_action calls).
+    for op in ["imprint", "noop_duplicate", "supersede",
+               "coexist", "delete", "update"]:
+        assert op in operations, f"§8.7 wire-in missing audit emission for branch: {op}"
+
+    # Target_id reconstruction — each mutation op records the right target.
+    sup = [e for e in entries if e["operation"] == "supersede"]
+    assert sup and sup[0]["target_id"] == seed_supersede
+    cox = [e for e in entries if e["operation"] == "coexist"]
+    assert cox and cox[0]["target_id"] == seed_coexist
+    delt = [e for e in entries if e["operation"] == "delete"]
+    assert delt and delt[0]["target_id"] == seed_delete
+    upd = [e for e in entries if e["operation"] == "update"]
+    assert upd and upd[0]["target_id"] == seed_update
+
+    # Actor + user propagation through the closure (regression guard:
+    # if the closure captures stale values from an earlier call, this
+    # asserts each entry carries the right scope).
+    assert all(e.get("user_id") == "audit_test_user" for e in entries
+               if e["operation"] in {"supersede", "coexist", "delete", "update"})
+    assert all(e.get("actor_agent_id") == agent for e in entries
+               if e["operation"] in {"supersede", "coexist", "delete", "update"})
 ```
 
 **Run:**
@@ -5094,7 +5149,7 @@ cd ~/code/agent-prep/lab-03-5-8-two-tier
 mkdir -p data
 set -a && . /Users/yuxinliu/code/agent-prep/.env && set +a
 uv run pytest tests/test_audit.py -v
-# Expect: 4/4 PASS (3 unit + 1 async integration smoke)
+# Expect: 4/4 PASS (3 unit + 1 async 6-branch integration on live Qdrant)
 tail -f data/audit.jsonl   # in another terminal — watch entries land
 ```
 
