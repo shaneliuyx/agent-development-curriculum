@@ -463,7 +463,7 @@ Stop condition:     what counts as done; when to stop and report blocked
 | Stop condition | `metadata.stop_reason` + the operation's terminal state | when "done" was declared |
 
 **Other curriculum instances:**
-- W3.5.8 Phase 9.6 supersede / coexist actions (write) ↔ Phase 10.3 `replay_audit` (read) — same 9-operation Literal Union.
+- W3.5.8 Phase 8.6 supersede / coexist actions (write) ↔ Phase 9.3 `replay_audit` (read) — same 9-operation Literal Union.
 - W11.6 cost-telemetry tags written at request time (write) ↔ DuckDB rollup queries at billing time (read) — every tag the writer emits becomes a column the reader can group by.
 - W11.8 CT pipeline training-data extraction (read) ↔ the audit log it consumes (write) — the writer's `metadata.quest_id` is what lets the reader reconstruct the gate→imprint chain.
 
@@ -621,8 +621,8 @@ Stop condition:     what counts as done; when to stop and report blocked
 
 **Curriculum instances:**
 
-- W3.5.8 Phase 9 (commit `ebee8dc`, 2026-05-15): `docs(week-3.5.8): Phase 9 spec → IMPLEMENTED status with measured 2026-05-15 result`. The section's opening line flipped from "ships when Phase 9 lands" to "shipped 2026-05-15, see `tests/test_dedup_synthesis.py` (5/5 PASS)".
-- W3.5.8 Phase 9.6 supersede / coexist (commit `e630daf`, 2026-05-15): chapter heading went from `Phase 9.6 Bitemporal Extension (SPEC)` to `Phase 9.6 Bitemporal Extension (Step 1+2 implemented 2026-05-15)`.
+- W3.5.8 Phase 8 (commit `ebee8dc`, 2026-05-15): `docs(week-3.5.8): Phase 8 spec → IMPLEMENTED status with measured 2026-05-15 result`. The section's opening line flipped from "ships when Phase 8 lands" to "shipped 2026-05-15, see `tests/test_dedup_synthesis.py` (5/5 PASS)". *(Renumbered from Phase 9 in 2026-05-26 chapter-wide renumber.)*
+- W3.5.8 Phase 8.6 supersede / coexist (commit `e630daf`, 2026-05-15): chapter heading went from `Phase 8.6 Bitemporal Extension (SPEC)` to `Phase 8.6 Bitemporal Extension (Step 1+2 implemented 2026-05-15)`. *(Renumbered from Phase 9.6 in 2026-05-26 chapter-wide renumber.)*
 - W7.7 quantization regime × technique grid (commit `7c952b0`, 2026-05-18): added with explicit `(SPEC)` markers on each technique row; flips to `(IMPLEMENTED)` per row as labs land.
 
 **Anti-pattern: silent transition.** Code lands in disk; nobody touches the chapter; six weeks later the chapter still describes the spec form. The chapter looks current but is six weeks stale. Detection: grep for status markers older than the latest commit touching the corresponding lab directory.

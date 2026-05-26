@@ -830,7 +830,7 @@ Then restart EverCore (`Ctrl-C` + `uv run web`).
 
 ---
 
-## 2026-05-15 — Week 3.5.8 — Phase 9.6 prompt upgrade silently invalidates pre-existing test's acceptable-action set
+## 2026-05-15 — Week 3.5.8 — Phase 8.6 prompt upgrade silently invalidates pre-existing test's acceptable-action set
 
 **Symptom:** `test_decide_action_handles_contradiction` FAILED after extending the dedup prompt from 4 to 6 actions:
 
@@ -848,7 +848,7 @@ AssertionError: unexpected action: supersede
 
 **Why it's a bad case:** The CLASSIFIER WAS WORKING CORRECTLY. Auth-token TTL change reads as **config rotation** (state evolution = the new `supersede` action) rather than factual correction (the old `delete`/`update` actions). The test's narrow acceptable set was written when the prompt had 4 actions; after extending to 6, the assertion needed to widen with it. Silent regression by omission.
 
-**Root cause:** Test acceptable-set was tied to launch-baseline contract (4-action). Prompt upgrade in §9.6 Step 1 extended the contract to 6 actions, but the test's `in (...)` clause didn't get updated in the same commit. The Phase 9.6 contract is "any non-silencing action is acceptable"; the test was encoding "specific 3-action subset is acceptable."
+**Root cause:** Test acceptable-set was tied to launch-baseline contract (4-action). Prompt upgrade in §8.6 Step 1 extended the contract to 6 actions, but the test's `in (...)` clause didn't get updated in the same commit. The Phase 8.6 contract is "any non-silencing action is acceptable"; the test was encoding "specific 3-action subset is acceptable."
 
 **Fix:**
 - Widen acceptable set: `assert action.action in ("delete", "update", "supersede")` (omit `add`/`no-op` — they silence the contradiction).

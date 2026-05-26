@@ -1,7 +1,9 @@
 ---
-title: Week 3.5.9 — Memory Benchmarks + Hypergraph Three-Tier
+title: "Memory Benchmarks + Hypergraph Three-Tier (PLANNED — TBD future decimal)"
 created: 2026-05-12
-updated: 2026-05-12
+updated: 2026-05-26
+status: PLANNED — not yet assigned a decimal; the W3.5.9 slot is now occupied by the Requirement-Driven Memory Architecture chapter (different topic)
+canonical_decimal: TBD (planned ~W3.5.97 between W3.5.95 Self-Observability and any future)
 tags:
   - agent
   - memory
@@ -11,10 +13,24 @@ tags:
   - longmemeval
   - locomo
   - three-tier
+  - planned
 audience: "cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$13 cloud spend cap across the program (12 main weeks + decimal supplements; see curriculum overview §How to Use This Guide for the three time-paths)"
 stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000, guild (Go binary), EverCore + HyperMem (Docker compose), Qdrant (Docker), Python 3.11
 prerequisites: W3.5.8 (Two-Tier Memory Architecture) shipped end-to-end with guild + EverCore composable + 4-way benchmark green
 ---
+
+> ⚠️ **PLANNED FUTURE CHAPTER — NOT YET SCHEDULED.**
+>
+> This file holds the design + lab spec for a HyperMem-based three-tier memory extension. It is **not the actual W3.5.9 chapter** — that slot is now occupied by **[[Week 3.5.9 - Requirement-Driven Memory Architecture]]** (sibling concern: how to choose between memory architectures given a workload, with LongMemEval as a worked exercise).
+>
+> **Status**: design + lab spec written (this file, ~42KB). Implementation deferred until the entity-density trigger described in [[Week 3.5.8 - Two-Tier Memory Architecture#When to Add a Third Tier (HyperMem)|W3.5.8's "When to Add a Third Tier" section]] crosses the production threshold (multi-entity-intersection query rate ≥ 30%). At that point, this file will be renamed to its canonical decimal (planned ~`W3.5.97`) and implementation phases begin.
+>
+> **Cross-link summary**:
+> - **For the actual W3.5.9 chapter (Requirement-Driven Memory Architecture, shipped 2026-05-26)** → [[Week 3.5.9 - Requirement-Driven Memory Architecture]]
+> - **For HyperMem decision rule + trigger condition** → [[Week 3.5.8 - Two-Tier Memory Architecture#When to Add a Third Tier (HyperMem)]]
+> - **For sibling self-facing memory chapter** → [[Week 3.5.95 - Self-Observability Memory]]
+>
+> **Why kept in the vault rather than deleted**: the lab spec below represents real design work (theory reading list, 5-phase lab breakdown, exit criteria, benchmark methodology) that should ship when the three-tier architecture is actually built. Deleting it would force re-design from scratch. Treating it as a "shelved spec" preserves the work + flags it explicitly as not-the-current-W3.5.9.
 
 ## Exit Criteria
 
