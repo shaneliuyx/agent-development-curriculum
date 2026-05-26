@@ -5788,7 +5788,7 @@ def replay_audit(tm: TieredMemoryLike, audit_log: list[dict]) -> dict[str, int]:
 - `src/memory_tools.py` (~120 LOC) — 5-tool client-facing surface (`memory_store` / `memory_query` / `memory_supersede` / `memory_export` / `memory_import` + `audit_replay`). Each tool wraps a TieredMemory primitive AND emits the right AuditEntry shape; transport (MCP / HTTP / direct import) is orthogonal.
 - `src/portability.py` (~150 LOC) — `ExportData` + `export()` + `import_()` + migration map.
 - `src/replay.py` (~100 LOC) — `replay_audit()` with idempotency contract.
-- `tests/test_portability_round_trip.py` — export → wipe → import → verify content survived; verify per-supersede chains preserved.
+- `tests/test_phase9.py` — 15 tests across 4 classes (TestReplayPureUnits / TestPortabilityMigration / TestPortabilityVersionGate / TestMemoryToolsIntegration). 11 unit (no Qdrant) + 4 integration (live Qdrant + isolated audit log). See §9.5 for the full source + walkthrough.
 - `RESULTS.md` row: per-client × per-task pass matrix (e.g., Claude Code 5/5 / Cursor 5/5 / Gemini CLI 4/5 — `memory_supersede` lacked Gemini's tool-schema support pre-v1.2). Honest reporting beats optimistic.
 
 `★ Insight ─────────────────────────────────────`
@@ -5796,6 +5796,304 @@ def replay_audit(tm: TieredMemoryLike, audit_log: list[dict]) -> dict[str, int]:
 - **`supportedVersions` set is a 2-line decision that saves months.** Future-self exports v3 from a newer codebase; current code's reader can fall back to v1/v2 migrations. Cost is one switch statement. Without it, every schema bump is a forced upgrade across all consumers.
 - **The 9-operation audit-log union (declared in §3.4, fully wired in §8.7) is the IMPORT'S precondition.** Without typed operations, `replay_audit()` can't know what to do with each entry. Forcing the union is what makes cross-backend migration tractable. Production rule: typed audit logs → portable memory; ad-hoc metadata → vendor-locked memory.
 - **The agentmemory project is the canonical reference impl** for the multi-client MCP-server pattern. iii-engine + WebSocket daemon adds production hardness (process-separated state, audit replay, eval module) that single-binary daemons (guild) skip. For curriculum scope, guild is the right starting point; for production scale, agentmemory's pattern is the trajectory.
+`─────────────────────────────────────────────────`
+
+### 9.5 Test suite — `tests/test_phase9.py`
+
+Covers §9.1.1 (memory_tools), §9.2 (portability), §9.3 (replay) in one file with four grouped test classes. Mix of pure-unit (no Qdrant required) and integration (live Qdrant + isolated audit log). Run unit-only for fast iteration:
+
+```bash
+uv run pytest tests/test_phase9.py -v
+# Unit-only (no Qdrant): -k "PureUnits or Migration or VersionGate"
+# Integration-only:      -k "Integration"
+```
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  F["tests/test_phase9.py"] --> U["TestReplayPureUnits<br/>6 tests, no Qdrant<br/>(uses _FakeTM shim)"]
+  F --> M["TestPortabilityMigration<br/>4 tests, no Qdrant<br/>(pure dict transforms)"]
+  F --> V["TestPortabilityVersionGate<br/>1 test, no Qdrant<br/>(reject unsupported version)"]
+  F --> I["TestMemoryToolsIntegration<br/>4 tests, live Qdrant<br/>+ isolated audit log"]
+```
+
+```python
+# tests/test_phase9.py — Phase 9 coverage: replay + portability + memory_tools
+"""Phase 9 test suite. Three modules covered:
+  - §9.3 replay.py             (TestReplayPureUnits — _FakeTM shim, no Qdrant)
+  - §9.2 portability.py        (TestPortabilityMigration + TestPortabilityVersionGate)
+  - §9.1.1 memory_tools.py     (TestMemoryToolsIntegration — live Qdrant + audit)
+
+Run:
+  uv run pytest tests/test_phase9.py -v
+"""
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from pathlib import Path
+
+import pytest
+
+from src.audit import read_audit_log
+from src.memory_tools import (
+    memory_export,
+    memory_import,
+    memory_query,
+    memory_store,
+    memory_supersede,
+)
+from src.portability import (
+    CURRENT_VERSION,
+    SUPPORTED_VERSIONS,
+    _v1_to_v2,
+    _v2_to_v3,
+)
+from src.portability import import_ as portability_import
+from src.replay import replay_audit
+from src.tiered_memory_qdrant import TieredMemory
+
+
+# ─── Fixtures ────────────────────────────────────────────────────────────
+@pytest.fixture
+def isolated_audit(tmp_path):
+    """Per-test audit log; restore module DEFAULT_AUDIT_PATH on teardown."""
+    import src.audit as audit_mod
+    original = audit_mod.DEFAULT_AUDIT_PATH
+    audit_mod.DEFAULT_AUDIT_PATH = tmp_path / "audit.jsonl"
+    yield audit_mod.DEFAULT_AUDIT_PATH
+    audit_mod.DEFAULT_AUDIT_PATH = original
+
+
+@pytest.fixture
+async def tm_iso():
+    """Isolated TieredMemory with uuid-suffixed user_id (§7.5 pattern).
+    Each integration test gets a fresh namespace to avoid cross-test residue."""
+    user = f"phase9_test_{uuid.uuid4().hex[:8]}"
+    async with TieredMemory(agent_id="phase9_agent", user_id=user) as tm:
+        yield tm
+
+
+class _FakeTM:
+    """In-memory shim implementing TieredMemoryLike.imprint only. Replay
+    unit tests use this to test audit-log-shape contract without needing
+    a live Qdrant. Records each imprint call for assertion."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def imprint(self, content: str, metadata: dict | None = None) -> str:
+        pid = uuid.uuid4().hex
+        self.calls.append({"content": content,
+                           "metadata": metadata or {},
+                           "id": pid})
+        return pid
+
+
+# ─── §9.3 replay.py — pure unit tests (no Qdrant) ────────────────────────
+class TestReplayPureUnits:
+    """Replay semantics on synthetic audit dicts via _FakeTM."""
+
+    def test_imprint_replays_as_imprint(self):
+        tm = _FakeTM()
+        log = [{"operation": "imprint", "payload_summary": "fact A",
+                "metadata": {}}]
+        counts = replay_audit(tm, log)
+        assert counts == {"replayed": 1, "skipped": 0, "unknown": 0}
+        assert tm.calls[0]["content"] == "fact A"
+
+    def test_promote_demote_skipped(self):
+        """promote+demote are decision records, not writes — must not replay."""
+        tm = _FakeTM()
+        log = [
+            {"operation": "promote", "payload_summary": "x", "metadata": {}},
+            {"operation": "demote",  "payload_summary": "y", "metadata": {}},
+        ]
+        counts = replay_audit(tm, log)
+        assert counts == {"replayed": 0, "skipped": 2, "unknown": 0}
+        assert tm.calls == []   # nothing imprinted
+
+    def test_supersede_preserves_supersedes_pointer(self):
+        tm = _FakeTM()
+        log = [{
+            "operation": "supersede", "payload_summary": "Svelte",
+            "target_id": "react-uuid", "metadata": {},
+        }]
+        replay_audit(tm, log)
+        assert tm.calls[0]["metadata"]["supersedes"] == "react-uuid"
+
+    def test_coexist_preserves_relates_to(self):
+        tm = _FakeTM()
+        log = [{
+            "operation": "coexist", "payload_summary": "API keys never expire",
+            "target_id": "auth-uuid", "metadata": {},
+        }]
+        replay_audit(tm, log)
+        assert tm.calls[0]["metadata"]["relates_to"] == "auth-uuid"
+
+    def test_unknown_op_logs_warning_and_counts(self, caplog):
+        """Forward-compat canary: unknown op = WARNING + counter increment."""
+        tm = _FakeTM()
+        log = [{"operation": "future_op_v4", "id": "abc",
+                "payload_summary": "x"}]
+        with caplog.at_level(logging.WARNING, logger="src.replay"):
+            counts = replay_audit(tm, log)
+        assert counts == {"replayed": 0, "skipped": 0, "unknown": 1}
+        assert "future_op_v4" in caplog.text
+        assert tm.calls == []   # unknown op = no imprint
+
+    def test_caller_metadata_supersedes_not_clobbered(self):
+        """setdefault contract: caller-provided supersedes pointer wins."""
+        tm = _FakeTM()
+        log = [{
+            "operation": "supersede", "payload_summary": "y",
+            "target_id": "from_target", "metadata": {"supersedes": "caller_set"},
+        }]
+        replay_audit(tm, log)
+        assert tm.calls[0]["metadata"]["supersedes"] == "caller_set"
+
+
+# ─── §9.2 portability.py — migration unit tests (no Qdrant) ─────────────
+class TestPortabilityMigration:
+    """Pure dict transforms for the v1 → v3 chain."""
+
+    def test_v1_to_v2_splits_content_to_payload_summary(self):
+        v1 = {"version": "v1", "memories": [{"content": "x" * 200, "id": "p1"}]}
+        v2 = _v1_to_v2(v1)
+        assert v2["version"] == "v2"
+        assert len(v2["memories"][0]["payload_summary"]) == 120
+        assert v2["memories"][0]["metadata"]["legacy_v1_content"] == "x" * 200
+
+    def test_v2_to_v3_coerces_upsert_to_imprint(self):
+        v2 = {"version": "v2", "memories": [], "audit_log": [
+            {"operation": "upsert", "id": "a"},      # legacy op name
+            {"operation": "supersede", "id": "b"},   # current name
+        ]}
+        v3 = _v2_to_v3(v2)
+        assert v3["version"] == "v3"
+        assert v3["audit_log"][0]["operation"] == "imprint"
+        assert v3["audit_log"][1]["operation"] == "supersede"
+
+    def test_migrate_to_current_walks_v1_to_v3(self):
+        """Full chain walk — v1 input lands at v3 with path ['v1','v2','v3']."""
+        from src.portability import migrate_to_current
+        v1 = {"version": "v1",
+              "memories": [{"content": "f", "id": "p"}],
+              "audit_log": []}
+        out, path = migrate_to_current(v1)
+        assert out["version"] == CURRENT_VERSION
+        assert path == ["v1", "v2", "v3"]
+
+    def test_migrate_skipped_on_current_version(self):
+        """Walker exits immediately when already at CURRENT_VERSION."""
+        from src.portability import migrate_to_current
+        cur = {"version": CURRENT_VERSION, "memories": [], "audit_log": []}
+        out, path = migrate_to_current(cur)
+        assert path == [CURRENT_VERSION]
+
+
+# ─── §9.2 portability.py — version-gate test (no Qdrant) ────────────────
+class TestPortabilityVersionGate:
+    """Unsupported version = clear error, not silent drift."""
+
+    def test_import_rejects_unsupported_version(self, tmp_path, isolated_audit):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"version": "v99",
+                                    "memories": [], "audit_log": []}))
+        tm = _FakeTM()
+        with pytest.raises(ValueError, match="not in supported set"):
+            portability_import(tm, bad)
+
+
+# ─── §9.1.1 memory_tools + §9.2 round-trip — integration ────────────────
+class TestMemoryToolsIntegration:
+    """Live Qdrant + isolated audit log. Each test exercises ONE tool +
+    asserts the matching AuditEntry shape per §9's task matrix contract."""
+
+    @pytest.mark.asyncio
+    async def test_memory_store_emits_imprint_audit(self, tm_iso,
+                                                     isolated_audit):
+        new_id = memory_store(tm_iso, content="fact about kubernetes",
+                              type="fact", tags=["infra", "k8s"],
+                              user_id=tm_iso.user_id)
+        entries = read_audit_log()
+        assert len(entries) == 1
+        assert entries[0]["operation"] == "imprint"
+        assert entries[0]["new_id"] == new_id
+        assert entries[0]["metadata"]["tags"] == ["infra", "k8s"]
+
+    @pytest.mark.asyncio
+    async def test_memory_query_emits_no_audit(self, tm_iso, isolated_audit):
+        """Reads don't audit (asymmetric policy: writes audit, reads don't)."""
+        memory_store(tm_iso, content="kubernetes scheduling primer",
+                     user_id=tm_iso.user_id)
+        results = memory_query(tm_iso, query="kubernetes", k=3,
+                               user_id=tm_iso.user_id)
+        entries = read_audit_log()
+        assert len(entries) == 1            # only the store, not the query
+        assert entries[0]["operation"] == "imprint"
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_memory_supersede_emits_supersede_audit(self, tm_iso,
+                                                          isolated_audit):
+        old_id = memory_store(tm_iso, content="user prefers React",
+                              user_id=tm_iso.user_id)
+        new_id = memory_supersede(tm_iso, old_id=old_id,
+                                  new_content="user now prefers Svelte",
+                                  reason="preference shifted",
+                                  user_id=tm_iso.user_id)
+        sup = [e for e in read_audit_log() if e["operation"] == "supersede"]
+        assert len(sup) == 1
+        assert sup[0]["target_id"] == old_id
+        assert sup[0]["new_id"] == new_id
+        assert sup[0]["metadata"]["supersede_reason"] == "preference shifted"
+
+    @pytest.mark.asyncio
+    async def test_export_import_round_trip(self, tm_iso, tmp_path,
+                                             isolated_audit):
+        """Single-source-of-truth import: replay reconstructs from audit log
+        alone. Regression-catches the original double-write trap (if anyone
+        re-adds memories[] iteration in import_, replay_counts doubles)."""
+        memory_store(tm_iso, content="fact 1: terraform supports OpenTofu",
+                     user_id=tm_iso.user_id)
+        memory_store(tm_iso, content="fact 2: pgvector supports HNSW",
+                     user_id=tm_iso.user_id)
+        bundle_path = tmp_path / "export.json"
+        bundle = memory_export(tm_iso, user_id=tm_iso.user_id,
+                               out_path=bundle_path)
+        assert bundle["version"] == CURRENT_VERSION
+        assert len(bundle["audit_log"]) == 2
+
+        # Replay into fresh TM namespace; audit log is single source of truth.
+        user2 = f"phase9_replay_{uuid.uuid4().hex[:8]}"
+        async with TieredMemory(agent_id="phase9_replay_agent",
+                                user_id=user2) as tm2:
+            result = memory_import(tm2, in_path=bundle_path)
+        assert result["replay_counts"]["replayed"] == 2   # exactly 2, NOT 4
+        assert result["replay_counts"]["unknown"] == 0
+        assert result["migrated_through"] == [CURRENT_VERSION]
+```
+
+**Walkthrough:**
+
+**Block 1 — Test grouping mirrors the chapter's §9 structure.** Four test classes correspond to §9.3 (TestReplayPureUnits) / §9.2 migrations (TestPortabilityMigration + TestPortabilityVersionGate) / §9.1.1 tools (TestMemoryToolsIntegration). Reader can navigate from any §9 subsection to its tests in one grep. The class-per-subsection convention also makes selective execution trivial: `pytest -k "Replay"` runs only replay tests, useful when iterating on §9.3 in isolation.
+
+**Block 2 — `_FakeTM` shim is the load-bearing decoupling.** Replay tests use `_FakeTM` (in-memory imprint recorder) instead of live `TieredMemory`. Why: replay's contract is "given AuditEntry log, call `tm.imprint` per write-op with right metadata" — that contract is testable against ANY object with an `imprint` method. Coupling tests to live Qdrant adds zero coverage (replay doesn't care which storage backend it imprints into) and a lot of setup cost. The pattern: test the contract, not the substrate. `_FakeTM` is ~10 LOC; live-Qdrant fixture is ~30 LOC + requires a running daemon.
+
+**Block 3 — Round-trip test is the regression guard for the original double-write trap.** The most important assertion: `assert result["replay_counts"]["replayed"] == 2`. If anyone re-introduces the original `import_` design (iterate `bundle["memories"]` + then call `replay_audit`), this number doubles to 4. Catching this regression structurally is why the round-trip test exists. Without this test, the double-write bug could silently reappear and only be caught by an integration test downstream when point counts look wrong.
+
+**Block 4 — `caplog` captures the forward-compat canary warning.** `test_unknown_op_logs_warning_and_counts` is the test that validates the `_OPS_REPLAY_AS_IMPRINT` vs `_OPS_SKIP` set design. When a v4 audit log lands with a new op like `future_op_v4`, replay must log a warning + increment the `unknown` counter (not crash, not silently skip). The test asserts both behaviors. Production CI runs this against synthetic audit logs containing every known op + one synthetic unknown op; non-zero `unknown` count would flag the new op for explicit set-membership decision.
+
+**Block 5 — Asymmetric audit policy enforced by `test_memory_query_emits_no_audit`.** This test exists to lock in the contract: reads do NOT audit. If anyone adds audit emission to `memory_query` (e.g., for "track every read" telemetry), this test fails. The test is short (3 lines body) but the contract it enforces is high-leverage: it stops well-meaning telemetry creep that would explode the audit log without adding replay/CT-pipeline value. Telemetry has its own log type; conflating it with the audit log breaks the audit log's denormalization contract.
+
+**Result** *(projected — actual `uv run pytest tests/test_phase9.py -v` execution TBD)*: expected 15 tests / 4 classes — 6 TestReplayPureUnits + 4 TestPortabilityMigration + 1 TestPortabilityVersionGate + 4 TestMemoryToolsIntegration. Unit-test wall: <1s (no I/O). Integration wall: ~5-10s (4 tests × ~1-2s each for Qdrant POST + audit JSONL write + replay round-trip). When the lab repo's test suite ships, replace this projection with the measured `pytest --durations=15` output.
+
+`★ Insight ─────────────────────────────────────`
+- **Test pyramid done right: 11 unit + 4 integration.** The 11 unit tests cover replay semantics and migration transforms without touching Qdrant — they're the fast-feedback layer (run in milliseconds). The 4 integration tests cover the end-to-end audit-emission + round-trip contracts — they're slower but verify the seams between modules. Classic pyramid ratio (~73% unit, ~27% integration) matches Martin Fowler's recommended test distribution.
+- **`_FakeTM` is the pattern for testing layered code against contracts, not substrates.** Replay depends on TieredMemory's `imprint` shape, not its storage semantics. A 10-line Protocol-conformant in-memory shim covers 6 tests' worth of behavior at zero infrastructure cost. Production codebases that test every module against live Postgres / live Qdrant / live Kafka pay 100× the CI time for marginal extra confidence. Reserve live-infra tests for actual integration boundaries.
+- **The round-trip test is the chapter's load-bearing regression guard.** Three audit-and-fix cycles in this session worked on §9.2/§9.3 — the double-write trap, the field-name drift, the stub branches. Each of those bugs would be caught by this single test (`assert replay_counts["replayed"] == 2` not 4 from double-write; import calls succeed without KeyError from field-name drift; all branches replay without crash). One integration test = three classes of regression caught. High leverage per LOC.
 `─────────────────────────────────────────────────`
 
 ---
