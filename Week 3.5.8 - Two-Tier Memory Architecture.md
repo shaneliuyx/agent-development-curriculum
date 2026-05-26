@@ -1950,7 +1950,7 @@ The 9 demote entries cluster tightly below threshold (`delta` range −0.03 to �
 1. **Operation enumeration is a contract.** A `Literal[...]` union forces every caller to use one of the 9 known operations; ad-hoc string fields drift over time as new ops get added without renaming old ones.
 2. **Audit log is replayable.** JSONL append-only with timestamp + actor + target lets you reconstruct the store's state at any past timestamp — same pattern as W11.8 CT's PSI history + W11.6's span parquet log.
 3. **`AuditEntry` is the integration point** for the W11.8 CT pipeline's drift detector (PSI over audit-entry counts per category) AND the W9.3 agent-eval rubric (trajectories that include memory ops get traced via AuditEntry IDs).
-4. **Cross-system contract.** When agent-prep eventually integrates with `rohitg00/agentmemory` (or any MCP-memory server with the same shape), the AuditEntry union is the wire-protocol-friendly export shape. See §10 for the multi-client portability extension.
+4. **Cross-system contract.** When agent-prep eventually integrates with `rohitg00/agentmemory` (or any MCP-memory server with the same shape), the AuditEntry union is the wire-protocol-friendly export shape. See §9 (Phase 9 — Memory-as-MCP-Server) for the multi-client portability extension.
 
 **Failure mode this prevents:** without an explicit AuditEntry type, every place that mutates the store invents its own metadata schema. The Phase 8.6 supersede fields (`supersedes`, `supersede_reason`, `supersede_category`) were added inline; the Phase 8 dedup fields (`facts_deduplicated` counter) lived elsewhere; the Phase 3.3 promote/demote signal lived in a third place. AuditEntry unifies them so future eval / replay / export code has ONE source of truth.
 
@@ -5554,7 +5554,7 @@ The arrows are the SAME shape as the two-tier: consolidation pipeline moves data
 
 **Concrete trigger to add HyperMem**: when ≥30% of your `query_context()` calls have a "tell me about X AND Y AND Z together" shape (multi-entity intersection), the semantic tier alone forces post-processing in Python. At that point a relational tier earns its operational cost.
 
-**Where it slots in the curriculum**: **[[Week 3.5.9 - Memory Benchmarks and Hypergraph Three-Tier]]** integrates HyperMem as the L3 relational tier on top of this lab's two-tier architecture. W3.5.9 also runs the LongMemEval `oracle` subset across all five backends (no-mem / guild / EverCore / two-tier / three-tier), turning the trigger-condition discussion above into a measurement. Prerequisite: this chapter (W3.5.8) shipped end-to-end. The cluster's graduation arc is now W3.5 → W3.5.5 → W3.5.8 → W3.5.9, with measurement-driven scaling at the top.
+**Where it slots in the curriculum**: a dedicated three-tier-with-HyperMem chapter is **TBD** (planned as a future decimal); until it ships, this section is the canonical HyperMem reference. [[Week 3.5.9 - Requirement-Driven Memory Architecture]] is a sibling concern — it teaches the meta-skill of choosing between 1-tier / 2-tier / graph-tier architectures given a workload (via LongMemEval as a worked exercise). The W3.5.9 decision matrix tells you WHEN to add a third tier; the future HyperMem chapter will teach HOW to build it. Cluster graduation arc: W3.5 → W3.5.5 → W3.5.8 → W3.5.9 (architecture choice) → future HyperMem (three-tier implementation, when entity-density warrants it). Prerequisite for the future chapter: this one (W3.5.8) shipped end-to-end.
 
 `★ Insight ─────────────────────────────────────`
 - **The two-tier → three-tier extension is a real production scaling pattern**, not just a research artifact. Most agent systems START at single-tier, GRADUATE to two-tier when cross-session knowledge transfer matters, and ADD relational only when entity-density crosses a threshold. Knowing all three stages — and the trigger for each — is the production-architect signal.
@@ -5606,7 +5606,7 @@ This lab implements a **Paradigm 1 + Paradigm 3 + Paradigm 6 composition** with 
 
 | # | Paradigm | Why not in W3.5.8 |
 |---|---|---|
-| 2 | Knowledge-graph | Deferred to [[Week 3.5.9 - Memory Benchmarks and Hypergraph Three-Tier]] which adds HyperMem as the L3 relational tier. W3.5.8 stays two-tier. |
+| 2 | Knowledge-graph | Deferred — see the chapter-end "When to Add a Third Tier (HyperMem)" section for the decision criteria; a dedicated three-tier-with-HyperMem chapter is TBD. W3.5.8 itself stays two-tier. |
 | 4 | Multi-index hybrid (RRF) | EverCore does this INTERNALLY (Mongo + ES + Milvus); we don't compose it externally. Stretch lab candidate. |
 | 5 | LLM-as-retriever | Different chapter entirely — would be a W3.7-class agentic-RAG topic, not a memory chapter. |
 | 7 | Karpathy wiki | Not memory-system shape; closer to W6.7 Agent Skills (Anthropic-pattern skills as Markdown). |
