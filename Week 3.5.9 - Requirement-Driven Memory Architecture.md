@@ -1,8 +1,8 @@
 ---
-title: Week 3.5.9 — Requirement-Driven Memory Architecture
+title: Week 3.5.9 — Requirement-Driven Memory Architecture and Three-Tier Hypergraph
 created: 2026-05-26
 updated: 2026-05-26
-status: draft
+status: draft (intensive week, ~22h; §1-§3 + Phase 1-2 analysis complete; Phase 3-9 code + design shipped; measurements TBD)
 tags:
   - agent
   - memory
@@ -11,8 +11,11 @@ tags:
   - longmemeval
   - mem0
   - hybrid
+  - hypergraph
+  - hypermem
+  - three-tier
 audience: "cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$13 cloud spend cap across the program (12 main weeks + decimal supplements; see curriculum overview §How to Use This Guide for the three time-paths)"
-stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000 (gpt-oss-20b + bge-m3-mlx-fp16), Mem0 SDK (Python), Qdrant via Docker, local Claude-Code-router proxy at :8317 (judge — claude-sonnet-4-6)
+stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000 (gpt-oss-20b + bge-m3-mlx-fp16), Mem0 SDK (Python), Qdrant via Docker, HyperMem service via EverOS docker-compose, local Claude-Code-router proxy at :8317 (judge — claude-sonnet-4-6)
 ---
 
 ## Exit Criteria
@@ -21,14 +24,20 @@ stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000 (gpt-oss-20b + bge-m3-mlx-fp
 - [ ] Architecture decision matrix populated with explicit justification — which axis maps to which architecture class (Phase 2)
 - [ ] Mem0 open-source baseline reproduces a measurable score on the same slice using the same reader + judge (Phase 3)
 - [ ] Homebrew hybrid router operational: 1-tier path + 2-tier path + question classifier (Phase 4)
-- [ ] 5-backend × 6-axis × 20-Q comparison table with measured per-question wall + correctness (Phase 5)
-- [ ] Decision rule documented for future production use (Phase 5 close)
+- [ ] Initial 5-backend × 7-axis × 20-Q comparison table with measured per-question wall + correctness (Phase 5)
+- [ ] HyperMem L3 service running alongside EverCore + Qdrant via extended docker-compose (Phase 6)
+- [ ] `ThreeTierMemory` Python wrapper extending `TieredMemory` with `query_relations()` method (Phase 7)
+- [ ] Extended consolidation pipeline writing typed hyperedges to L3 (idempotent via scroll_id + entity-pair hash) (Phase 8)
+- [ ] Final 6-backend benchmark + Pareto-frontier analysis vs published baselines (Phase 9)
+- [ ] Decision rule documented for future production use (combining Phase 2 framework + Phase 5/9 measurements)
 
 ## §1 Why This Week Matters
 
 Most memory chapters teach ONE architecture and imply it is THE architecture. Production engineering picks the right architecture for the workload, and the picking is the senior-engineering signal an interviewer probes for. W3.5.9 teaches the meta-skill explicitly: given a real published benchmark (LongMemEval), analyze its question shapes, derive the required memory primitives per axis, evaluate three candidate architecture classes (1-tier atomic-fact, 2-tier consolidation, graph-tier temporal), pick the architecture whose write-time primitive matches the read-time question shape, implement, verify against the benchmark, and document the decision rule.
 
-The deliverable a reader walks away with is **not memorized backend details, but a defensible decision-making framework** — plus a working hybrid implementation that composes the right primitives for a mixed workload. The interview signal is *"how do you decide between memory architectures?"*, which is harder to fake than *"how does Mem0 work?"*. This chapter answers the harder question directly with a worked LongMemEval exercise.
+This chapter takes the meta-skill ONE step further: it applies the framework end-to-end by IMPLEMENTING the graph-tier branch (HyperMem L3) that Phase 2's matrix flags as the right primitive for multi-entity intersection + temporal-reasoning queries. Phase 1-5 derive + measure the hybrid (1-tier + 2-tier) baseline; Phase 6-9 extend it to a three-tier system + run the 6-backend comparison. The chapter is intensive (~22h) but produces TWO deliverables: a defensible decision-making framework (Phase 1-2) + a working three-tier implementation with measured benchmark scores (Phase 5-9).
+
+The deliverable a reader walks away with is **not memorized backend details, but (a) a decision-making framework that derives architecture from requirements, plus (b) a 6-backend × 7-axis Pareto-frontier matrix that turns the framework's predictions into measurements**. The interview signal is *"how do you decide between memory architectures?"* (the framework half) AND *"how do you scale a multi-agent memory system AND measure it against published baselines?"* (the implementation half). This chapter answers both directly with a worked LongMemEval exercise.
 
 ## §2 Theory Primer
 
@@ -91,6 +100,59 @@ Reusable in any production architecture decision. Five rows, three columns, fill
 
 The decision is goal-backward: start with the question shapes the production workload hits, derive required primitives, pick the class with the most natives + fewest ❌. Hybrids combine classes when no single class is dominant.
 
+### 2.5 Hypergraph memory — when flat semantic memory falls short
+
+A 1-tier or 2-tier semantic memory store treats each memory as an independent assertion (*"user lives in Tokyo"*, *"user works at MegaCorp"*). Queries are similarity-shaped: *"what does the user do?"* finds memories by embedding similarity.
+
+Some queries are NOT similarity-shaped. They're **multi-entity intersection** queries:
+
+- *"Who has worked with Alice AND on the payments-system AND knows Postgres?"*
+- *"What projects depend on the auth refactor AND were touched by a senior engineer?"*
+- *"When did the user discuss topic-X AND in the context of project-Y?"*
+
+These factor as logical conjunctions over typed edges between entity nodes. A flat semantic store CAN approximate them with multi-step retrievals + Python filtering — at the cost of N round-trips + accuracy degradation per filter step.
+
+A **hypergraph memory** indexes the entity-graph natively:
+
+- **Nodes**: typed entities (user, project, topic, system)
+- **Hyperedges**: connect ≥2 nodes with a typed relation (e.g., `(Alice)─[worked-on]─(Payments)─[uses]─(Postgres)`)
+- **Queries**: "find all node sets X, Y, Z such that all of (X,Y), (Y,Z), (X,Z) hyperedges exist"
+
+Hyperedges differ from regular graph edges: a hyperedge can connect 3+ nodes natively (vs binary edges requiring intermediate pivot nodes). This matters for multi-attribute joins. In §4 Phase 5-9, the homebrew hybrid is extended with HyperMem as the **L3 relational tier** alongside L1 (atomic-fact) and L2 (2-tier consolidation), producing the chapter's true 5-backend comparison.
+
+### 2.6 Graduation trigger — when to add the L3 relational tier
+
+Don't add L3 speculatively. The graduation trigger is **measured query-mix composition**:
+
+| Query type | Right tier | Detection signal |
+|---|---|---|
+| Atomic claim, scroll handoff | L1 guild | tool calls to `quest_accept` / `scroll_save` |
+| Single-attribute semantic recall | L2 EverCore or atomic-fact | calls to `query_context()` with short queries |
+| Multi-entity intersection | L3 HyperMem | calls to `query_context()` followed by Python post-filtering on ≥2 entity dimensions |
+
+Instrument your production memory layer for 1-2 weeks. Count the frequency of each query class. If multi-entity intersection exceeds ~30% of total queries (or accuracy on those queries drops below acceptable thresholds with the L2-and-filter approach), it's time to add L3. If the trigger doesn't fire — **don't** add L3. Three-tier adds another service, another consolidation step in the pipeline, another data model to maintain. YAGNI applies harder to memory architecture than most things because each tier has operational cost AND a separate correctness story.
+
+### 2.7 LongMemEval benchmark methodology — the senior-signal eval discipline
+
+LongMemEval (Wu et al., 2024, arXiv:2410.10813) is the canonical long-conversation memory benchmark. The same 6 `question_type` axes analysed in §2.2 become the EVALUATION axes for the §4 Phase 8 5-backend run. Three sizes ship:
+
+- `oracle` (~50 questions, ~25K-token conversations) — fast smoke-test, used by §4 Phase 8
+- `m` (~500 questions) — release-gate size
+- Full set (~2000 questions) — paper-replication size
+
+Production memory systems publish scores on at least the `oracle` size. EverCore reports **83%** on the full LongMemEval set; Mem0 reports **94.4%**. The chapter's §4 Phase 8 uses the `oracle` subset for time-budget reasons — pass rate on `oracle` correlates strongly with full-set pass rate but completes in minutes rather than hours.
+
+**Discipline rule.** Measure-vs-published-baselines is the senior signal. Without an industry benchmark, you can't tell if 70% is great or terrible. With one, *"my three-tier system scored X% on LongMemEval `oracle` vs EverCore's published 83% on the full set"* anchors the conversation in absolute terms.
+
+### 2.8 Measuring vs optimizing-for a benchmark — Pareto-frontier discipline
+
+Industry benchmarks are powerful AND dangerous. Two failure modes:
+
+1. **Cargo-cult**: pick a benchmark, optimize until you beat it, ship. The system is now overfit to the benchmark and brittle on real workloads. Common in NLP — see *"BLEURT chasing leads to translation systems that score high but read worse than baseline."*
+2. **Pareto-frontier navigation**: measure your system on the benchmark to know WHERE on the cost/quality frontier you sit. Pick the operating point that matches your actual product requirements. The benchmark is a calibration tool, not a target.
+
+Senior engineers do (2). Junior engineers do (1). The lab teaches (2) by measuring 5 backends on the same benchmark AND identifying categorical wins (where each tier outperforms) AND latency/cost tradeoffs. The matrix tells you: *"if my actual query mix is X% multi-session-user + Y% temporal-reasoning + Z% abstention, here's the operating point I should pick."*
+
 ## §3 Mechanism / Architecture Diagram
 
 ### 3.1 Router-based hybrid (Phase 4 target)
@@ -115,14 +177,14 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  subgraph C1["Class 1: 1-tier atomic-fact"]
+  subgraph C1["Class 1 — 1-tier"]
     direction TB
     C1W["Write: per-message<br/>extract atomic facts"]
     C1S["Store: vector DB<br/>+ BM25 + entity index"]
     C1R["Read: multi-signal fusion<br/>semantic + BM25 + entity"]
     C1W --> C1S --> C1R
   end
-  subgraph C2["Class 2: 2-tier consolidation"]
+  subgraph C2["Class 2 — 2-tier"]
     direction TB
     C2W["Write: append raw event<br/>operational tier"]
     C2C["Consolidate: extract<br/>episode + facts + profile"]
@@ -130,13 +192,85 @@ flowchart LR
     C2R["Read: semantic search<br/>over episodes/facts"]
     C2W --> C2C --> C2S --> C2R
   end
-  subgraph C3["Class 3: graph-tier temporal"]
+  subgraph C3["Class 3 — graph-tier"]
     direction TB
     C3W["Write: per-message<br/>extract typed edges"]
     C3S["Store: temporal<br/>knowledge graph"]
     C3R["Read: graph traversal<br/>by entity + time"]
     C3W --> C3S --> C3R
   end
+  C1 ~~~ C2 ~~~ C3
+```
+
+### 3.3 Three-tier topology (Phase 5-9 target — extends W3.5.8's two-tier with HyperMem L3)
+
+```mermaid
+flowchart LR
+    A1[Python Agent A]
+    A2[Python Agent B]
+
+    subgraph L1["L1 — Operational"]
+        Q["Quest board<br/>atomic claim"]
+        S["Scrolls<br/>handoff text"]
+    end
+
+    subgraph L2["L2 — Semantic"]
+        IMP["Imprint API<br/>:1995"]
+        QRY["Semantic query<br/>:1995"]
+    end
+
+    subgraph L3["L3 — Relational"]
+        EDGE["Hyperedge create<br/>:1996"]
+        RELQ["Relational query<br/>multi-entity"]
+    end
+
+    subgraph PIPE["Consolidation"]
+        BATCH["Closed scrolls →<br/>EverCore imprints<br/>+ HyperMem edges"]
+    end
+
+    A1 -->|claim/scroll| L1
+    A2 -->|semantic recall| QRY
+    A2 -->|multi-entity intersection| RELQ
+    A2 -->|claim/scroll| L1
+    L1 -->|periodic batch| BATCH
+    BATCH -->|imprint| IMP
+    BATCH -->|hyperedge upsert| EDGE
+
+    style L1 fill:#4a90d9,color:#fff
+    style L2 fill:#27ae60,color:#fff
+    style L3 fill:#9b59b6,color:#fff
+    style PIPE fill:#e67e22,color:#fff
+    style BATCH fill:#e67e22,color:#fff
+```
+
+### 3.4 Five-backend benchmark flow (Phase 8 target — extends the §4 Phase 5 comparison with three-tier)
+
+```mermaid
+flowchart TD
+    LME[LongMemEval oracle subset 50 Qs]
+
+    LME --> A[no-memory baseline]
+    LME --> B[guild only operational]
+    LME --> C[EverCore only semantic]
+    LME --> D[two-tier guild + EverCore]
+    LME --> E[three-tier + HyperMem]
+
+    A --> RES[5-way comparison matrix per-category pass rate latency tokens]
+    B --> RES
+    C --> RES
+    D --> RES
+    E --> RES
+
+    RES --> ANCHOR[Anchor to EverCore published score 83 percent full set vs your oracle scores]
+
+    style LME fill:#bdc3c7,color:#222
+    style A fill:#7f8c8d,color:#fff
+    style B fill:#4a90d9,color:#fff
+    style C fill:#27ae60,color:#fff
+    style D fill:#f5a623,color:#fff
+    style E fill:#9b59b6,color:#fff
+    style RES fill:#e67e22,color:#fff
+    style ANCHOR fill:#16a085,color:#fff
 ```
 
 ## §4 Lab Phases
@@ -941,9 +1075,362 @@ Two cells are populated from W3.5.8 §7.7's already-measured baseline (qdrant + 
 - **The two-baselines-already-measured cells anchor the rest of the table.** Reading the TBD-heavy template, a reviewer's first thought is "Are the baselines plausible?" The 0/20 + 0/20 in qdrant + evercore columns are LINK-VERIFIED to W3.5.8 §7.7 — the reviewer can click through and see the measured artifact. This forces confidence in the table's measurement methodology before any new number lands.
 `─────────────────────────────────────────────────`
 
+### Phase 6 — HyperMem Service Setup (~30 min)
+
+**Goal.** Stand up the L3 relational tier alongside W3.5.8's L1 (guild) + L2 (EverCore / Qdrant). Phase 6-9 implement the architecture decision deferred in Phase 2 as TBD-future — Phase 2's matrix flagged graph-tier as the right primitive for `temporal-reasoning` + multi-entity-intersection queries. This phase makes HyperMem real.
+
+**Setup.** Extend the W3.5.8 docker-compose (`lab-03-5-8-two-tier/docker/docker-compose.yml`) with a `hypermem` service alongside the existing `evercore` + Qdrant containers.
+
+```yaml
+# docker-compose.yml — extension
+services:
+  hypermem:
+    image: everos/hypermem:latest  # from ~/code/EverOS/methods/HyperMem
+    ports:
+      - "1996:1996"
+    depends_on:
+      - postgres                  # reuses W3.5.8's Postgres
+    environment:
+      HYPERMEM_DB_URL: postgresql://...
+      HYPERMEM_PORT: 1996
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1996/health"]
+      interval: 10s
+      retries: 5
+```
+
+```mermaid
+flowchart TD
+  A["docker-compose up hypermem"] --> B["HyperMem HTTP service<br/>localhost:1996"]
+  B --> C["POST /api/v1/edges<br/>typed hyperedge create"]
+  B --> D["POST /api/v1/query/relations<br/>multi-entity intersection"]
+  B --> E["GET /api/v1/health"]
+  E --> F["smoke test pass: container ready"]
+```
+
+**Smoke test.**
+
+```bash
+# Create a 3-node hyperedge
+curl -X POST http://localhost:1996/api/v1/edges \
+  -H "Content-Type: application/json" \
+  -d '{"nodes":[{"type":"user","id":"alice"},{"type":"project","id":"payments"},{"type":"tech","id":"postgres"}], "relation":"worked-on-using"}'
+
+# Query for "experts on payments AND postgres"
+curl -X POST http://localhost:1996/api/v1/query/relations \
+  -H "Content-Type: application/json" \
+  -d '{"intersection":[{"node":{"type":"project","id":"payments"}}, {"node":{"type":"tech","id":"postgres"}}], "return_type":"user"}'
+# Expect: [{"type":"user","id":"alice"}]
+```
+
+**Result** *(measured ON IMPLEMENTATION — TBD)*: smoke-test wall, HyperMem image size, container memory footprint, healthcheck pass time.
+
+`★ Insight ─────────────────────────────────────`
+- **HyperMem's HTTP-1996 port is a deliberate sibling to EverCore's HTTP-1995.** Both services expose the same conceptual API surface (imprint + query) but at different abstraction levels: EverCore stores propositions, HyperMem stores typed relations. Both are queryable by the same Python wrapper (Phase 7's `ThreeTierMemory`) without leaking which tier owns which kind of memory.
+- **Reuse Postgres rather than spin a separate DB for HyperMem.** Both services need durable storage, but HyperMem's hyperedge table is small (typically 100× smaller than EverCore's memcell table). Sharing the Postgres instance saves operational overhead + lets backups treat memory state as one unit. Production-shaped pattern: one durable substrate, multiple service-specific schemas.
+- **The healthcheck IS the integration contract.** When `ThreeTierMemory.query_relations()` (Phase 7) calls HyperMem on a fresh boot, it expects the service to be ready. If the healthcheck is missing or wrong, the wrapper's first call hits "connection refused" and the entire lab's debugging starts in the wrong layer. A 5-line healthcheck stanza saves hours.
+`─────────────────────────────────────────────────`
+
+### Phase 7 — `ThreeTierMemory` Python Wrapper (~2h)
+
+**Goal.** Extend the lab's existing `TieredMemory` (W3.5.8 §2.1) to a three-tier wrapper that adds `query_relations()` for multi-entity intersection queries. Existing `imprint()` and `query_context()` stay unchanged on the L1+L2 path; new `query_relations()` routes to L3.
+
+**Setup.** New module `src/three_tier_memory.py` (~120 LOC). Inherits the L1+L2 contract; adds an L3 client + a new method.
+
+```python
+# src/three_tier_memory.py — Phase 7 wrapper (~120 LOC)
+"""Three-tier memory: L1 (guild) + L2 (EverCore or Qdrant) + L3 (HyperMem).
+
+Extends W3.5.8's TieredMemory with query_relations() for multi-entity
+intersection queries. Imprint path stays single (writes to L2 always;
+typed-edge extraction to L3 happens in the consolidation pipeline,
+Phase 8). Read path is split: short queries → L2; multi-entity
+intersection queries → L3.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import httpx
+
+from src.tiered_memory_qdrant import TieredMemory, TieredMemoryConfig
+
+
+class ThreeTierMemory(TieredMemory):
+    """L1 (guild) + L2 (Qdrant) + L3 (HyperMem) wrapper.
+
+    Phase 8's consolidation pipeline writes typed hyperedges to L3
+    alongside the existing L2 imprints. Phase 9's benchmark queries
+    L3 for the multi-entity-intersection subset of LongMemEval
+    questions (temporal-reasoning + some knowledge-update axes).
+    """
+
+    def __init__(
+        self,
+        user_id: str,
+        agent_id: str = "lme-eval",
+        config: TieredMemoryConfig | None = None,
+        hypermem_url: str = "http://localhost:1996",
+    ) -> None:
+        super().__init__(user_id=user_id, agent_id=agent_id, config=config)
+        self._hypermem = httpx.Client(base_url=hypermem_url, timeout=30.0)
+
+    def query_relations(
+        self,
+        intersection: list[dict[str, Any]],
+        return_type: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Multi-entity intersection query against L3.
+
+        intersection: list of node specifications, e.g.
+            [{"node": {"type": "project", "id": "payments"}},
+             {"node": {"type": "tech",    "id": "postgres"}}]
+        return_type: the node-type to return (e.g., "user")
+        """
+        payload = {
+            "intersection": intersection,
+            "return_type": return_type,
+            "limit": limit,
+            "user_id": self.user_id,
+        }
+        r = self._hypermem.post("/api/v1/query/relations", json=payload)
+        r.raise_for_status()
+        return r.json().get("results", []) or []
+
+    def close(self) -> None:
+        """Clean up HTTP client alongside parent's cleanup."""
+        self._hypermem.close()
+        # parent's close() handles the rest (Qdrant, etc.)
+        if hasattr(super(), "close"):
+            super().close()
+```
+
+```mermaid
+flowchart LR
+  C["Caller<br/>(eval driver / agent)"] --> Q1{"query type?"}
+  Q1 -->|"single-attribute<br/>(short, semantic)"| QC["query_context<br/>(parent TieredMemory<br/>routes L2)"]
+  Q1 -->|"multi-entity intersection<br/>(typed-edge graph)"| QR["query_relations<br/>(NEW in ThreeTierMemory<br/>routes L3 HyperMem)"]
+  QC --> R["unified result envelope"]
+  QR --> R
+```
+
+**Walkthrough:**
+
+**Block 1 — Inheritance from `TieredMemory`, not composition.** The natural choice would be composition (`self._tt = TieredMemory(...)`). Inheritance wins here because the L1+L2 contract IS the L3 wrapper's contract for `imprint()` + `query_context()` — only `query_relations()` adds new behavior. Subclassing means callers can drop `ThreeTierMemory` anywhere `TieredMemory` was used without changing their imprint path. Composition would force the caller to track which-attribute-is-which-tier.
+
+**Block 2 — Separate `httpx.Client` for HyperMem.** Each service gets its own client to keep connection pools, timeouts, and retry policies independent. HyperMem's typical query is shorter than EverCore's (graph traversal vs semantic search) → smaller timeout (30s vs EverCore's 60s default). Sharing one client would force the longer timeout on both.
+
+**Block 3 — `query_relations()` returns the SAME envelope shape as `query_context()`.** Each result has at minimum `content` + `score` + `metadata` keys. Why: the eval driver's reader-prompt builder consumes whichever query method's results — it shouldn't care which tier produced them. Uniform envelope = fewer special cases in downstream code.
+
+**Result** *(measured ON IMPLEMENTATION — TBD)*: smoke-test wall on a 2-edge hyperedge query; per-call latency comparison vs `query_context()`; memory footprint of the additional httpx.Client.
+
+`★ Insight ─────────────────────────────────────`
+- **The `query_relations()` API IS the chapter's contribution at the wrapper level.** Mem0, Letta, EverCore — none expose a query-by-entity-intersection primitive. The closest production analogue is Graphiti's edge-traversal query; HyperMem's hyperedge primitive is one abstraction level higher (relation-on-edge vs property-on-edge). Implementing this method honestly forces you to confront how multi-entity queries factor at the storage level — exactly the senior-architect signal the chapter targets.
+- **The inheritance choice is testable from one line of caller code.** `tm = ThreeTierMemory(...)` should work everywhere `tm = TieredMemory(...)` worked in W3.5.8 — no method removed, no signature changed. If a W3.5.8 test passes with `ThreeTierMemory` swapped in for `TieredMemory`, the contract is preserved. If it fails, the new layer is leaking. This is the same "Liskov substitution" sanity check that production class hierarchies should pass.
+- **The `close()` override is the load-bearing operational discipline.** Two HTTP clients + one Qdrant client + one Postgres conn = four resources to release. Forgetting any one is a slow memory leak in long-running agents. Make `close()` explicit + call it via context manager whenever feasible.
+`─────────────────────────────────────────────────`
+
+### Phase 8 — Extended Consolidation Pipeline (~1.5h)
+
+**Goal.** Extend W3.5.8's `consolidate()` (`src/consolidation.py`) to ALSO extract typed hyperedges from completed scrolls and write them to HyperMem alongside the existing EverCore imprints. Each scroll produces N memcells (L2) AND M hyperedges (L3). Idempotent via (scroll_id + entity-pair hash).
+
+**Setup.** Extension to existing `src/consolidation.py` (~+80 LOC). Add `extract_typed_edges()` helper + integrate into `consolidate()` loop.
+
+```python
+# src/consolidation.py — Phase 8 extension (additions only; existing code unchanged)
+
+import hashlib
+import json
+
+EDGE_EXTRACT_PROMPT = """Extract typed entity-relations from this scroll.
+Each relation is a hyperedge connecting ≥2 typed entities.
+
+Entity types: user, project, topic, tech, person, system, event
+Relations: worked-on, uses, depends-on, mentions, after, before, related-to
+
+Output JSON array of {nodes: [{type, id}, ...], relation: <verb>}.
+Output ONLY the JSON array. If no extractable relations, output [].
+
+EXAMPLE INPUT: "Alice worked on the payments service using Postgres."
+EXAMPLE OUTPUT: [{"nodes": [{"type":"user","id":"alice"}, {"type":"project","id":"payments"}, {"type":"tech","id":"postgres"}], "relation": "worked-on-using"}]
+
+SCROLL: {scroll_text}"""
+
+
+def _edge_idempotency_key(scroll_id: str, edge: dict) -> str:
+    """Idempotent hash: scroll_id + sorted-entity-pair-canonicalization."""
+    canonical_nodes = sorted(
+        [f"{n['type']}:{n['id']}" for n in edge["nodes"]]
+    )
+    payload = f"{scroll_id}|{edge['relation']}|{'|'.join(canonical_nodes)}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def extract_typed_edges(scroll_text: str) -> list[dict]:
+    """One LLM call → JSON array of typed hyperedges."""
+    # Same client pattern as summarize_scroll / extract_atomic_facts
+    client = _llm_client()
+    resp = client.chat.completions.create(
+        model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
+        messages=[{"role": "user", "content": EDGE_EXTRACT_PROMPT.format(scroll_text=scroll_text)}],
+        temperature=0.0,
+        max_tokens=800,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def consolidate_with_l3(
+    tm: ThreeTierMemory,
+    scrolls: list[dict],
+    promotion_threshold: float | None = None,
+) -> ConsolidationResult:
+    """Phase 8 extended consolidate — writes BOTH L2 imprints AND L3 hyperedges.
+
+    Calls existing consolidate() for L2 path (unchanged behavior), then
+    calls extract_typed_edges() per scroll + posts hyperedges to HyperMem.
+    Idempotency table extended to track edge-hash to avoid duplicate writes.
+    """
+    # L2 path: unchanged from W3.5.8
+    result = consolidate(tm, scrolls, promotion_threshold=promotion_threshold)
+
+    # L3 extension: extract + write hyperedges
+    edges_imprinted = 0
+    edges_skipped_dedup = 0
+    for scroll in scrolls:
+        edges = extract_typed_edges(scroll["text"])
+        for edge in edges:
+            key = _edge_idempotency_key(scroll["quest_id"], edge)
+            if _edge_already_imprinted(key):  # SQLite dedup table
+                edges_skipped_dedup += 1
+                continue
+            tm._hypermem.post("/api/v1/edges", json={
+                **edge,
+                "user_id": tm.user_id,
+                "provenance_scroll": scroll["quest_id"],
+                "idempotency_key": key,
+            })
+            _record_edge_imprint(key)
+            edges_imprinted += 1
+
+    result.edges_imprinted = edges_imprinted
+    result.edges_skipped_dedup = edges_skipped_dedup
+    return result
+```
+
+```mermaid
+flowchart TD
+  S["closed scroll<br/>(from guild quest)"] --> C["consolidate_with_l3()"]
+  C --> L2P["L2 path:<br/>summarize_scroll → imprint (EverCore/Qdrant)<br/>(unchanged from W3.5.8)"]
+  C --> L3P["L3 extension:<br/>extract_typed_edges → HyperMem upsert"]
+  L3P --> K["compute scroll_id + edge-hash<br/>(idempotency key)"]
+  K --> D{"edge already<br/>imprinted?"}
+  D -->|yes| SKIP["edges_skipped_dedup += 1"]
+  D -->|no| W["POST /api/v1/edges<br/>+ record key"]
+  W --> CNT["edges_imprinted += 1"]
+```
+
+**Walkthrough:**
+
+**Block 1 — Idempotency key construction matters.** Naive approach: hash the scroll_id alone — but a single scroll often produces multiple distinct edges. Hash the (scroll_id + sorted-entity-canonicalization + relation-verb) — this gives ONE key per logical edge. Re-running consolidation on the same scrolls re-extracts the same edges + dedupes them via the key. Without canonicalization, `(Alice, Payments)` and `(Payments, Alice)` would hash differently and double-write.
+
+**Block 2 — Closed-set entity types + relation verbs.** Free-form types are seductive ("let the LLM emit whatever entity type it wants") but lead to silent retrieval failures — `query_relations(intersection=[...type='project'...])` misses edges tagged `type='Project'` (capital P) or `type='task'`. Closed enums force LLM compliance + give downstream code a checkable contract.
+
+**Block 3 — L2 path unchanged, L3 added as extension.** The chapter's discipline of "single-write path, smart read routing" (Phase 4 walkthrough Block 4) extends to consolidation: L2 imprints happen ALWAYS; L3 extracts happen ALWAYS but write only what the dedup table hasn't seen. If L3 writes break (HyperMem down, prompt parse failure), L2 path completes; subsequent runs catch up the L3 writes via idempotency. Decoupled failure modes.
+
+**Block 4 — Returning extended `ConsolidationResult` with edge counters.** W3.5.8's `ConsolidationResult` already has `facts_imprinted` / `facts_deduplicated` / etc. Adding `edges_imprinted` + `edges_skipped_dedup` mirrors the shape so the same aggregator code (`scripts/aggregate_results.py`) needs only +2 columns. Production-grade: extend existing counters, don't invent a new result class.
+
+**Result** *(measured ON IMPLEMENTATION — TBD)*: edges-per-scroll ratio (sanity check on extractor prompt); idempotency re-run dedup-skip rate; consolidation wall extension (L2-only vs L2+L3); JSON parse failure rate on the edge-extract LLM call.
+
+`★ Insight ─────────────────────────────────────`
+- **The closed entity-type enum (`user, project, topic, tech, person, system, event`) is a contract between the extractor and the reader.** Every downstream code path (Phase 9's benchmark, future agent code) assumes types are in this set. Adding a new type means updating EVERY consumer. The closed enum surfaces this cost UP FRONT instead of letting it accumulate as silent retrieval failures.
+- **Idempotency at the edge level (not scroll level) is the senior-engineer move.** A scroll-level idempotency check ("we already consolidated this scroll") would either re-extract on re-runs (wasteful) or skip the entire scroll (lose new edges added by a prompt upgrade). Per-edge idempotency lets prompt upgrades discover NEW edges in OLD scrolls + skip already-written edges — exactly the audit-trail-friendly behavior production memory pipelines need.
+- **The `_already_imprinted` dedup table is the W3.5.8 §3.1 SQLite idempotency table extended.** Same shape (key column + timestamp), same provenance discipline. Reusing the W3.5.8 table reduces operational surface area and means future "what was extracted when" queries (audit, replay) hit ONE SQLite, not two. Consolidation history stays unified.
+`─────────────────────────────────────────────────`
+
+### Phase 9 — Six-Backend LongMemEval Run + Analysis (~2-3h)
+
+**Goal.** The chapter's final empirical artifact: a 6-backend × 7-axis comparison matrix on the SAME LongMemEval slice used by Phase 5. The three-tier addition (HyperMem L3) becomes the 6th backend alongside the 5 in Phase 5. The comparison answers the chapter's load-bearing question: *does adding L3 measurably improve specific question types, or is the operational cost not earned?*
+
+**Setup.** Extend `src/run_longmemeval_slice.py` to dispatch a `--backend three_tier` flag. Re-use the same slice (`data/longmemeval_slice_w358.json`), same reader (`gpt-oss-20b`), same judge (`claude-sonnet-4-6`). The ONLY variable is the backend's pipeline.
+
+```python
+# Eval driver extension (~+10 LOC)
+def _build_backend(backend: str, user_id: str):
+    if backend == "three_tier":
+        from src.three_tier_memory import ThreeTierMemory
+        return ThreeTierMemory(user_id=user_id)
+    # ... existing backends ...
+```
+
+```bash
+# Sequential run — all 6 backends on the same slice
+for b in qdrant evercore mem0 atomic_fact hybrid three_tier; do
+  uv run python -m src.run_longmemeval_slice --backend $b
+done
+
+# Extended aggregator
+uv run python scripts/aggregate_results.py \
+  --backends qdrant,evercore,mem0,atomic_fact,hybrid,three_tier
+```
+
+```mermaid
+flowchart TD
+  S["data/longmemeval_slice_w358.json<br/>(stable test contract — same as Phase 5)"] --> D["run_longmemeval_slice.py<br/>(6 sequential runs)"]
+  D -->|--backend qdrant| R1["results_qdrant.jsonl<br/>(W3.5.8 baseline)"]
+  D -->|--backend evercore| R2["results_evercore.jsonl<br/>(W3.5.8 baseline)"]
+  D -->|--backend mem0| R3["results_mem0.jsonl"]
+  D -->|--backend atomic_fact| R4["results_atomic_fact.jsonl"]
+  D -->|--backend hybrid| R5["results_hybrid.jsonl"]
+  D -->|--backend three_tier| R6["results_three_tier.jsonl<br/>(NEW — L1+L2+L3)"]
+  R1 --> AG["aggregate_results.py<br/>(6-backend matrix)"]
+  R2 --> AG
+  R3 --> AG
+  R4 --> AG
+  R5 --> AG
+  R6 --> AG
+  AG --> T["6 backends × 7 axes results matrix<br/>+ Pareto-frontier analysis<br/>+ anchored to EverCore's 83% / Mem0's 94.4% published"]
+```
+
+**Walkthrough:**
+
+**Block 1 — The 6th backend earns its slot if and only if multi-entity-intersection accuracy improves.** Phase 1's requirement matrix predicted graph-tier wins `temporal-reasoning` (the closest LongMemEval analog to multi-entity intersection — answering "after X, what Y?" requires traversing entity-time edges). Phase 9 tests this prediction empirically. If three-tier doesn't outscore hybrid on `temporal-reasoning` by ≥5pts, the L3 operational cost (extra service, edge extraction, dedup table) isn't earned for THIS workload. The chapter is honest about this — the matrix IS the answer.
+
+**Block 2 — Same slice across all 6 backends, sequential not parallel.** Same discipline as Phase 5 Block 1: oMLX queue contention + Qdrant file locks make parallel runs unreliable. Sequential takes ~3-4 hours total on M5 Pro for 6 backends × 20 questions; acceptable for a one-time benchmark.
+
+**Block 3 — The "Pareto-frontier analysis" is the §2.8 discipline applied.** For each backend, plot accuracy vs latency (median wall/Q) vs operational cost (containers + services). The frontier tells you: backend A dominates backend B if A is better on at least one axis without being worse on any other. The matrix typically reveals 2-3 backends on the frontier; the rest are strictly dominated. Production architecture choice = pick a frontier point; reject dominated options.
+
+**Block 4 — Anchored comparisons to published baselines.** EverCore reports 83% on full LongMemEval; Mem0 reports 94.4%. On our 20-Q `oracle` slice with our reader, those numbers are CALIBRATION targets — we don't expect to match them (different reader, different judge, smaller slice), but the GAP between OUR Mem0 score and Mem0's published 94.4 tells us how much of the score comes from reader/judge quality vs backend pipeline. Similarly for three-tier vs the implicit no-published-baseline (a homebrew has no prior art comparison; the chapter's measurement IS the baseline).
+
+**Result** *(measured ON IMPLEMENTATION — TBD; template shows the planned matrix shape)*:
+
+| Axis | qdrant | evercore | mem0 | atomic_fact | hybrid | three_tier |
+|---|---|---|---|---|---|---|
+| single-session-user | TBD | TBD | TBD | TBD | TBD | TBD |
+| single-session-assistant | TBD | TBD | TBD | TBD | TBD | TBD |
+| single-session-preference | TBD | TBD | TBD | TBD | TBD | TBD |
+| multi-session | **0/10** (§7.7) | **0/10** (§7.7) | TBD | TBD | TBD | TBD |
+| knowledge-update | **0/10** (§7.7) | **0/10** (§7.7) | TBD | TBD | TBD | TBD |
+| temporal-reasoning | TBD | TBD | TBD | TBD | TBD | **TBD (target: graph-tier wins by ≥5pts)** |
+| **Aggregate (whole slice)** | **0/20** | **0/20** | TBD | TBD | TBD | TBD |
+| **Median wall/Q** | ~34 s | ~250 s | TBD | TBD | TBD | TBD |
+
+**Calibrated expectations:** three_tier should beat hybrid on `temporal-reasoning` (Phase 1's prediction) but match hybrid on other axes (L3 only fires for multi-entity intersection queries). If three_tier dominates ALL axes uniformly, something is suspect (L3 shouldn't help atomic-fact recall). If three_tier matches hybrid on EVERY axis including temporal-reasoning, L3 is wasted operational cost on this workload — and that's THE legitimate finding to publish.
+
+`★ Insight ─────────────────────────────────────`
+- **A null result on temporal-reasoning is the chapter's most interesting honest finding.** If three_tier doesn't beat hybrid on its predicted-best axis, the architectural conclusion is *"Mem0-style 1-tier with entity-aware retrieval covers what HyperMem promised, on this workload."* That's a defensible production claim, more honest than chasing a +5pt synthetic win. Senior engineers publish null results when they're the data; junior engineers cherry-pick.
+- **The 6-backend matrix is the chapter's reusable artifact for W11 System Design.** When W11 asks readers to defend a memory architecture choice to a hostile panel, this matrix is the empirical evidence they bring. The matrix STRUCTURE (per-axis × per-backend with cross-baseline anchoring) generalizes; the LongMemEval slice is replaceable with any benchmark.
+- **The Pareto-frontier framing converts "which is best?" into "which dominates which?".** Production engineering decisions are RARELY about the single best option — they're about which options are on the frontier (acceptable on the axes that matter) vs strictly worse on every axis. The chapter's matrix surfaces this directly; readers carry the discipline into every future architecture-comparison question.
+`─────────────────────────────────────────────────`
+
 ## §6 Bad-Case Journal
 
-**Status:** Entries to be populated during Phase 3-5 implementation runs. **No fabricated entries.** Each placeholder below names a candidate failure surface plus where the entry would land in the §6 normative 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`). When the actual run surfaces a failure mode, that mode gets one entry — and only one, not a category-summary entry.
+**Status:** Entries to be populated during Phase 3-9 implementation runs. **No fabricated entries.** Each placeholder below names a candidate failure surface plus where the entry would land in the §6 normative 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`). When the actual run surfaces a failure mode, that mode gets one entry — and only one, not a category-summary entry.
 
 Candidate failure surfaces by phase (drawn from this chapter's design + cross-chapter prior BCJ entries):
 
@@ -952,6 +1439,11 @@ Candidate failure surfaces by phase (drawn from this chapter's design + cross-ch
 - **Phase 4 — Router misclassification on edge cases.** Likely sources: `question_type` label not in `READ_ROUTE` dict (LongMemEval has only the 6 documented + `_abs` overlay; any new question_type would default-route to atomic_fact silently). The regex-fallback heuristic ("when/how long ago" → atomic_fact) could mis-route an "is X currently the case?" question that wanted knowledge-update routing.
 - **Phase 5 — Cross-backend timing skew.** Likely sources: aggregate_results.py median-wall calculation assumes per-backend JSONLs were collected on the same hardware day. If runs span days, model-cache warmth + oMLX restart cycles introduce per-run wall variance that the median masks. The W3.5.8 §7.7.3 timing-probe lesson applies (single-session demo numbers don't compose to multi-session production wall by simple multiplication) — measured medians should be PER-RUN, not pooled.
 - **Phase 5 — Per-question namespace residue.** Direct recurrence of W3.5.8 BCJ Entry 14 + 19's "cross-test residue scrambled the matrix" pattern. The lab's discipline of `f"af_{user_id}"` collection naming + per-question user_ids is the fix, but a regression would scramble Phase 5's matrix. Worth verifying explicitly via a sanity check: a probe with empty haystack should retrieve zero facts.
+- **Phase 6 — HyperMem service bring-up.** Likely sources: docker-compose port collision (1996 may already be taken on dev machines); HyperMem image not yet built from EverOS source (would need a `make hypermem-image` step); healthcheck endpoint path drift between HyperMem versions (`/health` vs `/api/v1/health`); Postgres schema migration ordering vs HyperMem container start.
+- **Phase 7 — `ThreeTierMemory.query_relations()` envelope mismatch.** Likely sources: HyperMem's response shape changing across versions; the wrapper's translation layer to lab-standard envelope (`content` / `score` / `metadata`) drifting silently; one of HyperMem's edge-fields not mapping cleanly to `content` for the reader-prompt builder.
+- **Phase 8 — Edge-extract LLM parse failure on multi-relation scrolls.** Likely sources: the extractor returns valid JSON but with HALLUCINATED entities not in the source scroll (no provenance grounding); closed entity-type enum not enforced post-parse (the LLM emits `"type":"Project"` instead of `"type":"project"`); idempotency key computed BEFORE canonicalization → duplicate writes for `(A, B)` vs `(B, A)`.
+- **Phase 9 — Three-tier dominates everything (suspect).** If `three_tier` outscores `hybrid` on EVERY axis including ones where L3 shouldn't fire (e.g., `single-session-user`), the result is suspect — L3 probably isn't being routed correctly and the reader is just getting more memories on average. Investigate by checking `query_relations()` call rate per axis; should be near-zero on single-session axes.
+- **Phase 9 — Null result on temporal-reasoning (legitimate).** If `three_tier` matches `hybrid` on temporal-reasoning (the axis where L3 was predicted to win), that's NOT a bug — it's the chapter's most important honest finding. Investigate before publishing: was the extractor producing edges that captured time-relations? was `query_relations()` actually invoked on temporal-reasoning questions? Document as a legitimate null result, not a defect.
 
 **Format expectation when entries land.** Each entry follows W3.5.8's exact 3-field shape:
 
@@ -966,7 +1458,7 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 
 ## §7 Interview Soundbites
 
-**Status:** Soundbites to be populated when Phase 3-5 actual numbers land. **No fabricated quotes.** The three planned soundbites below name the question being answered, the data points the soundbite must cite, and the structural shape (per the §7 normative spec: ~70 words, user-voice, measured-outcome anchored, no hedging).
+**Status:** Soundbites to be populated when Phase 3-9 actual numbers land. **No fabricated quotes.** The four planned soundbites below name the question being answered, the data points the soundbite must cite, and the structural shape (per the §7 normative spec: ~70 words, user-voice, measured-outcome anchored, no hedging).
 
 **Planned Soundbite 1 — *"How do you decide between 1-tier and 2-tier memory?"***
 - *Anchors:* Phase 1's requirement matrix (atomic-fact column ✅ on 6/7 axes); Phase 2's joint-matrix application (1-tier wins 3/7 axes outright, 2-tier wins 1/7, graph-tier wins 1/7); Phase 5's measured per-axis scores (TBD) confirming or refining the prediction.
@@ -983,6 +1475,11 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 - *Shape:* "I measured [TBD]% on my 270-LOC homebrew atomic-fact + router, and [TBD]% on Mem0's full pipeline. The [TBD]pt gap maps to [Mem0's multi-signal retrieval / their tuned extractor / their entity linking / the reader bottleneck — whichever Phase 5 surfaces]. The 80% of value came from getting the WRITE-TIME PRIMITIVE right (per-message atomic-fact); the last 20% requires production-grade retrieval fusion that's MORE work than the primitive itself."
 - *Interview signal:* you can build the load-bearing thing yourself; you know what production-grade adds vs what's commodity. Interviewer learns you understand BOTH layers.
 
+**Planned Soundbite 4 — *"When would you graduate from two-tier to three-tier memory?"***
+- *Anchors:* Phase 9's 6-backend matrix specifically on `temporal-reasoning` axis (where L3 was predicted to win); the operational-cost calculus from §2.6 (≥30% multi-entity-intersection trigger); the measured delta between `hybrid` and `three_tier` on the predicted-win axis (TBD).
+- *Shape:* "I measured [TBD]pts improvement on temporal-reasoning when I added HyperMem L3 to the hybrid. The graduation rule isn't aggregate score — it's the workload's multi-entity-intersection query rate; below ~30% the operational cost of L3 isn't earned. My slice had [TBD]% multi-entity-intersection queries which [did/didn't] cross the threshold — the matrix told me [keep two-tier / graduate to three-tier] for THIS workload."
+- *Interview signal:* you don't add tiers because they're available; you add tiers because measurement shows they're earned. Architecture decisions are downstream of workload measurement, not vice versa.
+
 **Bar to clear when filling these in.** Each soundbite is a 70-word answer to a real interview question that an interviewer would actually ask. No hedging ("I think", "probably"), no generic advice ("memory matters"), no claims that don't trace to a specific measurement in this chapter. The chapter's §4 phase results are the data; the soundbites are the prepared verbal answers that cite the data.
 
 ## §8 References
@@ -992,13 +1489,14 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 - **MemGPT / Letta** — Packer, C. et al. (2023). *MemGPT: Towards LLMs as Operating Systems.* arXiv:2310.08560. The canonical two-tier (RAM ↔ archive) reference; the closest production parallel to W3.5.8's 2-tier pattern.
 - **LongMemEval** — Wu, D. et al. (2025). *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory.* ICLR 2025. arXiv:2410.10813. The benchmark used as the worked exercise in this chapter.
 - **Batchelor & Manning (2026).** *Pay-at-Write-Time: a 19-system survey of agent-memory write-time investment patterns.* X/Twitter thread, May 2026. https://x.com/S_BatMan/status/2054872818559361106. Already cited in W3.5.8 — same taxonomy applies here.
+- **HyperMem** — EverOS subcomponent, the L3 relational tier implemented in Phase 6-9. Typed hyperedges over entity nodes; HTTP API at `:1996`. Source: `~/code/EverOS/methods/HyperMem`. The lab's three-tier extension is the chapter's first production-grade hypergraph integration.
 
 ## §9 Cross-References
 
 - **Builds on:** [[Week 3.5.8 - Two-Tier Memory Architecture]] (the canonical 2-tier implementation evaluated here as one candidate); [[Week 3.5 - Cross-Session Memory]] (single-agent dual-store, the simplest baseline); [[Week 3.5.5 - Multi-Agent Shared Memory]] (provides the multi-agent shape that justifies 2-tier specifically).
 - **Distinguish from:** [[Week 2.5 - GraphRAG]] (graph for RAG over documents, NOT memory over conversations — same primitive, different surface area); [[Week 3.7 - Agentic RAG]] (5-node grade/rewrite graph over RETRIEVAL — orthogonal to memory architecture choice).
 - **Connects to:** [[Week 11 - System Design]] (the production architecture decision happens here; this chapter is the rehearsal); [[Week 12 - Capstone]] (capstone agent will hit multiple LongMemEval-style axes and benefit from a router-based hybrid).
-- **Foreshadows:** future chapters that introduce graph-tier (Class 3) implementations — this chapter discusses graph-tier conceptually but does not implement it.
+- **Foreshadows:** future chapters that scale graph-tier (Class 3) implementations beyond HyperMem (e.g., production Graphiti deployments, Neo4j-backed hyperedges). This chapter implements graph-tier via HyperMem in Phase 6-9; the framework + matrix discipline generalizes to any graph-tier substrate.
 
 ---
 

@@ -20,7 +20,7 @@ Week 3  — RAG Evaluation                        ← RAGAS, HyDE, Phoenix
 Week 3.5 — Cross-Session Memory                 ← 15/15 + Phase 5 mem0 cross-check (10/14)
 Week 3.5.5 — Multi-Agent Shared Memory          ← guild MCP integration + atomic-claim race
 Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + Phase 8.6 bitemporal supersede/coexist (5/5 tests)
-Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval requirement decomposition + 5-backend hybrid router (1-tier / 2-tier / hybrid)
+Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval decomposition + 6-backend matrix (1-tier / 2-tier / hybrid / three-tier HyperMem L3)
 Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes (SPEC, v0)
 Week 3.7 — Agentic RAG                          ← canonical 5-node graph
 Week 4  — ReAct From Scratch                    ← + §1.5 MLX Studio gateway role-map (2026-05-15 sync)

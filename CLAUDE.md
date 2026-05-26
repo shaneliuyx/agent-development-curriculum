@@ -44,7 +44,11 @@ Phases are numbered and time-budgeted (`## Phase 1 — <name> (~2 hours)`). Each
 
 **Per-Python-block bundle (NORMATIVE).** Each Python script (or substantive Python snippet) inside a Lab Phase MUST be presented as one self-contained bundle, in this exact order, before moving to the next block:
 
-1. **Architecture diagram** — Mermaid (non-ASCII) showing the data flow / call graph for THIS script. Place immediately before the code. Edge labels containing parens (`...(over-recall)...`) MUST be quote-wrapped (`-->|"text<br/>(parens)"| Node`) — bare parens in unquoted edge labels break the Mermaid parser.
+1. **Architecture diagram** — Mermaid (non-ASCII) showing the data flow / call graph for THIS script. Place immediately before the code. Mermaid hygiene rules (NORMATIVE):
+    - **Edge labels with parens** MUST be quote-wrapped (`-->|"text<br/>(parens)"| Node`). Bare parens in unquoted edge labels break the Mermaid parser.
+    - **Subgraph titles** MUST be ≤22 characters (single line at Obsidian default zoom). Longer titles wrap and clip into the first child node — Mermaid does not auto-pad the cluster bounding box. Move port numbers, version tags, qualifier suffixes into the section's prose paragraph or into child node labels (`Imprint API<br/>:1995`), not the cluster title.
+    - **Horizontal multi-cluster layouts** (`flowchart LR` with multiple `subgraph` blocks) MUST add invisible-link chaining (`C1 ~~~ C2 ~~~ C3`) when the subgraphs share no real edges. Without it, the layout engine stacks subgraphs vertically and wastes horizontal canvas, regardless of the top-level `LR` declaration.
+    - **Node labels** with multiple lines use `<br/>` (HTML break), not literal `\n`. Each line ≤20 chars to avoid box-width drift across siblings.
 2. **Code** — full `\`\`\`python` block. Annotate `**Code:**` header above for visual delineation.
 3. **Walkthrough** — `**Walkthrough:**` header, then bullet-per-block analysis (`**Block 1 — <title>.**` + 2–4 sentences answering *why*, not what). Cover gotchas a copy-paster would miss.
 4. **Result** — `**Result:**` header, then measured numbers from the actual lab run (wall time per stage, output sizes, aggregate scores). Pull from `RESULTS.md` in the lab repo. Mark `~estimated` if not yet measured; update after the run.
@@ -127,7 +131,7 @@ Update `updated:` on every substantive edit. Tags should overlap with sibling ch
 [ ] §4  Lab phases numbered, time-budgeted, with runnable code
 [ ] §4  Expected metrics table present
 [ ] §4  Per-Python-block bundle present (Architecture mermaid → Code → Walkthrough → Result → Insight) for every Python script
-[ ] §4  Mermaid edge labels with parens are quote-wrapped (`-->|"text<br/>(parens)"|`)
+[ ] §4  Mermaid hygiene: edge-label parens quote-wrapped (`-->|"text<br/>(parens)"|`); subgraph titles ≤22 chars (no wrap/clip); horizontal multi-cluster layouts use `~~~` invisible-link chaining; node labels use `<br/>` not `\n`
 [ ] §6  Bad-Case Journal — 3–5 entries in exact 3-field format
 [ ] §6  New entries copied to global Bad-Case Journal.md
 [ ] §7  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
