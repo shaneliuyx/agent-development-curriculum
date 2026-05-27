@@ -104,6 +104,28 @@ If your SLA says "respond within 5 seconds," the mean of 850 ms tells you NOTHIN
 
 Production rule: instrument distributions, not just averages. Histograms cost ~5% more storage than averages but answer 10x more questions.
 
+### Concept 5 — Cost-Governor Patterns (hard cap / soft cap / kill-switch / canary)
+
+Observability tells you what cost happened. Governors prevent runaway. Four patterns, layered:
+
+- **Hard cap.** Per-request token budget enforced at the agent loop boundary. Reach the cap → loop returns "(stopped: budget exhausted)" with partial answer. Production rule: hard caps are PER-REQUEST (one runaway can't bankrupt the day) and PER-DAY (sum of all requests). AutoGPT v1 lacked both — single runaway loop burned $200+ in hours. The simplest hard cap is `if total_tokens > MAX_TOKENS: break` at the top of every iteration.
+- **Soft cap.** Threshold (e.g., 80% of hard cap) triggers an internal flag the loop reads + downshifts to cheaper behavior (smaller model, shorter context, more aggressive truncation). User sees graceful degradation; cost stays bounded.
+- **Kill-switch.** Manual override: an external signal (env var, file flag, control-plane API) instantly stops new requests. Useful when an incident is discovered mid-billing-cycle. Production rule: kill-switch reads MUST happen on every request entry, not cached — kill needs to land within seconds, not at next restart.
+- **Canary.** Production traffic mostly to the safe configuration; small slice (5-10%) to the new configuration; per-cohort cost + accuracy metrics compared. If canary cohort costs 3x the safe baseline, roll back BEFORE 100% deployment. Same shape as web-app feature flags applied to LLM-config choices (model / context-cap / tool-set).
+
+Sources: Phase 15 lessons 13 (cost-governors) + 14 (kill-switches-canaries) in `rohitg00/ai-engineering-from-scratch`. AutoGPT v1 → AutoGPT Platform postmortem is the canonical "missing all four" failure case.
+
+### Concept 6 — A/B Testing + Shadow / Canary Deploy for LLM Features
+
+LLM-feature deployment shape — apply web-app deployment discipline to model + prompt + tool-set changes.
+
+- **Shadow deploy.** New configuration runs alongside production on the same requests; results compared offline, NOT shown to users. Risk-free measurement; cost-doubled traffic during the shadow window.
+- **Canary deploy.** Small slice of users (5-10%) gets the new configuration; metrics monitored per cohort (accuracy, latency, cost, user-feedback signals). Roll back fast if metrics regress. Same shape as Concept 5's cost-governor canary but applied to FEATURES not just COSTS.
+- **A/B test.** Two production cohorts each see a fixed configuration; results compared statistically (chi-square / t-test / Bayesian). Slower than canary but higher statistical confidence.
+- **Progressive rollout.** Combine canary → A/B → 100% deployment over days. Each stage's gate is a metric threshold (e.g., "canary accuracy within 2pts of baseline → promote to A/B").
+
+Sources: Phase 17 lessons 20 (shadow-canary-progressive) + 21 (ab-testing-llm-features) in `rohitg00/ai-engineering-from-scratch`. Production rule: NEVER deploy a model-change OR prompt-change to 100% of traffic without canary first. Cost spikes + accuracy regressions are common; blast-radius limitation is the senior-engineer discipline.
+
 ## Architecture Diagram
 
 ```mermaid

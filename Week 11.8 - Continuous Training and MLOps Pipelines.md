@@ -103,6 +103,33 @@ Operationally: PR ships a new model. CI runs eval suite. CI compares candidate m
 
 For RAG: primary metric is usually RAGAS faithfulness or answer relevance. For classification: F1 on a held-out set. For agents: task success rate on a curated benchmark.
 
+### Concept 5 — Fine-Tuning LoRA Primer (the CT update primitive)
+
+Source: Phase 11 lesson 08 (`rohitg00/ai-engineering-from-scratch`). LoRA (Low-Rank Adaptation, Hu et al. 2021, arXiv:2106.09685) is the production fine-tuning primitive most CT pipelines execute. The CT-loop's PSI detector fires → eval-gate confirms drift is real → pipeline schedules a fine-tune → new adapter is deployed via shadow → promoted if eval-gate passes. LoRA is the "what" the CT-loop is updating; this concept names when / why / how.
+
+**LoRA mechanism in one paragraph.** Instead of updating all parameters of a frozen base model (full fine-tune = N billion params), train two small low-rank matrices A (d×r) and B (r×d) per target layer where r << d (typical r=8 to 64). Effective update = A @ B (rank-r approximation of the full update matrix). Trainable params drop 100-1000×. At inference, the LoRA adapter is either merged into the base model (1-time merge, identical inference cost) or composed at runtime (small overhead, but multiple adapters can stack for multi-skill specialization).
+
+**When LoRA is the right CT update primitive:**
+- **Domain adaptation.** Base model is competent at general task; you need it specialized to your domain (legal, medical, code) without forgetting the base capabilities. Full fine-tune risks catastrophic forgetting; LoRA preserves the base.
+- **Multi-tenant specialization.** N customers each want a "customized" model. Train N LoRA adapters (each ~100MB) instead of N full models (each ~50GB). Adapters stack at inference; one base model serves all tenants.
+- **Continuous fine-tune on streaming feedback.** RLHF-style continuous improvement with daily/weekly adapter updates. Full fine-tune is too expensive per cycle; LoRA fits the cadence.
+
+**When LoRA is the wrong choice:**
+- **You need a fundamentally different capability** (the base model can't do task X at all). LoRA can't add capability not in the base; you need full fine-tune or different model.
+- **Instruction-tuned base model + you're doing instruction-tune again.** Diminishing returns; the base already has the instruction-following primitive you'd be re-teaching.
+- **Very small data (<100 examples).** LoRA still overfits on tiny datasets; few-shot prompting or RAG is cheaper + more reliable at that scale.
+
+**LoRA hyperparams that matter** (production rule-of-thumb):
+- `r` (rank): 8 for cheap-adaptation, 16-32 for domain-deep, 64+ rarely needed
+- `alpha` (scaling): typically 2×r
+- `target_modules`: usually `q_proj`, `k_proj`, `v_proj`, `o_proj` (attention matrices); add `up_proj`/`down_proj` (MLPs) for deeper adaptation
+- `dropout`: 0.05-0.1 to prevent overfitting on small datasets
+- Training cost: ~1-10% of full fine-tune wall-clock; trainable params <1% of model
+
+**QLoRA extension (Dettmers et al. 2023, arXiv:2305.14314)** — same LoRA mechanism but base model loaded in 4-bit quantization. Enables fine-tuning a 65B-param model on a single 48GB GPU. The cost-savings primitive that makes LoRA on consumer hardware practical (e.g., on the curriculum's M5 Pro 48GB target).
+
+**Integration with the CT pipeline:** Concept 4's eval-gate runs the LoRA-adapted model against the same eval suite as the base model + the previous adapter. Adapter promoted only if eval gate passes — same shape as Phase 2's PR-flow eval-gate but applied to model-weights changes, not code changes. Shadow deploy (Phase 3) compares adapter-with-new-data vs baseline-without on real production requests. Rollback = swap adapter back to previous version (no model redownload, no service restart needed — adapter loading is hot-swappable).
+
 ## Architecture Diagram
 
 ```mermaid

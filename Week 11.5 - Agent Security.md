@@ -658,6 +658,18 @@ Three governance primitives, each a deliberate design decision before go-live:
 - Bai, Y. et al. (2022). *Constitutional AI.* arXiv:2212.08073.
 - Rehberger, J. (2023). *Indirect Prompt Injection in the Wild.* embracethered.com.
 
+### Bias, fairness, and accountability (Phase 18 lifts — source attribution: `rohitg00/ai-engineering-from-scratch` Phase 18 lessons 20, 21, 26)
+
+- **Mitchell, Margaret et al. (2019). Model Cards for Model Reporting.** FAccT 2019. arXiv:1810.03993. Original Model Card framework — structured documentation accompanying a model release: intended use, primary use cases, out-of-scope uses, factors (demographic/context), per-factor metrics, training data, evaluation data, ethical considerations, caveats. Extended in 2024-2026 to System Cards (full system context, not just model) and Dataset Cards (training/eval data documentation). Required by EU AI Act for high-risk systems; voluntary best-practice elsewhere. Treat this as the documentation-as-code discipline for AI: every shipped model + system + dataset gets a card; every card has the standard fields; cards live in version control next to the model they document. Cross-link: [[Week 11.55 - Content Provenance and AI Regulatory]] §2.5 covers the extended 2026 form.
+- **Bias representational harm** — Phase 18 lesson 20. Catalog of harm types: stereotyping in outputs, erasure of demographic groups, demeaning portrayals, over-representation in negative contexts. Detection: audit outputs across demographic axes (race, gender, age, disability, geography); use red-team probes from established suites (BOLD, BBQ, HolisticBias). Mitigation: training-data audit + adversarial-training + RLHF on fairness signals + post-generation filters for known harm patterns.
+- **Fairness criteria — group vs individual vs counterfactual** — Phase 18 lesson 21. Three formal definitions of fairness, often INCOMPATIBLE on the same model:
+  - **Group fairness (demographic parity)** — equal positive-prediction rate across groups. Fails when base rates differ legitimately.
+  - **Individual fairness** — similar inputs get similar outputs (Lipschitz-style smoothness). Fails when "similar" is hard to define.
+  - **Counterfactual fairness** — output unchanged when a sensitive attribute is counterfactually flipped while holding non-sensitive attributes constant. Strongest definition; computationally expensive to evaluate.
+  - **Production rule:** pick ONE criterion per use case + measure consistently; pretending to satisfy all three is the most common failure mode (impossibility-theorem violation per Kleinberg et al. 2016).
+- **Multi-agent failure modes (MAST framework + groupthink + cascade)** — Phase 16 lesson 23, also lifted to [[Week 3.5.5 - Multi-Agent Shared Memory]] references. Treat as the multi-agent-specific extension of the OWASP-for-LLMs catalog. Production multi-agent deployments should run MAST-style audits before launch — same shape as web-app pentest discipline.
+- **EchoLeak CVE class** — see [[Week 11.55 - Content Provenance and AI Regulatory]] §2.6 for the disclosure timeline + defense pattern. AI vulnerabilities now sit in the CVE database; treat with CVSS-grade discipline.
+
 ---
 
 ## Cross-References
