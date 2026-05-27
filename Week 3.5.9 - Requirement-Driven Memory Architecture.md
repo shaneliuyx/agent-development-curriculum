@@ -49,6 +49,29 @@ Real production agent memory falls into three architecture classes. Each makes a
 
 **Class 2 — Two-tier consolidation memory** (Letta / MemGPT, the W3.5.8 EverCore-class pattern). Discrete task-completion events anchor consolidation: operational tier (quest queue, conversation log) accumulates raw state; a periodic / event-triggered consolidation job extracts episode + atomic_fact + profile to a separate semantic tier. **Strength**: narrative episodes ("here's what happened in this session"), per-user profile output, bitemporal correctness (can answer "what was true as of date T"), full audit lineage. **Weakness**: write-then-query freshness lag, complex infra (4-7 services in EverCore-class), atomic-fact recall is harder because facts are buried inside episodes by default.
 
+*How Class 2's "bitemporal correctness" actually works at write time.* Common-sense objection: "you can know `transaction_time` (now) at write, but you can't predict `valid_to` — when will this fact stop being true? — so how do you store both?" Answer: you don't try to predict. At write time, every fresh fact gets `valid_from = now()` and `valid_to = None` (an open-ended sentinel meaning "still valid as of now"). The sentinel is the contract — facts are live until something proves them stale. When a contradicting fact later arrives, the supersede pipeline (W3.5.8 §8.6) handles the close-window step in three coordinated moves:
+
+1. **Find prior.** The new fact's write path runs `tm.query_context(new_fact, k=5)` to surface semantically near candidates — same `query_context` call the dedup pipeline already makes for duplicate detection, so the find-prior step is FREE (no new infrastructure, no extra round-trip).
+2. **Classify.** The dedup LLM (`decide_action`) sees prior candidates with timestamps + the new fact + the temporal gap, and emits one of: `supersede` (state evolved — prior was true, now false), `coexist` (different scope — both still true), `delete` (prior was never true — hallucination), or `update`/`add`/`no-op`. Classification returns the `target_id` of the matched prior.
+3. **Patch + write.** The execute step patches the prior record's `valid_to = now()` (closing the prior's validity window) AND writes the new fact with `valid_from = now()`, `valid_to = None`, plus a `supersedes` pointer back to `target_id`. W3.5.8 §8.6 Step 3 ships this as `_qdrant_supersede(prior_id, new_id)` — a Qdrant `points/payload` PATCH (no embed change, no document rewrite, ~10ms wall). Step 1+2 of §8.6 launched with HARD-delete instead of payload-patch and shipped the same `supersedes` chain via metadata; Step 3 is a contract-free swap at the executor layer.
+
+Concrete worked example:
+
+| Time | Event | Prior record (`react-uuid`) | New record |
+|---|---|---|---|
+| `2024-01-15` | "user prefers React" arrives | `valid_from=2024-01-15`, `valid_to=None` (live) | (n/a — first record) |
+| `2026-05-26` | "user now prefers Svelte" arrives → classified as `supersede` | Patched: `valid_to=2026-05-26` (window closed) | `valid_from=2026-05-26`, `valid_to=None` (live), `supersedes=react-uuid` |
+
+Query semantics use both fields: `"what did the user prefer on 2025-06-01?"` translates to `WHERE valid_from <= '2025-06-01' AND (valid_to IS NULL OR valid_to > '2025-06-01')` — matches the React record (valid then). `"what does the user prefer NOW?"` matches the Svelte record (`valid_to IS NULL`). One schema, both temporal questions answered. Same SCD-Type-2 pattern Postgres / Snowflake / pgvector use for slowly-changing dimensions.
+
+Three subtle constraints worth noting up front:
+
+- **`valid_from` doesn't HAVE to equal `now()` at write.** If the writer knows ground truth (e.g., parsing a 2024-01 chat log on 2026-05), set `valid_from = "2024-01-15"` (when the fact actually became true) and `transaction_time = now()` (when you recorded it). The two times diverge for historical ingestion; the schema preserves both. Most live writes collapse them since now=now, but the structure pays off the first time someone backfills.
+- **Find-prior recall failures are the load-bearing risk.** If `tm.query_context` misses the prior record (vector search recall@5 fails on a contradicting fact), the supersede classifier never runs and TWO contradicting facts now both have `valid_to=None`. Mitigation: hybrid retrieval (semantic + BM25 + entity-key exact match) — entity-key indexing on the `(subject, predicate)` pair catches "user prefers X" vs "user prefers Y" via exact-match `user, prefers` lookup even when vector similarity drifts.
+- **Concurrent supersede on the same prior is idempotent by design.** Two parallel writes both try to patch the same prior's `valid_to`. The patch is conditional: `SET valid_to=now() WHERE id=X AND valid_to IS NULL`. Second writer sees `valid_to IS NOT NULL` and no-ops. SQL-style optimistic concurrency — no distributed locks needed.
+
+Practical anchor: W3.5.8's `lab-03-5-8-two-tier/src/dedup_synthesis.py` ships this exact pipeline end-to-end. The 6-action dispatch (`add`/`no-op`/`update`/`supersede`/`coexist`/`delete`) is the executable form of the three-move pattern above. §8.6 walks each branch with code; the AuditEntry shape (target_id + new_id + valid_from + supersedes pointer) is what makes the chain replay-able at any historical query point.
+
 **Class 3 — Graph-tier temporal memory** (Zep / Graphiti, the W2.5 GraphRAG-style pattern applied to memory not RAG). Per-message extraction emits typed entity-relationship edges over time. The store is a temporal knowledge graph; queries traverse edges by entity + time. **Strength**: cross-entity relational queries ("who did Alice work with on Project X last quarter"), explicit edge-level supersession, strong on multi-hop reasoning. **Weakness**: graph operational overhead, harder to fine-tune retrieval quality vs vector search, fewer production examples to copy from.
 
 ### 2.2 How question shape determines primitive choice
