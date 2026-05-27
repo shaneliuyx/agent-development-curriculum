@@ -5440,8 +5440,9 @@ def memory_store(tm: TieredMemory, *, content: str, type: str = "fact",
 def memory_query(tm: TieredMemory, *, query: str, k: int = 5,
                  user_id: str = "") -> list[dict]:
     """Retrieve up to k memories ranked by relevance. No audit emission
-    (reads don't mutate state)."""
-    return tm.query_context(query=query, top_k=k)
+    (reads don't mutate state). Note: TieredMemory.query_context uses
+    `k` kwarg, not `top_k` — match the §8.7 Protocol signature."""
+    return tm.query_context(query=query, k=k)
 
 
 # ─── Task 3: Supersede ────────────────────────────────────────────────────
@@ -5552,10 +5553,12 @@ CURRENT_VERSION: ExportVersion = "v3"
 
 class TieredMemoryLike(Protocol):
     """Structural subtype of both EverCore + Qdrant TieredMemory variants.
-    Portability needs imprint (write side) + dump_all_for_user (read side)."""
+    Portability needs imprint (write side); `dump_all_for_user` is OPTIONAL
+    and probed via hasattr at export time. Audit log is the canonical
+    source of truth for import; memories[] is best-effort for human
+    inspection."""
     def imprint(self, content: str,
                 metadata: dict[str, Any] | None = None) -> str: ...
-    def dump_all_for_user(self, user_id: str) -> list[dict]: ...
 
 
 @dataclass
@@ -5571,13 +5574,20 @@ class ExportData:
 def export(tm: TieredMemoryLike, user_id: str, out_path: Path) -> ExportData:
     """Snapshot a user's memories + audit log to disk. Returns the
     ExportData so in-process callers (round-trip tests) can assert
-    without re-reading the file."""
+    without re-reading the file.
+
+    Memories[] is best-effort: if the backend variant ships
+    `dump_all_for_user`, use it; otherwise empty list. Import path
+    reconstructs from audit_log alone (single source of truth)."""
+    memories: list[dict] = []
+    if hasattr(tm, "dump_all_for_user"):
+        memories = tm.dump_all_for_user(user_id)
     bundle = ExportData(
         version=CURRENT_VERSION,
         schema_url=f"https://github.com/shaneliuyx/agent-prep/schemas/{CURRENT_VERSION}.json",
         exported_at=datetime.now(timezone.utc).isoformat(),
         user_id=user_id,
-        memories=tm.dump_all_for_user(user_id),
+        memories=memories,
         audit_log=read_audit_log(user_id=user_id),
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5835,6 +5845,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from src.audit import read_audit_log
 from src.memory_tools import (
@@ -5866,13 +5877,25 @@ def isolated_audit(tmp_path):
     audit_mod.DEFAULT_AUDIT_PATH = original
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def tm_iso():
     """Isolated TieredMemory with uuid-suffixed user_id (§7.5 pattern).
-    Each integration test gets a fresh namespace to avoid cross-test residue."""
+    Each integration test gets a fresh namespace to avoid cross-test residue.
+
+    Uses manual __aenter__/__aexit__ (NOT `async with`) because the
+    backing MCP stdio client creates an anyio TaskGroup whose cancel
+    scope cannot cross task boundaries — pytest-asyncio's fixture
+    generator pattern enters and exits across different tasks, which
+    triggers `RuntimeError: Attempted to exit cancel scope in a
+    different task than it was entered in`. Manual enter/exit keeps
+    the lifecycle in one task frame."""
     user = f"phase9_test_{uuid.uuid4().hex[:8]}"
-    async with TieredMemory(agent_id="phase9_agent", user_id=user) as tm:
+    tm = TieredMemory(agent_id="phase9_agent", user_id=user)
+    await tm.__aenter__()
+    try:
         yield tm
+    finally:
+        await tm.__aexit__(None, None, None)
 
 
 class _FakeTM:
@@ -6088,7 +6111,15 @@ class TestMemoryToolsIntegration:
 
 **Block 5 — Asymmetric audit policy enforced by `test_memory_query_emits_no_audit`.** This test exists to lock in the contract: reads do NOT audit. If anyone adds audit emission to `memory_query` (e.g., for "track every read" telemetry), this test fails. The test is short (3 lines body) but the contract it enforces is high-leverage: it stops well-meaning telemetry creep that would explode the audit log without adding replay/CT-pipeline value. Telemetry has its own log type; conflating it with the audit log breaks the audit log's denormalization contract.
 
-**Result** *(projected — actual `uv run pytest tests/test_phase9.py -v` execution TBD)*: expected 15 tests / 4 classes — 6 TestReplayPureUnits + 4 TestPortabilityMigration + 1 TestPortabilityVersionGate + 4 TestMemoryToolsIntegration. Unit-test wall: <1s (no I/O). Integration wall: ~5-10s (4 tests × ~1-2s each for Qdrant POST + audit JSONL write + replay round-trip). When the lab repo's test suite ships, replace this projection with the measured `pytest --durations=15` output.
+**Result** *(measured 2026-05-27 first run on lab-03-5-8-two-tier: 13/15 PASS + 2 FAIL + 4 teardown errors in 5.84s)*: all 11 unit tests passed cleanly. 4 integration tests surfaced 3 real bugs in the chapter code:
+
+| Failure | Root cause | Fix landed in chapter |
+|---|---|---|
+| `test_memory_query_emits_no_audit` (FAIL) | `memory_tools.py` called `tm.query_context(top_k=k)`; real signature uses `k` not `top_k` per §8.7's Protocol declaration. | Changed kwarg `top_k=k` → `k=k`. |
+| `test_export_import_round_trip` (FAIL) | `portability.py` called `tm.dump_all_for_user(user_id)`; real `TieredMemory` doesn't ship that method. | Made `memories=` best-effort via `hasattr` probe; audit_log remains the canonical single source of truth (matches the §9.2 walkthrough's stated design). |
+| All 4 integration teardowns (ERROR) | `async with TieredMemory(...)` inside async fixture violates anyio TaskGroup task-ownership invariant: `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in`. | Switched fixture to `@pytest_asyncio.fixture` + manual `__aenter__`/`__aexit__` — lifecycle stays in one task frame. |
+
+Honest accounting: the test suite worked exactly as designed — caught 3 bugs the chapter authors (me) missed despite careful walkthrough composition. The unit-test layer (11/11 PASS) protected against substantial refactor risk; the integration layer (0/4 PASS first run) was the high-leverage discovery surface. After the three fixes, expect 15/15 PASS on next run. See BCJ Entry 20 for the post-mortem.
 
 `★ Insight ─────────────────────────────────────`
 - **Test pyramid done right: 11 unit + 4 integration.** The 11 unit tests cover replay semantics and migration transforms without touching Qdrant — they're the fast-feedback layer (run in milliseconds). The 4 integration tests cover the end-to-end audit-emission + round-trip contracts — they're slower but verify the seams between modules. Classic pyramid ratio (~73% unit, ~27% integration) matches Martin Fowler's recommended test distribution.
@@ -6100,7 +6131,7 @@ class TestMemoryToolsIntegration:
 
 ## Bad-Case Journal
 
-*Provenance.* Entries 1–5 are **pre-scoped** at chapter-authoring time — failure modes predicted from theory; not yet confirmed against this lab's runs. Entries 6–13 are **observed** in the 2026-05-14 first-execution session against live guild + EverCore + local oMLX. Entries 14–15 are **observed** in the 2026-05-15 Phase 8 + Phase 8.6 implementation sessions against live Qdrant + oMLX. Per the curriculum's real-data discipline, only the observed entries are load-bearing for interview soundbites; pre-scoped entries are intellectual scaffolding pending validation.
+*Provenance.* Entries 1–5 are **pre-scoped** at chapter-authoring time — failure modes predicted from theory; not yet confirmed against this lab's runs. Entries 6–13 are **observed** in the 2026-05-14 first-execution session against live guild + EverCore + local oMLX. Entries 14–15 are **observed** in the 2026-05-15 Phase 8 + Phase 8.6 implementation sessions against live Qdrant + oMLX. Entry 16 is **observed** in the 2026-05-19 §5.3 LongMemEval dry-run; Entries 17–18 in the 2026-05-20 atomisation ablation runs; Entry 19 in the 2026-05-25 §7.7 Sonnet proxy setup; Entry 20 in the 2026-05-27 §9.5 test-suite first-execution session. Per the curriculum's real-data discipline, only the observed entries are load-bearing for interview soundbites; pre-scoped entries are intellectual scaffolding pending validation.
 
 **Entry 1 — Consolidation pipeline runs while guild is mid-write; reads inconsistent quest state.** *(pre-scoped)*
 *Symptom:* Race between `consolidate()`'s `quest_list(status='done')` query and a concurrent `quest_fulfill` from a live agent. New quest lands in `done` state AFTER list query but BEFORE next batch; appears to be "skipped forever" until next cron cycle.
@@ -6191,6 +6222,11 @@ class TestMemoryToolsIntegration:
 *Symptom:* During §7.7 setup, an env-shim module (`sonnet_test_harness.py`) was written to redirect the chat LLM to `claude-sonnet-4-6` via the Claude-Code-router proxy on `:8317` by pre-setting `OMLX_BASE_URL` before importing `src.consolidation`. Idea: keep original `consolidation.py` byte-identical, just point its env to the proxy. Reality: any script that ALSO imported `tiered_memory_qdrant` (for the Qdrant embedding client) crashed at the first `embeddings.create()` call — Claude has no embeddings API, returns 404. Plus: even chat-only invocations hit a second failure: the proxy treats `system`-role messages as the host application's, injects its own Claude Code system prompt over the lab's `SUMMARIZE_PROMPT`, and Sonnet replies conversationally instead of returning the 25-word fact contract. Net: 100% of consolidation + embedding calls broken across both axes.
 *Root cause:* Two coupled architecture mistakes. (1) **Shared env var across heterogeneous roles.** `OMLX_BASE_URL` is read by BOTH the chat-LLM clients (`consolidation.py:149,217`; `dedup_synthesis.py:169`) AND the embedding client (`tiered_memory_qdrant.py:72`). Repointing it forces all three to the same backend; Claude does chat but not embeddings, so the embedding half always breaks. (2) **System-role OVERWRITE by proxy for OAuth-fingerprint coherence.** Source trace of CLIProxyAPI (`router-for-me/CLIProxyAPI@main`, the OSS engine under VibeProxy): `applyCloaking()` in `internal/runtime/executor/claude_executor.go` builds a fixed 3-block system payload (`billingBlock + agentBlock = "You are Claude Code, Anthropic's official CLI for Claude." + staticBlock = full Claude Code interactive prompt`) and writes it OVER `payload.system` with `sjson.SetRawBytes(payload, "system", systemResult)`. The caller's `system` is fully discarded, not merged. This isn't a bug — it's deliberate anti-detection cloaking so Anthropic counts traffic against the Claude Code subscription quota instead of extra-usage billing. Strict-format prompts (JSON-only, fixed-length, single-word labels) silently degrade to conversational replies because the cloak's system payload dominates whatever the caller asked for.
 *Fix:* Abandon the env-shim. Create a dedicated `src/judge_sonnet.py` (~85 LOC) with its own OpenAI client, its own three env knobs (`JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL`), and a single user-role payload (no `system` role) to bypass the proxy's injection. Verified: with `system` set, 3/3 smoke cases parsed as `<parse_error>`; with user-only payload, 3/3 parsed clean JSON. **Production rules:** (a) when one env var is read by clients with different shapes (chat vs embeddings vs reranker), introduce role-scoped envs even if the API surface is identical — the model-capability surface isn't. (b) When any third-party proxy fronts an OpenAI-compatible endpoint, run a `system`-vs-`user-only` diagnostic before committing to a prompt design; the proxy may be silently re-framing your contract.
+
+**Entry 20 — Phase 9 chapter code shipped with 3 latent bugs; first `tests/test_phase9.py` run caught all of them at the integration boundary.** *(observed 2026-05-27, §9.5 first-execution session)*
+*Symptom:* 13/15 PASS + 2 FAIL + 4 teardown errors in 5.84s on first `uv run pytest tests/test_phase9.py -v`. All 11 unit tests (TestReplayPureUnits + TestPortabilityMigration + TestPortabilityVersionGate) passed cleanly. 4 integration tests (TestMemoryToolsIntegration) failed at the chapter-vs-codebase contract boundary. Failure 1: `test_memory_query_emits_no_audit` → `TypeError: TieredMemory.query_context() got an unexpected keyword argument 'top_k'`. Failure 2: `test_export_import_round_trip` → `AttributeError: 'TieredMemory' object has no attribute 'dump_all_for_user'`. Errors 3-6: all four integration teardowns → `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in` in the `tm_iso` fixture.
+*Root cause:* Three independent chapter-authoring drifts. (1) `memory_tools.memory_query` used kwarg `top_k=k` when the §8.7 Protocol clearly declares `k`; transcription error in §9.1.1 walkthrough — code did NOT match the Protocol it claimed to consume. (2) `portability.export` called `tm.dump_all_for_user(user_id)` — a method NAMED in the §9.2 walkthrough's TieredMemoryLike Protocol but NOT shipped on the actual `TieredMemory` class. Chapter invented an attribute that didn't exist in the codebase. (3) The `tm_iso` test fixture used `async with TieredMemory(...) as tm: yield tm` inside a `@pytest.fixture` — anyio's TaskGroup invariant requires `__aenter__` and `__aexit__` in the same task, but pytest-asyncio's generator-fixture pattern enters in setup-task and exits in teardown-task. Standard pytest-asyncio + anyio interaction footgun, documented in pytest-asyncio's migration guide but missed during chapter authoring.
+*Fix:* Three targeted edits to the chapter, no codebase changes needed. (1) `memory_tools.py`: `tm.query_context(query=query, top_k=k)` → `tm.query_context(query=query, k=k)`. (2) `portability.py`: replace `memories=tm.dump_all_for_user(user_id)` with `hasattr` probe (`memories = tm.dump_all_for_user(user_id) if hasattr(tm, "dump_all_for_user") else []`); update TieredMemoryLike Protocol docstring to mark `dump_all_for_user` OPTIONAL; the §9.2 walkthrough already said "audit_log is the canonical source of truth; memories[] is best-effort for human inspection" — code now matches the doc. (3) `test_phase9.py`: switch `@pytest.fixture` → `@pytest_asyncio.fixture` + replace `async with` with manual `await tm.__aenter__()` + `try/yield/finally: await tm.__aexit__(None, None, None)` — keeps the lifecycle in one task frame. **Production rules:** (a) chapter code that wraps a class IS the contract-vs-implementation seam — every kwarg name, every method name must match the real class, not the chapter's mental model. (b) When the walkthrough prose says "X is optional" or "X is best-effort," the code must enforce that via `hasattr` / `try/except` — promises in prose without enforcement in code is documentation-as-aspiration. (c) `async with` inside pytest-asyncio generator fixtures crosses task boundaries; use explicit `__aenter__`/`__aexit__` to keep the lifecycle frame-local. This pattern is also the right shape for any async resource that's task-affine (database connections, MCP clients, anyio TaskGroups). Catch: 13/15 → 15/15 expected after fixes; no fabricated re-run number until the user re-runs `pytest`.
 
 **Entry 16 — §3.x consolidation pipeline destroys conversational details when applied to LongMemEval haystacks; agent returns NO_ANSWER_IN_CONTEXT despite retrieving candidates.** *(observed 2026-05-19, §5.3 LongMemEval dry-run)*
 *Symptom:* §5.3 20-Q smoke first attempt: 0/20 correct. Agent answer = `NO_ANSWER_IN_CONTEXT` on questions whose haystack DEMONSTRABLY contained the answer (e.g., "What was the first issue with my new car?" → gold "GPS not working" → haystack has 3 candidates retrieved, but agent says context doesn't contain answer). `candidates_returned > 0` AND `facts_imprinted > 0` ruled out retrieval/imprint failure. Per-candidate inspection: candidates were summarized into TECH-FLAVORED language ("Vehicle diagnostic procedures involve dealership firmware updates") with the original "user had GPS issue" detail eliminated.
