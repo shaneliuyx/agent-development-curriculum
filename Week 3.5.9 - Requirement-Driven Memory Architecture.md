@@ -218,7 +218,7 @@ flowchart LR
     C2R["Read: semantic search<br/>over episodes/facts"]
     C2W --> C2C --> C2S --> C2R
   end
-  subgraph C3["Class 3 — graph-tier"]
+  subgraph C3["Class 3 — graph"]
     direction TB
     C3W["Write: per-message<br/>extract typed edges"]
     C3S["Store: temporal<br/>knowledge graph"]
