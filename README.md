@@ -19,6 +19,7 @@ Week 2.7 — Structure-Aware RAG (PageIndex)      ← 16/16 GT-judge vs Vector 0
 Week 3  — RAG Evaluation                        ← RAGAS, HyDE, Phoenix
 Week 3.5 — Cross-Session Memory                 ← 15/15 + Phase 5 mem0 cross-check (10/14)
 Week 3.5.5 — Multi-Agent Shared Memory          ← guild MCP integration + atomic-claim race
+Week 3.5.5.5 — Multi-Agent Topology Patterns    ← supervisor / hierarchical / group-chat / handoffs / voting (Anthropic 90.2% measurement)
 Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + Phase 8.6 bitemporal supersede/coexist (5/5 tests)
 Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval decomposition + 6-backend matrix (1-tier / 2-tier / hybrid / three-tier HyperMem L3)
 Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes (SPEC, v0)
@@ -33,10 +34,12 @@ Week 6  — Claude Code Source Dive
 Week 6.4 — Low-Code Agent Platforms (Dify / Coze / n8n / LangFlow) ← 5-axis low-code-vs-custom matrix + Dify/Coze/n8n side-by-side (hello-agents Ch5, SPEC, v0)
 Week 6.5 — Hermes Agent Hands-On
 Week 6.6 — MCP Schema Bridge                    ← type-hint → JSON Schema producer + AsyncGenerator streaming (SPEC, v0)
+Week 6.65 — MCP Production Transports           ← Streamable HTTP + DNS-rebinding via Origin + HTTP+SSE 2026-migration + gateway composition + tool-poisoning catalog (SPEC, v0)
 Week 6.7 — Authoring Agent Skills
 Week 6.8 — Agent Communication Protocol Survey  ← MCP / A2A / ANP (SPEC, planned)
 Week 6.85 — Prompt Template Engineering Patterns ← 5-axis design space + schema-enforce + 4 anti-patterns (interview Q1, SPEC, v0)
 Week 6.9 — Context Engineering + Todo Mechanisms ← 4 context shapes + cognitive-narrowing argument + 80-LOC TodoList primitive (interview Q11, SPEC, v0)
+Week 6.95 — A2A Protocol                        ← Agent Card + Task lifecycle + AP2 signed cards + MCP-vs-A2A decision matrix + Linux Foundation v1.0 April 2026 (SPEC, v0)
 Week 7  — Tool Harness
 Week 7.3 — Production LLM Infrastructure          ← gateway + caching + cost attribution + fallback (Akshay 6-area #2+#5)
 Week 7.5 — Computer Use and Browser Agents
@@ -51,10 +54,12 @@ Week 9.5 — Agentic RL Fine-Tuning (SFT + GRPO)  ← LoRA r=16 SFT + GRPO group
 Week 10 — Framework Shootout                    ← LangGraph vs LlamaIndex vs OAI Agents SDK
 Week 11 — System Design
 Week 11.5 — Agent Security
-Week 11.6 — Production Tracing + Cost Telemetry ← OpenTelemetry + Langfuse + DuckDB rollups + p99 vs mean argument (JD#2, SPEC, v0)
+Week 11.55 — Content Provenance + AI Regulatory ← SynthID + Stable Signature + C2PA layered defense + EU AI Act / US EO / UK / Korea + Model Cards + EchoLeak CVE (SPEC, v0)
+Week 11.6 — Production Tracing + Cost Telemetry ← OpenTelemetry + Langfuse + DuckDB rollups + p99 vs mean argument + cost-governors + A/B canary (JD#2, SPEC, v0)
 Week 11.7 — Take-Home Dress Rehearsal           ← 4-hour timed take-home + evals-first git discipline + 5-min Loom defense + 30/30/25/15 rubric scoring
 Week 11.8 — Continuous Training + MLOps         ← PSI drift detector + eval-gated CI + shadow ramp + MLOps Level 3 (JD#3, SPEC, v0)
 Week 12 — Capstone and Mocks
+Week 12.5 — Multimodal Agents                   ← CLIP/BLIP-2/LLaVA substrates + ColPali vision-native RAG + cross-modal fusion + omni-models thinker-talker (SPEC, v0)
 ```
 
 > **Interview-prep spine:** see [[Interview Question Index]] for question → chapter → measured-anchor lookups. Use it as the pre-interview review entry point.
