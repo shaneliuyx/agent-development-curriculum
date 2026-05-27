@@ -5845,7 +5845,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-import pytest_asyncio
 
 from src.audit import read_audit_log
 from src.memory_tools import (
@@ -5877,25 +5876,22 @@ def isolated_audit(tmp_path):
     audit_mod.DEFAULT_AUDIT_PATH = original
 
 
-@pytest_asyncio.fixture
-async def tm_iso():
-    """Isolated TieredMemory with uuid-suffixed user_id (§7.5 pattern).
-    Each integration test gets a fresh namespace to avoid cross-test residue.
+@pytest.fixture
+def isolated_user_id():
+    """Per-test user_id for namespace isolation (§7.5 pattern). Tests
+    OWN the `async with TieredMemory(...)` lifecycle in their own task
+    body — this is the working escape hatch for the pytest-asyncio +
+    anyio TaskGroup task-affinity issue.
 
-    Uses manual __aenter__/__aexit__ (NOT `async with`) because the
-    backing MCP stdio client creates an anyio TaskGroup whose cancel
-    scope cannot cross task boundaries — pytest-asyncio's fixture
-    generator pattern enters and exits across different tasks, which
-    triggers `RuntimeError: Attempted to exit cancel scope in a
-    different task than it was entered in`. Manual enter/exit keeps
-    the lifecycle in one task frame."""
-    user = f"phase9_test_{uuid.uuid4().hex[:8]}"
-    tm = TieredMemory(agent_id="phase9_agent", user_id=user)
-    await tm.__aenter__()
-    try:
-        yield tm
-    finally:
-        await tm.__aexit__(None, None, None)
+    Why not an async fixture: even `@pytest_asyncio.fixture` with manual
+    `__aenter__`/`__aexit__` runs setup and teardown in different tasks
+    (pytest-asyncio's internal mechanism), so the MCP stdio_client's
+    internal `anyio.create_task_group()` cancel scope rejects the cross-
+    task exit with `RuntimeError: Attempted to exit cancel scope in a
+    different task than it was entered in`. The ONLY reliable fix is
+    pushing the entire `async with` into each test body so the TaskGroup
+    lives and dies within one task frame."""
+    return f"phase9_test_{uuid.uuid4().hex[:8]}"
 
 
 class _FakeTM:
@@ -6035,11 +6031,13 @@ class TestMemoryToolsIntegration:
     asserts the matching AuditEntry shape per §9's task matrix contract."""
 
     @pytest.mark.asyncio
-    async def test_memory_store_emits_imprint_audit(self, tm_iso,
+    async def test_memory_store_emits_imprint_audit(self, isolated_user_id,
                                                      isolated_audit):
-        new_id = memory_store(tm_iso, content="fact about kubernetes",
-                              type="fact", tags=["infra", "k8s"],
-                              user_id=tm_iso.user_id)
+        async with TieredMemory(agent_id="phase9_agent",
+                                user_id=isolated_user_id) as tm:
+            new_id = memory_store(tm, content="fact about kubernetes",
+                                  type="fact", tags=["infra", "k8s"],
+                                  user_id=isolated_user_id)
         entries = read_audit_log()
         assert len(entries) == 1
         assert entries[0]["operation"] == "imprint"
@@ -6047,26 +6045,32 @@ class TestMemoryToolsIntegration:
         assert entries[0]["metadata"]["tags"] == ["infra", "k8s"]
 
     @pytest.mark.asyncio
-    async def test_memory_query_emits_no_audit(self, tm_iso, isolated_audit):
+    async def test_memory_query_emits_no_audit(self, isolated_user_id,
+                                                isolated_audit):
         """Reads don't audit (asymmetric policy: writes audit, reads don't)."""
-        memory_store(tm_iso, content="kubernetes scheduling primer",
-                     user_id=tm_iso.user_id)
-        results = memory_query(tm_iso, query="kubernetes", k=3,
-                               user_id=tm_iso.user_id)
+        async with TieredMemory(agent_id="phase9_agent",
+                                user_id=isolated_user_id) as tm:
+            memory_store(tm, content="kubernetes scheduling primer",
+                         user_id=isolated_user_id)
+            results = memory_query(tm, query="kubernetes", k=3,
+                                   user_id=isolated_user_id)
         entries = read_audit_log()
         assert len(entries) == 1            # only the store, not the query
         assert entries[0]["operation"] == "imprint"
         assert len(results) >= 1
 
     @pytest.mark.asyncio
-    async def test_memory_supersede_emits_supersede_audit(self, tm_iso,
+    async def test_memory_supersede_emits_supersede_audit(self,
+                                                          isolated_user_id,
                                                           isolated_audit):
-        old_id = memory_store(tm_iso, content="user prefers React",
-                              user_id=tm_iso.user_id)
-        new_id = memory_supersede(tm_iso, old_id=old_id,
-                                  new_content="user now prefers Svelte",
-                                  reason="preference shifted",
-                                  user_id=tm_iso.user_id)
+        async with TieredMemory(agent_id="phase9_agent",
+                                user_id=isolated_user_id) as tm:
+            old_id = memory_store(tm, content="user prefers React",
+                                  user_id=isolated_user_id)
+            new_id = memory_supersede(tm, old_id=old_id,
+                                      new_content="user now prefers Svelte",
+                                      reason="preference shifted",
+                                      user_id=isolated_user_id)
         sup = [e for e in read_audit_log() if e["operation"] == "supersede"]
         assert len(sup) == 1
         assert sup[0]["target_id"] == old_id
@@ -6074,18 +6078,20 @@ class TestMemoryToolsIntegration:
         assert sup[0]["metadata"]["supersede_reason"] == "preference shifted"
 
     @pytest.mark.asyncio
-    async def test_export_import_round_trip(self, tm_iso, tmp_path,
+    async def test_export_import_round_trip(self, isolated_user_id, tmp_path,
                                              isolated_audit):
         """Single-source-of-truth import: replay reconstructs from audit log
         alone. Regression-catches the original double-write trap (if anyone
         re-adds memories[] iteration in import_, replay_counts doubles)."""
-        memory_store(tm_iso, content="fact 1: terraform supports OpenTofu",
-                     user_id=tm_iso.user_id)
-        memory_store(tm_iso, content="fact 2: pgvector supports HNSW",
-                     user_id=tm_iso.user_id)
         bundle_path = tmp_path / "export.json"
-        bundle = memory_export(tm_iso, user_id=tm_iso.user_id,
-                               out_path=bundle_path)
+        async with TieredMemory(agent_id="phase9_agent",
+                                user_id=isolated_user_id) as tm:
+            memory_store(tm, content="fact 1: terraform supports OpenTofu",
+                         user_id=isolated_user_id)
+            memory_store(tm, content="fact 2: pgvector supports HNSW",
+                         user_id=isolated_user_id)
+            bundle = memory_export(tm, user_id=isolated_user_id,
+                                   out_path=bundle_path)
         assert bundle["version"] == CURRENT_VERSION
         assert len(bundle["audit_log"]) == 2
 
@@ -6111,15 +6117,15 @@ class TestMemoryToolsIntegration:
 
 **Block 5 — Asymmetric audit policy enforced by `test_memory_query_emits_no_audit`.** This test exists to lock in the contract: reads do NOT audit. If anyone adds audit emission to `memory_query` (e.g., for "track every read" telemetry), this test fails. The test is short (3 lines body) but the contract it enforces is high-leverage: it stops well-meaning telemetry creep that would explode the audit log without adding replay/CT-pipeline value. Telemetry has its own log type; conflating it with the audit log breaks the audit log's denormalization contract.
 
-**Result** *(measured 2026-05-27 first run on lab-03-5-8-two-tier: 13/15 PASS + 2 FAIL + 4 teardown errors in 5.84s)*: all 11 unit tests passed cleanly. 4 integration tests surfaced 3 real bugs in the chapter code:
+**Result** *(measured 2026-05-27 on lab-03-5-8-two-tier across 3 iterations; final run 15/15 PASS in 3.27s with env loaded)*:
 
-| Failure | Root cause | Fix landed in chapter |
-|---|---|---|
-| `test_memory_query_emits_no_audit` (FAIL) | `memory_tools.py` called `tm.query_context(top_k=k)`; real signature uses `k` not `top_k` per §8.7's Protocol declaration. | Changed kwarg `top_k=k` → `k=k`. |
-| `test_export_import_round_trip` (FAIL) | `portability.py` called `tm.dump_all_for_user(user_id)`; real `TieredMemory` doesn't ship that method. | Made `memories=` best-effort via `hasattr` probe; audit_log remains the canonical single source of truth (matches the §9.2 walkthrough's stated design). |
-| All 4 integration teardowns (ERROR) | `async with TieredMemory(...)` inside async fixture violates anyio TaskGroup task-ownership invariant: `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in`. | Switched fixture to `@pytest_asyncio.fixture` + manual `__aenter__`/`__aexit__` — lifecycle stays in one task frame. |
+| Iteration | Run state | Bugs caught | Fix applied |
+|---|---|---|---|
+| Run 1 | 13/15 PASS + 2 FAIL + 4 teardown ERR | (a) `memory_tools.memory_query` used `top_k=k` instead of `k=k`. (b) `portability.export` called non-existent `tm.dump_all_for_user`. (c) `async with` inside `@pytest.fixture` triggers cross-task TaskGroup exit. | Bug (a): kwarg renamed. Bug (b): `hasattr` probe — `memories=` best-effort. Bug (c) attempt 1: switched to `@pytest_asyncio.fixture` + manual `__aenter__`/`__aexit__`. |
+| Run 2 | 13/15 PASS + 2 FAIL + 4 teardown ERR (same as Run 1) | Bugs (a) + (b) re-surfaced because I'd updated the CHAPTER file but not the lab repo files. Bug (c) fix attempt 1 did NOT work — pytest-asyncio still ran setup/teardown across different tasks. | Bug (a) + (b): applied to lab repo. Bug (c) attempt 2: drop async fixture entirely; convert to sync fixture yielding a `user_id` string; push `async with TieredMemory(...)` into each test BODY so TaskGroup lives + dies in the test's own task. |
+| Run 3 | **15/15 PASS in 3.27s** | None. | Final shape: sync `isolated_user_id` fixture + test-body-owned `async with` lifecycle. |
 
-Honest accounting: the test suite worked exactly as designed — caught 3 bugs the chapter authors (me) missed despite careful walkthrough composition. The unit-test layer (11/11 PASS) protected against substantial refactor risk; the integration layer (0/4 PASS first run) was the high-leverage discovery surface. After the three fixes, expect 15/15 PASS on next run. See BCJ Entry 20 for the post-mortem.
+Honest accounting: the test suite worked exactly as designed — caught 3 bugs the chapter authors (me) missed despite careful walkthrough composition. The unit-test layer (11/11 PASS across all runs) protected against substantial refactor risk; the integration layer was the high-leverage discovery surface, AND iterating on fix attempt 1 → fix attempt 2 was itself a load-bearing learning about pytest-asyncio + anyio task-affinity. See BCJ Entry 20 for the full iteration path.
 
 `★ Insight ─────────────────────────────────────`
 - **Test pyramid done right: 11 unit + 4 integration.** The 11 unit tests cover replay semantics and migration transforms without touching Qdrant — they're the fast-feedback layer (run in milliseconds). The 4 integration tests cover the end-to-end audit-emission + round-trip contracts — they're slower but verify the seams between modules. Classic pyramid ratio (~73% unit, ~27% integration) matches Martin Fowler's recommended test distribution.
@@ -6226,7 +6232,7 @@ Honest accounting: the test suite worked exactly as designed — caught 3 bugs t
 **Entry 20 — Phase 9 chapter code shipped with 3 latent bugs; first `tests/test_phase9.py` run caught all of them at the integration boundary.** *(observed 2026-05-27, §9.5 first-execution session)*
 *Symptom:* 13/15 PASS + 2 FAIL + 4 teardown errors in 5.84s on first `uv run pytest tests/test_phase9.py -v`. All 11 unit tests (TestReplayPureUnits + TestPortabilityMigration + TestPortabilityVersionGate) passed cleanly. 4 integration tests (TestMemoryToolsIntegration) failed at the chapter-vs-codebase contract boundary. Failure 1: `test_memory_query_emits_no_audit` → `TypeError: TieredMemory.query_context() got an unexpected keyword argument 'top_k'`. Failure 2: `test_export_import_round_trip` → `AttributeError: 'TieredMemory' object has no attribute 'dump_all_for_user'`. Errors 3-6: all four integration teardowns → `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in` in the `tm_iso` fixture.
 *Root cause:* Three independent chapter-authoring drifts. (1) `memory_tools.memory_query` used kwarg `top_k=k` when the §8.7 Protocol clearly declares `k`; transcription error in §9.1.1 walkthrough — code did NOT match the Protocol it claimed to consume. (2) `portability.export` called `tm.dump_all_for_user(user_id)` — a method NAMED in the §9.2 walkthrough's TieredMemoryLike Protocol but NOT shipped on the actual `TieredMemory` class. Chapter invented an attribute that didn't exist in the codebase. (3) The `tm_iso` test fixture used `async with TieredMemory(...) as tm: yield tm` inside a `@pytest.fixture` — anyio's TaskGroup invariant requires `__aenter__` and `__aexit__` in the same task, but pytest-asyncio's generator-fixture pattern enters in setup-task and exits in teardown-task. Standard pytest-asyncio + anyio interaction footgun, documented in pytest-asyncio's migration guide but missed during chapter authoring.
-*Fix:* Three targeted edits to the chapter, no codebase changes needed. (1) `memory_tools.py`: `tm.query_context(query=query, top_k=k)` → `tm.query_context(query=query, k=k)`. (2) `portability.py`: replace `memories=tm.dump_all_for_user(user_id)` with `hasattr` probe (`memories = tm.dump_all_for_user(user_id) if hasattr(tm, "dump_all_for_user") else []`); update TieredMemoryLike Protocol docstring to mark `dump_all_for_user` OPTIONAL; the §9.2 walkthrough already said "audit_log is the canonical source of truth; memories[] is best-effort for human inspection" — code now matches the doc. (3) `test_phase9.py`: switch `@pytest.fixture` → `@pytest_asyncio.fixture` + replace `async with` with manual `await tm.__aenter__()` + `try/yield/finally: await tm.__aexit__(None, None, None)` — keeps the lifecycle in one task frame. **Production rules:** (a) chapter code that wraps a class IS the contract-vs-implementation seam — every kwarg name, every method name must match the real class, not the chapter's mental model. (b) When the walkthrough prose says "X is optional" or "X is best-effort," the code must enforce that via `hasattr` / `try/except` — promises in prose without enforcement in code is documentation-as-aspiration. (c) `async with` inside pytest-asyncio generator fixtures crosses task boundaries; use explicit `__aenter__`/`__aexit__` to keep the lifecycle frame-local. This pattern is also the right shape for any async resource that's task-affine (database connections, MCP clients, anyio TaskGroups). Catch: 13/15 → 15/15 expected after fixes; no fabricated re-run number until the user re-runs `pytest`.
+*Fix:* Three targeted edits, one of them requiring TWO iterations before working. (1) `memory_tools.py`: `tm.query_context(query=query, top_k=k)` → `tm.query_context(query=query, k=k)` — one-line kwarg rename. (2) `portability.py`: replace `memories=tm.dump_all_for_user(user_id)` with `hasattr` probe (`memories = tm.dump_all_for_user(user_id) if hasattr(tm, "dump_all_for_user") else []`); mark `dump_all_for_user` OPTIONAL in `TieredMemoryLike` Protocol; the §9.2 walkthrough already said "audit_log is canonical, memories[] is best-effort" — code now matches doc. (3) Fixture fix took **two attempts**. Attempt 1: `@pytest.fixture` → `@pytest_asyncio.fixture` with manual `await tm.__aenter__()` + `try/yield/finally: await tm.__aexit__(None, None, None)`. **This did NOT work** — pytest-asyncio's fixture mechanism still runs setup and teardown in different tasks regardless of whether the user uses `async with` or manual `__aenter__/__aexit__`. The teardown crossed the same task boundary and hit the same `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in`. Attempt 2 (working): **drop the async fixture entirely.** Convert `tm_iso` to sync `isolated_user_id` fixture that returns just a `user_id` string; push `async with TieredMemory(agent_id=..., user_id=isolated_user_id) as tm:` INTO each integration test body. Now TaskGroup is created and destroyed in the SAME task (the test's task), invariant holds. Measured: 15/15 PASS in 3.27s after attempt 2. **Production rules:** (a) chapter code that wraps a class IS the contract-vs-implementation seam — every kwarg name, every method name must match the real class, not the chapter author's mental model. (b) When walkthrough prose says "X is optional" or "X is best-effort," code must enforce that via `hasattr`/`try-except` — promises in prose without enforcement is documentation-as-aspiration. (c) `pytest-asyncio` fixtures with async setup/teardown cross task boundaries, period. For ANY async resource that creates an `anyio.create_task_group()` internally (MCP stdio clients, async DB connections with retry pools, anyio-based libraries), the lifecycle MUST stay inside one task — push `async with` into the test body, not the fixture. The sync-fixture-yields-config-only pattern is the documented escape hatch. (d) Iteration discipline: when your first fix doesn't work, document WHY it failed and what attempt 2 changed. Bug 3 here went through TWO fixes; the chapter records both so a reader (or future-me) learns the actual constraint surface, not just the final answer.
 
 **Entry 16 — §3.x consolidation pipeline destroys conversational details when applied to LongMemEval haystacks; agent returns NO_ANSWER_IN_CONTEXT despite retrieving candidates.** *(observed 2026-05-19, §5.3 LongMemEval dry-run)*
 *Symptom:* §5.3 20-Q smoke first attempt: 0/20 correct. Agent answer = `NO_ANSWER_IN_CONTEXT` on questions whose haystack DEMONSTRABLY contained the answer (e.g., "What was the first issue with my new car?" → gold "GPS not working" → haystack has 3 candidates retrieved, but agent says context doesn't contain answer). `candidates_returned > 0` AND `facts_imprinted > 0` ruled out retrieval/imprint failure. Per-candidate inspection: candidates were summarized into TECH-FLAVORED language ("Vehicle diagnostic procedures involve dealership firmware updates") with the original "user had GPS issue" detail eliminated.
