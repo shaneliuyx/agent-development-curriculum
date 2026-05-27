@@ -154,6 +154,7 @@ Don't add L3 speculatively. The graduation trigger is **measured query-mix compo
 | Multi-entity intersection | L3 HyperMem | calls to `query_context()` followed by Python post-filtering on ≥2 entity dimensions |
 
 Instrument your production memory layer for 1-2 weeks. Count the frequency of each query class. If multi-entity intersection exceeds ~30% of total queries (or accuracy on those queries drops below acceptable thresholds with the L2-and-filter approach), it's time to add L3. If the trigger doesn't fire — **don't** add L3. Three-tier adds another service, another consolidation step in the pipeline, another data model to maintain. YAGNI applies harder to memory architecture than most things because each tier has operational cost AND a separate correctness story.
+(YAGNI - "You Aren't Gonna Need It.")
 
 ### 2.7 LongMemEval benchmark methodology — the senior-signal eval discipline
 
@@ -200,7 +201,7 @@ flowchart TD
 ### 3.2 Three-class comparison
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'48px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'28px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50}}}%%
 flowchart LR
   subgraph C1["Class 1 — 1-tier"]
     direction TB
@@ -230,7 +231,7 @@ flowchart LR
 ### 3.3 Three-tier topology (Phase 5-9 target — extends W3.5.8's two-tier with HyperMem L3)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'48px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'28px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50}}}%%
 flowchart LR
     A1[Python Agent A]
     A2[Python Agent B]

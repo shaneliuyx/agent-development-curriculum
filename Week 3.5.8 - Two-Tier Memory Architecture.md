@@ -109,7 +109,7 @@ Two-tier should beat each single-tier by ≥20% on the AGGREGATE while approxima
 ### Diagram 1 — The Two-Tier Architecture (steady state)
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'48px'}, 'flowchart':{'useMaxWidth':false}}}%%
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'28px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50}}}%%
 flowchart LR
     A1[Python Agent A]
     A2[Python Agent B]
