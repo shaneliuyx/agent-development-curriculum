@@ -234,8 +234,9 @@ uv venv && source .venv/bin/activate
 
 # IMPORTANT: use `uv pip` OR `python -m pip` — NOT bare `pip`.
 # Bare `pip` may resolve to another venv on $PATH and install into the wrong env.
-uv pip install httpx pytest
-# (equivalent: python -m pip install httpx pytest)
+uv pip install httpx pytest python-dotenv
+# (equivalent: python -m pip install httpx pytest python-dotenv)
+# python-dotenv loads ~/code/agent-prep/.env automatically — no `source .env` needed.
 
 echo -e "code/\noutputs/\n.venv/\n__pycache__/" > .gitignore
 git init && git add -A && git commit -m "scaffold W3.5.5.5 lab"
@@ -255,10 +256,23 @@ Providers (selected via LLM_PROVIDER env var):
   - "anthropic-proxy" — Claude-Sonnet-4.6 via local :8317 proxy (curriculum default)
   - "openai"          — OpenAI-compatible endpoint (Azure OpenAI / local oMLX / vLLM)
   - "mock"            — deterministic stub for offline tests (see tests/conftest.py)
+
+Environment: python-dotenv loads `.env` automatically at import time.
+Walks from cwd up to filesystem root looking for `.env` — finds the lab's
+`.env` AND `~/code/agent-prep/.env` (umbrella) without `source .env`.
 """
 from __future__ import annotations
 import os
 import httpx
+
+# Auto-load .env on module import. find_dotenv() walks up the directory tree.
+# Existing process env (real shell exports) takes precedence over .env values.
+try:
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(usecwd=True))
+except ImportError:
+    # python-dotenv optional — caller can still `source .env` manually.
+    pass
 
 _PROVIDER = os.getenv("LLM_PROVIDER", "anthropic-proxy")
 _TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "60"))
