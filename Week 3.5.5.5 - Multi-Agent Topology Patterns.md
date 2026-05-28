@@ -363,11 +363,26 @@ def _chat_openai(prompt: str, system: str | None, max_tokens: int = 1024) -> str
     r = httpx.post(url, json=body, headers=headers, timeout=_timeout_s())
     r.raise_for_status()
     data = r.json()
-    # Defensive: some OpenAI-compat servers return null content when model
-    # emits tool_calls or hits a stop sequence; others return empty string.
-    # Caller expects str; coerce None/missing to empty string.
+    # Defensive: reasoning models (gpt-oss-20b, DeepSeek-R1, o1-class) emit
+    # chain-of-thought into `reasoning_content` and the final answer into
+    # `content`. On heavy prompts the CoT can exhaust max_tokens entirely,
+    # leaving `content=null` + `finish_reason=length` + `reasoning_content`
+    # holding the truncated thinking. Falling back to reasoning_content
+    # salvages SOMETHING for the caller — even if it's just incomplete CoT,
+    # it's better than a silently empty string. See W3.5.5.5 BCJ Entry 6
+    # for the diagnostic probe + full trap analysis.
     try:
-        return data["choices"][0]["message"]["content"] or ""
+        choice = data["choices"][0]
+        msg = choice["message"]
+        content = msg.get("content")
+        if content:
+            return content
+        # Fall back to reasoning_content if final content is empty/null.
+        reasoning = msg.get("reasoning_content")
+        if reasoning:
+            finish_reason = choice.get("finish_reason", "unknown")
+            return f"[reasoning_only — finish_reason={finish_reason}]\n{reasoning}"
+        return ""
     except (KeyError, IndexError, TypeError):
         return ""
 
@@ -547,9 +562,14 @@ non-overlapping sub-questions. Each sub-question should be answerable independen
 Return JSON only, no prose:
 {"sub_questions": ["q1", "q2", "q3"]}"""
 
-LEAD_SYNTHESIZE_SYSTEM = """You are a research lead synthesizing 3 workers' answers into ONE coherent
+LEAD_SYNTHESIZE_SYSTEM = """You are a research lead synthesizing workers' answers into ONE coherent
 answer to the original question. Cite which worker contributed which fact. Surface disagreement explicitly
-if workers conflict — do NOT silently pick one side."""
+if workers conflict — do NOT silently pick one side.
+
+CRITICAL: synthesize ONLY what the workers provided. If the original question mentions a topic the workers
+did NOT cover (e.g. question asks about EU/US/UK but workers covered EU/US only), state that gap EXPLICITLY
+in one sentence and continue with what IS covered. Do NOT speculate or fill in missing material — that
+causes reasoning models to loop (W3.5.5.5 BCJ Entry 6). Acknowledge gap, move on."""
 
 WORKER_SYSTEM = """You are a research worker. Answer ONE sub-question with a 3-sentence factual response.
 Stay within scope; don't expand to adjacent topics. If you don't know, say so explicitly."""
@@ -582,21 +602,25 @@ def worker_run(sub_question: str) -> WorkerResult:
         wall_seconds=time.monotonic() - t0,
     )
 
-def synthesize(question: str, results: list[WorkerResult]) -> str:
+def synthesize(question: str, results: list[WorkerResult], max_tokens: int = 2048) -> str:
     """Lead's second LLM call: combine worker answers.
 
-    `max_tokens=2048` bump: synthesize prompts can be large (sum of all
-    worker answers + question + instruction); on reasoning models like
-    gpt-oss-20b the CoT can consume the budget before the final answer
-    emits (the W3.5.8 BCJ Entry 8 trap — finish_reason=length + empty
-    content). 2048 gives 1024 for reasoning + 1024 for the actual answer.
+    `max_tokens` defaults to 2048 (1024 CoT + 1024 answer for supervisor).
+    Hierarchical TOP-lead synthesize should pass HIGHER (e.g. 4096) because
+    its input is 2 sub-syntheses (each already table-formatted, multi-
+    paragraph, ~600-1000 tokens) PLUS the question — easily 2-3k input
+    tokens. Reasoning models reasoning over that need proportionally more
+    output budget. W3.5.8 BCJ Entry 8 trap (`finish_reason=length` + empty
+    content) recurs at each lifecycle layer: supervisor at 1024 budget,
+    hierarchical at 2048 budget — measured 2026-05-28 hierarchical run
+    still emitted empty TOP synthesize at 2048; bumped to 4096 in caller.
     """
     bundle = "\n\n".join(
         f"Worker {i+1} on '{r.sub_question}':\n{r.answer}"
         for i, r in enumerate(results)
     )
     prompt = f"ORIGINAL QUESTION: {question}\n\nWORKER ANSWERS:\n{bundle}\n\nSYNTHESIZE."
-    return chat(prompt, system=LEAD_SYNTHESIZE_SYSTEM, max_tokens=2048)
+    return chat(prompt, system=LEAD_SYNTHESIZE_SYSTEM, max_tokens=max_tokens)
 
 def supervisor_run(question: str) -> dict:
     """End-to-end supervisor topology. Returns answer + timing breakdown."""
@@ -861,7 +885,12 @@ def hierarchical_run(question: str) -> dict:
         for s in sub_results
     ]
     t_syn = time.monotonic()
-    answer = synthesize(question, sub_as_workers)
+    # Bump max_tokens for TOP-lead synthesize — each sub-answer is itself
+    # a synthesized output (table-formatted, multi-paragraph, ~600-1000
+    # tokens), so input is 2-3k tokens. Measured 2026-05-28: 2048 budget
+    # still produced empty TOP synthesize at 54s wall (CoT exhausted entire
+    # budget). 4096 = 2048 CoT + 2048 answer headroom on reasoning models.
+    answer = synthesize(question, sub_as_workers, max_tokens=4096)
     syn_wall = time.monotonic() - t_syn
 
     return {
@@ -1583,9 +1612,37 @@ This phase is the senior-engineer interview cover: 90 seconds defending a topolo
 
 ## 5. Bad-Case Journal
 
-*Empty — entries land when labs run.* Per the curriculum's real-data discipline, BCJ entries are populated from OBSERVED failure modes during actual Phase 1-6 execution, not from pre-scoped speculation. When lab runs surface concrete failures, add entries here in the standard 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`) per the chapter-structure rules in `CLAUDE.md`.
+All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 sessions). Per curriculum real-data discipline, no pre-scoped or hypothetical entries.
 
-Cross-reference [[Bad-Case Journal]] (the vault-wide journal) for OBSERVED entries from sibling chapters' lab runs — patterns there may apply to this chapter's failure surface preemptively.
+**Entry 1 — Module-level env-var capture defeats per-test override.** *(observed 2026-05-27)*
+*Symptom:* Tests called real LLM despite conftest's autouse fixture setting `LLM_PROVIDER=mock`. `pytest tests/` hit `:8000` even when `monkeypatch.setenv` was active.
+*Root cause:* `_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic-proxy")` captured the value at module IMPORT time — before conftest's autouse fixture ran. Subsequent `monkeypatch.setenv` mutated `os.environ` but the module-level constant was already frozen.
+*Fix:* Convert any `_CONST = os.getenv(...)` that needs per-test override to a function: `def _provider(): return os.getenv(...)`. Same trap-class as anyio TaskGroup task-affinity bug (Entry 5 below) — "captured at one time, consumed at another." Production rule: never capture env at import time when downstream callers need per-test override.
+
+**Entry 2 — `_chat_openai` crashed with `KeyError: 'content'` on tool-call responses.** *(observed 2026-05-27)*
+*Symptom:* Some OpenAI-compatible servers (vLLM in tool-use mode, certain Azure deployments) return `null` content when the model emits `tool_calls` or hits a stop sequence; others omit the `content` key entirely. Caller expected `str`, got either None or KeyError.
+*Root cause:* Naive `data["choices"][0]["message"]["content"]` parse assumed strict OpenAI shape; the wire-format varies across compat servers.
+*Fix:* Defensive parse at the wire boundary: `try: return data["choices"][0]["message"]["content"] or "" except (KeyError, IndexError, TypeError): return ""`. Coerce-or-empty is the right pattern at every third-party response boundary — same shape as W3.5 BCJ Entry 2's `extract_memories()` JSON-shape defense. NOTE: this fix is SUPERSEDED by Entry 6's reasoning_content fallback — see below.
+
+**Entry 3 — Mock provider's generic stub broke multi-call agent loops.** *(observed 2026-05-27)*
+*Symptom:* Original mock returned `"Mock response."` regardless of call context. But callers expected JSON (decompose), agent names (group-chat selector), `HANDOFF: tool` strings (triage), `BEST: N` votes (llm-judge). Each downstream parser crashed.
+*Root cause:* Mocks for shape-dependent consumers need shape-aware stubs. A single generic return value cannot satisfy 5 different downstream parsers that all consume `chat()` output.
+*Fix:* Format-aware `_chat_mock` inspects `(system, prompt)` to detect call intent + returns PARSE-VALID stub per call shape. Recognized formats: decompose → JSON array; synthesize → multi-sentence answer; triage → `HANDOFF: <tool>` keyed off USER MESSAGE; group-chat → agent name extracted from `Pick ONE of:`; llm-judge → `BEST: 0`; default → "Mock response." General rule: mocks ARE part of the test contract; mock-broken-on-shape-change is a real regression. Pattern generalizes to pytest-mock's `Mock.side_effect`.
+
+**Entry 4 — Triage mock false-matched "refund" because tool docstrings embedded in prompt.** *(observed 2026-05-27)*
+*Symptom:* "What plans do you offer?" routed to refund agent. Mock's `if "refund" in prompt.lower()` matched the agent's tool DESCRIPTION (which contained "refund"), not the user's actual question.
+*Root cause:* When mock-detecting intent from a prompt, the full prompt includes tool catalog + system instructions + user message. Substring matching across all of that causes false positives on tool-docstring keywords.
+*Fix:* Extract the load-bearing field FIRST: `re.search(r"USER MESSAGE:\s*(.+?)(?:\n|$)", prompt)` scopes keyword search to user input only, not the system prompt or tool catalog. Same shape as any parse defense — narrow the scope before pattern-matching.
+
+**Entry 5 — `pytest-asyncio` async-fixture crossed task boundary on anyio TaskGroup.** *(observed 2026-05-27)*
+*Symptom:* `async with TieredMemory(...) as tm: yield tm` inside `@pytest.fixture` entered TaskGroup in setup-task, tried to exit in teardown-task. Crashed with `RuntimeError: Attempted to exit cancel scope in a different task than it was entered in`. Affected 4 integration tests.
+*Root cause:* `pytest-asyncio` fixtures with async setup/teardown CROSS TASK BOUNDARIES — `__aenter__` runs in setup-task, `__aexit__` runs in teardown-task. anyio's TaskGroup invariant requires same task for both. Documented in pytest-asyncio's migration guide but easy to miss.
+*Fix:* (a) For any async resource that creates `anyio.create_task_group()` internally, the lifecycle MUST stay inside one task — push `async with` INTO the test body, not the fixture. (b) The sync-fixture-yields-config-only pattern is the documented escape hatch: have the fixture return just an isolated `user_id` string; let each test create+destroy the resource in its own body. See W3.5.8 BCJ Entry 20 for the full debug trace including a failed first-attempt fix.
+
+**Entry 6 — Reasoning-model `synthesize` returns empty `content`, CoT goes to `reasoning_content`, repetition loop on missing material.** *(observed 2026-05-28)*
+*Symptom:* `python code/hierarchical.py` produces `answer: ""` for TOP synthesize despite max_tokens=2048 AND max_tokens=4096 bumps. Sub-leads and leaves produce full structured answers; only the TOP synthesize is empty. Diagnostic probe (`code/probe_synthesize.py`) reveals raw API response: `content: null`, `reasoning_content: 13586 chars`, `finish_reason: length`, `completion_tokens: 4096`. The reasoning_content shows a stuck repetition loop: "UK has the AI Act? They have the AI Act? The UK has the AI Act? They have the AI Act?..." for ~13K chars.
+*Root cause:* Two interacting issues. **(a) gpt-oss-20b emits CoT separately**: reasoning models (gpt-oss-20b, DeepSeek-R1, o1-class) emit chain-of-thought into a `reasoning_content` field, NOT the standard `content` field. Most OpenAI-compatible clients read only `content` and silently drop `reasoning_content`. **(b) Prompts asking for material the workers didn't provide cause CoT repetition loops**: the original question asked about EU/US/UK regulatory frameworks; workers covered EU/US only. The model fixated on the UK gap and looped trying to recall whether the UK has an AI Act, exhausting the 4096-token budget on this loop without ever producing final `content`.
+*Fix:* Three layered defenses. **(a) `_chat_openai` falls back to `reasoning_content` when `content` is empty**: returns `[reasoning_only — finish_reason={X}]\n{reasoning_content}` so caller sees the trace + finish_reason instead of silent empty string. Defense at the wire boundary; SUPERSEDES Entry 2's bare `content or ""` coercion. **(b) `LEAD_SYNTHESIZE_SYSTEM` gains explicit gap-acknowledgement instruction**: "synthesize ONLY what workers provided; if question mentions material workers did NOT cover, state gap explicitly and continue. Do NOT speculate or fill in missing material — that causes reasoning models to loop." Prevents the trap at the prompt layer. **(c) Hierarchical TOP synthesize uses `max_tokens=4096`** (was 2048) — hierarchical synthesize input is 2 already-synthesized sub-answers (~600-1000 tokens each) vs supervisor's 3 short worker answers (~200-400 tokens each), so the budget doubles. Production rule generalizes beyond multi-agent: **any reasoning-model deployment must read both `content` AND `reasoning_content` from the API response, and prompts must explicitly bound the scope to provided material**. Same trap-class as W3.5.8 BCJ Entry 8 (reasoning-model max_tokens exhaustion) — adds the read-side `reasoning_content` defense.
 
 ---
 
