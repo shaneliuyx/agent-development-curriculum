@@ -1085,13 +1085,11 @@ Suggested workload set:
 
 **Deliverable shape:**
 
-```markdown
 | # | Workload | Decomposable? | Sub-decompose? | Knowable? | Triage? | Correctness > cost? | Shared memory? | Picked | Defense |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | Summarize 30-page paper | Yes | No | Yes | No | No | No | supervisor | One-layer decompose by section; parallelize; lead synthesizes |
 | 2 | Compare regs EU/US/UK/CN | Yes | Yes | Yes | No | No | No | hierarchical | Top decomposes by region; sub-leads decompose by dimension |
-| ... 8 more rows ... |
-```
+| ... | *(8 more rows fill in during the exercise)* | | | | | | | | |
 
 This phase is the senior-engineer interview cover: 90 seconds defending a topology choice for a novel workload using the 6-question matrix. Use the deliverable as anki-card material for the W3.5.5.5 interview soundbites.
 
