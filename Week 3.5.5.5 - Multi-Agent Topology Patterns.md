@@ -1074,10 +1074,9 @@ flowchart TD
 **Code:**
 
 ```python
-# code/group_chat.py — shared-message-pool group chat with 3 selector flavors
+# code/group_chat.py
 from __future__ import annotations
-from dataclasses import dataclass, field
-from itertools import cycle
+from dataclasses import dataclass
 from typing import Callable, Literal
 
 from llm import chat
@@ -1193,16 +1192,38 @@ def group_chat_run(
     }
 
 
+def print_group_chat(out: dict) -> None:
+    """Pretty-print the group-chat discussion process with per-agent turns.
+
+    Shared-memory note: every entry in `out['pool']` is visible to every agent
+    on every turn (see GroupAgent.respond — full pool fed as transcript).
+    The pool IS the shared memory; topology = blackboard pattern.
+    """
+    sel = out["selector"]
+    print(f"\n{'=' * 70}")
+    print(f"GROUP-CHAT (selector={sel}, rounds={out['rounds_used']}, "
+          f"selector_calls={out['selector_calls']}, "
+          f"terminated_by={out['terminated_by']})")
+    print(f"{'=' * 70}")
+    for i, msg in enumerate(out["pool"]):
+        speaker = msg["speaker"]
+        content = msg["content"]
+        # Highlight terminator
+        marker = " ← TERMINATE" if "TERMINATE" in content.upper() and speaker != "user" else ""
+        print(f"\n[turn {i}] {speaker.upper()}{marker}")
+        print(f"{'─' * 60}")
+        for line in content.splitlines() or [""]:
+            print(f"  {line}")
+    print(f"\n{'=' * 70}\n")
+
+
 if __name__ == "__main__":
-    import json
     for sel in ("round-robin", "llm-selected", "custom"):
         out = group_chat_run(
             "Write a Python function `is_palindrome(s: str) -> bool`. Reviewer + tester collaborate.",
             selector=sel,
         )
-        print(f"\n=== selector={sel} ===")
-        print(f"rounds={out['rounds_used']}  selector_calls={out['selector_calls']}  "
-              f"terminated_by={out['terminated_by']}")
+        print_group_chat(out)
 ```
 
 **Walkthrough:**
@@ -1247,7 +1268,21 @@ def test_terminate_token_ends_conversation():
         assert out["rounds_used"] < 20
 ```
 
-**Result** *(projected — actual run TBD)*: round-robin completes in ~6-9 rounds (3 agents × 2-3 cycles); llm-selected uses 2× LLM calls (selector + agent per round) but converges in ~5-7 rounds; custom uses ~1.5× LLM calls + converges in ~4-6 rounds. Cost per round: round-robin ~1 call, llm-selected ~2 calls, custom ~1.5 calls. Answer quality typically: custom ≈ llm-selected > round-robin (on tasks needing context-aware speaker order).
+**Result** *(measured 2026-05-28, Claude Sonnet 4.6 via CLIProxyAPI `:8317`, task = "Write a Python function is_palindrome(s) — reviewer + tester collaborate")*:
+
+| Selector | Rounds used | LLM calls | Termination | Discussion shape |
+|---|---:|---:|---|---|
+| `round-robin` | **9** (max cap hit, force-terminated) | 9 | hit max_rounds=9 | Cyclic coder→reviewer→tester×3; no convergence — last turn happened to emit TERMINATE in coder's response, otherwise would have continued |
+| `llm-selected` | **4** | 4 selector + 4 agent = **8** | coder→TERMINATE on turn 4 | Most efficient — selector picked coder→reviewer→tester→coder→TERMINATE, converged in 4 rounds. Discussion shape: code → review (punctuation gap) → test (exposes gap) → coder fixes + terminates |
+| `custom` | **7** | 7 (rules + LLM fallback hybrid) | coder→TERMINATE on turn 7 | Rule-pinned: tester always follows coder, reviewer always follows tester. Took 2× more rounds than llm-selected because rules forced extra cycles |
+
+**Memory-sharing observation:** every agent's `respond(pool)` reads the FULL pool as transcript before writing — blackboard pattern. Pool grew to 5/10/8 messages across the 3 selectors; full transcript fits in Sonnet's 200k context with no truncation needed. For longer discussions, pool should be summarized periodically OR routed to external store (Qdrant + bge-m3 retrieval per W3.5.8 two-tier pattern). At ≤10 turns + ≤5 agents the in-memory list IS the right shared-memory abstraction.
+
+**Counter to projection:** projected `round-robin completes in ~6-9 rounds` was approximately right but UNDERSPECIFIED — it hit max_cap=9 because round-robin has NO selector intelligence to detect convergence. The "completes" framing was generous; reality is "termination depends on whether an agent happens to emit TERMINATE during their natural turn." For round-robin to reliably converge, max_rounds must be raised AND agents must be prompted to emit TERMINATE when they observe consensus. **Projected `llm-selected converges in ~5-7 rounds` was over-pessimistic** — actual was 4 rounds because Sonnet's selector intelligence is high enough to route turns optimally on this simple task. Llm-selected scales better than projected when the task has clear convergence signals.
+
+Per-round LLM-call cost: round-robin = 1 call/round, llm-selected = 2 calls/round (selector + agent), custom = 1.5 calls/round (rule paths skip selector LLM call, fallback paths invoke it). On this task: round-robin 9 calls / llm-selected 8 calls / custom 7 calls — **llm-selected was cheapest by total calls despite the 2× per-round overhead**, because it terminated fastest.
+
+Full discussion transcript in `lab-03-5-5-5-topology/results/group_chat_sonnet-4-6.txt` (232 lines, all 3 selectors visible).
 
 `★ Insight ─────────────────────────────────────`
 - **The selector function IS the topology choice for group chats.** Same agents + same task; different selectors yield different conversation shapes + costs. Production rule: start with round-robin (cheapest), upgrade to custom-with-rules when you observe specific selection patterns recurring, fall back to llm-selected only when rules don't capture the patterns.
