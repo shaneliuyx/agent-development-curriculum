@@ -23,6 +23,7 @@ Week 3.5.5.5 — Multi-Agent Topology Patterns    ← supervisor / hierarchical 
 Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + Phase 8.6 bitemporal supersede/coexist (5/5 tests)
 Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval decomposition + 6-backend matrix (1-tier / 2-tier / hybrid / three-tier HyperMem L3)
 Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes (SPEC, v0)
+Week 3.5.96 — Self-Wiring Memory (GBrain)       ← markdown-first deterministic graph + HNSW+keyword RRF (83→95% Recall@5) + 74 MCP tools (Garry Tan / YC, MIT, SPEC+lab v0)
 Week 3.7 — Agentic RAG                          ← canonical 5-node graph
 Week 4  — ReAct From Scratch                    ← + §1.5 MLX Studio gateway role-map (2026-05-15 sync)
 Week 4.5 — Model Routing and Effort Tiering     ← local Qwen-1.5B classifier + cost-latency Pareto front (SPEC, v0)
@@ -35,7 +36,8 @@ Week 6.4 — Low-Code Agent Platforms (Dify / Coze / n8n / LangFlow) ← 5-axis 
 Week 6.5 — Hermes Agent Hands-On
 Week 6.6 — MCP Schema Bridge                    ← type-hint → JSON Schema producer + AsyncGenerator streaming (SPEC, v0)
 Week 6.65 — MCP Production Transports           ← Streamable HTTP + DNS-rebinding via Origin + HTTP+SSE 2026-migration + gateway composition + tool-poisoning catalog (SPEC, v0)
-Week 6.7 — Authoring Agent Skills
+Week 6.7 — Authoring Agent Skills              ← extended with microsoft/apm (Agent Package Manager, May 2026)
+Week 6.75 — Skill Optimization (SkillOpt)       ← microsoft/SkillOpt arXiv:2605.23904; text-space training of skills (epochs/batchsize/lr) without weight updates (SPEC+lab v0)
 Week 6.8 — Agent Communication Protocol Survey  ← MCP / A2A / ANP (SPEC, planned)
 Week 6.85 — Prompt Template Engineering Patterns ← 5-axis design space + schema-enforce + 4 anti-patterns (interview Q1, SPEC, v0)
 Week 6.9 — Context Engineering + Todo Mechanisms ← 4 context shapes + cognitive-narrowing argument + 80-LOC TodoList primitive (interview Q11, SPEC, v0)
@@ -43,6 +45,7 @@ Week 6.95 — A2A Protocol                        ← Agent Card + Task lifecycl
 Week 7  — Tool Harness
 Week 7.3 — Production LLM Infrastructure          ← gateway + caching + cost attribution + fallback (Akshay 6-area #2+#5)
 Week 7.5 — Computer Use and Browser Agents
+Week 7.6 — Small-Model Agent Stacks            ← MagenticLite + MagenticBrain (Qwen3-8B) + Fara1.5-9B local-first agent stack on M5 Pro (SPEC+lab v0)
 Week 7.7 — Quantization + Inference Optimization ← FP16 → MXFP4 hierarchy + KV-cache math + memory-bound regime (JD#1, SPEC, v0)
 Week 7.8 — Code-Agent Patterns (AST + Coverage + Mocks) ← tree-sitter + LSP + branch coverage + 4-class testability filter (interview Q3-Q7, SPEC, v0)
 Week 8  — Schema Reliability Bench

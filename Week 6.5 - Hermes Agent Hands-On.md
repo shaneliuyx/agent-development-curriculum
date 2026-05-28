@@ -835,6 +835,23 @@ Open [[Week 7 - Tool Harness]] when this lab's `RESULTS.md` is committed. The He
 - **Schick et al. (2023).** *Toolformer.* arXiv:2302.04761. Why fine-tuned models exhibit stronger tool-call reliability than instruction-tuned base.
 - **Microsoft Agent Governance Toolkit (2026).** Compliance risk taxonomy for autonomous code generation.
 
+### Current Hermes-agent features (May 2026 update)
+
+`NousResearch/hermes-agent` has substantially evolved since this chapter's v0. May 2026 production features worth knowing:
+
+- **Closed learning loop.** Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. Same shape as W6.75 SkillOpt's text-space optimization but integrated into the agent runtime (not as a separate training pipeline).
+- **Multi-platform gateway.** Single gateway process serves Telegram, Discord, Slack, WhatsApp, Signal, and CLI from one Hermes instance. Cross-platform conversation continuity; voice-memo transcription.
+- **Honcho dialectic user modeling.** Hermes uses [plastic-labs/honcho](https://github.com/plastic-labs/honcho) for cross-session user modeling (preferences, communication style, prior context). The "agent that grows with you" framing comes from this layer.
+- **FTS5 session search + LLM summarization.** SQLite FTS5 indexes every conversation; LLM summarizes cross-session for recall. Same shape as W3.5.8's two-tier memory but agent-internal.
+- **agentskills.io open standard compatibility.** Hermes reads + writes skills in the agentskills.io format — interoperable with Anthropic Skills, Microsoft apm, and other ecosystem tools (see [[Week 6.7 - Authoring Agent Skills]] apm section).
+- **Subagent delegation via Python RPC.** Spawn isolated subagents for parallel workstreams; subagents call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns. Same shape as W3.5.5.5 supervisor topology.
+- **Cron scheduler.** Built-in scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, unattended.
+- **Run-anywhere terminals.** Six backends — local / Docker / SSH / Singularity / Modal / Daytona. Daytona + Modal offer serverless persistence: agent's environment hibernates when idle, wakes on demand. Run on $5/mo VPS to GPU cluster.
+
+**Production rule:** Hermes-agent has graduated from research demo (W6.5 v0 era) to production runtime. The agent-growing-with-you thesis is now backed by Honcho's dialectic user-modeling primitive + FTS5 session search + autonomous skill creation. Read the [Hermes Atlas](https://hermes-agent.nousresearch.com/docs/) docs for current state.
+
+Source: NousResearch/hermes-agent. MIT license. https://github.com/NousResearch/hermes-agent.
+
 ---
 
 ## Cross-References

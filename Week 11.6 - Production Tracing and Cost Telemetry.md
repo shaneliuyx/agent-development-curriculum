@@ -542,6 +542,8 @@ Fix: monthly reconciliation — compare DuckDB rollup against actual invoice; in
 - **LangSmith** — Langchain's hosted observability. Vendor-locked but high-quality LLM-aware UI.
 - **Google SRE Book Ch. 6** — "Monitoring Distributed Systems." The canonical "instrument what matters" reference. Maps directly to LLM agents.
 - **DuckDB docs** — `QUANTILE_CONT`, `DATE_TRUNC`, parquet append. Production-grade analytical SQL for offline rollups.
+- **Langfuse Production Pipeline tutorial (May 2026).** Comprehensive walkthrough: tracing + prompt management + scoring + experiments + evals. Use this when standing up a Langfuse-as-observability-backend deployment from scratch. The pipeline pattern (trace → prompt registry → eval → experiment) maps directly to W11.6 Phases 1-3.
+- **Towards Data Science — *From Prototype to Profit: Solving the Agentic Token Burn Problem* (2026).** Production-anchored cost-control article. Anchors W11.6 Concept 5 (cost-governors) with real production-deployment cost numbers. Read this before architecting cost-governor patterns for your capstone.
 
 ## Cross-References
 

@@ -289,6 +289,8 @@ class TodoList:
 - **OpenAI Context Window docs** — model-specific window sizes + best-practices for tool-description compression.
 - **`tiktoken` package** — `tiktoken.encoding_for_model("gpt-4")` + `.encode(text)` for per-token counting. Production budget accounting.
 - **W3.5.8 §9.6 supersede semantics** — for context-staleness failure mode (Failure 3).
+- **HuggingFace — *The Context Course* (2026).** https://huggingface.co/learn/context-course. Production-anchored course on context engineering: rolling buffers, structured-state-as-list, RAG-recalled, summarized-history. Covers the 4 context shapes this chapter teaches plus token-budget formula derivation. Recommended supplement; pairs with Phase 1's TodoList primitive.
+- **Towards Data Science — *Prompt Engineering Isn't Enough — I Built a Control Layer That Works in Production*.** Names what this chapter calls "the agent's MEMORY OF INTENT" as a CONTROL LAYER. Same shape, different framing — useful when interview-discussing context engineering at a senior-engineer level. The control-layer framing emphasizes the structural-state vs prompt-content distinction.
 
 ## Cross-References
 
