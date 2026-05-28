@@ -582,14 +582,25 @@ class WorkerResult:
     wall_seconds: float
 
 def plan_decompose(question: str) -> list[str]:
-    """Lead's first LLM call: decompose question into 3 sub-questions."""
+    """Lead's first LLM call: decompose question into 3 sub-questions.
+
+    Defensive JSON extraction handles three observed wire-shapes:
+      1. Bare JSON object: `{"sub_questions": [...]}`
+      2. Markdown fence: ` ```json\n{...}\n``` ` or ` ```\n{...}\n``` `
+      3. Prose preamble: `Here are the sub-questions: {...}` (Qwen-Opus-distill
+         emits explanatory prose despite the 'Return JSON only, no prose'
+         instruction — distilled models are sometimes MORE verbose than the
+         model they were distilled from when instructions conflict with their
+         instruction-following bias).
+    """
+    import re
     raw = chat(question, system=LEAD_DECOMPOSE_SYSTEM)
-    # Strip optional ```json fence
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    parsed = json.loads(raw.strip())
+    # Find the first { ... } JSON object in the response. Greedy match to
+    # the outermost balanced braces (re.DOTALL for multi-line JSON).
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        raise ValueError(f"plan_decompose: no JSON object in LLM response: {raw[:200]!r}")
+    parsed = json.loads(m.group(0))
     return parsed["sub_questions"]
 
 def worker_run(sub_question: str) -> WorkerResult:
@@ -851,12 +862,12 @@ class SubLeadResult:
     wall_seconds: float
 
 
-def sub_supervisor(macro_question: str) -> SubLeadResult:
-    """Sub-lead: decompose macro into 2 sub-questions, run 2 leaf workers in
-    parallel, synthesize. Returns full per-agent structure (NOT just timing)."""
+def sub_supervisor(macro_question: str, leaf_fan: int = 2) -> SubLeadResult:
+    """Sub-lead: decompose macro into N sub-questions (default 2), run N
+    leaf workers in parallel, synthesize. Returns full per-agent structure."""
     t0 = time.monotonic()
-    sub_qs = plan_decompose(macro_question)[:2]   # cap at 2 sub-qs per macro
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    sub_qs = plan_decompose(macro_question)[:leaf_fan]
+    with ThreadPoolExecutor(max_workers=len(sub_qs)) as pool:
         leaf_results = list(pool.map(worker_run, sub_qs))
     sub_answer = synthesize(macro_question, leaf_results)
     return SubLeadResult(
@@ -868,15 +879,24 @@ def sub_supervisor(macro_question: str) -> SubLeadResult:
     )
 
 
-def hierarchical_run(question: str) -> dict:
-    """Two-layer hierarchy: top lead → 2 sub-leads → 4 leaf workers."""
+def hierarchical_run(question: str, top_fan: int = 3, leaf_fan: int = 2) -> dict:
+    """Two-layer hierarchy: top lead → top_fan sub-leads → top_fan * leaf_fan leaf workers.
+
+    Default `top_fan=3` matches `LEAD_DECOMPOSE_SYSTEM`'s "decompose into
+    EXACTLY 3" contract — uses all sub-questions the planner returns, so
+    no top-level macros silently dropped. Lower `top_fan` (e.g. 2) caps
+    cost at the expense of dropping the planner's 3rd macro.
+
+    `leaf_fan=2` keeps each sub-lead's internal cost bounded. Total
+    agents = 1 + top_fan + top_fan*leaf_fan (default 1+3+6 = 10).
+    """
     t_total = time.monotonic()
     t_plan = time.monotonic()
-    macros = plan_decompose(question)[:2]   # cap at 2 macros
+    macros = plan_decompose(question)[:top_fan]
     plan_wall = time.monotonic() - t_plan
 
     with ThreadPoolExecutor(max_workers=len(macros)) as pool:
-        sub_results = list(pool.map(sub_supervisor, macros))
+        sub_results = list(pool.map(lambda m: sub_supervisor(m, leaf_fan=leaf_fan), macros))
 
     # Top-lead synthesizes by treating each sub-lead's output as a WorkerResult
     sub_as_workers = [
@@ -911,7 +931,7 @@ def hierarchical_run(question: str) -> dict:
             for s in sub_results
         ],
         "depth": 2,
-        "agents_total": 1 + len(macros) + len(macros) * 2,   # top + sub-leads + leaves
+        "agents_total": 1 + len(macros) + sum(len(s.leaf_results) for s in sub_results),
         "plan_wall_s": round(plan_wall, 2),
         "sub_walls_s": [round(s.wall_seconds, 2) for s in sub_results],
         "max_sub_wall_s": round(max(s.wall_seconds for s in sub_results), 2),
@@ -963,7 +983,7 @@ if __name__ == "__main__":
 
 **Block 1 — `sub_supervisor` REUSES `plan_decompose` + `worker_run` + `synthesize`.** No new primitives; hierarchical is just supervisor-recursion. The chapter's "topology is composition" thesis becomes code-visible: each layer composes the same primitives. Adding a 3rd layer would be another file with `def super_sub_supervisor` calling `sub_supervisor` 2x.
 
-**Block 2 — Cap at 2 macros + 2 sub-qs per macro = 4 leaf workers.** 2×2 fan keeps total agents = 7 (1 top + 2 sub + 4 leaves). Bigger fans (3×3 = 13 agents) blow token cost without proportional accuracy gain at this depth. Production rule: hierarchical fan width should taper at deeper levels (top wider, leaves narrower).
+**Block 2 — Default `top_fan=3, leaf_fan=2` = 10 agents.** 1 top + 3 sub-leads + 6 leaves matches `LEAD_DECOMPOSE_SYSTEM`'s "decompose into EXACTLY 3" contract — no top-level macros silently dropped. Earlier `[:2]` hardcoded cap was a bug masquerading as cost-bound feature (BCJ Entry 9 — silently dropped the planner's 3rd macro for the entire chapter's lifetime). Use `top_fan=2` explicitly to opt into the 7-agent cost-bounded variant. Bigger fans (3×3 = 13 agents) blow token cost without proportional accuracy gain at this depth. Production rule: hierarchical fan width should taper at deeper levels (top wider, leaves narrower) — default 3×2 fits this rule.
 
 **Block 3 — `agents_total` is the cost signal the test can assert.** 7 agents on a 2-macro × 2-sub-q hierarchy = 7 LLM calls just for the decomposition / leaf / sub-synth layer + 1 top-synth = 8 calls minimum. Sequential single-agent on same task = 1 call. ~8× cost. Hierarchy must EARN that 8× through accuracy/structure win on a TRULY 2-layer-decomposable question.
 
@@ -999,19 +1019,27 @@ def test_hierarchy_parallel_at_sub_level():
     assert out["total_wall_s"] < (parallel + sequential) / 2
 ```
 
-**Result** *(measured 2026-05-28 — 3-model compose sweep on same prompt + same hardware)*: `python code/hierarchical.py` on "Compare regulatory frameworks for AI across EU, US, and UK" against 3 compose models:
+**Result** *(measured 2026-05-28, canonical — default top_fan=3, leaf_fan=2 = 10 agents)*: `python code/hierarchical.py` on "Compare regulatory frameworks for AI across EU, US, and UK" against 3 compose models. **Earlier 2-macro measurements were superseded by BCJ Entry 9 cap-vs-contract fix** — the `[:2]` hardcoded cap silently dropped the planner's 3rd macro for the entire chapter's lifetime. Default now matches `LEAD_DECOMPOSE_SYSTEM`'s "decompose into EXACTLY 3" contract.
 
-| Model | Provider | total_wall_s | plan | max_sub | synth | speedup | UK behavior |
-|---|---|---:|---:|---:|---:|---:|---|
-| gpt-oss-20b-MXFP4-Q8 | oMLX local | **115.46** | 9.05 | 68.15 | 38.25 | 1.51× | Label-and-FILL: speculated UK from training-data |
-| Qwen3.5-27B-Opus-distill | oMLX local (MLX 4bit) | **410.57** | 48.76 | 255.81 | 106.00 | 1.55× | Label-and-STOP: empty UK column |
-| Claude Sonnet 4.6 | CLIProxyAPI `:8317` | **55.74** | 4.82 | 29.86 | 21.06 | 1.43× | Label-and-STOP-FIRST: gap notice UPFRONT |
+| Model | Provider | total_wall_s | plan | sub_walls | max_sub | synth | speedup | UK macro present? |
+|---|---|---:|---:|---|---:|---:|---:|---|
+| **Sonnet 4.6** | CLIProxyAPI `:8317` (cloud) | **61.31** | 5.21 | [25.28, 32.34, 24.83] | 32.34 | 23.76 | **1.82×** | ✓ |
+| **gpt-oss-20b-MXFP4-Q8** | oMLX local | **150.95** | 15.25 | [75.04, 100.19, 81.39] | 100.19 | 35.51 | **2.04×** | ✓ |
+| **Qwen3.5-27B-Opus-distill** | oMLX local (MLX 4bit) | **374.59** | 45.12 | [198.54, 237.57, 216.20] | 237.57 | 91.90 | **2.11×** | ✓ |
 
-**Three counter-intuitive findings:** (1) Wall-time ranking is OPPOSITE of "smaller local = faster" — cloud frontier (Sonnet) is fastest, mid-size local distilled (Qwen) is slowest. Cloud-data-center GPU throughput dwarfs M5 Pro on 27B-param class. (2) **Speedup ratio is INVARIANT across models (1.43-1.55×)** despite 7.4× wall-time variation. Speedup is the TOPOLOGY constant; wall is the MODEL constant. Production rule: design topology first (Amdahl), then pick model for wall budget. (3) BCJ Entry 6 reasoning_content trap is gpt-oss-20b-SPECIFIC; both Qwen-distill and Sonnet returned non-empty content immediately, no `reasoning_content` field-separation. Trap is exclusive to OpenAI-compat reasoning-model family.
+**Four key findings:**
 
-**The hierarchical pattern's viability shifts with compose model.** At 410s wall (Qwen-distill) the pattern is batch-only; at 115s (gpt-oss-20b) it's borderline batch; at 55s (Sonnet via cloud) it's interactive-acceptable. The cloud-frontier-model architectural unlock: pattern that's theoretically right but practically slow on local becomes practically right on cloud.
+(1) **Speedup jumped 1.43-1.55× (2-macro buggy) → 1.82-2.11× (3-macro canonical).** Adding the 3rd parallel sub-lead diluted the plan+synth serial overhead across more parallel work. Refined production rule: **speedup is a topology-AND-fan-width constant; wall is a model constant**. Doubling parallel branches (top_fan 2→3) doesn't double speedup because plan+synth grows too — Amdahl ceiling for this 1+N+2N hierarchy is ~2-2.5×.
 
-~7× token cost vs single-agent on all 3 models (1 top-plan + 2 sub-plans + 4 leaves + 2 sub-synths + 1 top-synth = 10 LLM calls). Hierarchy WINS when question has genuine 2-layer decomposition (regulatory comparison across regions confirmed — sub-leads naturally split EU vs US); LOSES (vs flat supervisor with 6 workers) when question is one-layer.
+(2) **3-macro fan revealed the UK regulatory framework that 2-macro silently dropped.** All 3 models' 3rd sub-lead branch covered UK explicitly. Prior 2-macro runs had to fabricate UK content at the top-synthesize layer because no sub-lead ever researched it. **Root cause: `[:2]` cap mismatched the planner's 3-question contract.** Two design surfaces disagreed for chapter's lifetime; fixed via `top_fan=3` default + `top_fan=2` explicit caller override.
+
+(3) **Wall-time ranking is OPPOSITE of "smaller local = faster" intuition.** Cloud frontier (Sonnet) fastest at 61.31s. Smallest local reasoning (gpt-oss-20b) at 150.95s. Mid-size local distilled (Qwen-distill) slowest at 374.59s. Cloud-data-center GPU throughput dwarfs M5 Pro on 27B-param class. **Hierarchical pattern viability shifts with model:** at Sonnet's 61s = INTERACTIVE; at gpt-oss-20b's 151s = borderline batch; at Qwen-distill's 375s = batch-only.
+
+(4) **BCJ Entry 6 reasoning_content trap remained gpt-oss-20b-SPECIFIC at 3-macro fan.** Both Qwen-distill and Sonnet returned non-empty content first try; only gpt-oss-20b hit the empty-content + CoT-loop pattern. Trap is exclusive to OpenAI-compat reasoning-model family.
+
+~14 LLM calls (1 top-plan + 3 sub-plans + 6 leaves + 3 sub-synths + 1 top-synth) — slightly higher than the older 2-macro 10-call estimate. Hierarchy WINS when question has genuine N-layer decomposition with N >= 3 regions (regulatory comparison across EU/US/UK confirmed); LOSES vs flat supervisor when question is one-layer or 2-layer-with-strict-cost-cap.
+
+Full per-run outputs in `lab-03-5-5-5-topology/results/hierarchical_{sonnet-4-6,gpt-oss-20b,qwen-3.5-27b-claude-opus-distill}.txt`. See `lab-03-5-5-5-topology/RESULTS.md` §"Phase 2 hierarchical — 3-macro compose-model sweep" for full 10-finding analysis + production decision matrix.
 
 Full per-run outputs in `lab-03-5-5-5-topology/results/hierarchical_{gpt-oss-20b,qwen-3.5-27b-claude-opus-distill,sonnet-4-6}.txt`. See `lab-03-5-5-5-topology/RESULTS.md` §"Phase 2 hierarchical — compose-model sweep" for full 8-finding analysis + production decision matrix.
 
@@ -1657,6 +1685,21 @@ All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 s
 *Symptom:* `python code/hierarchical.py` produces `answer: ""` for TOP synthesize despite max_tokens=2048 AND max_tokens=4096 bumps. Sub-leads and leaves produce full structured answers; only the TOP synthesize is empty. Diagnostic probe (`code/probe_synthesize.py`) reveals raw API response: `content: null`, `reasoning_content: 13586 chars`, `finish_reason: length`, `completion_tokens: 4096`. The reasoning_content shows a stuck repetition loop: "UK has the AI Act? They have the AI Act? The UK has the AI Act? They have the AI Act?..." for ~13K chars.
 *Root cause:* Two interacting issues. **(a) gpt-oss-20b emits CoT separately**: reasoning models (gpt-oss-20b, DeepSeek-R1, o1-class) emit chain-of-thought into a `reasoning_content` field, NOT the standard `content` field. Most OpenAI-compatible clients read only `content` and silently drop `reasoning_content`. **(b) Prompts asking for material the workers didn't provide cause CoT repetition loops**: the original question asked about EU/US/UK regulatory frameworks; workers covered EU/US only. The model fixated on the UK gap and looped trying to recall whether the UK has an AI Act, exhausting the 4096-token budget on this loop without ever producing final `content`.
 *Fix:* Three layered defenses. **(a) `_chat_openai` falls back to `reasoning_content` when `content` is empty**: returns `[reasoning_only — finish_reason={X}]\n{reasoning_content}` so caller sees the trace + finish_reason instead of silent empty string. Defense at the wire boundary; SUPERSEDES Entry 2's bare `content or ""` coercion. **(b) `LEAD_SYNTHESIZE_SYSTEM` gains explicit gap-acknowledgement instruction**: "synthesize ONLY what workers provided; if question mentions material workers did NOT cover, state gap explicitly and continue. Do NOT speculate or fill in missing material — that causes reasoning models to loop." Prevents the trap at the prompt layer. **(c) Hierarchical TOP synthesize uses `max_tokens=4096`** (was 2048) — hierarchical synthesize input is 2 already-synthesized sub-answers (~600-1000 tokens each) vs supervisor's 3 short worker answers (~200-400 tokens each), so the budget doubles. Production rule generalizes beyond multi-agent: **any reasoning-model deployment must read both `content` AND `reasoning_content` from the API response, and prompts must explicitly bound the scope to provided material**. Same trap-class as W3.5.8 BCJ Entry 8 (reasoning-model max_tokens exhaustion) — adds the read-side `reasoning_content` defense.
+
+**Entry 7 — Distilled models inherit source verbosity despite explicit JSON-only instructions.** *(observed 2026-05-28)*
+*Symptom:* `Qwen3.5-27B-Claude-Opus-Distilled-MLX-4bit` running `plan_decompose` (which requires JSON-only output per `LEAD_DECOMPOSE_SYSTEM`) returned prose preamble before the JSON object: `"Here are 3 sub-questions:\n\n{...}"`. The original `plan_decompose` parser used `raw.startswith("```")` to handle markdown fence; the prose-before-JSON shape wasn't covered. `json.loads(raw.strip())` raised `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`. gpt-oss-20b and Sonnet both honored the JSON-only format on the same prompt; only the distilled Qwen-Opus violated it.
+*Root cause:* Distillation transfers behaviors selectively. Qwen3.5-27B-Claude-Opus-Distilled inherited Opus's THOROUGHNESS (verbose explanatory prose) but didn't fully inherit Opus's INSTRUCTION-DISCIPLINE (strict format compliance). When instructions conflict with the distilled model's "explain your work" bias, the bias wins. This is a counter-intuitive distillation property worth noting: distilled models can be MORE verbose than the model they were distilled from, NOT less.
+*Fix:* Regex-extract the first `{.*}` JSON object instead of `startswith` check. `m = re.search(r"\{.*\}", raw, re.DOTALL)`. Handles three observed wire-shapes: (a) bare JSON, (b) ```json fence, (c) prose preamble + JSON body. Raise `ValueError` with truncated response when no JSON object found — surface genuine parse failures instead of silent empty `[]`. Production rule generalizes: **at every LLM output-parsing boundary, assume the model COULD emit prose despite explicit "JSON only" instructions; extract the structured payload with a regex/parser, don't trust `startswith` checks**. Same shape as W3.5 BCJ Entry 2 ("`response_format=json_object` is a contract on cloud models, a hint on local models") — distillation can transmute the cloud-contract hint into a local-bias-override.
+
+**Entry 8 — `LLM_TIMEOUT_S=60` default insufficient for Sonnet via CLIProxyAPI.** *(observed 2026-05-28)*
+*Symptom:* First hierarchical run against Sonnet via `:8317` proxy raised `httpx.ReadTimeout: timed out` after exactly 60 seconds. Sonnet's per-call latency on heavy synthesis prompts (~2k input tokens, structured table output) routinely exceeds 60s through the proxy stack (caller → proxy → Anthropic API → backend → response back). The 60s default in `_chat_anthropic_proxy` was inherited from gpt-oss-20b-shaped curriculum baselines where local inference returns in ≤30s per call.
+*Root cause:* Single global `LLM_TIMEOUT_S` env var read by ALL providers. The 60s default works for local oMLX (≤30s per call) but fails for proxied frontier models (4 network hops + Anthropic queuing + heavy-synthesis output). The right abstraction is per-provider config, not a single constant.
+*Fix:* Workaround: bump via `LLM_TIMEOUT_S=300` env override before invocation. Follow-up code change: read per-provider env first, fall back to global: e.g., `_timeout_s_anthropic_proxy()` reads `ANTHROPIC_TIMEOUT_S` then `LLM_TIMEOUT_S` then defaults to 300; `_timeout_s_openai()` defaults to 60. Production rule: when one timeout constant fronts heterogeneous providers, surface per-provider overrides — same pattern as `OMLX_API_KEY` precedence over `OPENAI_API_KEY` already established in `_chat_openai`.
+
+**Entry 9 — Hierarchical `[:2]` cap was bug masquerading as cost-bound feature; silently dropped planner's 3rd macro for chapter's lifetime.** *(observed 2026-05-28)*
+*Symptom:* `hierarchical_run("Compare regulatory frameworks for AI across EU, US, and UK")` produced `decomposed into 2 macros` even though the user's question explicitly named 3 regions. UK never appeared as a sub-lead's research scope; top-synthesize had to FABRICATE UK content from training-data knowledge (which then triggered BCJ Entry 6's repetition loop on reasoning models). User flagged: "why only 2 macros? Should be 3 including UK."
+*Root cause:* TWO design surfaces disagreed silently. (a) `LEAD_DECOMPOSE_SYSTEM` contract: "Decompose into EXACTLY 3 sub-questions" + JSON schema `{"sub_questions": ["q1", "q2", "q3"]}`. Planner returns 3. (b) `hierarchical_run` runtime: `macros = plan_decompose(question)[:2]` — hardcoded cap to 2. Chapter §2.4 framed this as cost control ("2×2 fan keeps total agents = 7"), but the cap silently dropped the planner's 3rd macro for EVERY question, not just cost-bounded ones. Same shape as W3.5.8 §5.3.2 (chapter predicted matrix vs harness methodology disagreement) — two design surfaces describe the same value, runtime assertion absent, drift compounds.
+*Fix:* (a) Add `top_fan` parameter to `hierarchical_run` with default `top_fan=3` matching planner contract. `top_fan=2` becomes explicit caller override for cost-bounded variants. (b) Same parameterization for `leaf_fan` (default 2). (c) `agents_total` computed from actual results (`1 + len(macros) + sum(len(s.leaf_results) for s in sub_results)`), not hardcoded `1 + len(macros) + len(macros) * 2`. (d) Test `test_hierarchy_depth_and_agent_count` updated to assert `agents_total == 10` (3-macro default); new test `test_hierarchy_top_fan_2_preserves_7_agents` preserves the 7-agent contract for the cost-bounded variant. Production rule: **when two design surfaces describe the same value (prompt contract + runtime cap), put a runtime assertion that they agree** — `assert len(plan_decompose(q)) >= top_fan, "planner returned fewer macros than top_fan; cap mismatch"`. Without the assertion, silent drift compounds for the entire codebase lifetime.
 
 ---
 
