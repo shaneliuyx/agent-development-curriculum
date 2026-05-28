@@ -274,19 +274,31 @@ except ImportError:
     # python-dotenv optional — caller can still `source .env` manually.
     pass
 
-_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic-proxy")
-_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "60"))
+def _provider() -> str:
+    """Resolve provider at CALL time, not import time. Allows pytest
+    monkeypatch.setenv to override LLM_PROVIDER per-test."""
+    return os.getenv("LLM_PROVIDER", "anthropic-proxy")
+
+
+def _timeout_s() -> float:
+    return float(os.getenv("LLM_TIMEOUT_S", "60"))
+
+
+# Back-compat shims for any older callers reading module-level constants.
+_PROVIDER = _provider()
+_TIMEOUT_S = _timeout_s()
 
 
 def chat(prompt: str, system: str | None = None) -> str:
     """Send (system, prompt) → return assistant text. Sync; uses httpx."""
-    if _PROVIDER == "anthropic-proxy":
+    provider = _provider()
+    if provider == "anthropic-proxy":
         return _chat_anthropic_proxy(prompt, system)
-    if _PROVIDER == "openai":
+    if provider == "openai":
         return _chat_openai(prompt, system)
-    if _PROVIDER == "mock":
+    if provider == "mock":
         return _chat_mock(prompt, system)
-    raise ValueError(f"unknown LLM_PROVIDER: {_PROVIDER}")
+    raise ValueError(f"unknown LLM_PROVIDER: {provider}")
 
 
 def _chat_anthropic_proxy(prompt: str, system: str | None) -> str:
@@ -347,15 +359,74 @@ def _chat_openai(prompt: str, system: str | None) -> str:
         "max_tokens": 1024,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
-    r = httpx.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
+    r = httpx.post(url, json=body, headers=headers, timeout=_timeout_s())
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    data = r.json()
+    # Defensive: some OpenAI-compat servers return null content when model
+    # emits tool_calls or hits a stop sequence; others return empty string.
+    # Caller expects str; coerce None/missing to empty string.
+    try:
+        return data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
 
 
 def _chat_mock(prompt: str, system: str | None) -> str:
-    """Deterministic stub. Returns first 100 chars of prompt reversed.
-    Useful for offline unit tests; tests/conftest.py sets LLM_PROVIDER=mock."""
-    return (prompt[:100])[::-1]
+    """Format-aware deterministic stub. Inspects (system, prompt) and returns
+    a response that satisfies the calling code's parse expectations.
+
+    Recognized formats:
+      - decompose plan      → JSON {"sub_questions": [...]}
+      - synthesize          → multi-sentence answer
+      - triage / handoff    → "HANDOFF: <tool_name>"
+      - group-chat selector → single agent name
+      - LLM-judge           → "BEST: <id>\\nREASON: ..."
+      - default             → "Mock response."
+    """
+    import re
+    sys = (system or "").lower()
+    p = prompt.lower()
+
+    # Supervisor decomposition: needs JSON shape with sub_questions list
+    if "decompose" in sys and ("sub-question" in sys or "json" in sys):
+        return '{"sub_questions": ["mock sub-q 1", "mock sub-q 2", "mock sub-q 3"]}'
+
+    # Synthesis prompt → non-trivial multi-sentence answer
+    if "synthesi" in sys:
+        return ("Mock synthesized answer. Combines worker outputs into one summary. "
+                "Surfaces no disagreement because workers are mocked.")
+
+    # Triage handoff: emit HANDOFF: <tool> based on USER MESSAGE keywords.
+    # Important: tool docstrings are embedded in the prompt; extract just the
+    # USER MESSAGE line to avoid false-matching on tool descriptions.
+    if "triage" in sys:
+        user_msg_match = re.search(r"USER MESSAGE:\s*(.+?)(?:\n|$)", prompt)
+        umsg = (user_msg_match.group(1) if user_msg_match else prompt).lower()
+        if any(k in umsg for k in ("refund", "money", "billing", "credit card", "charge")):
+            return "HANDOFF: transfer_to_refunds"
+        if any(k in umsg for k in ("plan", "upgrade", "pricing", "enterprise", "subscribe", "difference between")):
+            return "HANDOFF: transfer_to_sales"
+        return "I can help with that directly."
+
+    # Group-chat speaker selector: "Pick ONE of: coder/reviewer/tester"
+    m = re.search(r"[Pp]ick\s+(?:one\s+of)?:\s*([\w/]+)", prompt)
+    if m:
+        return m.group(1).split("/")[0]
+
+    # LLM-judge: "Which solver's ANSWER is most accurate?"
+    if "which solver" in p or "best:" in p:
+        return "BEST: 0\nREASON: mock judge picks solver 0"
+
+    # Worker / specialist: 3-sentence factual response
+    if any(k in sys for k in ("worker", "refund specialist", "sales specialist")):
+        return "Mock answer line one. Line two. Line three end."
+
+    # Solver agents — return one of "42" / "yes" / "Paris" with ANSWER: prefix
+    if "answer:" in sys:
+        return "Reasoning step. Reasoning step. ANSWER: 42"
+
+    # Default fallback
+    return "Mock response."
 ```
 
 **Step 3 — Configure provider:**
@@ -555,12 +626,17 @@ if __name__ == "__main__":
 **Test:**
 
 ```python
-# tests/test_supervisor.py — runs the full topology against a fixed question
+# tests/test_supervisor.py
 import json
+import os
+import pytest
 from supervisor import supervisor_run
 
 def test_supervisor_parallel_wins():
-    """total ≈ plan + max(workers) + synth, NOT plan + sum(workers) + synth."""
+    """total ≈ plan + max(workers) + synth, NOT plan + sum(workers) + synth.
+    Requires real LLM latency; mock returns instantly so wall-times are 0."""
+    if os.getenv("LLM_PROVIDER") == "mock":
+        pytest.skip("parallel-wall test requires real LLM latency")
     out = supervisor_run("What is photosynthesis?")
     parallel = out["plan_wall_s"] + out["max_worker_wall_s"] + out["synthesize_wall_s"]
     sequential = out["plan_wall_s"] + out["sum_worker_walls_s"] + out["synthesize_wall_s"]
@@ -677,6 +753,8 @@ if __name__ == "__main__":
 
 ```python
 # tests/test_hierarchical.py
+import os
+import pytest
 from hierarchical import hierarchical_run
 
 def test_hierarchy_depth_and_agent_count():
@@ -685,7 +763,10 @@ def test_hierarchy_depth_and_agent_count():
     assert out["depth"] == 2 and out["agents_total"] == 7
 
 def test_hierarchy_parallel_at_sub_level():
-    """Sub-leads run in parallel: total ≈ plan + max(sub) + synth."""
+    """Sub-leads run in parallel: total ≈ plan + max(sub) + synth.
+    Requires real LLM latency; mock returns instantly so wall-times are 0."""
+    if os.getenv("LLM_PROVIDER") == "mock":
+        pytest.skip("parallel-wall test requires real LLM latency")
     out = hierarchical_run("OAuth 2.0 vs OAuth 2.1 differences?")
     parallel = out["plan_wall_s"] + out["max_sub_wall_s"] + out["synthesize_wall_s"]
     sequential = out["plan_wall_s"] + sum(out["sub_walls_s"]) + out["synthesize_wall_s"]
