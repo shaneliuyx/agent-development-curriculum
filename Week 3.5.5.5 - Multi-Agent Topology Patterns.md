@@ -1268,19 +1268,35 @@ def test_terminate_token_ends_conversation():
         assert out["rounds_used"] < 20
 ```
 
-**Result** *(measured 2026-05-28, Claude Sonnet 4.6 via CLIProxyAPI `:8317`, task = "Write a Python function is_palindrome(s) — reviewer + tester collaborate")*:
+**Result** *(measured 2026-05-28, 3-model compose sweep, task = "Write a Python function is_palindrome(s) — reviewer + tester collaborate")*:
 
-| Selector | Rounds used | LLM calls | Termination | Discussion shape |
-|---|---:|---:|---|---|
-| `round-robin` | **9** (max cap hit, force-terminated) | 9 | hit max_rounds=9 | Cyclic coder→reviewer→tester×3; no convergence — last turn happened to emit TERMINATE in coder's response, otherwise would have continued |
-| `llm-selected` | **4** | 4 selector + 4 agent = **8** | coder→TERMINATE on turn 4 | Most efficient — selector picked coder→reviewer→tester→coder→TERMINATE, converged in 4 rounds. Discussion shape: code → review (punctuation gap) → test (exposes gap) → coder fixes + terminates |
-| `custom` | **7** | 7 (rules + LLM fallback hybrid) | coder→TERMINATE on turn 7 | Rule-pinned: tester always follows coder, reviewer always follows tester. Took 2× more rounds than llm-selected because rules forced extra cycles |
+| Model | round-robin | llm-selected | custom | Total LLM calls |
+|---|:-:|:-:|:-:|:-:|
+| **Sonnet 4.6** (cloud) | 9 (max cap hit, no convergence) | **4** (optimal — coder→reviewer→tester→coder+TERMINATE) | 7 | 24 |
+| **gpt-oss-20b** (local reasoning) | **3** (early TERMINATE) | 6 | 4 | 19 |
+| **Qwen3.5-27B-Opus-distill** (local distilled) | 6 | **1** (PREMATURE — coder shortcuts collaboration) | **1** (PREMATURE) | 9 |
 
-**Memory-sharing observation:** every agent's `respond(pool)` reads the FULL pool as transcript before writing — blackboard pattern. Pool grew to 5/10/8 messages across the 3 selectors; full transcript fits in Sonnet's 200k context with no truncation needed. For longer discussions, pool should be summarized periodically OR routed to external store (Qdrant + bge-m3 retrieval per W3.5.8 two-tier pattern). At ≤10 turns + ≤5 agents the in-memory list IS the right shared-memory abstraction.
+**Three distinct failure shapes — same selector, opposite behaviors per model:**
 
-**Counter to projection:** projected `round-robin completes in ~6-9 rounds` was approximately right but UNDERSPECIFIED — it hit max_cap=9 because round-robin has NO selector intelligence to detect convergence. The "completes" framing was generous; reality is "termination depends on whether an agent happens to emit TERMINATE during their natural turn." For round-robin to reliably converge, max_rounds must be raised AND agents must be prompted to emit TERMINATE when they observe consensus. **Projected `llm-selected converges in ~5-7 rounds` was over-pessimistic** — actual was 4 rounds because Sonnet's selector intelligence is high enough to route turns optimally on this simple task. Llm-selected scales better than projected when the task has clear convergence signals.
+1. **Sonnet HEDGES (round-robin hits max cap).** Sonnet's coder kept iterating, asking for more review — no natural stopping point. Round-robin has no convergence detection. Sonnet's "calibrated hedging" trait that wins §5.3.5 LongMemEval becomes "doesn't know when to stop" in group_chat.
 
-Per-round LLM-call cost: round-robin = 1 call/round, llm-selected = 2 calls/round (selector + agent), custom = 1.5 calls/round (rule paths skip selector LLM call, fallback paths invoke it). On this task: round-robin 9 calls / llm-selected 8 calls / custom 7 calls — **llm-selected was cheapest by total calls despite the 2× per-round overhead**, because it terminated fastest.
+2. **gpt-oss-20b TERMINATES EARLY (round-robin = 3 rounds).** Reasoning model's CoT decided "good enough" after only 3 turns. Internal "I think we're done" reasoning leaked into emitted text as TERMINATE.
+
+3. **Qwen-distill SHORTCUTS THE COLLABORATION (llm-selected + custom = 1 round).** Coder turn 1 emitted: code + `"**Reviewer:** Please review..."` + `"**Tester:** Please provide test cases..."` + **`TERMINATE`** — coder DELEGATED to reviewer/tester but ALSO emitted TERMINATE in the same turn, so the loop exited before named collaborators ever responded. The commitment-bias trait that wins LongMemEval (committed answers vs hedging) BREAKS group_chat (committed to "done" before any actual collaboration).
+
+**Memory-sharing observation:** every agent's `respond(pool)` reads the FULL pool as transcript before writing — blackboard pattern. At ≤10 turns + ≤5 agents the in-memory list IS the right shared-memory abstraction. For longer discussions, pool should be summarized OR routed to external store (Qdrant + bge-m3 per W3.5.8 two-tier pattern).
+
+**The trait-vs-eval crystallized finding:** SAME model trait wins one eval, fails another.
+- LongMemEval (commitment-bias eval): Qwen-distill 77% > Opus 4.7 68% > Sonnet 4.6 60% — commit wins, hedge loses.
+- Group_chat collaboration: Sonnet 7 rounds custom > gpt-oss-20b 4 rounds custom >> Qwen-distill 1 round (BROKEN) — collaboration wins, premature-commit loses.
+
+**Production rule from cross-eval evidence:** pick a model for the right TRAIT for your workload's failure mode, not for "best score on benchmark X." Shipping Qwen-distill (LongMemEval winner) into a multi-agent collaboration workload gets a 1-round broken loop. The selector × model matrix is a true 2D search space.
+
+Per-round LLM-call cost: round-robin = 1 call/round, llm-selected = 2 calls/round (selector + agent), custom = 1.5 calls/round (rules skip selector LLM call, fallback invokes it). Total calls across selectors: Sonnet 24, gpt-oss-20b 19, Qwen-distill 9 (but Qwen's "low cost" is the failure mode — premature termination).
+
+**NEW BCJ Entry 10 — Group-chat premature-TERMINATE on commit-biased models.** Termination contract `if "TERMINATE" in msg.upper()` assumes TERMINATE = convergence. Commit-biased models emit TERMINATE before any actual collaboration. **Fix**: prompt-layer ("emit TERMINATE ONLY after ≥3 turns + reviewer/tester both responded") OR runtime-layer (assert minimum-rounds before honoring TERMINATE). The bug surfaces only on collaboration-required tasks; tests that just count rounds wouldn't catch it.
+
+Full per-run transcripts: `lab-03-5-5-5-topology/results/group_chat_{sonnet-4-6,gpt-oss-20b,qwen-3.5-27b-claude-opus-distill}.txt`.
 
 Full discussion transcript in `lab-03-5-5-5-topology/results/group_chat_sonnet-4-6.txt` (232 lines, all 3 selectors visible).
 
@@ -1735,6 +1751,11 @@ All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 s
 *Symptom:* `hierarchical_run("Compare regulatory frameworks for AI across EU, US, and UK")` produced `decomposed into 2 macros` even though the user's question explicitly named 3 regions. UK never appeared as a sub-lead's research scope; top-synthesize had to FABRICATE UK content from training-data knowledge (which then triggered BCJ Entry 6's repetition loop on reasoning models). User flagged: "why only 2 macros? Should be 3 including UK."
 *Root cause:* TWO design surfaces disagreed silently. (a) `LEAD_DECOMPOSE_SYSTEM` contract: "Decompose into EXACTLY 3 sub-questions" + JSON schema `{"sub_questions": ["q1", "q2", "q3"]}`. Planner returns 3. (b) `hierarchical_run` runtime: `macros = plan_decompose(question)[:2]` — hardcoded cap to 2. Chapter §2.4 framed this as cost control ("2×2 fan keeps total agents = 7"), but the cap silently dropped the planner's 3rd macro for EVERY question, not just cost-bounded ones. Same shape as W3.5.8 §5.3.2 (chapter predicted matrix vs harness methodology disagreement) — two design surfaces describe the same value, runtime assertion absent, drift compounds.
 *Fix:* (a) Add `top_fan` parameter to `hierarchical_run` with default `top_fan=3` matching planner contract. `top_fan=2` becomes explicit caller override for cost-bounded variants. (b) Same parameterization for `leaf_fan` (default 2). (c) `agents_total` computed from actual results (`1 + len(macros) + sum(len(s.leaf_results) for s in sub_results)`), not hardcoded `1 + len(macros) + len(macros) * 2`. (d) Test `test_hierarchy_depth_and_agent_count` updated to assert `agents_total == 10` (3-macro default); new test `test_hierarchy_top_fan_2_preserves_7_agents` preserves the 7-agent contract for the cost-bounded variant. Production rule: **when two design surfaces describe the same value (prompt contract + runtime cap), put a runtime assertion that they agree** — `assert len(plan_decompose(q)) >= top_fan, "planner returned fewer macros than top_fan; cap mismatch"`. Without the assertion, silent drift compounds for the entire codebase lifetime.
+
+**Entry 10 — Group-chat premature-TERMINATE on commit-biased models breaks multi-turn collaboration.** *(observed 2026-05-28)*
+*Symptom:* `python code/group_chat.py` against Qwen3.5-27B-Claude-Opus-distill on task "Write `is_palindrome` — reviewer + tester collaborate" terminated in **1 round** for both `llm-selected` and `custom` selectors. Coder's turn 1 emitted code + delegated to "**Reviewer:** Please review..." + "**Tester:** Please provide test cases..." + **`TERMINATE`** in the same response. Loop's `if "TERMINATE" in msg.upper(): exit` triggered immediately — reviewer and tester NEVER spoke. Task required collaboration; collaboration never happened. Same selector + same task on Sonnet 4.6 produced 4 rounds (proper collaboration); on gpt-oss-20b produced 6 rounds.
+*Root cause:* The termination contract assumes `TERMINATE` = convergence-after-collaboration. Models with strong commitment-bias (Qwen-Opus-distill, transferred from Opus's "commit-with-evidence" trait — see §5.3.5 LongMemEval where this trait WINS at 77% vs Sonnet's 60%) can decide "I'm done" and emit TERMINATE BEFORE collaboration has occurred. The same trait that wins commit-bias evals (LongMemEval) fails coordination-required workloads (group_chat). **Eval-trait mismatch:** picking a model for "best score on benchmark X" without checking whether the trait that scores HIGH on X is the SAME trait your workload needs.
+*Fix:* Two-layer defense. (a) **Prompt layer**: CODER's system prompt gains explicit minimum-turn condition — "End with TERMINATE ONLY after AT LEAST 3 turns have happened AND reviewer + tester have both responded. Until then, write code + ask for review/tests but do NOT emit TERMINATE." Forces the model to defer termination to a state it can verify from `pool` content. (b) **Runtime layer**: assert minimum-rounds before honoring TERMINATE — `if "TERMINATE" in msg.upper() and round_n >= min_rounds_for_collaboration: break`. Production rule generalizes: **termination contracts must be defensible against shortcut paths** — any predicate that exits a multi-turn loop should require BOTH a textual signal AND a state-check (turn count, agent participation, completion criteria). Without the state-check, commit-biased models bypass the entire interaction.
 
 ---
 
