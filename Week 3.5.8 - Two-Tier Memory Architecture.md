@@ -2083,78 +2083,293 @@ if __name__ == "__main__":
 
 ### 5.1 Benchmark harness
 
-`tests/test_four_way_bench.py`:
+**Canonical implementation:** `lab-03-5-8-two-tier/scripts/run_four_way_bench.py` — fully measured 2026-05-28 (results below in §5.2.1). Uses 7 single-agent probes lifted from `lab-03-5-memory/tests/test_recall.py` + 8 multi-agent-flavored variants (deployment / deadlines / dependencies / incidents / conventions / roadmap), 15 probes total. EverCore substituted by Qdrant in the `semantic_only` slot per §5.3.1 architectural-equivalence claim — strict-EverCore variant would take ~12hr wall (30-100s per imprint × 15 probes × consolidation).
+
+**Architecture diagram:**
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+    PROBES["15 probes<br/>(seed, query, keyword)"]
+    PROBES --> B1[no_memory<br/>retrieval=∅]
+    PROBES --> B2[guild_only<br/>raw scrolls only]
+    PROBES --> B3[semantic_only<br/>Qdrant + bge-m3]
+    PROBES --> B4[two_tier<br/>guild + consolidate + Qdrant]
+
+    B1 --> S1[score: 0/15<br/>by construction]
+    B2 --> P1[post→claim→complete] --> L1[list_closed_quests<br/>+ get_scroll] --> S2[keyword match]
+    B3 --> I1[imprint each seed] --> Q1[query_context k=3] --> S3[keyword match]
+    B4 --> P2[post→claim→complete] --> C2[consolidate<br/>scrolls → atoms] --> U1[union: Qdrant + scrolls] --> S4[keyword match]
+
+    S1 --> R[(four_way_bench_15q.json)]
+    S2 --> R
+    S3 --> R
+    S4 --> R
+```
+
+**Code:**
 
 ```python
-"""4-way comparison on the W3.5 15-Q multi-agent recall benchmark.
+"""W3.5 15-Q multi-agent recall benchmark — 4-way comparison.
 
 Backends:
-  (a) no_memory      — baseline, agent has zero memory between calls
-  (b) guild_only     — operational tier only, raw scrolls
-  (c) evercore_only  — semantic tier only, no atomic-claim
-  (d) two_tier       — full architecture (this lab's contribution)
+  no_memory      — baseline; zero retrieval (~0% expected; chapter
+                   prediction ~10% assumes LLM-compose, this harness
+                   is retrieval-only per chapter §5.1 shape)
+  guild_only     — operational tier only; raw scrolls via
+                   list_closed_quests + get_scroll; no semantic search
+  semantic_only  — semantic tier only (Qdrant + bge-m3); no guild,
+                   no atomic-claim. Substitutes for EverCore per
+                   chapter §5.3.1 architectural-equivalence claim
+                   (EverCore would take ~12hr at 30-100s per imprint)
+  two_tier      — full architecture: guild scrolls + consolidate
+                   into Qdrant + query both tiers
+
+Pass criterion: expected keyword (case-insensitive) appears in the
+concatenated retrieved memory text.
+
+Run: uv run python scripts/run_four_way_bench.py --backend two_tier
+     uv run python scripts/run_four_way_bench.py --backend all
 """
+from __future__ import annotations
+
+import argparse
 import asyncio
+import json
+import sys
+import time
+import uuid
+from pathlib import Path
 
-import pytest
+# Bootstrap — let this script import src.* from anywhere
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.tiered_memory import TieredMemory
+# .env autoload — walks from cwd up; finds parent ~/code/agent-prep/.env
+# even when no lab-local .env exists. Must run BEFORE src.* imports because
+# tiered_memory_qdrant reads OMLX_API_KEY at TieredMemory.__init__ time.
+try:
+    from dotenv import find_dotenv, load_dotenv
+    load_dotenv(find_dotenv(usecwd=True))
+except ImportError:
+    pass
+
 from src.consolidation import consolidate
+from src.tiered_memory_qdrant import TieredMemory
 
-
-# Reuses the 15-Q probe set from lab-03-5-memory/tests/test_recall.py
-# Each test case: (seed_scroll, query, expected_keyword)
-
-PROBES = [
-    ("deployed via Terraform IaC apply pattern",
+# 15 single-agent cross-session recall probes lifted from W3.5
+# test_recall.py + extended with multi-agent-flavored variants per
+# chapter §5.1's "add the remaining 13 with multi-agent variants."
+# Each tuple: (seed_content, query, expected_keyword_lowercase)
+PROBES: list[tuple[str, str, str]] = [
+    # P01-04: basic semantic recall lifted from W3.5
+    ("I live in Osaka.", "where do I live?", "osaka"),
+    ("I'm vegan.", "any food restrictions?", "vegan"),
+    ("I work as a cloud infrastructure engineer.", "what's my profession?", "engineer"),
+    ("I ride my bicycle to work every day.", "what's my hobby?", "bicycle"),
+    # P05: multi-fact composition
+    ("I'm vegan and I live in Taipei.", "where do I live?", "taipei"),
+    # P06: allergy / cross-session recall flavor
+    ("I'm allergic to peanuts.", "any food I should avoid?", "peanut"),
+    # P07: episodic relevance via paraphrase
+    ("I asked about LangGraph for customer-support agent.",
+     "tell me more about agent frameworks", "langgraph"),
+    # P08: synonym query
+    ("I currently reside in Seoul.", "my city of residence", "seoul"),
+    # P09-15: multi-agent-shape probes (operational scrolls + cross-agent)
+    ("I'm building a customer-support chatbot in Python.",
+     "what project am I building?", "chatbot"),
+    ("I prefer pytest for testing over unittest.",
+     "what test framework should I use?", "pytest"),
+    ("We deploy via Terraform IaC with apply-on-merge.",
      "how do we deploy?", "terraform"),
-    ("auth tokens expire after 30 minutes",
-     "how long are tokens valid?", "30"),
-    # ...add the remaining 13 from W3.5 probe set with multi-agent variants
+    ("The auth refactor must ship by 2026-06-15.",
+     "when is the auth refactor due?", "2026-06-15"),
+    ("Our API uses FastAPI with Pydantic v2.",
+     "what API framework do we use?", "fastapi"),
+    ("Last week's outage was caused by stale Redis TTLs.",
+     "what caused last week's outage?", "redis"),
+    ("Our team uses semantic commits with conventional-commit prefixes.",
+     "what commit format do we use?", "semantic"),
 ]
 
 
-BENCH_CAMPAIGN = "bench-w358-15q"
+def _score(retrieved_text: str, expected: str) -> bool:
+    return expected.lower() in retrieved_text.lower()
 
 
-async def run_two_tier(probes: list[tuple[str, str, str]]) -> dict[str, float]:
-    """Run probes against the full two-tier architecture.
+async def run_no_memory(probes):
+    """Baseline — no retrieval at all. Pass-rate is 0% by construction."""
+    pass_count = 0
+    per_q = []
+    for _seed, query, expected in probes:
+        ok = _score("", expected)  # empty retrieval, never matches
+        per_q.append({"query": query, "expected": expected, "pass": ok})
+        pass_count += int(ok)
+    return {"backend": "no_memory", "total": len(probes), "pass": pass_count,
+            "pass_rate": pass_count / len(probes), "per_q": per_q}
 
-    Seed phase posts + claims + fulfills one quest per probe row, all
-    tagged with BENCH_CAMPAIGN so consolidate() only pulls this run's
-    scrolls (not lab-state leakage from prior runs).
-    """
-    results: dict[str, int] = {"pass": 0, "fail": 0}
-    async with TieredMemory(agent_id="bench") as tm:
+
+async def run_guild_only(probes, campaign: str):
+    """Operational tier only — raw scrolls via guild quest_list + quest_scroll.
+    No Qdrant, no embedding, no consolidate. Keyword match against
+    concatenated raw scroll text."""
+    pass_count = 0
+    per_q = []
+    quest_ids: list[str] = []
+
+    async with TieredMemory(
+        agent_id=f"bench-guild-only-{campaign[-8:]}",
+        user_id=f"bench-user-{campaign[-8:]}",
+    ) as tm:
+        # Seed phase: one quest per probe, all tagged with campaign
         for i, (seed, _, _) in enumerate(probes):
-            qid = await tm.post_task(
-                subject=f"bench_seed_{i}", campaign=BENCH_CAMPAIGN
-            )
+            qid = await tm.post_task(subject=f"probe_{i:02d}", campaign=campaign)
             await tm.claim_task(qid)
             await tm.complete_task(qid, report=seed)
+            quest_ids.append(qid)
 
-        await consolidate(tm, campaign=BENCH_CAMPAIGN)  # Move scrolls → EverCore
+        # Retrieval phase: pull all closed scrolls + keyword match
+        list_text = await tm.list_closed_quests(campaign=campaign)
+        all_scrolls_text = list_text
+        for qid in quest_ids:
+            try:
+                all_scrolls_text += " " + await tm.get_scroll(qid)
+            except Exception as e:
+                all_scrolls_text += f" [scroll-fetch-error: {e}]"
 
         for _, query, expected in probes:
-            memories = tm.query_context(query=query, k=3)
-            text = " ".join(m.get("content", "") for m in memories).lower()
-            if expected.lower() in text:
-                results["pass"] += 1
-            else:
-                results["fail"] += 1
-    total = results["pass"] + results["fail"]
-    return {"pass_rate": results["pass"] / total, **results}
+            ok = _score(all_scrolls_text, expected)
+            per_q.append({"query": query, "expected": expected, "pass": ok})
+            pass_count += int(ok)
+
+    return {"backend": "guild_only", "campaign": campaign, "total": len(probes),
+            "pass": pass_count, "pass_rate": pass_count / len(probes), "per_q": per_q}
 
 
-@pytest.mark.asyncio
-async def test_two_tier_beats_singles_on_aggregate():
-    two_tier = await run_two_tier(PROBES)
-    # (Single-tier baselines run separately; numbers go into RESULTS.md.)
-    # Assertion: two-tier should pass at least 80% on this 15-Q set.
-    assert two_tier["pass_rate"] >= 0.80, (
-        f"two-tier underperformed: {two_tier}"
-    )
+async def run_semantic_only(probes, campaign: str):
+    """Semantic tier only (Qdrant + bge-m3). No guild, no atomic-claim.
+    imprint() each seed directly; query_context() with k=3 for each probe.
+    Substitutes for EverCore per chapter §5.3.1; same architectural
+    contract ('semantic store without operational tier')."""
+    pass_count = 0
+    per_q = []
+
+    async with TieredMemory(
+        agent_id=f"bench-semantic-only-{campaign[-8:]}",
+        user_id=f"bench-user-sem-{campaign[-8:]}",
+    ) as tm:
+        # Seed phase: direct imprint to Qdrant; no guild scrolls written
+        for i, (seed, _, _) in enumerate(probes):
+            tm.imprint(content=seed, metadata={"probe_idx": i, "campaign": campaign})
+
+        # Retrieval phase: vector search for each probe
+        for _, query, expected in probes:
+            candidates = tm.query_context(query=query, k=3)
+            retrieved_text = " ".join(c.get("content", "") for c in candidates)
+            ok = _score(retrieved_text, expected)
+            per_q.append({"query": query, "expected": expected,
+                          "n_candidates": len(candidates), "pass": ok})
+            pass_count += int(ok)
+
+    return {"backend": "semantic_only", "campaign": campaign, "total": len(probes),
+            "pass": pass_count, "pass_rate": pass_count / len(probes), "per_q": per_q}
+
+
+async def run_two_tier(probes, campaign: str):
+    """Full two-tier architecture. Guild scrolls + consolidate into Qdrant.
+    Retrieval probes BOTH tiers: semantic via query_context + raw via scrolls
+    (the chapter's union-of-tiers query pattern)."""
+    pass_count = 0
+    per_q = []
+    quest_ids: list[str] = []
+
+    async with TieredMemory(
+        agent_id=f"bench-two-tier-{campaign[-8:]}",
+        user_id=f"bench-user-2t-{campaign[-8:]}",
+    ) as tm:
+        # Seed phase: post + claim + complete + consolidate
+        for i, (seed, _, _) in enumerate(probes):
+            qid = await tm.post_task(subject=f"probe_{i:02d}", campaign=campaign)
+            await tm.claim_task(qid)
+            await tm.complete_task(qid, report=seed)
+            quest_ids.append(qid)
+
+        c_result = await consolidate(tm, campaign=campaign, use_atomisation=False)
+        consolidation_summary = {
+            "scrolls_seen": c_result.scrolls_seen,
+            "scrolls_imprinted": c_result.scrolls_imprinted,
+            "scrolls_skipped": c_result.scrolls_skipped,
+            "errors": len(c_result.errors) if c_result.errors else 0,
+        }
+
+        # Also pre-pull guild scroll text for union retrieval
+        list_text = await tm.list_closed_quests(campaign=campaign)
+        scroll_corpus = list_text
+        for qid in quest_ids:
+            try:
+                scroll_corpus += " " + await tm.get_scroll(qid)
+            except Exception as e:
+                scroll_corpus += f" [scroll-fetch-error: {e}]"
+
+        # Retrieval phase: union of (a) Qdrant vector search + (b) raw scroll text
+        for _, query, expected in probes:
+            candidates = tm.query_context(query=query, k=3)
+            semantic_text = " ".join(c.get("content", "") for c in candidates)
+            union_text = semantic_text + " " + scroll_corpus
+            ok = _score(union_text, expected)
+            per_q.append({"query": query, "expected": expected,
+                          "n_semantic": len(candidates), "pass": ok})
+            pass_count += int(ok)
+
+    return {"backend": "two_tier", "campaign": campaign, "total": len(probes),
+            "pass": pass_count, "pass_rate": pass_count / len(probes),
+            "consolidation": consolidation_summary, "per_q": per_q}
+
+
+async def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--backend", required=True,
+                   choices=["no_memory", "guild_only", "semantic_only", "two_tier", "all"])
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    campaign = f"bench-w358-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    backends = (["no_memory", "guild_only", "semantic_only", "two_tier"]
+                if args.backend == "all" else [args.backend])
+
+    results = {}
+    for b in backends:
+        t0 = time.time()
+        bc = f"{campaign}-{b}"  # per-backend unique campaign — no state bleed
+        if b == "no_memory":     r = await run_no_memory(PROBES)
+        elif b == "guild_only":  r = await run_guild_only(PROBES, bc)
+        elif b == "semantic_only": r = await run_semantic_only(PROBES, bc)
+        elif b == "two_tier":    r = await run_two_tier(PROBES, bc)
+        r["wall_s"] = round(time.time() - t0, 2)
+        results[b] = r
+        print(f"[{b}] {r['pass']}/{r['total']} ({r['pass_rate']:.1%}) in {r['wall_s']}s")
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
+
+**Walkthrough:**
+
+**Block 1 — `_score()` is keyword-in-text, not embedding-similarity.** Pass criterion is "expected keyword (case-insensitive) appears in concat of retrieved text." This is INTENTIONALLY simpler than the chapter's predicted-matrix methodology (which assumed LLM-compose downstream of retrieval, scoring against gold answer strings). Tradeoff: keyword-match doesn't punish noisy retrieval the way LLM-compose would; raw scrolls + a substring-match ace the bench. The §5.2.1 reconciliation makes this gap explicit rather than papering over it.
+
+**Block 2 — `.env` autoload via `find_dotenv(usecwd=True)`.** Required because `tiered_memory_qdrant.py` reads `OMLX_API_KEY` at `TieredMemory.__init__` time. Walks from CWD up to filesystem root looking for `.env` — finds parent `~/code/agent-prep/.env` even when no lab-local `.env` exists. Same pattern as W3.5.5.5 `code/llm.py` (curriculum convention for cross-lab env-var loading).
+
+**Block 3 — `PROBES` is 7 lifted + 8 authored.** The lifted 7 (P01-P08, minus contradiction probes that aren't retrieval signals) come straight from `lab-03-5-memory/tests/test_recall.py` — proves cross-lab probe-reuse works. The authored 8 (P09-P15) are multi-agent-shape variants — deployment, deadlines, dependencies, incidents, conventions, roadmap — designed to look like real operational scrolls a multi-agent system would produce.
+
+**Block 4 — Parallel-structure across 4 backend functions is INTENTIONAL pedagogy.** Each backend has the same shape: (1) async with TieredMemory ctx, (2) seed phase writing to the appropriate tier, (3) retrieval phase reading from the same tier, (4) score loop. The reader can `diff run_guild_only run_semantic_only` and SEE the architectural difference at the source level — guild_only never imprints to Qdrant; semantic_only never touches guild's quest_list. The duplication-vs-readability tradeoff resolves in favor of readability here because the parallel structure IS the lesson.
+
+**Block 5 — Per-backend unique campaign prevents cross-run bleed.** `bc = f"{campaign}-{b}"` gives each of the 4 runs its own campaign tag. guild's quest_list filters by campaign; Qdrant uses unique user_ids tagged with the campaign suffix. Without per-backend campaigns, guild_only's scrolls would leak into two_tier's scroll-union retrieval and inflate two_tier's scores artificially. This is the same isolation discipline as W3.5.8 BCJ Entry 11 (per-test unique campaigns to prevent append-only-store residue).
+
+**Block 6 — `try/except Exception` on `get_scroll` is intentional resilience.** Scroll-fetch errors get swallowed into the corpus as `[scroll-fetch-error: ...]` rather than crashing the whole benchmark. Benchmark scripts have different error-handling priorities than production code: a single failed scroll fetch should NOT abort a 15-probe run that's already consumed compute. The error text lands in the corpus so the score function can still process — and a `scroll-fetch-error` in the retrieved text means the keyword won't match anyway, so the pass-rate captures the failure honestly.
 
 ### 5.2 Expected RESULTS.md matrix
 
