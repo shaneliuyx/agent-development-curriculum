@@ -2167,6 +2167,35 @@ async def test_two_tier_beats_singles_on_aggregate():
 
 Two-tier should beat each single-tier by ≥20% absolute on aggregate.
 
+#### 5.2.1 Measured results — 4-way retrieval-only benchmark (2026-05-28)
+
+**Canonical implementation:** `scripts/run_four_way_bench.py` (lab repo) — ~260 LOC, lifts 7 probes from `lab-03-5-memory/tests/test_recall.py` and adds 8 multi-agent-flavored variants (deployment, deadlines, incidents, conventions, roadmap). EverCore substituted by Qdrant per §5.3.1 architectural-equivalence claim (strict-EverCore version would take ~12hr due to 30-100s per imprint).
+
+**Measured matrix:**
+
+| Backend | Predicted §5.2 | **Measured** | Wall |
+|---|---:|---:|---:|
+| `no_memory` | ~10% | **0/15 (0.0%)** | 0.0s |
+| `guild_only` | ~55% | **15/15 (100.0%)** | 0.59s |
+| `semantic_only` (Qdrant) | ~60% | **13/15 (86.7%)** | 2.2s |
+| `two_tier` (full) | ~85% | **15/15 (100.0%)** | 60.4s |
+
+**Why measured beats predicted everywhere — and why two_tier doesn't visibly beat guild_only:** the chapter's predicted matrix assumed an LLM-compose step downstream of retrieval, scoring against per-question gold answer strings. The current harness is **retrieval-only**, keyword-in-retrieved-text. Two consequences: (a) raw scrolls contain expected keywords verbatim by construction, so `guild_only` aces the bench without semantic indexing; (b) `two_tier` doesn't differentiate from `guild_only` because the chapter's predicted 20-30pt two-tier advantage requires the LLM-compose step (which can pick clean semantic atoms over noisy raw scrolls). Without compose, raw-scroll union is unbeatable when the keyword is in the scroll.
+
+**`semantic_only` lost 2/15 probes** at top-k=3 — both are precision-recall-lever signals:
+- P04 "what's my hobby?" → seed framed bicycle as transport ("I ride my bicycle to work every day"), not hobby; bge-m3 cosine pulled other top-3 candidates
+- P05 "where do I live?" → seed had 2 facts ("I'm vegan AND I live in Taipei"); top-3 retrieval pulled OTHER location-flavored seeds before this multi-fact one
+
+Bumping k from 3 to 5 would likely fix both — same noise-floor calibration question as W3.5 BCJ Entry 6.
+
+**Two_tier's 60.4s wall is dominated by `consolidate()`** (15 scrolls → 12 imprints, 3 SKIPPED). The 3 SKIPPED reveal the **same scenario-binding finding as BCJ Entry 16** from a different angle: `SUMMARIZE_PROMPT`'s tech-bias filters out conversational probes (location, diet, hobby) at consolidation time. The two_tier still scores 100% because the guild-scroll-union fallback catches what consolidation dropped. **Confirms the §5.3.1 direct-imprint lesson empirically on a second corpus.**
+
+`★ Insight ─────────────────────────────────────`
+- **The chapter's predicted matrix isn't wrong — it's a different methodology.** Predicted assumes LLM-compose scoring against gold strings; measured here is keyword-in-text retrieval. Both defensible; they answer different questions. Document the methodology gap rather than picking one and calling the other wrong.
+- **This benchmark VALIDATES the architecture without DIFFERENTIATING it.** All three memory backends store + retrieve the seeded facts. The two-tier advantage shows up at LLM-compose time. Next-step measurement: add an LLM-compose extension that picks clean semantic atoms when available + falls back to guild scrolls, then scores answer against gold.
+- **3/15 SKIPPED at consolidation is the chapter-level invariant confirmed twice.** N=100 LongMemEval showed conversational data needs direct-imprint at write time (§5.3.1). This 15-Q bench shows the SAME tech-bias of `SUMMARIZE_PROMPT` dropping 20% of conversational probes on a different corpus. The fix (drop §3.x cascade for conversational data, direct-imprint to Qdrant) holds across both corpora.
+`─────────────────────────────────────────────────`
+
 ### 5.3 Optional — LongMemEval `oracle` subset (STRETCH)
 
 For industry-standard comparison against EverCore's published 83% baseline. Status: `(SPEC — to be measured on actual run)`. The procedure below is fully runnable; the comparison number depends on YOUR specific consolidation-pipeline + summarizer choices.
