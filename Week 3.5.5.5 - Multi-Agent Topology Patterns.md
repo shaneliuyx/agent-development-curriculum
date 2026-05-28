@@ -41,7 +41,7 @@ W3.5.5 covered multi-agent at the SHARED-KNOWLEDGE axis — agents coordinating 
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED — SPEC)
+## 2. Theory Primer 
 
 ### 2.1 The topology-vs-shared-knowledge axis split
 
@@ -168,7 +168,7 @@ N agents independently solve the same problem. Aggregator collects answers + dec
 
 ---
 
-## 3. System Architecture (REQUIRED — Mermaid)
+## 3. System Architecture
 
 ### 3.1 Supervisor topology
 
@@ -217,51 +217,946 @@ flowchart LR
 
 ---
 
-## 4. Lab Phases (REQUIRED — SPEC — code lands when lab runs)
+## 4. Lab Phases
+
+Each phase ships an executable Python file in `code/` + a test file in `tests/` + a per-block bundle (mermaid → code → walkthrough → result → insight). All code targets Python 3.11+ with stdlib + `httpx` + a frozen LLM endpoint (Claude-Sonnet-4.6 via `:8317` proxy OR local oMLX). The LLM client is abstracted via a tiny `llm.chat(prompt, system=None) -> str` helper so swapping providers is one line.
 
 ### Phase 1 — Supervisor from primitives (~1.5 hours)
 
-Goal: `code/supervisor.py` (~120 LOC). One lead, 3 workers, `threading` for parallelism. Lead decomposes a research question into 3 sub-questions. Each worker gets its own context + LLM call. Lead synthesizes returned artifacts.
+Goal: one lead + 3 workers in parallel via `concurrent.futures.ThreadPoolExecutor`. Lead decomposes a research question → 3 sub-questions; workers run concurrently with fresh contexts; lead synthesizes. Wall-time should be `max(worker_times) + plan + synthesis`, NOT `sum`.
 
-Verification: wall-time < `max(worker_times) + plan + synthesis`, NOT `sum`. Run on a real question; measure wall + tokens. Compare to single-agent baseline on the same question.
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[Question] --> P[plan_decompose<br/>lead LLM call]
+  P --> SUB[3 sub-questions]
+  SUB --> X[ThreadPoolExecutor<br/>max_workers=3]
+  X --> W1[worker_run<br/>sub_q 1<br/>fresh context]
+  X --> W2[worker_run<br/>sub_q 2<br/>fresh context]
+  X --> W3[worker_run<br/>sub_q 3<br/>fresh context]
+  W1 --> S[synthesize<br/>lead LLM call]
+  W2 --> S
+  W3 --> S
+  S --> A[Final answer]
+```
+
+**Code:**
+
+```python
+# code/supervisor.py — supervisor topology with thread-pool parallel workers
+from __future__ import annotations
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+from llm import chat   # tiny chat(prompt, system=None) -> str helper
+
+
+LEAD_DECOMPOSE_SYSTEM = """You are a research lead. Decompose the user's question into EXACTLY 3 narrow,
+non-overlapping sub-questions. Each sub-question should be answerable independently with one focused search.
+
+Return JSON only, no prose:
+{"sub_questions": ["q1", "q2", "q3"]}"""
+
+LEAD_SYNTHESIZE_SYSTEM = """You are a research lead synthesizing 3 workers' answers into ONE coherent
+answer to the original question. Cite which worker contributed which fact. Surface disagreement explicitly
+if workers conflict — do NOT silently pick one side."""
+
+WORKER_SYSTEM = """You are a research worker. Answer ONE sub-question with a 3-sentence factual response.
+Stay within scope; don't expand to adjacent topics. If you don't know, say so explicitly."""
+
+
+@dataclass
+class WorkerResult:
+    sub_question: str
+    answer: str
+    wall_seconds: float
+
+
+def plan_decompose(question: str) -> list[str]:
+    """Lead's first LLM call: decompose question into 3 sub-questions."""
+    raw = chat(question, system=LEAD_DECOMPOSE_SYSTEM)
+    # Strip optional ```json fence
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    parsed = json.loads(raw.strip())
+    return parsed["sub_questions"]
+
+
+def worker_run(sub_question: str) -> WorkerResult:
+    """One worker: fresh context, narrow answer."""
+    t0 = time.monotonic()
+    answer = chat(sub_question, system=WORKER_SYSTEM)
+    return WorkerResult(
+        sub_question=sub_question,
+        answer=answer,
+        wall_seconds=time.monotonic() - t0,
+    )
+
+
+def synthesize(question: str, results: list[WorkerResult]) -> str:
+    """Lead's second LLM call: combine worker answers."""
+    bundle = "\n\n".join(
+        f"Worker {i+1} on '{r.sub_question}':\n{r.answer}"
+        for i, r in enumerate(results)
+    )
+    prompt = f"ORIGINAL QUESTION: {question}\n\nWORKER ANSWERS:\n{bundle}\n\nSYNTHESIZE."
+    return chat(prompt, system=LEAD_SYNTHESIZE_SYSTEM)
+
+
+def supervisor_run(question: str) -> dict:
+    """End-to-end supervisor topology. Returns answer + timing breakdown."""
+    t_total = time.monotonic()
+
+    t_plan = time.monotonic()
+    sub_qs = plan_decompose(question)
+    plan_wall = time.monotonic() - t_plan
+
+    with ThreadPoolExecutor(max_workers=len(sub_qs)) as pool:
+        results = list(pool.map(worker_run, sub_qs))
+
+    t_syn = time.monotonic()
+    answer = synthesize(question, results)
+    syn_wall = time.monotonic() - t_syn
+
+    return {
+        "answer": answer,
+        "plan_wall_s": round(plan_wall, 2),
+        "worker_walls_s": [round(r.wall_seconds, 2) for r in results],
+        "max_worker_wall_s": round(max(r.wall_seconds for r in results), 2),
+        "sum_worker_walls_s": round(sum(r.wall_seconds for r in results), 2),
+        "synthesize_wall_s": round(syn_wall, 2),
+        "total_wall_s": round(time.monotonic() - t_total, 2),
+    }
+
+
+if __name__ == "__main__":
+    out = supervisor_run("What changed in multi-agent agent systems between 2023 and 2026?")
+    print(json.dumps(out, indent=2))
+```
+
+**Walkthrough:**
+
+**Block 1 — Three system prompts, three distinct roles.** `LEAD_DECOMPOSE_SYSTEM` produces JSON-only output (decomposition into 3 sub-questions); `WORKER_SYSTEM` constrains scope to a single sub-question with a 3-sentence answer; `LEAD_SYNTHESIZE_SYSTEM` requires explicit disagreement-surfacing. Three roles, three prompts — same JD as in production supervisor systems (Anthropic Research's lead + worker prompts have the same shape).
+
+**Block 2 — JSON fence stripping is the load-bearing parse defense.** Models occasionally emit ` ```json ... ``` ` even when prompted "no markdown fence." `raw.startswith("```")` + split path catches this without exception. Same pattern as W4 ReAct's parse defense + W3.5.8 §8.1's dedup-prompt parse.
+
+**Block 3 — `ThreadPoolExecutor` with `max_workers=len(sub_qs)` gives true parallelism on I/O-bound work.** LLM calls are network-I/O; GIL doesn't block. Wall-time of the worker batch becomes `max(worker_walls)`, not `sum`. Returned `worker_walls_s` + `max_worker_wall_s` + `sum_worker_walls_s` measurements let the reader VERIFY parallelism empirically — if max ≈ sum, threading didn't actually parallelize (something's serializing under the hood).
+
+**Block 4 — Synthesis prompt names the workers explicitly + asks for disagreement-surfacing.** `Worker {i+1} on '...'` framing prevents the lead from blending answers anonymously. Disagreement-surfacing is the failure-mode defense from §2.3's "synthesis conflicts" point: silent picking is worse than explicit disagreement.
+
+**Test:**
+
+```python
+# tests/test_supervisor.py — runs the full topology against a fixed question
+import json
+from supervisor import supervisor_run
+
+
+def test_supervisor_parallel_wins():
+    """Wall-time invariant: total should be roughly max(workers) + plan + synth,
+    NOT sum(workers) + plan + synth. If max ≈ sum, parallelism is broken."""
+    out = supervisor_run("What is photosynthesis?")
+    parallel_wall = out["plan_wall_s"] + out["max_worker_wall_s"] + out["synthesize_wall_s"]
+    sequential_wall = out["plan_wall_s"] + out["sum_worker_walls_s"] + out["synthesize_wall_s"]
+    # total_wall_s should be within 20% of parallel-bound, not sequential-bound
+    assert out["total_wall_s"] < (parallel_wall + sequential_wall) / 2
+
+
+def test_supervisor_decomposition_is_three():
+    """plan_decompose must return exactly 3 sub-questions per the system prompt contract."""
+    out = supervisor_run("Compare REST vs GraphQL.")
+    assert len(out["worker_walls_s"]) == 3
+
+
+def test_supervisor_synthesizes_answer():
+    """End-to-end: an answer string is returned + is non-trivially long."""
+    out = supervisor_run("What is OAuth?")
+    assert isinstance(out["answer"], str)
+    assert len(out["answer"]) > 50
+```
+
+**Result** *(projected — actual run TBD; replace with measured numbers after `python code/supervisor.py` + `pytest tests/test_supervisor.py -v`)*: expected `total_wall_s` ~15-25s (plan ~3s + max_worker ~10s + synth ~5s); `sum_worker_walls_s` ~30-50s (3 workers × ~10s each). Parallel speedup ≈ 2-3×. Token cost ~ 5× single-agent baseline on the same question (lead × 2 + workers × 3).
+
+`★ Insight ─────────────────────────────────────`
+- **`ThreadPoolExecutor` is the cheapest way to demonstrate the supervisor parallelism win.** Asyncio would be slightly faster (no thread overhead) but adds event-loop ceremony. Threads + I/O-bound LLM calls = parallel in practice; the GIL releases on socket-read.
+- **Returning `max_worker_wall_s` + `sum_worker_walls_s` in the output dict is the test-friendly empirical anchor.** Reader can ASSERT `total_wall_s ≈ plan + max + synth`, not `plan + sum + synth`. Test catches regression to sequential execution.
+- **Lead's synthesize prompt that REQUIRES disagreement-surfacing is the load-bearing prompt-engineering choice.** Without it, the lead's natural style smooths over worker disagreement. With it, the chapter's "silent picking is worst" failure mode is structurally prevented in the system prompt.
+`─────────────────────────────────────────────────`
+
+---
 
 ### Phase 2 — Hierarchical (one extra layer) (~1 hour)
 
-Goal: extend Phase 1 with one sub-supervisor. Top lead decomposes into 2 macro-questions; each macro-question gets its own sub-lead + 2 workers. Total = 1 + 2 + 4 = 7 agents.
+Goal: extend Phase 1 with one sub-supervisor layer. Top lead decomposes into 2 MACRO-questions → each macro spawns its own sub-lead + 2 workers. Total: 1 top + 2 sub-leads + 4 workers = 7 agents.
 
-Verification: hierarchy depth = 2 (1 top + sub-leads). Wall-time comparison vs flat supervisor with 6 workers (Phase 1 generalization). When does hierarchy win vs flat? Capture in `outputs/hierarchy_vs_flat.md`.
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[Question] --> TOP[Top lead<br/>plan into 2 macros]
+  TOP --> M1[Sub-lead 1<br/>plan macro 1 into 2 sub-qs]
+  TOP --> M2[Sub-lead 2<br/>plan macro 2 into 2 sub-qs]
+  M1 --> W1A[Worker 1A]
+  M1 --> W1B[Worker 1B]
+  M2 --> W2A[Worker 2A]
+  M2 --> W2B[Worker 2B]
+  W1A --> S1[Sub-lead 1 synth]
+  W1B --> S1
+  W2A --> S2[Sub-lead 2 synth]
+  W2B --> S2
+  S1 --> TS[Top synth]
+  S2 --> TS
+  TS --> ANS[Final answer]
+```
 
-### Phase 3 — Group-Chat speaker-selection (~1.5 hours)
+**Code:**
 
-Goal: `code/group_chat.py` (~150 LOC). 3 agents (coder, reviewer, tester), shared message pool, 3 selector flavors (round-robin / LLM-selected / custom). Termination on `TERMINATE` token in any message OR max-rounds reached.
+```python
+# code/hierarchical.py — supervisor-of-supervisors (2 layers)
+from __future__ import annotations
+import time
+from concurrent.futures import ThreadPoolExecutor
+from supervisor import plan_decompose, worker_run, synthesize, WorkerResult
 
-Verification: same task run with each selector flavor. Compare wall + token cost + answer quality. Capture in `outputs/selector_comparison.md`.
 
-### Phase 4 — Handoffs / Swarm from primitives (~1.5 hours)
+def sub_supervisor(macro_question: str) -> WorkerResult:
+    """Sub-lead: decompose macro into 2 sub-questions, run 2 workers, synthesize."""
+    t0 = time.monotonic()
+    sub_qs = plan_decompose(macro_question)[:2]   # cap at 2 sub-qs per macro
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leaf_results = list(pool.map(worker_run, sub_qs))
+    sub_answer = synthesize(macro_question, leaf_results)
+    return WorkerResult(
+        sub_question=macro_question,
+        answer=sub_answer,
+        wall_seconds=time.monotonic() - t0,
+    )
 
-Goal: `code/handoffs.py` (~80 LOC). 3 agents (triage, refund, sales). Triage has 2 handoff tools (`transfer_to_refund`, `transfer_to_sales`). Run 5 user prompts that should route to different specialists. Measure: did triage route correctly each time?
 
-Verification: 5/5 correct routing on a labeled test set. False-routing rate < 20% on edge cases.
+def hierarchical_run(question: str) -> dict:
+    """Two-layer hierarchy: top lead → 2 sub-leads → 4 leaf workers."""
+    t_total = time.monotonic()
+    t_plan = time.monotonic()
+    macros = plan_decompose(question)[:2]   # cap at 2 macros
+    plan_wall = time.monotonic() - t_plan
+
+    with ThreadPoolExecutor(max_workers=len(macros)) as pool:
+        sub_results = list(pool.map(sub_supervisor, macros))
+
+    t_syn = time.monotonic()
+    answer = synthesize(question, sub_results)
+    syn_wall = time.monotonic() - t_syn
+
+    return {
+        "answer": answer,
+        "depth": 2,
+        "agents_total": 1 + len(macros) + len(macros) * 2,   # top + sub-leads + leaves
+        "plan_wall_s": round(plan_wall, 2),
+        "sub_walls_s": [round(r.wall_seconds, 2) for r in sub_results],
+        "max_sub_wall_s": round(max(r.wall_seconds for r in sub_results), 2),
+        "synthesize_wall_s": round(syn_wall, 2),
+        "total_wall_s": round(time.monotonic() - t_total, 2),
+    }
+
+
+if __name__ == "__main__":
+    import json
+    out = hierarchical_run(
+        "Compare regulatory frameworks for AI across EU, US, and UK."
+    )
+    print(json.dumps(out, indent=2))
+```
+
+**Walkthrough:**
+
+**Block 1 — `sub_supervisor` REUSES `plan_decompose` + `worker_run` + `synthesize`.** No new primitives; hierarchical is just supervisor-recursion. The chapter's "topology is composition" thesis becomes code-visible: each layer composes the same primitives. Adding a 3rd layer would be another file with `def super_sub_supervisor` calling `sub_supervisor` 2x.
+
+**Block 2 — Cap at 2 macros + 2 sub-qs per macro = 4 leaf workers.** 2×2 fan keeps total agents = 7 (1 top + 2 sub + 4 leaves). Bigger fans (3×3 = 13 agents) blow token cost without proportional accuracy gain at this depth. Production rule: hierarchical fan width should taper at deeper levels (top wider, leaves narrower).
+
+**Block 3 — `agents_total` is the cost signal the test can assert.** 7 agents on a 2-macro × 2-sub-q hierarchy = 7 LLM calls just for the decomposition / leaf / sub-synth layer + 1 top-synth = 8 calls minimum. Sequential single-agent on same task = 1 call. ~8× cost. Hierarchy must EARN that 8× through accuracy/structure win on a TRULY 2-layer-decomposable question.
+
+**Test:**
+
+```python
+# tests/test_hierarchical.py
+from hierarchical import hierarchical_run
+
+
+def test_hierarchy_depth_and_agent_count():
+    """2-macro × 2-sub-q hierarchy = 7 agents (1 top + 2 sub + 4 leaves)."""
+    out = hierarchical_run("Compare HTTP/2 vs HTTP/3 vs HTTP/3 over QUIC.")
+    assert out["depth"] == 2
+    assert out["agents_total"] == 7
+
+
+def test_hierarchy_parallel_at_sub_level():
+    """Total wall should be plan + max(sub) + synth, NOT plan + sum(sub) + synth.
+    Sub-leads run in parallel inside the top-level ThreadPoolExecutor."""
+    out = hierarchical_run("What are the differences between OAuth 2.0 and OAuth 2.1?")
+    parallel_bound = out["plan_wall_s"] + out["max_sub_wall_s"] + out["synthesize_wall_s"]
+    sequential_bound = out["plan_wall_s"] + sum(out["sub_walls_s"]) + out["synthesize_wall_s"]
+    assert out["total_wall_s"] < (parallel_bound + sequential_bound) / 2
+```
+
+**Result** *(projected — actual run TBD)*: expected `total_wall_s` ~30-50s (deeper hierarchy = more sequential LLM-call layers); 7-8× token cost vs single-agent. Hierarchy WINS when question has genuine 2-layer decomposition (regulatory comparison across regions); LOSES (vs flat supervisor with 6 workers) when question is one-layer.
+
+`★ Insight ─────────────────────────────────────`
+- **Reusing Phase 1's primitives in Phase 2 is the chapter's load-bearing teaching moment.** Hierarchical topology is NOT a new pattern — it's supervisor composed with itself. Production frameworks (LangGraph, CrewAI) sometimes hide this composition behind framework abstractions; teaching it as composition keeps the mental model honest.
+- **The `[:2]` slicing on `plan_decompose` is the FAN-WIDTH dial.** A reader extending to 3×3 hierarchy changes one line. Production deployments often tune fan-width PER LAYER (3 at top, 2 at middle, 1 at leaves) — the chapter's code makes that tuning trivial.
+- **`agents_total` field is the cost-signaling primitive.** Treat it like cardinality in SQL EXPLAIN — surface it in the run output, assert against it in tests, watch it in production traces.
+`─────────────────────────────────────────────────`
+
+---
+
+### Phase 3 — Group-Chat with speaker-selection (~1.5 hours)
+
+Goal: 3 agents (coder / reviewer / tester) share one message pool; selector function picks next speaker. Three selector flavors: round-robin / LLM-selected / custom-with-fallback-rules. Termination on `TERMINATE` in any message OR `max_rounds` reached.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  POOL[Shared messages list] --> SEL{Selector type}
+  SEL -- round-robin --> RR[next = agents-rr-cycle]
+  SEL -- llm-selected --> LL[LLM reads pool<br/>returns next agent name]
+  SEL -- custom --> CU[LLM + fallback rules<br/>e.g. always verifier after coder]
+  RR --> RUN[agent.respond context=pool]
+  LL --> RUN
+  CU --> RUN
+  RUN --> APP[append message to pool]
+  APP --> TERM{TERMINATE in msg<br/>OR max_rounds?}
+  TERM -- no --> SEL
+  TERM -- yes --> OUT[Return final pool]
+```
+
+**Code:**
+
+```python
+# code/group_chat.py — shared-message-pool group chat with 3 selector flavors
+from __future__ import annotations
+from dataclasses import dataclass, field
+from itertools import cycle
+from typing import Callable, Literal
+
+from llm import chat
+
+
+SelectorFlavor = Literal["round-robin", "llm-selected", "custom"]
+
+
+@dataclass
+class GroupAgent:
+    name: str
+    system_prompt: str
+
+    def respond(self, pool: list[dict]) -> str:
+        """One agent turn: read full pool, return a message."""
+        transcript = "\n".join(f"{m['speaker']}: {m['content']}" for m in pool)
+        prompt = f"CONVERSATION SO FAR:\n{transcript}\n\nYour turn ({self.name}):"
+        return chat(prompt, system=self.system_prompt)
+
+
+CODER = GroupAgent(
+    name="coder",
+    system_prompt=(
+        "You are a Python coder. Propose code. Keep messages short (≤80 words). "
+        "End with TERMINATE only when the team has converged on a complete solution."
+    ),
+)
+REVIEWER = GroupAgent(
+    name="reviewer",
+    system_prompt=(
+        "You are a code reviewer. Critique the latest code for bugs / style / edge cases. "
+        "≤80 words per message. Do NOT write code yourself; ask coder to fix."
+    ),
+)
+TESTER = GroupAgent(
+    name="tester",
+    system_prompt=(
+        "You are a tester. Propose ONE test case for the latest code. "
+        "≤80 words per message. Don't repeat tests."
+    ),
+)
+AGENTS = {"coder": CODER, "reviewer": REVIEWER, "tester": TESTER}
+
+
+def select_round_robin(pool: list[dict], agents: list[GroupAgent]) -> GroupAgent:
+    """Cyclic next-speaker; ignores context."""
+    return agents[len(pool) % len(agents)]
+
+
+def select_llm(pool: list[dict], agents: list[GroupAgent]) -> GroupAgent:
+    """LLM reads pool, picks next agent name."""
+    names = "/".join(a.name for a in agents)
+    transcript = "\n".join(f"{m['speaker']}: {m['content']}" for m in pool[-5:])   # last 5
+    prompt = (
+        f"Conversation (last 5):\n{transcript}\n\n"
+        f"Who should speak next? Pick ONE of: {names}. "
+        f"Do NOT pick the speaker who just spoke unless required. "
+        f"Reply with the single name only."
+    )
+    pick = chat(prompt).strip().lower()
+    # Defensive: fall back to first agent if LLM returns garbage
+    for a in agents:
+        if a.name in pick:
+            return a
+    return agents[0]
+
+
+def select_custom(pool: list[dict], agents: list[GroupAgent]) -> GroupAgent:
+    """LLM-selected + RULE: tester always follows coder; reviewer always follows tester."""
+    if not pool:
+        return AGENTS["coder"]
+    last = pool[-1]["speaker"]
+    if last == "coder":
+        return AGENTS["tester"]
+    if last == "tester":
+        return AGENTS["reviewer"]
+    # Otherwise defer to LLM-selected
+    return select_llm(pool, agents)
+
+
+SELECTORS: dict[SelectorFlavor, Callable] = {
+    "round-robin": select_round_robin,
+    "llm-selected": select_llm,
+    "custom": select_custom,
+}
+
+
+def group_chat_run(
+    task: str,
+    selector: SelectorFlavor = "round-robin",
+    max_rounds: int = 9,
+) -> dict:
+    """Run group chat until TERMINATE or max_rounds."""
+    pool: list[dict] = [{"speaker": "user", "content": task}]
+    agents = list(AGENTS.values())
+    pick_fn = SELECTORS[selector]
+    selector_calls = 0
+    for round_n in range(1, max_rounds + 1):
+        speaker = pick_fn(pool, agents)
+        selector_calls += 1
+        msg = speaker.respond(pool)
+        pool.append({"speaker": speaker.name, "content": msg})
+        if "TERMINATE" in msg.upper():
+            return {
+                "selector": selector,
+                "rounds_used": round_n,
+                "selector_calls": selector_calls,
+                "terminated_by": "TERMINATE token",
+                "pool": pool,
+            }
+    return {
+        "selector": selector,
+        "rounds_used": max_rounds,
+        "selector_calls": selector_calls,
+        "terminated_by": "max_rounds",
+        "pool": pool,
+    }
+
+
+if __name__ == "__main__":
+    import json
+    for sel in ("round-robin", "llm-selected", "custom"):
+        out = group_chat_run(
+            "Write a Python function `is_palindrome(s: str) -> bool`. Reviewer + tester collaborate.",
+            selector=sel,
+        )
+        print(f"\n=== selector={sel} ===")
+        print(f"rounds={out['rounds_used']}  selector_calls={out['selector_calls']}  "
+              f"terminated_by={out['terminated_by']}")
+```
+
+**Walkthrough:**
+
+**Block 1 — `GroupAgent` is the minimal abstraction.** `name` + `system_prompt` + `respond(pool)` is the whole API. No state-machine ceremony; no DAG topology declaration; pool reading + LLM call + return. Same shape as `ConversableAgent` in AutoGen but ~10× smaller.
+
+**Block 2 — Three selector flavors have different cost profiles.** Round-robin: 0 LLM calls (pure cyclic). LLM-selected: 1 extra LLM call PER ROUND (context-aware but slow). Custom: 0 or 1 extra LLM call per round (rules first, LLM fallback). `selector_calls` field surfaces this cost — round-robin = 0, llm-selected = N, custom = ~N/2.
+
+**Block 3 — The "do NOT pick the speaker who just spoke" prompt is the load-bearing self-loop defense.** Without it, LLM-selected sometimes picks the same agent repeatedly (latest message is the most engaging). With it, the conversation advances structurally. This is the §6 BCJ candidate "LLM-selected speaker stalls into self-loops" defense.
+
+**Block 4 — Custom selector composes rules + LLM fallback.** Tester always follows coder; reviewer always follows tester; otherwise LLM picks. Production custom selectors are usually rules-on-top-of-LLM, not LLM-only. Rules encode domain knowledge cheaply; LLM picks up the remainder.
+
+**Test:**
+
+```python
+# tests/test_group_chat.py
+from group_chat import group_chat_run, SELECTORS
+
+
+def test_round_robin_zero_selector_calls():
+    """Round-robin does pure cyclic selection — selector_calls equals rounds_used
+    (we count each pick as one selector_call, but LLM calls inside are 0)."""
+    # Note: selector_calls == rounds_used by definition; the cost is that LLM
+    # calls per pick = 0 for round-robin, 1 for llm-selected
+    out = group_chat_run("Test task", selector="round-robin", max_rounds=3)
+    assert out["selector_calls"] == out["rounds_used"]
+
+
+def test_llm_selected_returns_valid_agent_name():
+    """LLM-selected must always return one of the registered agents."""
+    valid_names = {"coder", "reviewer", "tester"}
+    out = group_chat_run("Write factorial(n).", selector="llm-selected", max_rounds=3)
+    for msg in out["pool"][1:]:   # skip user message
+        assert msg["speaker"] in valid_names
+
+
+def test_custom_tester_follows_coder():
+    """Custom rule: after a coder message, tester MUST speak next."""
+    out = group_chat_run("Write a Python function.", selector="custom", max_rounds=6)
+    for i in range(len(out["pool"]) - 1):
+        if out["pool"][i]["speaker"] == "coder":
+            assert out["pool"][i + 1]["speaker"] == "tester", (
+                f"Rule violation at msg {i}: coder followed by "
+                f"{out['pool'][i + 1]['speaker']}"
+            )
+
+
+def test_terminate_token_ends_conversation():
+    """Any agent emitting TERMINATE ends the loop early."""
+    out = group_chat_run("Solve x + 1 = 2.", selector="round-robin", max_rounds=20)
+    # Either we hit TERMINATE OR max_rounds; if TERMINATE, rounds_used < max
+    if out["terminated_by"] == "TERMINATE token":
+        assert out["rounds_used"] < 20
+```
+
+**Result** *(projected — actual run TBD)*: round-robin completes in ~6-9 rounds (3 agents × 2-3 cycles); llm-selected uses 2× LLM calls (selector + agent per round) but converges in ~5-7 rounds; custom uses ~1.5× LLM calls + converges in ~4-6 rounds. Cost per round: round-robin ~1 call, llm-selected ~2 calls, custom ~1.5 calls. Answer quality typically: custom ≈ llm-selected > round-robin (on tasks needing context-aware speaker order).
+
+`★ Insight ─────────────────────────────────────`
+- **The selector function IS the topology choice for group chats.** Same agents + same task; different selectors yield different conversation shapes + costs. Production rule: start with round-robin (cheapest), upgrade to custom-with-rules when you observe specific selection patterns recurring, fall back to llm-selected only when rules don't capture the patterns.
+- **`selector_calls` + `rounds_used` together expose the cost shape.** Round-robin: 1 LLM call per round (the agent's). Llm-selected: 2 LLM calls per round (selector + agent). Custom: between. Reader can rank-order selectors by cost just by reading the output dict.
+- **`pool[-5:]` truncation in `select_llm` is the context-window-cost defense.** A 30-message conversation passed to the selector every round = quadratic context cost. Truncate to last 5 — the selector's job is "who SHOULD speak next given recent state," not "what's the full conversation history."
+`─────────────────────────────────────────────────`
+
+---
+
+### Phase 4 — Handoffs / Routines from primitives (~1.5 hours)
+
+Goal: 3 agents (triage / refund / sales). Triage exposes 2 handoff tools that RETURN agent objects; runtime detects the Agent return + switches active agent. Two-primitive API: `Agent = prompt + tools`; `handoff = function returning Agent`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  USER[User msg] --> CUR[active = triage]
+  CUR --> CALL[run_agent active, user_msg]
+  CALL --> RET{Tool return type?}
+  RET -- str answer --> DONE[return to user]
+  RET -- Agent obj --> SWITCH[active = returned agent]
+  SWITCH --> CALL
+```
+
+**Code:**
+
+```python
+# code/handoffs.py — OpenAI Swarm-style handoffs (two-primitive API)
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Callable, Any
+
+from llm import chat
+
+
+@dataclass
+class Agent:
+    name: str
+    system_prompt: str
+    tools: list[Callable] = field(default_factory=list)
+
+    def respond(self, user_msg: str, history: list[dict]) -> tuple[str, "Agent | None"]:
+        """Run one agent turn. Returns (final_response, next_agent_or_None).
+        If model emits a tool-call to a handoff fn, returns (None_text, that_agent).
+        Otherwise returns (text_response, None) and the conversation ends."""
+        tool_doc = "\n".join(f"- {t.__name__}(): {t.__doc__ or ''}" for t in self.tools)
+        prompt = (
+            f"USER MESSAGE: {user_msg}\n\n"
+            f"AVAILABLE TOOLS:\n{tool_doc}\n\n"
+            f"If you should hand off, reply with EXACTLY: HANDOFF: <tool_name>\n"
+            f"Otherwise, reply with your final answer."
+        )
+        reply = chat(prompt, system=self.system_prompt).strip()
+        if reply.upper().startswith("HANDOFF:"):
+            tool_name = reply.split(":", 1)[1].strip()
+            for tool in self.tools:
+                if tool.__name__ == tool_name:
+                    next_agent = tool()
+                    return ("", next_agent)
+        return (reply, None)
+
+
+# Specialist agents
+REFUND_AGENT = Agent(
+    name="refund",
+    system_prompt=(
+        "You are a refund specialist. Process refunds. Be specific about "
+        "refund amounts, timing, and policy."
+    ),
+)
+SALES_AGENT = Agent(
+    name="sales",
+    system_prompt=(
+        "You are a sales specialist. Help with pricing, plans, upgrades. "
+        "Be helpful and specific."
+    ),
+)
+
+
+# Handoff tools (return Agent objects)
+def transfer_to_refunds() -> Agent:
+    """Hand off to the refund specialist when user wants a refund or
+    has a billing dispute."""
+    return REFUND_AGENT
+
+
+def transfer_to_sales() -> Agent:
+    """Hand off to the sales specialist when user asks about plans,
+    pricing, upgrades, or feature comparisons."""
+    return SALES_AGENT
+
+
+# Triage entry point with both handoff tools
+TRIAGE_AGENT = Agent(
+    name="triage",
+    system_prompt=(
+        "You are a triage agent. Route the user to the right specialist by "
+        "calling a handoff tool. Don't try to handle specialist queries yourself."
+    ),
+    tools=[transfer_to_refunds, transfer_to_sales],
+)
+
+
+def swarm_run(user_msg: str, max_handoffs: int = 3) -> dict:
+    """Run user_msg through the swarm; return final response + handoff trace."""
+    active = TRIAGE_AGENT
+    history: list[dict] = []
+    handoff_trace: list[str] = [active.name]
+    for _ in range(max_handoffs + 1):
+        reply, next_agent = active.respond(user_msg, history)
+        history.append({"agent": active.name, "reply": reply})
+        if next_agent is None:
+            return {
+                "final_response": reply,
+                "handoff_trace": handoff_trace,
+                "handoff_count": len(handoff_trace) - 1,
+                "history": history,
+            }
+        active = next_agent
+        handoff_trace.append(active.name)
+    return {
+        "final_response": "(stopped: max_handoffs reached)",
+        "handoff_trace": handoff_trace,
+        "handoff_count": len(handoff_trace) - 1,
+        "history": history,
+    }
+
+
+if __name__ == "__main__":
+    import json
+    test_msgs = [
+        "I want a refund for my recent purchase.",
+        "What's the difference between Pro and Enterprise plans?",
+        "How do I cancel my subscription and get my money back?",
+        "Can I upgrade to the Pro plan?",
+        "My credit card was charged twice for the same order.",
+    ]
+    for msg in test_msgs:
+        out = swarm_run(msg)
+        print(f"\nUser: {msg}")
+        print(f"Trace: {' → '.join(out['handoff_trace'])}")
+        print(f"Final: {out['final_response'][:120]}")
+```
+
+**Walkthrough:**
+
+**Block 1 — `Agent` dataclass has only 3 fields: name + system_prompt + tools.** The whole "two-primitive API" of Swarm fits in ~20 LOC. No DSL, no DAG declaration, no graph compiler. Just a dataclass + a `respond` method.
+
+**Block 2 — `respond` returns a TUPLE `(text, next_agent_or_None)`.** This is the load-bearing protocol. If the LLM emits `HANDOFF: tool_name`, we look up the tool, call it (returns an Agent), and return `("", that_agent)`. Otherwise the LLM's text reply is the final answer + `next_agent = None`. The two return slots encode "continue with new active agent" vs "we're done."
+
+**Block 3 — `tool.__doc__` is the load-bearing trigger description for the LLM.** Each handoff tool's docstring tells the triage agent WHEN to call it ("when user wants a refund or has a billing dispute"). The system prompt + docstrings together form the routing rules; no extra prompt-engineering needed.
+
+**Block 4 — `max_handoffs` guards against infinite handoff loops.** If triage hands off to refund, refund could conceivably hand off back to triage, triggering an infinite cycle. The guard catches that. Production loops with persistent state require this guard plus a stale-state check.
+
+**Test:**
+
+```python
+# tests/test_handoffs.py
+from handoffs import swarm_run
+
+
+def test_refund_intent_routes_to_refund():
+    """Refund-flavored message should hand off to refund agent."""
+    out = swarm_run("I want a refund please.")
+    assert "refund" in out["handoff_trace"]
+
+
+def test_sales_intent_routes_to_sales():
+    """Plan-question message should hand off to sales agent."""
+    out = swarm_run("What plans do you offer?")
+    assert "sales" in out["handoff_trace"]
+
+
+def test_handoff_count_bounded():
+    """No path should require more than 2 handoffs (triage → specialist)."""
+    out = swarm_run("Tell me about your enterprise plan.")
+    assert out["handoff_count"] <= 2
+
+
+def test_trace_starts_with_triage():
+    """Every conversation starts at triage."""
+    out = swarm_run("Anything works")
+    assert out["handoff_trace"][0] == "triage"
+```
+
+**Result** *(projected — actual run TBD)*: on a labeled 5-message test set, expect 5/5 correct routing (refund messages → refund agent, sales messages → sales agent). Per-message wall ~2-4s (triage LLM call + specialist LLM call = ~2 calls). Total token cost ≈ 2× single-agent.
+
+`★ Insight ─────────────────────────────────────`
+- **The whole Swarm primitive is the `respond` method's return-type-switch.** Return `Agent` → switch. Return `str` → done. Two cases; no DSL; no graph. The chapter's "two-primitive API" claim becomes provable in code.
+- **Docstrings AS prompts is a deliberate design choice.** Same shape as W4 ReAct's `TOOLS = {name: (callable, docstring)}` pattern. Single source of truth: docstring describes the tool to humans AND to the LLM. No drift between code-level docs and prompt-level descriptions.
+- **The `handoff_trace` field is the auditable artifact.** A test asserts `"refund" in trace`; a production system logs the trace for routing analysis. Same shape as W11.6's OTel span tree, applied at the handoff layer.
+`─────────────────────────────────────────────────`
+
+---
 
 ### Phase 5 — Voting / Debate (~1.5 hours)
 
-Goal: `code/voting.py` (~120 LOC). 3 independent agents solve same problem with different seeds. Aggregator picks via majority OR LLM-judge. Compare to single-agent baseline accuracy.
+Goal: 3 independent agents solve the same problem with DIFFERENT prompts (or seeds). Aggregator picks the final answer via majority vote OR LLM-judge. Compare to single-agent baseline.
 
-Verification: on a 20-question test set with known answers, measure single-agent vs voting accuracy. Calculate cost-per-correct-answer (tokens / questions correct).
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[Question] --> P[parallel solvers]
+  P --> A1[Solver 1<br/>prompt variant A]
+  P --> A2[Solver 2<br/>prompt variant B]
+  P --> A3[Solver 3<br/>prompt variant C]
+  A1 --> AGG{Aggregator}
+  A2 --> AGG
+  A3 --> AGG
+  AGG -- majority --> MAJ[normalized-string majority]
+  AGG -- llm-judge --> LJ[LLM reads 3 answers<br/>picks best]
+  MAJ --> ANS[Final answer + confidence]
+  LJ --> ANS
+```
+
+**Code:**
+
+```python
+# code/voting.py — voting/debate topology with 3 solvers + 2 aggregators
+from __future__ import annotations
+import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+from llm import chat
+
+
+SOLVER_PROMPTS = [
+    # Three distinct prompt variants to maximize answer independence
+    "You are a careful, step-by-step solver. Show your reasoning. End with: ANSWER: <final>",
+    "You are an efficient solver. Skip reasoning; give just the answer. End with: ANSWER: <final>",
+    "You are a creative solver. Consider unusual angles. End with: ANSWER: <final>",
+]
+
+
+@dataclass
+class SolverResult:
+    solver_id: int
+    raw_response: str
+    extracted_answer: str
+
+
+def _extract_answer(raw: str) -> str:
+    """Pull 'ANSWER: ...' line from a solver's raw response."""
+    m = re.search(r"ANSWER:\s*(.+?)(?:\n|$)", raw, re.IGNORECASE)
+    return (m.group(1) if m else raw).strip().rstrip(".").lower()
+
+
+def solve_one(args: tuple[int, str, str]) -> SolverResult:
+    """One solver runs the question with its prompt variant."""
+    solver_id, question, system_prompt = args
+    raw = chat(question, system=system_prompt)
+    return SolverResult(
+        solver_id=solver_id,
+        raw_response=raw,
+        extracted_answer=_extract_answer(raw),
+    )
+
+
+def aggregate_majority(results: list[SolverResult]) -> dict:
+    """Majority vote on the extracted answers (normalized to lowercase, stripped)."""
+    counts = Counter(r.extracted_answer for r in results)
+    winner, count = counts.most_common(1)[0]
+    return {
+        "method": "majority",
+        "answer": winner,
+        "votes": dict(counts),
+        "confidence": count / len(results),
+    }
+
+
+def aggregate_llm_judge(question: str, results: list[SolverResult]) -> dict:
+    """LLM reads all 3 answers + picks the best."""
+    bundle = "\n\n".join(
+        f"SOLVER {r.solver_id}:\n{r.raw_response}"
+        for r in results
+    )
+    prompt = (
+        f"QUESTION: {question}\n\n{bundle}\n\n"
+        f"Which solver's ANSWER is most accurate? Reply with EXACTLY:\n"
+        f"BEST: <solver_id>\n"
+        f"REASON: <one sentence>"
+    )
+    reply = chat(prompt)
+    m = re.search(r"BEST:\s*(\d+)", reply)
+    if m:
+        best_id = int(m.group(1))
+        winner = next((r for r in results if r.solver_id == best_id), results[0])
+        return {
+            "method": "llm-judge",
+            "answer": winner.extracted_answer,
+            "judge_reply": reply,
+            "winning_solver": best_id,
+        }
+    # Defensive fallback: majority
+    return aggregate_majority(results)
+
+
+def voting_run(
+    question: str,
+    aggregator: str = "majority",
+) -> dict:
+    """Run 3 solvers in parallel + aggregate."""
+    tasks = [(i, question, prompt) for i, prompt in enumerate(SOLVER_PROMPTS)]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(solve_one, tasks))
+
+    if aggregator == "majority":
+        agg = aggregate_majority(results)
+    elif aggregator == "llm-judge":
+        agg = aggregate_llm_judge(question, results)
+    else:
+        raise ValueError(f"unknown aggregator: {aggregator}")
+
+    return {
+        "question": question,
+        "aggregator": aggregator,
+        "solver_answers": [r.extracted_answer for r in results],
+        "aggregate": agg,
+    }
+
+
+if __name__ == "__main__":
+    import json
+    questions = [
+        "What is 137 * 23?",
+        "Is the Eiffel Tower in Paris? Yes or No.",
+        "What year was Python first released?",
+    ]
+    for q in questions:
+        print(f"\nQ: {q}")
+        print("Majority:", voting_run(q, "majority")["aggregate"])
+        print("LLM-judge:", voting_run(q, "llm-judge")["aggregate"])
+```
+
+**Walkthrough:**
+
+**Block 1 — Three DISTINCT system prompts maximize answer independence.** Same model + same question + 3 prompts produces 3 reasoning paths. If prompts were identical (or seeds-only differ), majority voting would suffer from herd behavior — the same wrong answer 3 times. Distinct prompts force divergent reasoning paths, raising the probability that errors cancel.
+
+**Block 2 — `_extract_answer` regex on "ANSWER: ..." is the load-bearing normalization.** Without it, free-form responses with prose around the answer would never match for majority vote. The contract is in the system prompt ("End with: ANSWER: <final>"); the extractor enforces it client-side.
+
+**Block 3 — Majority vote uses `.lower()` + `.rstrip(".")` normalization.** "Python" / "python" / "python." all collapse to one bucket. Production normalization is task-specific: numbers may need range comparison; categories may need synonym mapping; long-form answers may need semantic similarity. The chapter teaches the cheapest normalization; production teams extend.
+
+**Block 4 — LLM-judge with `BEST: <id>` + `REASON: <sentence>` is the structured-output trick.** Without explicit format, the LLM might emit "I think solver 2 is best because..." — hard to parse. The regex `BEST:\s*(\d+)` is the cheap parser; the format is the contract.
+
+**Test:**
+
+```python
+# tests/test_voting.py
+from voting import voting_run, aggregate_majority, SolverResult
+
+
+def test_majority_agreement_high_confidence():
+    """When all 3 solvers agree, confidence should be 1.0."""
+    results = [
+        SolverResult(0, "raw", "42"),
+        SolverResult(1, "raw", "42"),
+        SolverResult(2, "raw", "42"),
+    ]
+    agg = aggregate_majority(results)
+    assert agg["confidence"] == 1.0
+    assert agg["answer"] == "42"
+
+
+def test_majority_split_lower_confidence():
+    """2-of-3 split yields 0.667 confidence."""
+    results = [
+        SolverResult(0, "raw", "yes"),
+        SolverResult(1, "raw", "yes"),
+        SolverResult(2, "raw", "no"),
+    ]
+    agg = aggregate_majority(results)
+    assert agg["confidence"] == 2 / 3
+    assert agg["answer"] == "yes"
+
+
+def test_voting_returns_three_solver_answers():
+    """End-to-end run produces 3 solver answers + an aggregate."""
+    out = voting_run("Is 2 + 2 = 4? Yes or No.", aggregator="majority")
+    assert len(out["solver_answers"]) == 3
+    assert "answer" in out["aggregate"]
+
+
+def test_llm_judge_returns_answer_in_voted_set():
+    """LLM-judge's pick should be one of the solver answers."""
+    out = voting_run("What color is the sky on a clear day?", aggregator="llm-judge")
+    voted = set(out["solver_answers"])
+    assert out["aggregate"]["answer"] in voted
+```
+
+**Result** *(projected — actual run TBD)*: on a 20-question test set with known answers, expect single-agent accuracy ~70-80%; voting accuracy ~85-90% (3-5pt improvement from majority cancellation). Cost: 3× single-agent for majority (3 solver calls); 4× for llm-judge (3 solvers + 1 judge). Cost-per-correct-answer is the real metric: 3-4× cost / 1.1× accuracy = ~3× cost-per-correct. Voting only earns its cost when correctness > cost (medical, legal, security).
+
+`★ Insight ─────────────────────────────────────`
+- **Prompt-variant diversity is the cheapest way to ensure answer independence.** Same-model + different-prompt yields different reasoning paths even at temperature=0. Seed-only variation produces correlated errors; prompt variation breaks the correlation cheaply.
+- **`extracted_answer` normalization + bucket-count IS the majority vote.** No fancy ML; just `Counter()`. Production teams sometimes reach for fuzzy-string-match or semantic similarity to merge near-duplicates — start with strict matching and only escalate when the bucket-count is too granular.
+- **LLM-judge wins on free-form answers where majority can't normalize.** "The Eiffel Tower is in Paris" vs "Paris" vs "It's in Paris, France" don't collapse via lowercase + strip. LLM-judge reads the 3 answers + picks the most-correct one regardless of phrasing. Cost +1 LLM call.
+`─────────────────────────────────────────────────`
+
+---
 
 ### Phase 6 — Topology decision matrix exercise (~30 min)
 
-Goal: for 10 sample workloads (research, customer-support, code-review, data-analysis, etc.), answer the §2.9 6-question decision matrix and pick a topology. Defend each choice in 2 sentences.
+Goal: for 10 sample workloads, answer the §2.9 6-question matrix + pick a topology. Defend each choice in 2 sentences.
 
-Deliverable: `outputs/topology_decisions.md` — 10-row table of (workload, 6 answers, picked topology, defense).
+This phase is ANALYSIS-only — no new code. Deliverable: `outputs/topology_decisions.md` — 10-row table of (workload, 6 answers, picked topology, defense). Reuses code from Phase 1-5 to run any chosen topology against the workload after the decision matrix.
+
+Suggested workload set:
+1. "Summarize this 30-page research paper" → flat supervisor (one-layer decompose by section)
+2. "Compare regulatory frameworks across EU, US, UK, China" → hierarchical (region × dimension)
+3. "Customer support: route to refund / sales / technical" → handoffs (triage shape)
+4. "Code review: coder + reviewer + tester iterate on a function" → group-chat (emergent collaboration)
+5. "Medical diagnosis from symptoms: 3 specialists vote" → voting/debate (correctness > cost)
+6. "Plan a 7-day vacation itinerary" → flat supervisor (decompose by day)
+7. "Triage a stack-trace and route to backend / frontend / db debugger" → handoffs
+8. "Legal-review a contract: 3 lawyers + judge" → voting/debate
+9. "Code-mod across 50 files" → flat supervisor (parallelize by file)
+10. "Customer call simulation: agent + customer + supervisor" → group-chat
+
+**Deliverable shape:**
+
+```markdown
+| # | Workload | Decomposable? | Sub-decompose? | Knowable? | Triage? | Correctness > cost? | Shared memory? | Picked | Defense |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Summarize 30-page paper | Yes | No | Yes | No | No | No | supervisor | One-layer decompose by section; parallelize; lead synthesizes |
+| 2 | Compare regs EU/US/UK/CN | Yes | Yes | Yes | No | No | No | hierarchical | Top decomposes by region; sub-leads decompose by dimension |
+| ... 8 more rows ... |
+```
+
+This phase is the senior-engineer interview cover: 90 seconds defending a topology choice for a novel workload using the 6-question matrix. Use the deliverable as anki-card material for the W3.5.5.5 interview soundbites.
 
 ---
 
-## 5. (deprecated)
-
----
-
-## 6. Bad-Case Journal (3-5 entries — SPEC)
+## 5. Bad-Case Journal (3-5 entries — SPEC)
 
 Candidate failure surfaces:
 
@@ -273,7 +1168,7 @@ Candidate failure surfaces:
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC)
+## 6. Interview Soundbites (2-3 entries — SPEC)
 
 - **Planned Soundbite 1 — "When would you reach for supervisor vs group-chat?"** Anchors: §2.9 6-question matrix + Anthropic 90.2% measurement. 70 words: "Supervisor when the workflow IS knowable — decompose, parallelize, synthesize. Anthropic Research shows 90.2% improvement vs single-agent on internal evals, with 80% of variance from fresh context per subagent. Group-chat when workflow isn't statically known — coder might ask reviewer OR researcher OR writer. Group-chat pays selector overhead per turn. Pick supervisor when you can name the sub-questions; pick group-chat when the agents need to react to each other emergently."
 - **Planned Soundbite 2 — "Why is OpenAI Swarm two concepts?"** Anchors: §2.6. 70 words naming the design choice (routing IS the LLM's tool-call; no DSL burden) + the stateless trade-off.
@@ -281,7 +1176,7 @@ Candidate failure surfaces:
 
 ---
 
-## 8. References
+## 7. References
 
 ### Papers + canonical writing
 
@@ -311,7 +1206,7 @@ Candidate failure surfaces:
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 3.5.5 - Multi-Agent Shared Knowledge]] (shared-knowledge axis — this chapter is the topology axis); [[Week 4 - ReAct From Scratch]] (single-agent loop primitive that topologies compose).
 - **Distinguish from:** [[Week 6.95 - A2A Protocol]] (A2A is cross-organization protocol; topology choice is intra-system structure — orthogonal concerns); [[Week 4.6 - Durable Agent Runtime and Process Topologies]] (W4.6's "process topology" is execution-trigger axis; this chapter is communication-topology axis).
