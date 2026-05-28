@@ -483,6 +483,14 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "code"))
 
 
+def pytest_configure(config):
+    """Register custom markers so pytest doesn't warn about them."""
+    config.addinivalue_line(
+        "markers",
+        "integration: test requires a real LLM endpoint (set LLM_PROVIDER=openai or anthropic-proxy)",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _mock_llm_for_unit_tests(monkeypatch, request):
     """Default unit tests use mock LLM (deterministic, fast).
@@ -632,11 +640,15 @@ import os
 import pytest
 from supervisor import supervisor_run
 
+@pytest.mark.integration
 def test_supervisor_parallel_wins():
     """total ≈ plan + max(workers) + synth, NOT plan + sum(workers) + synth.
-    Requires real LLM latency; mock returns instantly so wall-times are 0."""
-    if os.getenv("LLM_PROVIDER") == "mock":
-        pytest.skip("parallel-wall test requires real LLM latency")
+    Requires real LLM latency; mock returns instantly so wall-times are 0.
+    Conftest's autouse fixture leaves LLM_PROVIDER alone for tests with the
+    `integration` marker; the user's exported provider (openai / anthropic-
+    proxy) takes effect here."""
+    if os.getenv("LLM_PROVIDER", "mock") == "mock":
+        pytest.skip("set LLM_PROVIDER=openai or anthropic-proxy to run")
     out = supervisor_run("What is photosynthesis?")
     parallel = out["plan_wall_s"] + out["max_worker_wall_s"] + out["synthesize_wall_s"]
     sequential = out["plan_wall_s"] + out["sum_worker_walls_s"] + out["synthesize_wall_s"]
@@ -762,11 +774,13 @@ def test_hierarchy_depth_and_agent_count():
     out = hierarchical_run("Compare HTTP/2 vs HTTP/3 vs HTTP/3 over QUIC.")
     assert out["depth"] == 2 and out["agents_total"] == 7
 
+@pytest.mark.integration
 def test_hierarchy_parallel_at_sub_level():
     """Sub-leads run in parallel: total ≈ plan + max(sub) + synth.
-    Requires real LLM latency; mock returns instantly so wall-times are 0."""
-    if os.getenv("LLM_PROVIDER") == "mock":
-        pytest.skip("parallel-wall test requires real LLM latency")
+    Requires real LLM latency. Marked `integration` so conftest's autouse
+    fixture preserves the user's exported LLM_PROVIDER."""
+    if os.getenv("LLM_PROVIDER", "mock") == "mock":
+        pytest.skip("set LLM_PROVIDER=openai or anthropic-proxy to run")
     out = hierarchical_run("OAuth 2.0 vs OAuth 2.1 differences?")
     parallel = out["plan_wall_s"] + out["max_sub_wall_s"] + out["synthesize_wall_s"]
     sequential = out["plan_wall_s"] + sum(out["sub_walls_s"]) + out["synthesize_wall_s"]
