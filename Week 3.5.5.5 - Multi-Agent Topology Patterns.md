@@ -339,10 +339,22 @@ export LLM_PROVIDER=mock
 
 **Step 4 — Verify end-to-end:**
 
+`llm.py` lives in `code/`, NOT in lab root. Two equivalent run-from-root paths:
+
 ```bash
-python -c "from llm import chat; print(chat('Reply with the single word: PONG'))"
-# Expected: PONG (or a sentence containing PONG)
+# Option A — PYTHONPATH inline
+PYTHONPATH=code python -c "from llm import chat; print(chat('Reply with the single word: PONG'))"
+
+# Option B — cd into code/ first
+cd code && python -c "from llm import chat; print(chat('Reply with the single word: PONG'))" ; cd ..
 ```
+
+Expected output: `PONG` (or a sentence containing PONG).
+
+Common errors:
+- `ModuleNotFoundError: No module named 'llm'` → you ran from lab root without `PYTHONPATH=code`. Use Option A or B above.
+- `httpx.ConnectError: All connection attempts failed` → the configured `LLM_PROVIDER`'s endpoint isn't running. For `anthropic-proxy`, start the `:8317` proxy first; for `openai`, start your oMLX/vLLM server; for `mock`, no endpoint needed.
+- Stray `# Expected: PONG ...` line treated as zsh command → drop the `#`-comment lines when copying the bash block; they're docs not commands.
 
 **Step 5 — Author `tests/conftest.py` — pytest fixtures:**
 
