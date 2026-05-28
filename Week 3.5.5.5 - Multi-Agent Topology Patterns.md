@@ -284,30 +284,31 @@ def _timeout_s() -> float:
     return float(os.getenv("LLM_TIMEOUT_S", "60"))
 
 
-# Back-compat shims for any older callers reading module-level constants.
-_PROVIDER = _provider()
-_TIMEOUT_S = _timeout_s()
+def chat(prompt: str, system: str | None = None, max_tokens: int = 1024) -> str:
+    """Send (system, prompt) → return assistant text. Sync; uses httpx.
 
-
-def chat(prompt: str, system: str | None = None) -> str:
-    """Send (system, prompt) → return assistant text. Sync; uses httpx."""
+    `max_tokens` defaults to 1024. Bump higher for synthesis-heavy calls
+    when the model is a reasoning model (e.g. gpt-oss-20b) whose CoT
+    consumes the budget before the final answer emits — see W3.5.8 BCJ
+    Entry 8 for the canonical 'finish_reason=length, content=None' trap.
+    """
     provider = _provider()
     if provider == "anthropic-proxy":
-        return _chat_anthropic_proxy(prompt, system)
+        return _chat_anthropic_proxy(prompt, system, max_tokens)
     if provider == "openai":
-        return _chat_openai(prompt, system)
+        return _chat_openai(prompt, system, max_tokens)
     if provider == "mock":
         return _chat_mock(prompt, system)
     raise ValueError(f"unknown LLM_PROVIDER: {provider}")
 
 
-def _chat_anthropic_proxy(prompt: str, system: str | None) -> str:
+def _chat_anthropic_proxy(prompt: str, system: str | None, max_tokens: int = 1024) -> str:
     """Claude-Sonnet-4.6 via local :8317 proxy. User-only payload avoids the
     proxy's system-field overwrite (see W3.5.8 BCJ Entry 19)."""
     url = os.getenv("ANTHROPIC_BASE_URL", "http://localhost:8317") + "/v1/messages"
     body = {
         "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "messages": [{
             "role": "user",
             "content": (f"[INSTRUCTIONS]\n{system}\n\n[USER MESSAGE]\n{prompt}"
@@ -319,12 +320,12 @@ def _chat_anthropic_proxy(prompt: str, system: str | None) -> str:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    r = httpx.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
+    r = httpx.post(url, json=body, headers=headers, timeout=_timeout_s())
     r.raise_for_status()
     return r.json()["content"][0]["text"]
 
 
-def _chat_openai(prompt: str, system: str | None) -> str:
+def _chat_openai(prompt: str, system: str | None, max_tokens: int = 1024) -> str:
     """OpenAI-compatible chat.completions endpoint (Azure / vLLM / oMLX).
 
     Env-var precedence (agent-prep convention):
@@ -356,7 +357,7 @@ def _chat_openai(prompt: str, system: str | None) -> str:
         "model": model,
         "messages": messages,
         "temperature": 0.0,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     r = httpx.post(url, json=body, headers=headers, timeout=_timeout_s())
@@ -530,7 +531,7 @@ flowchart TD
 **Code:**
 
 ```python
-# code/supervisor.py — supervisor topology with thread-pool parallel workers
+# code/supervisor.py
 from __future__ import annotations
 import json
 import time
@@ -564,6 +565,105 @@ def plan_decompose(question: str) -> list[str]:
     """Lead's first LLM call: decompose question into 3 sub-questions."""
     raw = chat(question, system=LEAD_DECOMPOSE_SYSTEM)
     # Strip optional ```json fence
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    parsed = json.loads(raw.strip())
+    return parsed["sub_questions"]
+
+def worker_run(sub_question: str) -> WorkerResult:
+    """One worker: fresh context, narrow answer."""
+    t0 = time.monotonic()
+    answer = chat(sub_question, system=WORKER_SYSTEM)
+    return WorkerResult(
+        sub_question=sub_question,
+        answer=answer,
+        wall_seconds=time.monotonic() - t0,
+    )
+
+def synthesize(question: str, results: list[WorkerResult]) -> str:
+    """Lead's second LLM call: combine worker answers.
+
+    `max_tokens=2048` bump: synthesize prompts can be large (sum of all
+    worker answers + question + instruction); on reasoning models like
+    gpt-oss-20b the CoT can consume the budget before the final answer
+    emits (the W3.5.8 BCJ Entry 8 trap — finish_reason=length + empty
+    content). 2048 gives 1024 for reasoning + 1024 for the actual answer.
+    """
+    bundle = "\n\n".join(
+        f"Worker {i+1} on '{r.sub_question}':\n{r.answer}"
+        for i, r in enumerate(results)
+    )
+    prompt = f"ORIGINAL QUESTION: {question}\n\nWORKER ANSWERS:\n{bundle}\n\nSYNTHESIZE."
+    return chat(prompt, system=LEAD_SYNTHESIZE_SYSTEM, max_tokens=2048)
+
+def supervisor_run(question: str) -> dict:
+    """End-to-end supervisor topology. Returns answer + timing breakdown."""
+    t_total = time.monotonic()
+
+    t_plan = time.monotonic()
+    sub_qs = plan_decompose(question)
+    plan_wall = time.monotonic() - t_plan
+
+    with ThreadPoolExecutor(max_workers=len(sub_qs)) as pool:
+        results = list(pool.map(worker_run, sub_qs))
+
+    t_syn = time.monotonic()
+    answer = synthesize(question, results)
+    syn_wall = time.monotonic() - t_syn
+
+    return {
+        "answer": answer,
+        "sub_questions": sub_qs,
+        "workers": [
+            {"sub_question": r.sub_question, "answer": r.answer,
+             "wall_s": round(r.wall_seconds, 2)}
+            for r in results
+        ],
+        "plan_wall_s": round(plan_wall, 2),
+        "worker_walls_s": [round(r.wall_seconds, 2) for r in results],
+        "max_worker_wall_s": round(max(r.wall_seconds for r in results), 2),
+        "sum_worker_walls_s": round(sum(r.wall_seconds for r in results), 2),
+        "synthesize_wall_s": round(syn_wall, 2),
+        "total_wall_s": round(time.monotonic() - t_total, 2),
+    }
+
+
+def print_supervisor_tree(out: dict) -> None:
+    """Pretty-print supervisor run with per-agent visibility."""
+    print(f"\n{'=' * 70}")
+    print(f"SUPERVISOR TOPOLOGY — total {out['total_wall_s']}s "
+          f"(plan {out['plan_wall_s']}s + max_worker {out['max_worker_wall_s']}s "
+          f"+ synth {out['synthesize_wall_s']}s)")
+    print(f"{'=' * 70}\n")
+    print(f"LEAD (plan): decomposed into {len(out['workers'])} sub-questions:")
+    for i, w in enumerate(out["workers"], 1):
+        print(f"\n  Worker {i} (wall {w['wall_s']}s)")
+        print(f"  ├─ sub-question: {w['sub_question']}")
+        print(f"  └─ answer:")
+        for line in (w["answer"] or "<empty>").splitlines():
+            print(f"     │ {line}")
+    print(f"\n{'─' * 70}")
+    print(f"LEAD (synthesize): combined {len(out['workers'])} worker answers:")
+    print(f"{'─' * 70}")
+    for line in (out["answer"] or "<EMPTY — BCJ Entry 8 trap, bump max_tokens>").splitlines():
+        print(f"  {line}")
+    print(f"\n{'=' * 70}")
+    # Guard against ZeroDivisionError on instant workers (mock provider /
+    # cached responses can produce max_worker_wall_s = 0.0)
+    ratio = out['sum_worker_walls_s'] / max(out['max_worker_wall_s'], 0.01)
+    print(f"PARALLELISM RECEIPT: sum_worker_walls_s = {out['sum_worker_walls_s']}s, "
+          f"max_worker_wall_s = {out['max_worker_wall_s']}s, "
+          f"ratio = {ratio:.2f}× "
+          f"(close to N-1={len(out['workers'])-1} = full parallelism)")
+    print(f"{'=' * 70}\n")
+
+
+if __name__ == "__main__":
+    out = supervisor_run("What changed in multi-agent agent systems between 2023 and 2026?")
+    print_supervisor_tree(out)
+```json fence
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -630,6 +730,12 @@ if __name__ == "__main__":
 **Block 3 — `ThreadPoolExecutor` with `max_workers=len(sub_qs)` gives true parallelism on I/O-bound work.** LLM calls are network-I/O; GIL doesn't block. Wall-time of the worker batch becomes `max(worker_walls)`, not `sum`. Returned `worker_walls_s` + `max_worker_wall_s` + `sum_worker_walls_s` measurements let the reader VERIFY parallelism empirically — if max ≈ sum, threading didn't actually parallelize (something's serializing under the hood).
 
 **Block 4 — Synthesis prompt names the workers explicitly + asks for disagreement-surfacing.** `Worker {i+1} on '...'` framing prevents the lead from blending answers anonymously. Disagreement-surfacing is the failure-mode defense from §2.3's "synthesis conflicts" point: silent picking is worse than explicit disagreement.
+
+**Block 5 — `synthesize()` passes `max_tokens=2048`, not the default 1024.** Synthesize prompts can be ~2k input tokens (sum of N worker answers + question + instruction). On reasoning models like `gpt-oss-20b-MXFP4-Q8`, the chain-of-thought consumes the budget before the final answer emits — the W3.5.8 BCJ Entry 8 trap (`finish_reason=length` + `content=None`). 2048 gives 1024 for reasoning + 1024 for the actual answer. The `chat()` API gained a `max_tokens` parameter (default 1024 preserved) specifically to expose this knob without globally bumping cost.
+
+**Block 6 — `supervisor_run()` returns per-worker structure, not just timings.** New `workers: [{sub_question, answer, wall_s}, ...]` field and `sub_questions: [...]` field expose what each worker SAID, not just how long it took. Reader sees "Worker 2 answered with X" — visibility into the multi-agent intermediate state. Without this, the result is opaque: you only see `max_worker_wall_s=18.8s`, not WHY Worker 2 was the slowest.
+
+**Block 7 — `print_supervisor_tree()` walks the topology with visible per-agent outputs.** Replaces `json.dumps(out)` in `__main__` with a tree-walk: header banner → `LEAD (plan)` decomposition → each Worker's sub-question + wall + answer (line-by-line indented) → `LEAD (synthesize)` final answer → parallelism receipt line. Empty answers print as `<empty>` so the BCJ Entry 8 trap is visible-not-silent. The parallelism receipt uses `max(max_worker_wall_s, 0.01)` to guard against ZeroDivisionError on mock-provider instant returns.
 
 **Test:**
 
@@ -700,24 +806,43 @@ flowchart TD
 **Code:**
 
 ```python
-# code/hierarchical.py — supervisor-of-supervisors (2 layers)
+# code/hierarchical.py
 from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
 from supervisor import plan_decompose, worker_run, synthesize, WorkerResult
 
-def sub_supervisor(macro_question: str) -> WorkerResult:
-    """Sub-lead: decompose macro into 2 sub-questions, run 2 workers, synthesize."""
+
+@dataclass
+class SubLeadResult:
+    """Sub-lead's full output: its macro question, the sub-questions it
+    decomposed into, each leaf worker's answer + wall, the synthesized
+    sub-answer, and the sub-lead's total wall."""
+    macro_question: str
+    sub_questions: list[str]
+    leaf_results: list[WorkerResult]
+    sub_answer: str
+    wall_seconds: float
+
+
+def sub_supervisor(macro_question: str) -> SubLeadResult:
+    """Sub-lead: decompose macro into 2 sub-questions, run 2 leaf workers in
+    parallel, synthesize. Returns full per-agent structure (NOT just timing)."""
     t0 = time.monotonic()
     sub_qs = plan_decompose(macro_question)[:2]   # cap at 2 sub-qs per macro
     with ThreadPoolExecutor(max_workers=2) as pool:
         leaf_results = list(pool.map(worker_run, sub_qs))
     sub_answer = synthesize(macro_question, leaf_results)
-    return WorkerResult(
-        sub_question=macro_question,
-        answer=sub_answer,
+    return SubLeadResult(
+        macro_question=macro_question,
+        sub_questions=sub_qs,
+        leaf_results=leaf_results,
+        sub_answer=sub_answer,
         wall_seconds=time.monotonic() - t0,
     )
+
 
 def hierarchical_run(question: str) -> dict:
     """Two-layer hierarchy: top lead → 2 sub-leads → 4 leaf workers."""
@@ -729,28 +854,80 @@ def hierarchical_run(question: str) -> dict:
     with ThreadPoolExecutor(max_workers=len(macros)) as pool:
         sub_results = list(pool.map(sub_supervisor, macros))
 
+    # Top-lead synthesizes by treating each sub-lead's output as a WorkerResult
+    sub_as_workers = [
+        WorkerResult(sub_question=s.macro_question, answer=s.sub_answer,
+                     wall_seconds=s.wall_seconds)
+        for s in sub_results
+    ]
     t_syn = time.monotonic()
-    answer = synthesize(question, sub_results)
+    answer = synthesize(question, sub_as_workers)
     syn_wall = time.monotonic() - t_syn
 
     return {
         "answer": answer,
+        "macros": macros,
+        "sub_leads": [
+            {
+                "macro_question": s.macro_question,
+                "sub_questions": s.sub_questions,
+                "leaves": [
+                    {"sub_question": lf.sub_question, "answer": lf.answer,
+                     "wall_s": round(lf.wall_seconds, 2)}
+                    for lf in s.leaf_results
+                ],
+                "sub_answer": s.sub_answer,
+                "wall_s": round(s.wall_seconds, 2),
+            }
+            for s in sub_results
+        ],
         "depth": 2,
         "agents_total": 1 + len(macros) + len(macros) * 2,   # top + sub-leads + leaves
         "plan_wall_s": round(plan_wall, 2),
-        "sub_walls_s": [round(r.wall_seconds, 2) for r in sub_results],
-        "max_sub_wall_s": round(max(r.wall_seconds for r in sub_results), 2),
+        "sub_walls_s": [round(s.wall_seconds, 2) for s in sub_results],
+        "max_sub_wall_s": round(max(s.wall_seconds for s in sub_results), 2),
         "synthesize_wall_s": round(syn_wall, 2),
         "total_wall_s": round(time.monotonic() - t_total, 2),
     }
 
 
+def print_hierarchy_tree(out: dict) -> None:
+    """Pretty-print 2-layer hierarchical run with per-agent visibility."""
+    print(f"\n{'=' * 70}")
+    print(f"HIERARCHICAL TOPOLOGY — depth {out['depth']}, "
+          f"{out['agents_total']} agents, total {out['total_wall_s']}s")
+    print(f"  plan {out['plan_wall_s']}s + max_sub {out['max_sub_wall_s']}s "
+          f"+ synth {out['synthesize_wall_s']}s")
+    print(f"{'=' * 70}\n")
+    print(f"TOP LEAD (plan): decomposed into {len(out['sub_leads'])} macros\n")
+    for i, sl in enumerate(out["sub_leads"], 1):
+        print(f"┌─ Sub-lead {i} (wall {sl['wall_s']}s)")
+        print(f"│  macro: {sl['macro_question']}")
+        print(f"│  decomposed into {len(sl['leaves'])} leaf sub-questions:")
+        for j, lf in enumerate(sl["leaves"], 1):
+            print(f"│    Leaf {i}.{j} (wall {lf['wall_s']}s)")
+            print(f"│    ├─ sub-question: {lf['sub_question']}")
+            print(f"│    └─ answer:")
+            for line in (lf["answer"] or "<empty>").splitlines():
+                print(f"│       │ {line}")
+        print(f"│")
+        print(f"│  Sub-synthesis:")
+        for line in (sl["sub_answer"] or "<empty>").splitlines():
+            print(f"│    │ {line}")
+        print(f"└─{'─' * 60}\n")
+    print(f"{'─' * 70}")
+    print(f"TOP LEAD (synthesize): combined {len(out['sub_leads'])} sub-answers:")
+    print(f"{'─' * 70}")
+    for line in (out["answer"] or "<EMPTY — BCJ Entry 8 trap, bump max_tokens>").splitlines():
+        print(f"  {line}")
+    print(f"\n{'=' * 70}\n")
+
+
 if __name__ == "__main__":
-    import json
     out = hierarchical_run(
         "Compare regulatory frameworks for AI across EU, US, and UK."
     )
-    print(json.dumps(out, indent=2))
+    print_hierarchy_tree(out)
 ```
 
 **Walkthrough:**
@@ -760,6 +937,12 @@ if __name__ == "__main__":
 **Block 2 — Cap at 2 macros + 2 sub-qs per macro = 4 leaf workers.** 2×2 fan keeps total agents = 7 (1 top + 2 sub + 4 leaves). Bigger fans (3×3 = 13 agents) blow token cost without proportional accuracy gain at this depth. Production rule: hierarchical fan width should taper at deeper levels (top wider, leaves narrower).
 
 **Block 3 — `agents_total` is the cost signal the test can assert.** 7 agents on a 2-macro × 2-sub-q hierarchy = 7 LLM calls just for the decomposition / leaf / sub-synth layer + 1 top-synth = 8 calls minimum. Sequential single-agent on same task = 1 call. ~8× cost. Hierarchy must EARN that 8× through accuracy/structure win on a TRULY 2-layer-decomposable question.
+
+**Block 4 — `SubLeadResult` dataclass captures the full per-agent tree.** Fields: `macro_question`, `sub_questions` (the 2 sub-qs the sub-lead decomposed into), `leaf_results` (list of `WorkerResult` with sub_question + answer + wall_s per leaf), `sub_answer` (the sub-lead's synthesized output), `wall_seconds` (sub-lead's total wall). This replaces the previous shape where `sub_supervisor` returned a bare `WorkerResult` exposing only sub_answer + wall — readers couldn't see the 2 leaf workers' individual outputs. Per-agent visibility is the senior-engineer artifact: a multi-agent run is opaque without it.
+
+**Block 5 — `sub_as_workers = [WorkerResult(...) for s in sub_results]` is a deliberate type-adapter, not a refactor candidate.** `synthesize()` (from supervisor.py) takes `list[WorkerResult]` — a contract the supervisor module owns. Hierarchical reuses that contract at the top-lead layer by adapting `SubLeadResult` → `WorkerResult`. Alternative (overloading `synthesize` to accept either type) is worse: it would couple the supervisor module to the hierarchical module's dataclass shape. The adapter is the right call.
+
+**Block 6 — `print_hierarchy_tree()` walks the topology TOP-DOWN with full per-agent visibility.** TOP LEAD plan banner → 2 sub-leads (each its own indented block) → each sub-lead's 2 leaves (deeper indented) with per-leaf wall + answer → each sub-lead's synthesis at the leaf-block close → TOP LEAD synthesize at the bottom. Empty answers print as `<EMPTY — BCJ Entry 8 trap, bump max_tokens>` — critical signal because hierarchical synthesize is MORE susceptible to that trap than supervisor synthesize (input tokens are higher: sum of 2 sub-answers + question vs sum of 3 worker answers + question, and the 2 sub-answers tend to be longer because each is already a synthesis of 2 leaves).
 
 **Test:**
 
