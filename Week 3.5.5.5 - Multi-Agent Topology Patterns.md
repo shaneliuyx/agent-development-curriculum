@@ -1326,7 +1326,7 @@ flowchart TD
 **Code:**
 
 ```python
-# code/handoffs.py — OpenAI Swarm-style handoffs (two-primitive API)
+# code/handoffs.py
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Any
@@ -1353,11 +1353,22 @@ class Agent:
         )
         reply = chat(prompt, system=self.system_prompt).strip()
         if reply.upper().startswith("HANDOFF:"):
-            tool_name = reply.split(":", 1)[1].strip()
-            for tool in self.tools:
-                if tool.__name__ == tool_name:
-                    next_agent = tool()
-                    return ("", next_agent)
+            # Defensive parse: handle both 'HANDOFF: transfer_to_X' (bare ID
+            # per prompt contract) AND 'HANDOFF: transfer_to_X()' (function-
+            # call format that models often emit despite the bare-ID
+            # instruction). Sonnet 4.6 and gpt-oss-20b both observed emitting
+            # the parens variant 2026-05-28; without this fix, the loop
+            # silently stays at triage even though the model decided to
+            # hand off. Same trap-class as W3.5.5.5 BCJ Entry 7 (models
+            # emit format variants of explicit-format instructions).
+            import re
+            m = re.search(r"HANDOFF:\s*(\w+)", reply, re.IGNORECASE)
+            if m:
+                tool_name = m.group(1)
+                for tool in self.tools:
+                    if tool.__name__ == tool_name:
+                        next_agent = tool()
+                        return ("", next_agent)
         return (reply, None)
 
 
@@ -1478,7 +1489,23 @@ def test_trace_starts_with_triage():
     assert out["handoff_trace"][0] == "triage"
 ```
 
-**Result** *(projected — actual run TBD)*: on a labeled 5-message test set, expect 5/5 correct routing (refund messages → refund agent, sales messages → sales agent). Per-message wall ~2-4s (triage LLM call + specialist LLM call = ~2 calls). Total token cost ≈ 2× single-agent.
+**Result** *(measured 2026-05-28, 3-model compose sweep on 5 triage messages)*:
+
+| Model | Routing accuracy | Specialist persona |
+|---|:-:|:-:|
+| **Sonnet 4.6** (cloud via proxy) | **5/5** | **0/5** — BROKEN (BCJ Entry 19 cloak-injection: proxy re-injects Claude Code system prompt on EVERY agent invocation; specialist's `system_prompt` drowned) |
+| **gpt-oss-20b** (local) | **5/5** | **5/5** (clean, confident: "I'm sorry to hear you'd like a refund. To process it quickly...") |
+| **Qwen3.5-27B-Opus-distill** (local) | **5/5** | **5/5** (clean, hedging: "I don't have access to specific..." — calibrated knowledge-gap admission carries into specialist roleplay) |
+
+**TWO BUGS FOUND during the sweep** (added as BCJ Entries 11 + the re-application of Entry 19):
+
+(1) **BCJ Entry 11 — Handoff parser couldn't strip parens.** Sonnet emitted `HANDOFF: transfer_to_refunds()` 4/5 times; gpt-oss-20b emitted parens variant on 2/5 sales messages. Original parser `reply.split(":", 1)[1].strip()` kept `()`; `tool.__name__ == "transfer_to_refunds()"` mismatched against bare-identifier function name → loop silently stayed at triage despite model deciding to hand off. Fix: regex `\w+` extract. Same trap-class as BCJ Entry 7 (format-variant on explicit-format instructions).
+
+(2) **BCJ Entry 19 (W3.5.8) STILL bites at nested-agent layer.** The `_chat_anthropic_proxy` user-only-payload bypass works for top-level synthesis (verified on hierarchical TOP) but proxy re-injects Claude Code system prompt on EVERY agent call. **Production rule: proxy cloaking is incompatible with multi-agent specialist patterns; use direct Anthropic API with subscription billing OR local models for nested-agent topologies.**
+
+Per-message wall: ~3-15s (triage + specialist = 2 calls, Sonnet ~3s/call, gpt-oss-20b ~10s/call, Qwen-distill ~20s/call). Total token cost ≈ 2× single-agent.
+
+Full per-run outputs: `lab-03-5-5-5-topology/results/handoffs_{sonnet-4-6,gpt-oss-20b,qwen-3.5-27b-claude-opus-distill}.txt`.
 
 `★ Insight ─────────────────────────────────────`
 - **The whole Swarm primitive is the `respond` method's return-type-switch.** Return `Agent` → switch. Return `str` → done. Two cases; no DSL; no graph. The chapter's "two-primitive API" claim becomes provable in code.
@@ -1663,7 +1690,29 @@ def test_llm_judge_returns_answer_in_voted_set():
     assert out["aggregate"]["answer"] in set(out["solver_answers"])
 ```
 
-**Result** *(projected — actual run TBD)*: on a 20-question test set with known answers, expect single-agent accuracy ~70-80%; voting accuracy ~85-90% (3-5pt improvement from majority cancellation). Cost: 3× single-agent for majority (3 solver calls); 4× for llm-judge (3 solvers + 1 judge). Cost-per-correct-answer is the real metric: 3-4× cost / 1.1× accuracy = ~3× cost-per-correct. Voting only earns its cost when correctness > cost (medical, legal, security).
+**Result** *(measured 2026-05-28, 3-model compose sweep on 3 questions × 2 aggregators)*:
+
+| Model | Q1: 137×23 | Q2: Eiffel Tower? | Q3: Python year |
+|---|---|---|---|
+| **Sonnet 4.6** | Majority 2/3 conf **0.67** (1 solver "3,151" with comma) | 3/3 conf 1.0 | 3/3 conf 1.0 |
+| **gpt-oss-20b** | **3/3 conf 1.0** | 3/3 conf 1.0 | 3/3 conf 1.0 |
+| **Qwen-distill** | **3/3 conf 1.0** | 3/3 conf 1.0 | 2/3 conf **0.67** (1 solver "**1991**" markdown-bold) |
+
+All 9 final answers correct (3151, yes, 1991). The 2/3-confidence cells reflect **format-consistency-within-model variance** — same model, same prompt, 3 solver samples; one solver chose a different surface-format that the answer-extractor saw as a different vote. Model-specific format-leak signatures:
+
+| Model | Format-failure surface |
+|---|---|
+| Sonnet 4.6 | Comma-formatted numbers (`3,151` ≠ `3151`) |
+| gpt-oss-20b | No observed format-failures across 3 Qs (reasoning model = format-strict) |
+| Qwen-distill | Markdown-bold formatting (`**1991**` ≠ `1991`) — Opus-trait transfer (BCJ Entry 7 same root cause) |
+
+**Voting is the most resilient topology.** No reasoning_content trap (no synthesis), no premature-TERMINATE (no multi-turn loop), no specialist-cloak (no nested agent invocation), no parser-format issues. Solver quality is the only model-dependent variable; the aggregator pattern is bullet-proof. **Production rule:** when you have a hard decision with reliability requirements, the architectural answer is voting + judge — pay the 3-5× cost, eliminate the topology-level failure surface.
+
+Cost: 3× single-agent for majority (3 solver calls); 4× for llm-judge (3 solvers + 1 judge). Wall: ~5-15s per Q (Sonnet), ~20-40s (gpt-oss-20b), ~40-80s (Qwen-distill). Cost-per-correct-answer is the real metric: 3-4× cost / 1.0× accuracy on these simple Qs = ~3-4× cost-per-correct.
+
+**Production fix for the format-leak failure mode:** post-process solver outputs through a normalizer (strip markdown, normalize numbers via regex) before majority-counting. The aggregator pattern is robust; answer-extraction is the seam where same-model format variance hurts confidence. Worth adding to the chapter as a follow-up enhancement.
+
+Full per-run outputs: `lab-03-5-5-5-topology/results/voting_{sonnet-4-6,gpt-oss-20b,qwen-3.5-27b-claude-opus-distill}.txt`.
 
 `★ Insight ─────────────────────────────────────`
 - **Prompt-variant diversity is the cheapest way to ensure answer independence.** Same-model + different-prompt yields different reasoning paths even at temperature=0. Seed-only variation produces correlated errors; prompt variation breaks the correlation cheaply.
@@ -1756,6 +1805,19 @@ All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 s
 *Symptom:* `python code/group_chat.py` against Qwen3.5-27B-Claude-Opus-distill on task "Write `is_palindrome` — reviewer + tester collaborate" terminated in **1 round** for both `llm-selected` and `custom` selectors. Coder's turn 1 emitted code + delegated to "**Reviewer:** Please review..." + "**Tester:** Please provide test cases..." + **`TERMINATE`** in the same response. Loop's `if "TERMINATE" in msg.upper(): exit` triggered immediately — reviewer and tester NEVER spoke. Task required collaboration; collaboration never happened. Same selector + same task on Sonnet 4.6 produced 4 rounds (proper collaboration); on gpt-oss-20b produced 6 rounds.
 *Root cause:* The termination contract assumes `TERMINATE` = convergence-after-collaboration. Models with strong commitment-bias (Qwen-Opus-distill, transferred from Opus's "commit-with-evidence" trait — see §5.3.5 LongMemEval where this trait WINS at 77% vs Sonnet's 60%) can decide "I'm done" and emit TERMINATE BEFORE collaboration has occurred. The same trait that wins commit-bias evals (LongMemEval) fails coordination-required workloads (group_chat). **Eval-trait mismatch:** picking a model for "best score on benchmark X" without checking whether the trait that scores HIGH on X is the SAME trait your workload needs.
 *Fix:* Two-layer defense. (a) **Prompt layer**: CODER's system prompt gains explicit minimum-turn condition — "End with TERMINATE ONLY after AT LEAST 3 turns have happened AND reviewer + tester have both responded. Until then, write code + ask for review/tests but do NOT emit TERMINATE." Forces the model to defer termination to a state it can verify from `pool` content. (b) **Runtime layer**: assert minimum-rounds before honoring TERMINATE — `if "TERMINATE" in msg.upper() and round_n >= min_rounds_for_collaboration: break`. Production rule generalizes: **termination contracts must be defensible against shortcut paths** — any predicate that exits a multi-turn loop should require BOTH a textual signal AND a state-check (turn count, agent participation, completion criteria). Without the state-check, commit-biased models bypass the entire interaction.
+
+**Entry 11 — Handoff parser couldn't strip parens from `HANDOFF: transfer_to_X()`; loop silently stayed at triage despite model deciding to hand off.** *(observed 2026-05-28)*
+*Symptom:* `python code/handoffs.py` against Sonnet 4.6: 4/5 traces showed `Trace: triage` (no handoff occurred) despite Sonnet's final message being `HANDOFF: transfer_to_refunds()` or `HANDOFF: transfer_to_sales()`. The model decided to hand off; the runtime didn't honor the decision. Against gpt-oss-20b: 3/5 worked (model emitted bare-identifier `transfer_to_refunds` without parens), 2/5 stuck at triage (sales messages, model emitted parens variant `transfer_to_sales()`). The mismatch surfaced ONLY when the model emitted parens; bare-identifier outputs worked fine.
+*Root cause:* Original parser `tool_name = reply.split(":", 1)[1].strip()` extracted the suffix after `HANDOFF:` but kept any trailing characters. `"HANDOFF: transfer_to_refunds()".split(":", 1)[1].strip()` returns `"transfer_to_refunds()"`. The lookup `tool.__name__ == tool_name` compares against the bare Python function name `"transfer_to_refunds"` — mismatch, no agent dispatched, runtime stays at active=triage, returns triage's HANDOFF token as final reply. **The model decided correctly; the parser failed to honor the decision.** Same trap-class as Entry 7 (models emit format variants of explicit-format instructions). The prompt says "reply with EXACTLY: HANDOFF: <tool_name>" but models routinely emit function-call format (`tool_name()`) — they pattern-match on tool docstrings + their own training distribution.
+*Fix:* Replace `split(":", 1)[1].strip()` with regex `\w+` extract:
+```python
+import re
+m = re.search(r"HANDOFF:\s*(\w+)", reply, re.IGNORECASE)
+if m:
+    tool_name = m.group(1)
+    # ... lookup + dispatch
+```
+The `\w+` captures ONLY the bare identifier, ignoring `()`, whitespace, trailing punctuation, or any other formatting decoration. Production rule generalizes: **at every output-parsing boundary, regex-extract the structured payload — never use `startswith`/`split` for structured data**. The instruction-format-variant happens at EVERY output-parsing boundary; lab code should assume it.
 
 ---
 
