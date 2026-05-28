@@ -221,6 +221,107 @@ Soundbites will be populated with concrete numbers after Phase 1-6 actual runs.
 
 ---
 
+## 10. Companion — WorkOS `auth.md` Agent Registration Protocol (TRENDS-LIFT 2026-05-28)
+
+W6.65 teaches MCP transport security: Origin allowlist + DNS-rebinding defense + signed sessions. The next layer up is AGENT IDENTITY: how does a service know which agent is calling, on behalf of which user? **WorkOS auth.md** (May 2026) standardizes this.
+
+### The thesis
+
+Traditional auth models assume a USER is the principal. Agents are now writing code, opening PRs, triaging tickets, querying systems, updating records — and most services have NO STANDARD WAY for an agent to register on behalf of a user with scoped, auditable credentials. auth.md fixes this with a Markdown file at `https://your-service.com/auth.md` that tells agents how to register.
+
+### How it works
+
+Service publishes `auth.md` describing supported flows + scopes + endpoints. Agent reads `auth.md` → picks a flow → registers → gets scoped credentials. Two flows supported:
+
+- **Agent-verified flow (ID-JAG-based).** Synchronous, no human interaction. Agent presents an OIDC ID-JAG identity assertion (proves "this agent is acting on behalf of this verified user"). Service grants scoped credentials. Used for trusted agent platforms with strong identity.
+- **User-claimed flow (OTP-based).** Asynchronous, human-in-loop. User receives a one-time code; agent uses code to complete registration. Used when the service doesn't trust the agent's claimed identity assertion.
+
+### Key design decisions
+
+- **Markdown-first.** `auth.md` is human-readable + machine-parseable. Same shape as `robots.txt`, `security.txt`, `humans.txt`, `.well-known/openid-configuration`. Operationally familiar.
+- **OAuth-standard composition.** Built on Protected Resource Metadata (RFC 9728) + ID-JAG identity assertions. Not a new auth stack; a wrapper over existing OAuth.
+- **No vendor lock-in.** Any app can publish, any agent can read. WorkOS infrastructure not required.
+- **Early partners (May 2026 launch).** Cloudflare + Firecrawl. Anchor adoption.
+
+### Lab (~1.5h)
+
+```bash
+# 1. Author an example auth.md (won't deploy; teaches shape)
+cat > /tmp/auth.md <<'EOF'
+# AGENT-Registration for ExampleApp
+
+## Supported Flows
+
+### agent-verified
+- **Authentication:** ID-JAG identity assertion (RFC TBD)
+- **Endpoint:** https://api.example.com/agent/register
+- **Required scopes:** read:tickets, write:tickets
+- **Token format:** OAuth 2.1 access token
+- **Token expires:** 24h, renewable
+
+### user-claimed
+- **Authentication:** OTP (6-digit, 10min validity)
+- **Endpoint:** https://api.example.com/agent/register-otp
+- **Required scopes:** read:tickets, write:tickets
+- **Flow:** user receives OTP via email → agent submits OTP
+
+## Available scopes
+
+- `read:tickets` — list and read support tickets
+- `write:tickets` — create and update tickets
+- `delete:tickets` — delete tickets (high-privilege; requires user_claimed)
+
+## Audit
+
+All agent-issued tokens are logged with: agent_id, user_id,
+scopes_granted, issued_at, last_used. Visible in user's
+account settings under "Active Agents".
+
+## Contact
+
+agents@example.com for support and security issues.
+EOF
+
+# 2. Parse the auth.md programmatically (simulate agent's view)
+python3 -c '
+import re
+with open("/tmp/auth.md") as f:
+    content = f.read()
+flows = re.findall(r"### (\S+)", content)
+print("Supported flows:", flows)
+scopes_section = content.split("## Available scopes")[1].split("##")[0]
+print("Scopes available:\n", scopes_section.strip())
+'
+
+# 3. Walk through the agent-verified flow conceptually:
+# a. Agent has an ID-JAG from its platform (e.g., WorkOS-managed identity)
+# b. Agent POSTs to /agent/register with the assertion
+# c. Service validates assertion, grants scoped token
+# d. Agent uses token for subsequent API calls
+
+# 4. Walk through user-claimed flow:
+# a. User initiates "register an agent" in service UI
+# b. Service emails user a 6-digit OTP
+# c. User pastes OTP to agent
+# d. Agent submits OTP to /agent/register-otp
+# e. Service validates, grants scoped token
+```
+
+**Verification:** can write a valid auth.md from the schema; can parse another service's auth.md (Cloudflare's or Firecrawl's, when available); can articulate the trade-off between the two flows.
+
+### Cross-link to W11.55 + W6.95
+
+- **W11.55** Content Provenance + AI Regulatory: auth.md's audit trail is the regulatory-compliance primitive — every agent-issued token is auditable per user.
+- **W6.95** A2A Protocol: A2A's Agent Card (`.well-known/agent.json`) + AP2 signing is the AGENT-SIDE identity; auth.md is the SERVICE-SIDE registration. Complementary protocols.
+
+### Source attribution
+
+- WorkOS auth.md (May 2026). https://github.com/workos/auth.md + https://workos.com/auth-md.
+- Launch announcement (Michael Grinich, X, 2026-05-25).
+- WorkOS blog: *Agent Registration with Auth.md.* https://workos.com/blog/agent-registration-with-auth-md.
+
+---
+
 ## What's Next
 
 After W6.65: [[Week 6.7 - Authoring Agent Skills]] (skills + the SKILL.md format are the application layer that runs on top of Streamable HTTP MCP servers); [[Week 6.95 - A2A Protocol]] (agent-to-agent collaboration via the protocol that complements MCP).

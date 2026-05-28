@@ -481,6 +481,94 @@ Developer set `allowed-tools: [Bash]` for a knowledge-lookup skill. Model used `
 
 ---
 
+## apm — Agent Package Manager (TRENDS-LIFT 2026-05-28)
+
+W6.7 teaches how to AUTHOR skills. **microsoft/apm** (Agent Package Manager, May 2026, 2.6K⭐) teaches how to DISTRIBUTE + INSTALL + REPRODUCE skill + MCP-server dependencies across team / repos / agent clients. apm is to skills what npm is to JavaScript packages OR pip is to Python: a manifest (`apm.yml`), a lockfile, a CLI (`apm install`), transitive dependency resolution, and compile targets for major agent clients (Claude Code, Cursor, Copilot, Codex, Gemini, Windsurf, OpenCode).
+
+**Why this matters.** Before apm: every developer set up skill + MCP configuration manually per repo per agent client. No portability, no reproducibility, no manifest. Cloning a repo and getting a working agent setup took 30+ minutes per developer × N agent clients × M repos. After apm: one `apm.yml` in the repo declares everything; `apm install` reproduces the agent setup in seconds for any team member with any supported agent client. Same operational discipline as `npm install` for a JS project.
+
+### The manifest shape (`apm.yml`)
+
+```yaml
+# apm.yml — ships with your project
+name: your-project
+version: 1.0.0
+dependencies:
+  apm:
+    # Skills from any repository
+    - anthropics/skills/skills/frontend-design
+    # Plugins
+    - github/awesome-copilot/plugins/context-engineering
+    # Specific agent primitives from any repository
+    - github/awesome-copilot/agents/api-architect.agent.md
+    # A full APM package with instructions, skills, prompts, hooks...
+    - microsoft/apm-sample-package#v1.0.0
+  mcp:
+    # MCP servers -- installed into every detected client
+    - name: io.github.github/github-mcp-server
+      transport: http   # MCP transport name; over HTTPS
+```
+
+### Install + lab (~2h)
+
+```bash
+# Install apm
+brew install microsoft/apm/apm   # OR: npm install -g @microsoft/apm
+
+# Initialize in your lab repo
+cd ~/code/agent-prep/lab-03-5-8-two-tier
+apm init   # generates apm.yml scaffold
+
+# Edit apm.yml to declare your project's skills + MCP servers
+cat > apm.yml <<'EOF'
+name: lab-03-5-8-two-tier
+version: 0.1.0
+dependencies:
+  apm:
+    - anthropics/skills/skills/api-architect
+  mcp:
+    - name: mathomhaus/guild
+      transport: stdio
+EOF
+
+# Install
+apm install   # downloads + resolves + installs into every detected client
+
+# Compile to specific target
+apm compile -t copilot   # writes .github/copilot-instructions.md
+apm compile -t claude-code   # writes .claude/CLAUDE.md additions
+apm compile -t cursor    # writes .cursor/rules
+
+# Verify
+apm list   # shows installed skills + MCP servers + which clients picked them up
+```
+
+**Verification:** clone your lab repo in a clean directory → `apm install` → confirm Claude Code / Cursor (whichever is installed) both pick up the skills + MCP server. Time-to-working-agent < 30s.
+
+### Production rule
+
+The `apm.yml` + lockfile pair are the **portable manifest** for agent configuration — same shape as `package.json` + `package-lock.json` for JS or `pyproject.toml` + `uv.lock` for Python. Treat `apm.yml` as version-controlled infrastructure-as-code; never edit installed files manually (apm overwrites on next install).
+
+### apm vs `npx skills add` (Anthropic's earlier tool)
+
+Drop-in compatibility:
+```bash
+apm install vercel-labs/agent-skills                            # whole bundle, like npx skills add
+apm install vercel-labs/agent-skills --skill deploy-to-vercel   # one skill, persisted to apm.yml
+```
+
+Same install gesture; apm adds the manifest + lockfile + reproducibility. Use apm in any project where multiple developers / multiple clients / version-pinning matters.
+
+### Cross-link to W6.65 MCP Production Transports
+
+`apm.yml`'s `mcp:` block declares MCP server dependencies; the manifest specifies the `transport` (stdio for local, http for Streamable HTTP). Same MCP transport vocabulary W6.65 teaches; apm is the dependency-management layer above the transport layer.
+
+### Source attribution
+
+- microsoft/apm (May 2026, 2.6K stars).  https://github.com/microsoft/apm + https://microsoft.github.io/apm/.
+
+---
+
 ## References
 
 - Claude Code Skills documentation: https://docs.anthropic.com/en/docs/claude-code/skills
