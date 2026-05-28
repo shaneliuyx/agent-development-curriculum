@@ -299,19 +299,40 @@ def _chat_anthropic_proxy(prompt: str, system: str | None) -> str:
 
 
 def _chat_openai(prompt: str, system: str | None) -> str:
-    """OpenAI-compatible chat.completions endpoint (Azure / vLLM / oMLX)."""
-    url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1") + "/chat/completions"
+    """OpenAI-compatible chat.completions endpoint (Azure / vLLM / oMLX).
+
+    Env-var precedence (agent-prep convention):
+      OMLX_*   — local oMLX server (canonical for the curriculum's labs)
+      OPENAI_* — generic OpenAI-compatible (Azure, public OpenAI, etc.)
+    Whichever is set wins; OMLX_* takes precedence when BOTH are set.
+    """
+    base_url = (
+        os.getenv("OMLX_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or "http://localhost:8000/v1"
+    )
+    api_key = (
+        os.getenv("OMLX_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or "sk-local"
+    )
+    model = (
+        os.getenv("OMLX_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "gpt-oss-20b-MXFP4-Q8"
+    )
+    url = base_url.rstrip("/") + "/chat/completions"
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
     body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-oss-20b-MXFP4-Q8"),
+        "model": model,
         "messages": messages,
         "temperature": 0.0,
         "max_tokens": 1024,
     }
-    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', 'sk-local')}"}
+    headers = {"Authorization": f"Bearer {api_key}"}
     r = httpx.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
