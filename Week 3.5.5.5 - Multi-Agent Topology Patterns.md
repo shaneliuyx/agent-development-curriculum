@@ -221,6 +221,158 @@ flowchart LR
 
 Each phase ships an executable Python file in `code/` + a test file in `tests/` + a per-block bundle (mermaid → code → walkthrough → result → insight). All code targets Python 3.11+ with stdlib + `httpx` + a frozen LLM endpoint (Claude-Sonnet-4.6 via `:8317` proxy OR local oMLX). The LLM client is abstracted via a tiny `llm.chat(prompt, system=None) -> str` helper so swapping providers is one line.
 
+### Phase 0 — Environment Preparation (~20 min)
+
+Goal: spin up a lab directory + Python venv + the shared `llm.py` provider abstraction. All Phase 1-6 code reuses this setup; run it ONCE.
+
+**Step 1 — Create lab repo + venv:**
+
+```bash
+mkdir -p ~/code/agent-prep/lab-03-5-5-5-topology/{code,tests,outputs}
+cd ~/code/agent-prep/lab-03-5-5-5-topology
+uv venv && source .venv/bin/activate
+pip install httpx pytest
+echo -e "code/\noutputs/\n.venv/\n__pycache__/" > .gitignore
+git init && git add -A && git commit -m "scaffold W3.5.5.5 lab"
+```
+
+**Step 2 — Author `code/llm.py` — the provider abstraction:**
+
+```python
+# code/llm.py — single chat() helper; swap providers via env vars
+"""Tiny LLM provider abstraction. All chapter code calls llm.chat(prompt, system).
+
+Providers (selected via LLM_PROVIDER env var):
+  - "anthropic-proxy" — Claude-Sonnet-4.6 via local :8317 proxy (curriculum default)
+  - "openai"          — OpenAI-compatible endpoint (Azure OpenAI / local oMLX / vLLM)
+  - "mock"            — deterministic stub for offline tests (see tests/conftest.py)
+"""
+from __future__ import annotations
+import os
+import httpx
+
+_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic-proxy")
+_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "60"))
+
+
+def chat(prompt: str, system: str | None = None) -> str:
+    """Send (system, prompt) → return assistant text. Sync; uses httpx."""
+    if _PROVIDER == "anthropic-proxy":
+        return _chat_anthropic_proxy(prompt, system)
+    if _PROVIDER == "openai":
+        return _chat_openai(prompt, system)
+    if _PROVIDER == "mock":
+        return _chat_mock(prompt, system)
+    raise ValueError(f"unknown LLM_PROVIDER: {_PROVIDER}")
+
+
+def _chat_anthropic_proxy(prompt: str, system: str | None) -> str:
+    """Claude-Sonnet-4.6 via local :8317 proxy. User-only payload avoids the
+    proxy's system-field overwrite (see W3.5.8 BCJ Entry 19)."""
+    url = os.getenv("ANTHROPIC_BASE_URL", "http://localhost:8317") + "/v1/messages"
+    body = {
+        "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        "max_tokens": 1024,
+        "messages": [{
+            "role": "user",
+            "content": (f"[INSTRUCTIONS]\n{system}\n\n[USER MESSAGE]\n{prompt}"
+                        if system else prompt),
+        }],
+    }
+    headers = {
+        "x-api-key": os.getenv("ANTHROPIC_API_KEY", "dummy"),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    r = httpx.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
+    r.raise_for_status()
+    return r.json()["content"][0]["text"]
+
+
+def _chat_openai(prompt: str, system: str | None) -> str:
+    """OpenAI-compatible chat.completions endpoint (Azure / vLLM / oMLX)."""
+    url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1") + "/chat/completions"
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-oss-20b-MXFP4-Q8"),
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 1024,
+    }
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', 'sk-local')}"}
+    r = httpx.post(url, json=body, headers=headers, timeout=_TIMEOUT_S)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _chat_mock(prompt: str, system: str | None) -> str:
+    """Deterministic stub. Returns first 100 chars of prompt reversed.
+    Useful for offline unit tests; tests/conftest.py sets LLM_PROVIDER=mock."""
+    return (prompt[:100])[::-1]
+```
+
+**Step 3 — Configure provider:**
+
+```bash
+# Option A — Claude-Sonnet-4.6 via :8317 proxy (curriculum default; matches W3.5.8 §7.7)
+export LLM_PROVIDER=anthropic-proxy
+export ANTHROPIC_BASE_URL=http://localhost:8317
+export ANTHROPIC_MODEL=claude-sonnet-4-6
+# Verify the proxy is running:
+curl -s http://localhost:8317/v1/messages -X POST -H "x-api-key: dummy" \
+  -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":20,"messages":[{"role":"user","content":"ping"}]}' \
+  | head -c 200
+
+# Option B — local oMLX / vLLM (OpenAI-compatible)
+export LLM_PROVIDER=openai
+export OPENAI_BASE_URL=http://localhost:8000/v1
+export OPENAI_MODEL=gpt-oss-20b-MXFP4-Q8
+export OPENAI_API_KEY=sk-local
+
+# Option C — offline mock (no LLM; for fast unit-test iterations)
+export LLM_PROVIDER=mock
+```
+
+**Step 4 — Verify end-to-end:**
+
+```bash
+python -c "from llm import chat; print(chat('Reply with the single word: PONG'))"
+# Expected: PONG (or a sentence containing PONG)
+```
+
+**Step 5 — Author `tests/conftest.py` — pytest fixtures:**
+
+```python
+# tests/conftest.py — shared test setup
+import os
+import sys
+import pytest
+
+# Make code/ importable from tests/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "code"))
+
+
+@pytest.fixture(autouse=True)
+def _mock_llm_for_unit_tests(monkeypatch, request):
+    """Default unit tests use mock LLM (deterministic, fast).
+    Tests marked @pytest.mark.integration use the real configured provider."""
+    if "integration" not in request.keywords:
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+```
+
+**Verification:** `pytest tests/ -v --collect-only` lists test names without errors; `python -c "from llm import chat; print(chat('ping'))"` returns a response.
+
+**Run modes (used per Phase below):**
+- Fast iteration (no LLM cost, deterministic): `pytest tests/ -v` (uses mock)
+- Integration run (real LLM, costs tokens): `pytest tests/ -v -m integration` (uses configured provider)
+- Manual lab run: `python code/<phase>.py` (always uses configured provider, never mock)
+
+---
+
 ### Phase 1 — Supervisor from primitives (~1.5 hours)
 
 Goal: one lead + 3 workers in parallel via `concurrent.futures.ThreadPoolExecutor`. Lead decomposes a research question → 3 sub-questions; workers run concurrently with fresh contexts; lead synthesizes. Wall-time should be `max(worker_times) + plan + synthesis`, NOT `sum`.
