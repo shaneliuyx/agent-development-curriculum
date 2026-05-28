@@ -231,9 +231,18 @@ Goal: spin up a lab directory + Python venv + the shared `llm.py` provider abstr
 mkdir -p ~/code/agent-prep/lab-03-5-5-5-topology/{code,tests,outputs}
 cd ~/code/agent-prep/lab-03-5-5-5-topology
 uv venv && source .venv/bin/activate
-pip install httpx pytest
+
+# IMPORTANT: use `uv pip` OR `python -m pip` — NOT bare `pip`.
+# Bare `pip` may resolve to another venv on $PATH and install into the wrong env.
+uv pip install httpx pytest
+# (equivalent: python -m pip install httpx pytest)
+
 echo -e "code/\noutputs/\n.venv/\n__pycache__/" > .gitignore
 git init && git add -A && git commit -m "scaffold W3.5.5.5 lab"
+
+# Verify the right venv is active:
+which python   # should resolve to ./.venv/bin/python
+python -c "import httpx, pytest; print('ok')"
 ```
 
 **Step 2 — Author `code/llm.py` — the provider abstraction:**
