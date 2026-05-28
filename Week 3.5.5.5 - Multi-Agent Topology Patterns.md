@@ -352,24 +352,20 @@ import json
 from supervisor import supervisor_run
 
 def test_supervisor_parallel_wins():
-    """Wall-time invariant: total should be roughly max(workers) + plan + synth,
-    NOT sum(workers) + plan + synth. If max ≈ sum, parallelism is broken."""
+    """total ≈ plan + max(workers) + synth, NOT plan + sum(workers) + synth."""
     out = supervisor_run("What is photosynthesis?")
-    parallel_wall = out["plan_wall_s"] + out["max_worker_wall_s"] + out["synthesize_wall_s"]
-    sequential_wall = out["plan_wall_s"] + out["sum_worker_walls_s"] + out["synthesize_wall_s"]
-    # total_wall_s should be within 20% of parallel-bound, not sequential-bound
-    assert out["total_wall_s"] < (parallel_wall + sequential_wall) / 2
+    parallel = out["plan_wall_s"] + out["max_worker_wall_s"] + out["synthesize_wall_s"]
+    sequential = out["plan_wall_s"] + out["sum_worker_walls_s"] + out["synthesize_wall_s"]
+    assert out["total_wall_s"] < (parallel + sequential) / 2
 
 def test_supervisor_decomposition_is_three():
-    """plan_decompose must return exactly 3 sub-questions per the system prompt contract."""
-    out = supervisor_run("Compare REST vs GraphQL.")
-    assert len(out["worker_walls_s"]) == 3
+    """plan_decompose returns exactly 3 sub-questions per contract."""
+    assert len(supervisor_run("Compare REST vs GraphQL.")["worker_walls_s"]) == 3
 
 def test_supervisor_synthesizes_answer():
-    """End-to-end: an answer string is returned + is non-trivially long."""
+    """End-to-end: answer is a non-trivially long string."""
     out = supervisor_run("What is OAuth?")
-    assert isinstance(out["answer"], str)
-    assert len(out["answer"]) > 50
+    assert isinstance(out["answer"], str) and len(out["answer"]) > 50
 ```
 
 **Result** *(projected — actual run TBD; replace with measured numbers after `python code/supervisor.py` + `pytest tests/test_supervisor.py -v`)*: expected `total_wall_s` ~15-25s (plan ~3s + max_worker ~10s + synth ~5s); `sum_worker_walls_s` ~30-50s (3 workers × ~10s each). Parallel speedup ≈ 2-3×. Token cost ~ 5× single-agent baseline on the same question (lead × 2 + workers × 3).
@@ -476,18 +472,16 @@ if __name__ == "__main__":
 from hierarchical import hierarchical_run
 
 def test_hierarchy_depth_and_agent_count():
-    """2-macro × 2-sub-q hierarchy = 7 agents (1 top + 2 sub + 4 leaves)."""
+    """2-macro × 2-sub-q hierarchy → 7 agents (1 top + 2 sub + 4 leaves)."""
     out = hierarchical_run("Compare HTTP/2 vs HTTP/3 vs HTTP/3 over QUIC.")
-    assert out["depth"] == 2
-    assert out["agents_total"] == 7
+    assert out["depth"] == 2 and out["agents_total"] == 7
 
 def test_hierarchy_parallel_at_sub_level():
-    """Total wall should be plan + max(sub) + synth, NOT plan + sum(sub) + synth.
-    Sub-leads run in parallel inside the top-level ThreadPoolExecutor."""
-    out = hierarchical_run("What are the differences between OAuth 2.0 and OAuth 2.1?")
-    parallel_bound = out["plan_wall_s"] + out["max_sub_wall_s"] + out["synthesize_wall_s"]
-    sequential_bound = out["plan_wall_s"] + sum(out["sub_walls_s"]) + out["synthesize_wall_s"]
-    assert out["total_wall_s"] < (parallel_bound + sequential_bound) / 2
+    """Sub-leads run in parallel: total ≈ plan + max(sub) + synth."""
+    out = hierarchical_run("OAuth 2.0 vs OAuth 2.1 differences?")
+    parallel = out["plan_wall_s"] + out["max_sub_wall_s"] + out["synthesize_wall_s"]
+    sequential = out["plan_wall_s"] + sum(out["sub_walls_s"]) + out["synthesize_wall_s"]
+    assert out["total_wall_s"] < (parallel + sequential) / 2
 ```
 
 **Result** *(projected — actual run TBD)*: expected `total_wall_s` ~30-50s (deeper hierarchy = more sequential LLM-call layers); 7-8× token cost vs single-agent. Hierarchy WINS when question has genuine 2-layer decomposition (regulatory comparison across regions); LOSES (vs flat supervisor with 6 workers) when question is one-layer.
@@ -671,34 +665,27 @@ if __name__ == "__main__":
 from group_chat import group_chat_run, SELECTORS
 
 def test_round_robin_zero_selector_calls():
-    """Round-robin does pure cyclic selection — selector_calls equals rounds_used
-    (we count each pick as one selector_call, but LLM calls inside are 0)."""
-    # Note: selector_calls == rounds_used by definition; the cost is that LLM
-    # calls per pick = 0 for round-robin, 1 for llm-selected
+    """Round-robin: selector_calls == rounds_used (0 LLM calls inside)."""
     out = group_chat_run("Test task", selector="round-robin", max_rounds=3)
     assert out["selector_calls"] == out["rounds_used"]
 
 def test_llm_selected_returns_valid_agent_name():
-    """LLM-selected must always return one of the registered agents."""
-    valid_names = {"coder", "reviewer", "tester"}
+    """LLM-selected always returns a registered agent name."""
+    valid = {"coder", "reviewer", "tester"}
     out = group_chat_run("Write factorial(n).", selector="llm-selected", max_rounds=3)
-    for msg in out["pool"][1:]:   # skip user message
-        assert msg["speaker"] in valid_names
+    assert all(m["speaker"] in valid for m in out["pool"][1:])
 
 def test_custom_tester_follows_coder():
     """Custom rule: after a coder message, tester MUST speak next."""
     out = group_chat_run("Write a Python function.", selector="custom", max_rounds=6)
-    for i in range(len(out["pool"]) - 1):
-        if out["pool"][i]["speaker"] == "coder":
-            assert out["pool"][i + 1]["speaker"] == "tester", (
-                f"Rule violation at msg {i}: coder followed by "
-                f"{out['pool'][i + 1]['speaker']}"
-            )
+    msgs = out["pool"]
+    for i in range(len(msgs) - 1):
+        if msgs[i]["speaker"] == "coder":
+            assert msgs[i + 1]["speaker"] == "tester"
 
 def test_terminate_token_ends_conversation():
-    """Any agent emitting TERMINATE ends the loop early."""
+    """TERMINATE token ends the loop before max_rounds."""
     out = group_chat_run("Solve x + 1 = 2.", selector="round-robin", max_rounds=20)
-    # Either we hit TERMINATE OR max_rounds; if TERMINATE, rounds_used < max
     if out["terminated_by"] == "TERMINATE token":
         assert out["rounds_used"] < 20
 ```
@@ -1046,38 +1033,26 @@ if __name__ == "__main__":
 from voting import voting_run, aggregate_majority, SolverResult
 
 def test_majority_agreement_high_confidence():
-    """When all 3 solvers agree, confidence should be 1.0."""
-    results = [
-        SolverResult(0, "raw", "42"),
-        SolverResult(1, "raw", "42"),
-        SolverResult(2, "raw", "42"),
-    ]
+    """All 3 agree → confidence = 1.0."""
+    results = [SolverResult(i, "raw", "42") for i in range(3)]
     agg = aggregate_majority(results)
-    assert agg["confidence"] == 1.0
-    assert agg["answer"] == "42"
+    assert agg["confidence"] == 1.0 and agg["answer"] == "42"
 
 def test_majority_split_lower_confidence():
-    """2-of-3 split yields 0.667 confidence."""
-    results = [
-        SolverResult(0, "raw", "yes"),
-        SolverResult(1, "raw", "yes"),
-        SolverResult(2, "raw", "no"),
-    ]
+    """2-of-3 split → confidence = 0.667."""
+    results = [SolverResult(0, "raw", "yes"), SolverResult(1, "raw", "yes"), SolverResult(2, "raw", "no")]
     agg = aggregate_majority(results)
-    assert agg["confidence"] == 2 / 3
-    assert agg["answer"] == "yes"
+    assert agg["confidence"] == 2 / 3 and agg["answer"] == "yes"
 
 def test_voting_returns_three_solver_answers():
-    """End-to-end run produces 3 solver answers + an aggregate."""
-    out = voting_run("Is 2 + 2 = 4? Yes or No.", aggregator="majority")
-    assert len(out["solver_answers"]) == 3
-    assert "answer" in out["aggregate"]
+    """End-to-end run produces 3 solver answers + aggregate."""
+    out = voting_run("Is 2 + 2 = 4?", aggregator="majority")
+    assert len(out["solver_answers"]) == 3 and "answer" in out["aggregate"]
 
 def test_llm_judge_returns_answer_in_voted_set():
-    """LLM-judge's pick should be one of the solver answers."""
-    out = voting_run("What color is the sky on a clear day?", aggregator="llm-judge")
-    voted = set(out["solver_answers"])
-    assert out["aggregate"]["answer"] in voted
+    """LLM-judge picks one of the solver answers."""
+    out = voting_run("What color is the sky?", aggregator="llm-judge")
+    assert out["aggregate"]["answer"] in set(out["solver_answers"])
 ```
 
 **Result** *(projected — actual run TBD)*: on a 20-question test set with known answers, expect single-agent accuracy ~70-80%; voting accuracy ~85-90% (3-5pt improvement from majority cancellation). Cost: 3× single-agent for majority (3 solver calls); 4× for llm-judge (3 solvers + 1 judge). Cost-per-correct-answer is the real metric: 3-4× cost / 1.1× accuracy = ~3× cost-per-correct. Voting only earns its cost when correctness > cost (medical, legal, security).
