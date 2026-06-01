@@ -643,24 +643,32 @@ class Mem0Adapter:
 **Dispatch addition to `src/run_longmemeval_slice.py`:**
 
 ```python
-# Existing driver has dispatch for 'qdrant' (W3.5.8 §7.7) and 'evercore' (W3.5.8 §7.1).
-# Phase 3 adds 'mem0'. Phase 4 adds 'atomic_fact' + 'hybrid'.
+# Baseline driver (W3.5.8) dispatched 'qdrant' (§7.7) and 'evercore' (§7.1, HTTP).
+# Phase 3 adds 'mem0'; Phase 4 adds 'atomic_fact' + 'hybrid'; Phase 7 adds 'three_tier'.
+# EverCore is an HTTP service handled inline in _run_backend, so it is NOT built
+# here. The rest are object-backends exposing imprint(content, metadata) +
+# query_context(query, k); _run_backend imprints the raw session scroll for the
+# W3.5.9 backends (they extract internally) and keeps the summarize path for qdrant.
+OBJECT_BACKENDS = ("qdrant", "mem0", "atomic_fact", "hybrid", "three_tier")
+ALL_BACKENDS = ("qdrant", "evercore", "mem0", "atomic_fact", "hybrid", "three_tier")
+
 
 def _build_backend(backend: str, user_id: str):
     if backend == "qdrant":
-        return _qd_tm(user_id)             # W3.5.8 TieredMemory (Qdrant variant)
-    if backend == "evercore":
-        return _ec_tm(user_id)             # W3.5.8 TieredMemory (EverCore variant)
+        return _qd_tm(user_id)                                  # W3.5.8 2-tier (Qdrant variant)
     if backend == "mem0":
-        from src.mem0_backend_adapter import Mem0Adapter
+        from src.mem0_backend_adapter import Mem0Adapter        # Phase 3
         return Mem0Adapter(user_id=user_id)
     if backend == "atomic_fact":
         from src.atomic_fact_memory import AtomicFactMemory     # Phase 4
         return AtomicFactMemory(user_id=user_id)
     if backend == "hybrid":
-        from src.router_memory import RouterMemory              # Phase 4
+        from src.router_memory import RouterMemory              # Phase 4 — question-type router
         return RouterMemory(user_id=user_id)
-    raise ValueError(f"unknown backend: {backend}")
+    if backend == "three_tier":
+        from src.three_tier_memory import ThreeTierMemory       # Phase 7 — L1+L2+L3 (HyperMem)
+        return ThreeTierMemory(user_id=user_id)
+    raise ValueError(f"unknown object-backend: {backend!r}")
 ```
 
 **Walkthrough:**
@@ -1451,12 +1459,11 @@ flowchart TD
 **Setup.** Extend `src/run_longmemeval_slice.py` to dispatch a `--backend three_tier` flag. Re-use the same slice (`data/longmemeval_slice_w358.json`), same reader (`gpt-oss-20b`), same judge (`claude-sonnet-4-6`). The ONLY variable is the backend's pipeline.
 
 ```python
-# Eval driver extension (~+10 LOC)
-def _build_backend(backend: str, user_id: str):
+# Eval driver: 'three_tier' is the sixth branch of _build_backend (defined in
+# §4 Phase 3) — already wired. No other driver change: same slice, reader, judge.
     if backend == "three_tier":
         from src.three_tier_memory import ThreeTierMemory
         return ThreeTierMemory(user_id=user_id)
-    # ... existing backends ...
 ```
 
 ```bash
