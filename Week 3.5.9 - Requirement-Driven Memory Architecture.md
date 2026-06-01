@@ -1022,111 +1022,91 @@ flowchart TD
 **Code:**
 
 ```python
-# scripts/aggregate_results.py — Phase 5 extension (~+40 LOC on existing aggregator)
-"""Adds 5-backend comparison mode to W3.5.8's aggregator.
+# scripts/aggregate_results.py — W3.5.9 multi-backend comparison aggregator
+"""Aggregate the driver's combined results JSONL into a backend x axis matrix.
 
-Existing aggregator reads ONE JSONL (single backend run). The Phase 5
-extension reads N JSONLs (one per backend), aligns by question_id, and
-emits a backend × axis × question matrix.
+`src/run_longmemeval_slice.py` writes ONE `data/results_w358.jsonl`; each line is
 
-Usage:
+    {"question_id", "question_type", "question", "gold",
+     "<backend>": {"score", "correct", "wall_imprint", "wall_retrieve", ...}, ...}
+
+with one nested result block per backend that ran (run_one writes
+`record[backend] = result`). This reads that file and prints:
+  1. per-question_type x per-backend mean score
+  2. per-backend median wall-clock per question (imprint + retrieve)
+
+Run from the lab root::
+
     uv run python scripts/aggregate_results.py
-        --backends qdrant,evercore,mem0,atomic_fact,hybrid
-        --results-dir data/
+    uv run python scripts/aggregate_results.py --backends qdrant,mem0,atomic_fact
 """
+from __future__ import annotations
+
 import argparse
 import json
 import pathlib
 import statistics
 from collections import defaultdict
 
-
-def load_backend_results(path: pathlib.Path) -> dict[str, dict]:
-    """Read one JSONL → dict keyed by question_id."""
-    records: dict[str, dict] = {}
-    for line in path.read_text().splitlines():
-        if line.strip():
-            rec = json.loads(line)
-            records[rec["question_id"]] = rec
-    return records
+LAB_ROOT = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_RESULTS = LAB_ROOT / "data" / "results_w358.jsonl"
+ALL_BACKENDS = ["qdrant", "evercore", "mem0", "atomic_fact", "hybrid", "three_tier"]
 
 
-def aggregate_n_backend(backends: list[str], results_dir: pathlib.Path) -> dict:
-    """Load N backends' JSONLs and align by question_id."""
-    per_backend = {}
-    for b in backends:
-        path = results_dir / f"results_{b}.jsonl"
-        if not path.exists():
-            print(f"[skip] {b}: no JSONL at {path}")
-            continue
-        per_backend[b] = load_backend_results(path)
+def load_records(path: pathlib.Path) -> list[dict]:
+    """Read the combined results JSONL (one record per question)."""
+    return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
 
-    # Build question_id × backend × outcome table
-    all_qids: set[str] = set()
-    for b_records in per_backend.values():
-        all_qids.update(b_records.keys())
 
-    # Per-axis × per-backend aggregation
-    axis_backend_scores: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for qid in sorted(all_qids):
-        for b, records in per_backend.items():
-            rec = records.get(qid)
-            if rec is None:
-                continue
-            axis = rec.get("question_type", "unknown")
-            score = float(rec.get("score", 0.0))
-            axis_backend_scores[axis][b].append(score)
-
-    # Wall-clock medians per backend
-    wall_clock_medians = {}
-    for b, records in per_backend.items():
-        walls = [
-            float(rec.get("wall_imprint_s", 0.0)) + float(rec.get("wall_retrieve_s", 0.0))
-            for rec in records.values()
-        ]
-        wall_clock_medians[b] = statistics.median(walls) if walls else 0.0
-
-    return {
-        "per_backend_question": per_backend,
-        "axis_backend_scores": dict(axis_backend_scores),
-        "wall_clock_medians": wall_clock_medians,
-        "all_qids": sorted(all_qids),
-    }
+def aggregate(records: list[dict], backends: list[str]) -> dict:
+    """Align the nested per-backend blocks by question_type into score lists +
+    per-backend wall-clock lists."""
+    axis_backend: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    walls: dict[str, list[float]] = defaultdict(list)
+    for rec in records:
+        axis = rec.get("question_type", "unknown")
+        for b in backends:
+            res = rec.get(b)
+            if not isinstance(res, dict):
+                continue  # backend didn't run for this question
+            axis_backend[axis][b].append(float(res.get("score", 0.0)))
+            walls[b].append(float(res.get("wall_imprint", 0.0))
+                            + float(res.get("wall_retrieve", 0.0)))
+    medians = {b: (statistics.median(w) if w else 0.0) for b, w in walls.items()}
+    return {"axis_backend": dict(axis_backend), "wall_medians": medians}
 
 
 def print_matrix(agg: dict, backends: list[str]) -> None:
-    """Render the comparison table in markdown for copy into chapter."""
+    """Render the comparison table as markdown (copy-paste into the chapter)."""
     print("\n## Aggregate score (mean per backend, per axis)\n")
     print("| Axis | " + " | ".join(backends) + " |")
     print("|" + "---|" * (len(backends) + 1))
-    for axis, scores_per_backend in sorted(agg["axis_backend_scores"].items()):
+    for axis, per_b in sorted(agg["axis_backend"].items()):
         row = [axis]
         for b in backends:
-            scores = scores_per_backend.get(b, [])
-            if scores:
-                mean = sum(scores) / len(scores)
-                row.append(f"{mean:.2f} (n={len(scores)})")
-            else:
-                row.append("—")
+            scores = per_b.get(b, [])
+            row.append(f"{sum(scores) / len(scores):.2f} (n={len(scores)})" if scores else "-")
         print("| " + " | ".join(row) + " |")
     print("\n## Wall-clock median per question (seconds)\n")
     print("| Backend | Median wall/Q |")
     print("|---|---|")
     for b in backends:
-        m = agg["wall_clock_medians"].get(b)
-        if m is not None:
-            print(f"| {b} | {m:.2f} s |")
+        if b in agg["wall_medians"]:
+            print(f"| {b} | {agg['wall_medians'][b]:.2f} s |")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backends", default="qdrant,evercore,mem0,atomic_fact,hybrid")
-    ap.add_argument("--results-dir", default="data")
+    ap.add_argument("--backends", default=",".join(ALL_BACKENDS),
+                    help="comma-separated column order / subset")
+    ap.add_argument("--results", default=str(DEFAULT_RESULTS),
+                    help="path to the combined results JSONL")
     args = ap.parse_args()
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
-    agg = aggregate_n_backend(backends, pathlib.Path(args.results_dir))
+    path = pathlib.Path(args.results)
+    if not path.exists():
+        raise SystemExit(f"no results at {path} - run src.run_longmemeval_slice first")
+    agg = aggregate(load_records(path), backends)
     print_matrix(agg, backends)
 
 
@@ -1337,13 +1317,19 @@ flowchart TD
 **Setup.** Extension to existing `src/consolidation.py` (~+80 LOC). Add `extract_typed_edges()` helper + integrate into `consolidate()` loop.
 
 ```python
-# src/consolidation.py — Phase 8 extension (additions only; existing code unchanged)
+# src/consolidation.py — Phase 8 L3 extension (additions only; appended to the file)
 
+# ── Phase 8: L3 (HyperMem) hyperedge extension ───────────────────────
+# Extends the L2 consolidate() above with typed-hyperedge extraction written
+# to the L3 HyperMem tier. NOTE the adaptation vs the chapter sketch: the real
+# consolidate() is async and pulls closed quests from guild itself (no scrolls
+# arg), so consolidate_with_l3() awaits it for the L2 path and takes an explicit
+# `scrolls` list only for L3 edge extraction. Edge writes are idempotent via a
+# dedup table (mirrors _ensure_dedup_table's `imprinted` pattern).
 import hashlib
-import json
 
 EDGE_EXTRACT_PROMPT = """Extract typed entity-relations from this scroll.
-Each relation is a hyperedge connecting ≥2 typed entities.
+Each relation is a hyperedge connecting >=2 typed entities.
 
 Entity types: user, project, topic, tech, person, system, event
 Relations: worked-on, uses, depends-on, mentions, after, before, related-to
@@ -1351,25 +1337,49 @@ Relations: worked-on, uses, depends-on, mentions, after, before, related-to
 Output JSON array of {nodes: [{type, id}, ...], relation: <verb>}.
 Output ONLY the JSON array. If no extractable relations, output [].
 
-EXAMPLE INPUT: "Alice worked on the payments service using Postgres."
-EXAMPLE OUTPUT: [{"nodes": [{"type":"user","id":"alice"}, {"type":"project","id":"payments"}, {"type":"tech","id":"postgres"}], "relation": "worked-on-using"}]
-
 SCROLL: {scroll_text}"""
 
 
+def _ensure_edge_dedup_table(db_path: Path | None = None) -> sqlite3.Connection:
+    """Edge idempotency table (twin of _ensure_dedup_table's `imprinted`)."""
+    if db_path is None:
+        db_path = DEDUP_DB
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE IF NOT EXISTS edges_imprinted (edge_key TEXT PRIMARY KEY)")
+    return conn
+
+
+def _edge_already_imprinted(key: str, db_path: Path | None = None) -> bool:
+    conn = _ensure_edge_dedup_table(db_path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM edges_imprinted WHERE edge_key = ?", (key,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _record_edge_imprint(key: str, db_path: Path | None = None) -> None:
+    conn = _ensure_edge_dedup_table(db_path)
+    try:
+        conn.execute("INSERT OR IGNORE INTO edges_imprinted (edge_key) VALUES (?)", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _edge_idempotency_key(scroll_id: str, edge: dict) -> str:
-    """Idempotent hash: scroll_id + sorted-entity-pair-canonicalization."""
-    canonical_nodes = sorted(
-        [f"{n['type']}:{n['id']}" for n in edge["nodes"]]
-    )
+    """Idempotent hash: scroll_id + relation + canonicalized sorted entity list."""
+    canonical_nodes = sorted(f"{n['type']}:{n['id']}" for n in edge["nodes"])
     payload = f"{scroll_id}|{edge['relation']}|{'|'.join(canonical_nodes)}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def extract_typed_edges(scroll_text: str) -> list[dict]:
-    """One LLM call → JSON array of typed hyperedges."""
-    # Same client pattern as summarize_scroll / extract_atomic_facts
-    client = _llm_client()
+    """One LLM call -> JSON array of typed hyperedges (same client pattern as
+    summarize_scroll). Returns [] on empty/parse failure."""
+    client = OpenAI(base_url=os.getenv("OMLX_BASE_URL"), api_key=os.getenv("OMLX_API_KEY"))
     resp = client.chat.completions.create(
         model=os.getenv("MODEL_HAIKU", "gpt-oss-20b-MXFP4-Q8"),
         messages=[{"role": "user", "content": EDGE_EXTRACT_PROMPT.format(scroll_text=scroll_text)}],
@@ -1378,33 +1388,33 @@ def extract_typed_edges(scroll_text: str) -> list[dict]:
     )
     raw = (resp.choices[0].message.content or "").strip()
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
     except (json.JSONDecodeError, TypeError):
         return []
 
 
-def consolidate_with_l3(
-    tm: ThreeTierMemory,
+async def consolidate_with_l3(
+    tm: "ThreeTierMemory",
     scrolls: list[dict],
     promotion_threshold: float | None = None,
 ) -> ConsolidationResult:
-    """Phase 8 extended consolidate — writes BOTH L2 imprints AND L3 hyperedges.
+    """Phase 8 extended consolidate: L2 imprints (via the async consolidate())
+    PLUS L3 typed hyperedges POSTed to HyperMem.
 
-    Calls existing consolidate() for L2 path (unchanged behavior), then
-    calls extract_typed_edges() per scroll + posts hyperedges to HyperMem.
-    Idempotency table extended to track edge-hash to avoid duplicate writes.
+    `scrolls` is a list of {"quest_id": str, "text": str} for the L3 edge pass.
+    L3 writes are deduped by _edge_idempotency_key so re-runs are idempotent.
     """
-    # L2 path: unchanged from W3.5.8
-    result = consolidate(tm, scrolls, promotion_threshold=promotion_threshold)
+    # L2 path — unchanged behavior; consolidate() pulls its own closed quests.
+    result = await consolidate(tm, promotion_threshold=promotion_threshold)
 
-    # L3 extension: extract + write hyperedges
+    # L3 extension — extract + write typed hyperedges per supplied scroll.
     edges_imprinted = 0
     edges_skipped_dedup = 0
     for scroll in scrolls:
-        edges = extract_typed_edges(scroll["text"])
-        for edge in edges:
+        for edge in extract_typed_edges(scroll["text"]):
             key = _edge_idempotency_key(scroll["quest_id"], edge)
-            if _edge_already_imprinted(key):  # SQLite dedup table
+            if _edge_already_imprinted(key):
                 edges_skipped_dedup += 1
                 continue
             tm._hypermem.post("/api/v1/edges", json={
