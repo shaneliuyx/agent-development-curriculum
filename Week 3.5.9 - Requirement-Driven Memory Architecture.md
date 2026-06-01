@@ -314,6 +314,19 @@ uv venv --python 3.11 && source .venv/bin/activate
 uv pip install openai python-dotenv pytest httpx mcp mem0ai qdrant-client
 ```
 
+**Prepare reused data + code** (copy from the sibling W3.5.8 lab):
+
+```bash
+OLD=~/code/agent-prep/lab-03-5-8-two-tier
+cp "$OLD/data/longmemeval_slice_w358.json" data/      # immutable test slice (Phase 1 extends it to ~24 Q)
+cp "$OLD/scripts/build_slice.py"            scripts/  # slice builder - no src deps, copies clean
+cp "$OLD/scripts/aggregate_results.py"      scripts/  # comparison-matrix aggregator (Phase 5)
+cp "$OLD/src/tiered_memory_qdrant.py"       src/      # W3.5.8 2-tier backend the router reuses
+cp "$OLD/src/guild_client.py"               src/      # re-export shim -> agent-prep/shared/guild_client.py
+```
+
+`build_slice.py` and `aggregate_results.py` import nothing from `src`, so they copy clean. `tiered_memory_qdrant.py`'s only `src` dependency is the `guild_client` shim, so the two together are self-contained. The LongMemEval eval *driver* (`run_longmemeval_slice.py`) additionally pulls in W3.5.8's `consolidation` + `judge_sonnet` chain, so drive the slice eval from the W3.5.8 lab harness (it dispatches to these new backends by name) rather than re-vendoring half the 5-8 lab.
+
 **New files (the W3.5.9 contribution):**
 
 ```text
