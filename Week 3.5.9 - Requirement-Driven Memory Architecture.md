@@ -333,7 +333,7 @@ cp "$OLD/src/tiered_memory_qdrant.py"       src/      # W3.5.8 2-tier backend th
 cp "$OLD/src/guild_client.py"               src/      # re-export shim -> agent-prep/shared/guild_client.py
 ```
 
-`build_slice.py` and `aggregate_results.py` import nothing from `src`, so they copy clean. The eval driver `run_longmemeval_slice.py` pulls in W3.5.8's `consolidation` + `judge_sonnet` + `audit` + `quality_gate` + `dedup_synthesis` chain (and `tiered_memory_qdrant`, whose only `src` dep is the `guild_client` shim) — the whole closure is vendored above so the slice eval runs entirely in THIS lab (`python -m src.run_longmemeval_slice --backend atomic_fact|router|mem0|three_tier|evercore`). Keeping the chain byte-identical to the 5-8 source is the reuse contract; re-sync if the 5-8 originals change.
+`build_slice.py` and `aggregate_results.py` import nothing from `src`, so they copy clean. The eval driver `run_longmemeval_slice.py` pulls in W3.5.8's `consolidation` + `judge_sonnet` + `audit` + `quality_gate` + `dedup_synthesis` chain (and `tiered_memory_qdrant`, whose only `src` dep is the `guild_client` shim) — the whole closure is vendored above so the slice eval runs entirely in THIS lab (`python -m src.run_longmemeval_slice --backend qdrant|evercore|mem0|atomic_fact|hybrid` (or `--backend all`)). Keeping the chain byte-identical to the 5-8 source is the reuse contract; re-sync if the 5-8 originals change.
 
 **New files (the W3.5.9 contribution):**
 
