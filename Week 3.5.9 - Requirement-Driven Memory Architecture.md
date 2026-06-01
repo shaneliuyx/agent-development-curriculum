@@ -328,9 +328,9 @@ lab-03-5-9-requirement-driven/
 ├── data/   results/   tests/   scripts/
 ```
 
-**Reused from the W3.5.8 lab** (`lab-03-5-8-two-tier`), by copy or by adding it to `PYTHONPATH`:
+**Reused from the W3.5.8 lab** (`lab-03-5-8-two-tier`) by **copying** the file or script into this lab (a cross-lab `PYTHONPATH` cannot bridge these: both labs use a `src` package, so the first `src` on the path wins and `from src.…` never resolves to the sibling lab — copy, or vendor as below):
 
-- `data/longmemeval_slice_w358.json` — the immutable test contract (extended to a balanced ~24 Q by `scripts/build_slice.py` in Phase 1)
+- `data/longmemeval_slice_w358.json` — the immutable test contract; copy the JSON in (or point Phase 1's `build_slice.py` at an output path here). It is a data file, so no import path is involved.
 - `src/run_longmemeval_slice.py` + `scripts/aggregate_results.py` — eval driver + comparison matrix (each grows one backend-dispatch branch for the new backends)
 - `src/tiered_memory_qdrant.py` — the 2-tier path the router dispatches to for `knowledge-update`; vendored into this lab's `src/` so the `from src.tiered_memory_qdrant import TieredMemory` imports resolve without a cross-lab `src` package collision
 - `src/guild_client.py` — the re-export shim over the cluster-shared `shared/guild_client.py` (see [[Week 3.5.5 - Multi-Agent Shared Memory]] §2.1)
