@@ -17,7 +17,7 @@ stack: macOS Apple Silicon M5 Pro 48 GB, oMLX :8000, guild via homebrew (Go bina
 
 - [ ] guild server installed via homebrew + `guild --version` passes
 - [ ] guild initialized for the lab project (`guild init`)
-- [ ] `src/guild_client.py` — Python MCP client wrapper over guild's stdio interface
+- [ ] `shared/guild_client.py` — Python MCP client wrapper over guild's stdio interface (cluster-shared; each lab imports it via a `src/guild_client.py` re-export shim)
 - [ ] `src/atomic_claim_demo.py` — two parallel Python processes both calling `quest_accept` on the same quest; exactly-one-winner verified
 - [ ] `src/three_act_handoff.py` — agent A completes → exits → agent B reads scroll → completes → exits → agent C sees the full chain
 - [ ] Architectural deep-dive note (`docs/atomic_claim_internals.md`) — 1-page explanation of guild's SQLite WAL + UPDATE...WHERE atomic-claim primitive after reading `internal/store/sqlite/`
@@ -197,7 +197,7 @@ uv pip install mcp openai python-dotenv pytest pytest-asyncio
 lab-03-5-5-guild/
 ├── src/              # library code; importable as `from src.X import Y`
 │   ├── __init__.py   # makes src a package (empty file is fine)
-│   ├── guild_client.py
+│   ├── guild_client.py   # re-export shim -> agent-prep/shared/guild_client.py
 │   └── ...
 ├── tests/            # pytest test modules; import sibling `src` package
 │   ├── conftest.py   # sys.path bootstrap so `from src.X` works (see below)
@@ -439,7 +439,7 @@ python -m src.smoke_test
 
 ### 2.1 Tooling abstraction
 
-`src/guild_client.py`:
+Build the wrapper once as the cluster's shared module at `shared/guild_client.py`. Every W3.5.x lab - including this one - imports it through a thin `src/guild_client.py` re-export shim (`sys.path` adds `shared/`, then `from guild_client import ...`), so `from src.guild_client import GuildClient` keeps working with a single source of truth:
 
 ```python
 """Python wrapper over guild's MCP stdio interface (v3, schema-verified).

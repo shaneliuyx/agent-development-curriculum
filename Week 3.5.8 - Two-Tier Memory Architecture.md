@@ -351,11 +351,15 @@ python -m src.smoke_test
 
 ### 2.1 The orchestrator wrapper
 
-**Vendored dependency.** Copy `guild_client.py` from W3.5.5's lab into this lab's `src/` directory:
+**Shared dependency.** `guild_client.py` is the W3.5.x cluster's single MCP-stdio wrapper - it lives once at `agent-prep/shared/guild_client.py` (promoted there in [[Week 3.5.5 - Multi-Agent Shared Memory]] §2.1). This lab consumes it the way every lab in the cluster does: a thin re-export shim at `src/guild_client.py` that puts `shared/` on the path and re-exports the public API, so `from src.guild_client import GuildClient, is_accept_winner` keeps working with no copy to drift:
 
-```bash
-cp ~/code/agent-prep/lab-03-5-5-guild/src/guild_client.py \
-   ~/code/agent-prep/lab-03-5-8-two-tier/src/guild_client.py
+```python
+# src/guild_client.py - re-export shim (single source: agent-prep/shared/guild_client.py)
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
+from guild_client import GuildClient, is_accept_winner, QuestStatus  # noqa: E402,F401
 ```
 
 That file is the post-simplifier wrapper (153 LOC) probed live against guild's 43-tool MCP surface via `session.list_tools()[i].inputSchema`. It encapsulates two non-obvious facts: (1) guild responses are TEXT-ONLY (no `structuredContent`) — wrappers must regex-parse identifiers and substring-classify status; (2) agent identity is SESSION-SCOPED — the MCP schema rejects per-call `owner` / `agent` / `agent_id` args. See W3.5.5 §2.1 walkthrough + RESULTS.md BCJ Entry 5 for the discovery path.
@@ -568,7 +572,7 @@ class TieredMemory:
 - **No write-through**: `complete_task` does NOT immediately call `imprint`. Consolidation is a SEPARATE batch job (Phase 3). This is the load-bearing architectural decision — async consolidation prevents EverCore latency from blocking guild's hot path.
 
 `★ Insight ─────────────────────────────────────`
-- **The wrapper IS the architecture.** Once `TieredMemory` exists, the rest of the lab is "use it". Swapping guild for another MCP coordinator or EverCore for another semantic backend is a one-method-pair change. Cross-lab vendoring (`cp guild_client.py`) makes the W3.5.5 → W3.5.8 promotion concrete: one schema-verified wrapper, shared.
+- **The wrapper IS the architecture.** Once `TieredMemory` exists, the rest of the lab is "use it". Swapping guild for another MCP coordinator or EverCore for another semantic backend is a one-method-pair change. Promoting the schema-verified wrapper to `shared/guild_client.py` plus a thin re-export shim makes the W3.5.5 → W3.5.8 promotion concrete: one wrapper, a single source of truth for the whole cluster, with no vendored copies to drift.
 - **Session-scoped identity is the most-missed MCP invariant.** Three of the W3.5.5 BCJ entries trace back to "I tried to pass agent_id / owner / agent into quest_accept / quest_journal". guild's MCP wire schema rejects them; identity must be carried out-of-band (Python-side label, or `--campaign` tag for grouping). When wiring a new MCP-served coordinator, probe `session.list_tools()[i].inputSchema` FIRST.
 - **The async/sync mismatch is honest, not a bug.** MCP-stdio is async by transport shape; HTTP is sync by request semantics. Pretending one is the other hides where backpressure actually lives.
 `─────────────────────────────────────────────────`
@@ -852,7 +856,7 @@ uv add openai httpx "mcp[cli]" pydantic
 Why each:
 - `openai` — `src/consolidation.py` `summarize_scroll()` LLM call against the OMLX endpoint
 - `httpx` — `src/tiered_memory.py` EverCore HTTP client on `:1995`
-- `mcp[cli]` — `src/guild_client.py` MCP stdio client (vendored from W3.5.5 lab)
+- `mcp[cli]` — the shared MCP stdio client at `shared/guild_client.py` (re-exported through the `src/guild_client.py` shim)
 - `pydantic` — typed data classes referenced via the MCP wrapper
 
 **EverCore `.env` — point at local oMLX, not openrouter/grok.** Upstream `env.template` defaults the LLM provider to `openrouter` with a placeholder grok-4-fast key. The chapter's local-first contract requires routing EverCore's internal memcell-extraction LLM at the local oMLX server instead:
