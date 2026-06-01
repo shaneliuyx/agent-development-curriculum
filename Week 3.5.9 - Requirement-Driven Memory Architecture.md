@@ -308,11 +308,12 @@ flowchart TD
 W3.5.9 ships its own lab, `lab-03-5-9-requirement-driven`. It does NOT live inside the W3.5.8 lab - instead it carries the four new backends and *reuses* W3.5.8's 2-tier machinery (the schema-verified `tiered_memory_qdrant` backend, the LongMemEval slice, and the eval harness). The architecture chosen by the §2.4 decision matrix (1-tier atomic-fact + a 2-tier router, plus three-tier HyperMem in Phases 6-9) is the contribution.
 
 ```bash
-mkdir -p ~/code/agent-prep/lab-03-5-9-requirement-driven/{src,data,results,tests,scripts}
 cd ~/code/agent-prep/lab-03-5-9-requirement-driven
-uv venv --python 3.11 && source .venv/bin/activate
-uv pip install openai python-dotenv pytest httpx mcp mem0ai qdrant-client
+uv sync                       # creates .venv + installs deps from pyproject.toml
+source .venv/bin/activate     # (openai, httpx, mcp, pydantic, qdrant-client, mem0ai)
 ```
+
+The lab ships a `pyproject.toml` (uv project mode), so `uv sync` installs everything and `uv add <pkg>` works for later extras. If you bootstrap an empty dir instead, run `uv init --no-readme --no-workspace --python 3.12` FIRST - bare `uv add` errors with `No pyproject.toml found` (W3.5.8 §3 BCJ Entry 6).
 
 **Prepare reused data + code** (copy from the sibling W3.5.8 lab):
 
