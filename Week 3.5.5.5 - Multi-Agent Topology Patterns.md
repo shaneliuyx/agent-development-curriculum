@@ -612,7 +612,7 @@ def plan_decompose(question: str) -> list[str]:
 
     Defensive JSON extraction handles three observed wire-shapes:
       1. Bare JSON object: `{"sub_questions": [...]}`
-      2. Markdown fence: ` ```json\n{...}\n``` ` or ` ```\n{...}\n``` `
+      2. Markdown fence: &#96;&#96;&#96;json\n{...}\n&#96;&#96;&#96; (or bare &#96;&#96;&#96;\n{...}\n&#96;&#96;&#96;)
       3. Prose preamble: `Here are the sub-questions: {...}` (Qwen-Opus-distill
          emits explanatory prose despite the 'Return JSON only, no prose'
          instruction — distilled models are sometimes MORE verbose than the
@@ -724,69 +724,13 @@ def print_supervisor_tree(out: dict) -> None:
 if __name__ == "__main__":
     out = supervisor_run("What changed in multi-agent agent systems between 2023 and 2026?")
     print_supervisor_tree(out)
-```json fence
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    parsed = json.loads(raw.strip())
-    return parsed["sub_questions"]
-
-def worker_run(sub_question: str) -> WorkerResult:
-    """One worker: fresh context, narrow answer."""
-    t0 = time.monotonic()
-    answer = chat(sub_question, system=WORKER_SYSTEM)
-    return WorkerResult(
-        sub_question=sub_question,
-        answer=answer,
-        wall_seconds=time.monotonic() - t0,
-    )
-
-def synthesize(question: str, results: list[WorkerResult]) -> str:
-    """Lead's second LLM call: combine worker answers."""
-    bundle = "\n\n".join(
-        f"Worker {i+1} on '{r.sub_question}':\n{r.answer}"
-        for i, r in enumerate(results)
-    )
-    prompt = f"ORIGINAL QUESTION: {question}\n\nWORKER ANSWERS:\n{bundle}\n\nSYNTHESIZE."
-    return chat(prompt, system=LEAD_SYNTHESIZE_SYSTEM)
-
-def supervisor_run(question: str) -> dict:
-    """End-to-end supervisor topology. Returns answer + timing breakdown."""
-    t_total = time.monotonic()
-
-    t_plan = time.monotonic()
-    sub_qs = plan_decompose(question)
-    plan_wall = time.monotonic() - t_plan
-
-    with ThreadPoolExecutor(max_workers=len(sub_qs)) as pool:
-        results = list(pool.map(worker_run, sub_qs))
-
-    t_syn = time.monotonic()
-    answer = synthesize(question, results)
-    syn_wall = time.monotonic() - t_syn
-
-    return {
-        "answer": answer,
-        "plan_wall_s": round(plan_wall, 2),
-        "worker_walls_s": [round(r.wall_seconds, 2) for r in results],
-        "max_worker_wall_s": round(max(r.wall_seconds for r in results), 2),
-        "sum_worker_walls_s": round(sum(r.wall_seconds for r in results), 2),
-        "synthesize_wall_s": round(syn_wall, 2),
-        "total_wall_s": round(time.monotonic() - t_total, 2),
-    }
-
-
-if __name__ == "__main__":
-    out = supervisor_run("What changed in multi-agent agent systems between 2023 and 2026?")
-    print(json.dumps(out, indent=2))
 ```
 
 **Walkthrough:**
 
 **Block 1 — Three system prompts, three distinct roles.** `LEAD_DECOMPOSE_SYSTEM` produces JSON-only output (decomposition into 3 sub-questions); `WORKER_SYSTEM` constrains scope to a single sub-question with a 3-sentence answer; `LEAD_SYNTHESIZE_SYSTEM` requires explicit disagreement-surfacing. Three roles, three prompts — same JD as in production supervisor systems (Anthropic Research's lead + worker prompts have the same shape).
 
-**Block 2 — JSON fence stripping is the load-bearing parse defense.** Models occasionally emit ` ```json ... ``` ` even when prompted "no markdown fence." `raw.startswith("```")` + split path catches this without exception. Same pattern as W4 ReAct's parse defense + W3.5.8 §8.1's dedup-prompt parse.
+**Block 2 — `re.search(r"\{.*\}", raw, re.DOTALL)` is the load-bearing parse defense.** Models emit THREE shape-variants despite "JSON only" instructions: (a) bare JSON object, (b) markdown fence, (c) prose preamble before JSON (BCJ Entry 7 — Qwen-Opus-distill). A first-`{`…`}`-extraction regex handles all three with one line; raises `ValueError` with truncated raw response when no JSON object found. The old `raw.startswith(...)` markdown-fence check was superseded when BCJ Entry 7 exposed the prose-preamble variant it silently failed on.
 
 **Block 3 — `ThreadPoolExecutor` with `max_workers=len(sub_qs)` gives true parallelism on I/O-bound work.** LLM calls are network-I/O; GIL doesn't block. Wall-time of the worker batch becomes `max(worker_walls)`, not `sum`. Returned `worker_walls_s` + `max_worker_wall_s` + `sum_worker_walls_s` measurements let the reader VERIFY parallelism empirically — if max ≈ sum, threading didn't actually parallelize (something's serializing under the hood).
 
@@ -1028,9 +972,17 @@ import pytest
 from hierarchical import hierarchical_run
 
 def test_hierarchy_depth_and_agent_count():
-    """2-macro × 2-sub-q hierarchy → 7 agents (1 top + 2 sub + 4 leaves)."""
+    """Default 3-macro × 2-sub-q hierarchy → 10 agents (1 top + 3 sub + 6 leaves).
+    The 3-macro top fan matches LEAD_DECOMPOSE_SYSTEM's 'decompose into EXACTLY 3'
+    contract — no top-level macros silently dropped. Use top_fan=2 to cap at 7."""
     out = hierarchical_run("Compare HTTP/2 vs HTTP/3 vs HTTP/3 over QUIC.")
-    assert out["depth"] == 2 and out["agents_total"] == 7
+    assert out["depth"] == 2 and out["agents_total"] == 10
+
+
+def test_hierarchy_top_fan_2_preserves_7_agents():
+    """Backward-compatible 2-macro cap still produces 7 agents."""
+    out = hierarchical_run("Compare HTTP/2 vs HTTP/3 vs HTTP/3 over QUIC.", top_fan=2)
+    assert out["agents_total"] == 7
 
 @pytest.mark.integration
 def test_hierarchy_parallel_at_sub_level():
@@ -1127,7 +1079,9 @@ CODER = GroupAgent(
     name="coder",
     system_prompt=(
         "You are a Python coder. Propose code. Keep messages short (≤80 words). "
-        "End with TERMINATE only when the team has converged on a complete solution."
+        "End with TERMINATE ONLY after AT LEAST 3 turns have happened AND "
+        "reviewer + tester have both responded. Until then, write code and ask "
+        "for review/tests but do NOT emit TERMINATE."
     ),
 )
 REVIEWER = GroupAgent(
@@ -1190,8 +1144,15 @@ def group_chat_run(
     task: str,
     selector: SelectorFlavor = "round-robin",
     max_rounds: int = 9,
+    min_rounds: int = 3,
 ) -> dict:
-    """Run group chat until TERMINATE or max_rounds."""
+    """Run group chat until TERMINATE (after min_rounds) or max_rounds.
+
+    `min_rounds` guards against premature-TERMINATE on commit-biased models
+    (W3.5.5.5 BCJ Entry 10 — Qwen-Opus-distill emitted TERMINATE in round 1
+    before any collaboration occurred). TERMINATE is only honored after
+    round_n >= min_rounds; earlier TERMINATE tokens are ignored.
+    """
     pool: list[dict] = [{"speaker": "user", "content": task}]
     agents = list(AGENTS.values())
     pick_fn = SELECTORS[selector]
@@ -1201,7 +1162,7 @@ def group_chat_run(
         selector_calls += 1
         msg = speaker.respond(pool)
         pool.append({"speaker": speaker.name, "content": msg})
-        if "TERMINATE" in msg.upper():
+        if "TERMINATE" in msg.upper() and round_n >= min_rounds:
             return {
                 "selector": selector,
                 "rounds_used": round_n,
@@ -1851,9 +1812,9 @@ All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 s
 *Fix:* Three layered defenses. **(a) `_chat_openai` falls back to `reasoning_content` when `content` is empty**: returns `[reasoning_only — finish_reason={X}]\n{reasoning_content}` so caller sees the trace + finish_reason instead of silent empty string. Defense at the wire boundary; SUPERSEDES Entry 2's bare `content or ""` coercion. **(b) `LEAD_SYNTHESIZE_SYSTEM` gains explicit gap-acknowledgement instruction**: "synthesize ONLY what workers provided; if question mentions material workers did NOT cover, state gap explicitly and continue. Do NOT speculate or fill in missing material — that causes reasoning models to loop." Prevents the trap at the prompt layer. **(c) Hierarchical TOP synthesize uses `max_tokens=4096`** (was 2048) — hierarchical synthesize input is 2 already-synthesized sub-answers (~600-1000 tokens each) vs supervisor's 3 short worker answers (~200-400 tokens each), so the budget doubles. Production rule generalizes beyond multi-agent: **any reasoning-model deployment must read both `content` AND `reasoning_content` from the API response, and prompts must explicitly bound the scope to provided material**. Same trap-class as W3.5.8 BCJ Entry 8 (reasoning-model max_tokens exhaustion) — adds the read-side `reasoning_content` defense.
 
 **Entry 7 — Distilled models inherit source verbosity despite explicit JSON-only instructions.** *(observed 2026-05-28)*
-*Symptom:* `Qwen3.5-27B-Claude-Opus-Distilled-MLX-4bit` running `plan_decompose` (which requires JSON-only output per `LEAD_DECOMPOSE_SYSTEM`) returned prose preamble before the JSON object: `"Here are 3 sub-questions:\n\n{...}"`. The original `plan_decompose` parser used `raw.startswith("```")` to handle markdown fence; the prose-before-JSON shape wasn't covered. `json.loads(raw.strip())` raised `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`. gpt-oss-20b and Sonnet both honored the JSON-only format on the same prompt; only the distilled Qwen-Opus violated it.
+*Symptom:* `Qwen3.5-27B-Claude-Opus-Distilled-MLX-4bit` running `plan_decompose` (which requires JSON-only output per `LEAD_DECOMPOSE_SYSTEM`) returned prose preamble before the JSON object: `"Here are 3 sub-questions:\n\n{...}"`. The original `plan_decompose` parser used a `raw.startswith(...)` check to handle the markdown fence; the prose-before-JSON shape wasn't covered. `json.loads(raw.strip())` raised `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`. gpt-oss-20b and Sonnet both honored the JSON-only format on the same prompt; only the distilled Qwen-Opus violated it.
 *Root cause:* Distillation transfers behaviors selectively. Qwen3.5-27B-Claude-Opus-Distilled inherited Opus's THOROUGHNESS (verbose explanatory prose) but didn't fully inherit Opus's INSTRUCTION-DISCIPLINE (strict format compliance). When instructions conflict with the distilled model's "explain your work" bias, the bias wins. This is a counter-intuitive distillation property worth noting: distilled models can be MORE verbose than the model they were distilled from, NOT less.
-*Fix:* Regex-extract the first `{.*}` JSON object instead of `startswith` check. `m = re.search(r"\{.*\}", raw, re.DOTALL)`. Handles three observed wire-shapes: (a) bare JSON, (b) ```json fence, (c) prose preamble + JSON body. Raise `ValueError` with truncated response when no JSON object found — surface genuine parse failures instead of silent empty `[]`. Production rule generalizes: **at every LLM output-parsing boundary, assume the model COULD emit prose despite explicit "JSON only" instructions; extract the structured payload with a regex/parser, don't trust `startswith` checks**. Same shape as W3.5 BCJ Entry 2 ("`response_format=json_object` is a contract on cloud models, a hint on local models") — distillation can transmute the cloud-contract hint into a local-bias-override.
+*Fix:* Regex-extract the first `{.*}` JSON object instead of `startswith` check. `m = re.search(r"\{.*\}", raw, re.DOTALL)`. Handles three observed wire-shapes: (a) bare JSON, (b) a &#96;&#96;&#96;json fence, (c) prose preamble + JSON body. Raise `ValueError` with truncated response when no JSON object found — surface genuine parse failures instead of silent empty `[]`. Production rule generalizes: **at every LLM output-parsing boundary, assume the model COULD emit prose despite explicit "JSON only" instructions; extract the structured payload with a regex/parser, don't trust `startswith` checks**. Same shape as W3.5 BCJ Entry 2 ("`response_format=json_object` is a contract on cloud models, a hint on local models") — distillation can transmute the cloud-contract hint into a local-bias-override.
 
 **Entry 8 — `LLM_TIMEOUT_S=60` default insufficient for Sonnet via CLIProxyAPI.** *(observed 2026-05-28)*
 *Symptom:* First hierarchical run against Sonnet via `:8317` proxy raised `httpx.ReadTimeout: timed out` after exactly 60 seconds. Sonnet's per-call latency on heavy synthesis prompts (~2k input tokens, structured table output) routinely exceeds 60s through the proxy stack (caller → proxy → Anthropic API → backend → response back). The 60s default in `_chat_anthropic_proxy` was inherited from gpt-oss-20b-shaped curriculum baselines where local inference returns in ≤30s per call.
@@ -1868,7 +1829,7 @@ All entries below are OBSERVED during lab execution (2026-05-27 → 2026-05-28 s
 **Entry 10 — Group-chat premature-TERMINATE on commit-biased models breaks multi-turn collaboration.** *(observed 2026-05-28)*
 *Symptom:* `python code/group_chat.py` against Qwen3.5-27B-Claude-Opus-distill on task "Write `is_palindrome` — reviewer + tester collaborate" terminated in **1 round** for both `llm-selected` and `custom` selectors. Coder's turn 1 emitted code + delegated to "**Reviewer:** Please review..." + "**Tester:** Please provide test cases..." + **`TERMINATE`** in the same response. Loop's `if "TERMINATE" in msg.upper(): exit` triggered immediately — reviewer and tester NEVER spoke. Task required collaboration; collaboration never happened. Same selector + same task on Sonnet 4.6 produced 4 rounds (proper collaboration); on gpt-oss-20b produced 6 rounds.
 *Root cause:* The termination contract assumes `TERMINATE` = convergence-after-collaboration. Models with strong commitment-bias (Qwen-Opus-distill, transferred from Opus's "commit-with-evidence" trait — see §5.3.5 LongMemEval where this trait WINS at 77% vs Sonnet's 60%) can decide "I'm done" and emit TERMINATE BEFORE collaboration has occurred. The same trait that wins commit-bias evals (LongMemEval) fails coordination-required workloads (group_chat). **Eval-trait mismatch:** picking a model for "best score on benchmark X" without checking whether the trait that scores HIGH on X is the SAME trait your workload needs.
-*Fix:* Two-layer defense. (a) **Prompt layer**: CODER's system prompt gains explicit minimum-turn condition — "End with TERMINATE ONLY after AT LEAST 3 turns have happened AND reviewer + tester have both responded. Until then, write code + ask for review/tests but do NOT emit TERMINATE." Forces the model to defer termination to a state it can verify from `pool` content. (b) **Runtime layer**: assert minimum-rounds before honoring TERMINATE — `if "TERMINATE" in msg.upper() and round_n >= min_rounds_for_collaboration: break`. Production rule generalizes: **termination contracts must be defensible against shortcut paths** — any predicate that exits a multi-turn loop should require BOTH a textual signal AND a state-check (turn count, agent participation, completion criteria). Without the state-check, commit-biased models bypass the entire interaction.
+*Fix (applied 2026-05-30 in `code/group_chat.py`):* Two-layer defense. (a) **Prompt layer**: CODER's system prompt gains explicit minimum-turn condition — "End with TERMINATE ONLY after AT LEAST 3 turns have happened AND reviewer + tester have both responded. Until then, write code and ask for review/tests but do NOT emit TERMINATE." Forces the model to defer termination to a state it can verify from `pool` content. (b) **Runtime layer** (`min_rounds=3` param on `group_chat_run`): `if "TERMINATE" in msg.upper() and round_n >= min_rounds: break` — earlier TERMINATE tokens are ignored. Production rule generalizes: **termination contracts must be defensible against shortcut paths** — any predicate that exits a multi-turn loop should require BOTH a textual signal AND a state-check (turn count, agent participation, completion criteria). Without the state-check, commit-biased models bypass the entire interaction.
 
 **Entry 11 — Handoff parser couldn't strip parens from `HANDOFF: transfer_to_X()`; loop silently stayed at triage despite model deciding to hand off.** *(observed 2026-05-28)*
 *Symptom:* `python code/handoffs.py` against Sonnet 4.6: 4/5 traces showed `Trace: triage` (no handoff occurred) despite Sonnet's final message being `HANDOFF: transfer_to_refunds()` or `HANDOFF: transfer_to_sales()`. The model decided to hand off; the runtime didn't honor the decision. Against gpt-oss-20b: 3/5 worked (model emitted bare-identifier `transfer_to_refunds` without parens), 2/5 stuck at triage (sales messages, model emitted parens variant `transfer_to_sales()`). The mismatch surfaced ONLY when the model emitted parens; bare-identifier outputs worked fine.
@@ -1925,13 +1886,17 @@ The chapter §4 Phase 4 Result table now reports the Option-C-fixed Sonnet 5/5 p
 
 ## 6. Interview Soundbites
 
-*Empty — soundbites land when labs run.* Per the curriculum's real-data discipline, soundbites cite MEASURED outcomes from this chapter's lab runs (token deltas, accuracy gains, wall-time comparisons). Until Phase 1-6 execute and produce numbers, this section stays empty rather than carrying placeholder text.
+**"Walk me through the supervisor pattern and why it wins."**
 
-Anchor candidates (for future writing once measurements land):
-- §2.9 6-question decision matrix application
-- §4 Phase 1 supervisor parallelism wall-time measurement (max-vs-sum)
-- §4 Phase 5 voting accuracy delta vs single-agent baseline
-- §2.5 MCP-vs-A2A topology-vs-protocol distinction
+In our lab, a 3-worker supervisor on a multi-agent evolution question ran in 35 seconds total — matching `plan + max(workers) + synth = 35.15s` — while the sequential equivalent would have taken 62 seconds. That 1.77× wall-time speedup is the parallelism win: workers get fresh 200k-token contexts instead of sharing the lead's planning context, and they run concurrently. The ~5× token cost is real — you pay it when the task genuinely decomposes. For a simple "summarise this paper" request, I'd skip the pattern entirely.
+
+**"How do you pick a topology for a novel workload?"**
+
+I run the six-question matrix from §2.9: is the task decomposable into independent sub-questions? Does it have a second decomposition layer? Is the workflow statically knowable? Is it triage-shaped? Is correctness worth 3-5× cost? Does it need long shared memory? In the lab the selector-versus-model finding sharpened this: the same CODER-REVIEWER-TESTER group-chat with round-robin hit max-rounds (9) on Sonnet because Sonnet hedges, reached TERMINATE in 3 rounds on gpt-oss-20b because it commits, and terminated after 1 round on Qwen-distill because the commit bias bypassed collaboration entirely. Topology choice and model trait choice are a 2D search space — not one dimension.
+
+**"When does voting earn its 3-5× cost?"**
+
+In Phase 5 we ran 3 independent solvers on 3 factual questions. Every final answer was correct across all 3 models; the interesting finding was WHERE the cost shows up: confidence dropped to 0.67 on Sonnet for `137×23` because one solver formatted the answer as `3,151` with a comma — same value, different surface format, different vote bucket. The majority-vote aggregator is bullet-proof; answer-extraction normalization is the seam. For decisions where correctness genuinely exceeds cost — medical triage routing, security code review — the 3-4× cost-per-correct-answer is the right trade. For cheap-correctness questions, it is not.
 
 ---
 
