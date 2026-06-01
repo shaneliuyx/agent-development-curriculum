@@ -322,11 +322,18 @@ OLD=~/code/agent-prep/lab-03-5-8-two-tier
 cp "$OLD/data/longmemeval_slice_w358.json" data/      # immutable test slice (Phase 1 extends it to ~24 Q)
 cp "$OLD/scripts/build_slice.py"            scripts/  # slice builder - no src deps, copies clean
 cp "$OLD/scripts/aggregate_results.py"      scripts/  # comparison-matrix aggregator (Phase 5)
+# eval driver + its full dependency chain (vendored so the slice eval runs in THIS lab):
+cp "$OLD/src/run_longmemeval_slice.py"      src/      # the eval driver (dispatches by --backend)
+cp "$OLD/src/consolidation.py"              src/      # summarize_scroll + 2-tier consolidation
+cp "$OLD/src/judge_sonnet.py"               src/      # LLM judge
+cp "$OLD/src/audit.py"                      src/      # AuditEntry / record_audit (consolidation dep)
+cp "$OLD/src/quality_gate.py"               src/      # promotion gate (consolidation dep)
+cp "$OLD/src/dedup_synthesis.py"            src/      # 6-action dedup (consolidation dep)
 cp "$OLD/src/tiered_memory_qdrant.py"       src/      # W3.5.8 2-tier backend the router reuses
 cp "$OLD/src/guild_client.py"               src/      # re-export shim -> agent-prep/shared/guild_client.py
 ```
 
-`build_slice.py` and `aggregate_results.py` import nothing from `src`, so they copy clean. `tiered_memory_qdrant.py`'s only `src` dependency is the `guild_client` shim, so the two together are self-contained. The LongMemEval eval *driver* (`run_longmemeval_slice.py`) additionally pulls in W3.5.8's `consolidation` + `judge_sonnet` chain, so drive the slice eval from the W3.5.8 lab harness (it dispatches to these new backends by name) rather than re-vendoring half the 5-8 lab.
+`build_slice.py` and `aggregate_results.py` import nothing from `src`, so they copy clean. The eval driver `run_longmemeval_slice.py` pulls in W3.5.8's `consolidation` + `judge_sonnet` + `audit` + `quality_gate` + `dedup_synthesis` chain (and `tiered_memory_qdrant`, whose only `src` dep is the `guild_client` shim) — the whole closure is vendored above so the slice eval runs entirely in THIS lab (`python -m src.run_longmemeval_slice --backend atomic_fact|router|mem0|three_tier|evercore`). Keeping the chain byte-identical to the 5-8 source is the reuse contract; re-sync if the 5-8 originals change.
 
 **New files (the W3.5.9 contribution):**
 
