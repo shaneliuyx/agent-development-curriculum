@@ -303,36 +303,39 @@ flowchart TD
 
 ## §4 Lab Phases
 
-### 4.0 Lab scaffold (extends the W3.5.8 lab)
+### 4.0 Lab scaffold
 
-W3.5.9 adds **no new lab directory** — it extends [[Week 3.5.8 - Two-Tier Memory Architecture]]'s `lab-03-5-8-two-tier`. The architecture chosen by the §2.4 decision matrix (1-tier atomic-fact + a 2-tier router, plus three-tier HyperMem in Phases 6-9) ships as four new backend files alongside the reused two-tier infrastructure.
+W3.5.9 ships its own lab, `lab-03-5-9-requirement-driven`. It does NOT live inside the W3.5.8 lab - instead it carries the four new backends and *reuses* W3.5.8's 2-tier machinery (the schema-verified `tiered_memory_qdrant` backend, the LongMemEval slice, and the eval harness). The architecture chosen by the §2.4 decision matrix (1-tier atomic-fact + a 2-tier router, plus three-tier HyperMem in Phases 6-9) is the contribution.
 
 ```bash
-cd ~/code/agent-prep/lab-03-5-8-two-tier
-source .venv/bin/activate
-uv pip install mem0ai qdrant-client        # Phase 3 (Mem0) + Phase 4 (atomic-fact Qdrant store)
+mkdir -p ~/code/agent-prep/lab-03-5-9-requirement-driven/{src,data,results,tests,scripts}
+cd ~/code/agent-prep/lab-03-5-9-requirement-driven
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install openai python-dotenv pytest httpx mcp mem0ai qdrant-client
 ```
 
 **New files (the W3.5.9 contribution):**
 
 ```text
-lab-03-5-8-two-tier/
+lab-03-5-9-requirement-driven/
 ├── src/
 │   ├── mem0_backend_adapter.py   # Phase 3 — adapts Mem0's SDK to the eval driver's imprint/query interface
 │   ├── atomic_fact_memory.py     # Phase 4 — 1-tier atomic-fact backend (per-message extraction -> Qdrant point/fact)
 │   ├── router_memory.py          # Phase 4 — question-type dispatch (atomic-fact vs 2-tier)
-│   └── three_tier_memory.py      # Phase 7 — L1 guild + L2 EverCore/Qdrant + L3 HyperMem wrapper
-└── ...
+│   ├── three_tier_memory.py      # Phase 7 — L1 guild + L2 EverCore/Qdrant + L3 HyperMem wrapper
+│   ├── tiered_memory_qdrant.py   # vendored reuse of W3.5.8's 2-tier backend (router's knowledge-update path)
+│   └── guild_client.py           # re-export shim -> agent-prep/shared/guild_client.py
+├── data/   results/   tests/   scripts/
 ```
 
-**Reused from W3.5.8 (no changes needed):**
+**Reused from the W3.5.8 lab** (`lab-03-5-8-two-tier`), by copy or by adding it to `PYTHONPATH`:
 
 - `data/longmemeval_slice_w358.json` — the immutable test contract (extended to a balanced ~24 Q by `scripts/build_slice.py` in Phase 1)
-- `src/run_longmemeval_slice.py` + `scripts/aggregate_results.py` — eval driver + comparison matrix (each grows one backend-dispatch branch)
-- `src/tiered_memory.py` / `tiered_memory_qdrant.py` / `consolidation.py` — the 2-tier path the router dispatches to for `knowledge-update`
+- `src/run_longmemeval_slice.py` + `scripts/aggregate_results.py` — eval driver + comparison matrix (each grows one backend-dispatch branch for the new backends)
+- `src/tiered_memory_qdrant.py` — the 2-tier path the router dispatches to for `knowledge-update`; vendored into this lab's `src/` so the `from src.tiered_memory_qdrant import TieredMemory` imports resolve without a cross-lab `src` package collision
 - `src/guild_client.py` — the re-export shim over the cluster-shared `shared/guild_client.py` (see [[Week 3.5.5 - Multi-Agent Shared Memory]] §2.1)
 
-**Extra services (Phases 6-9 only):** a `hypermem` container alongside the existing EverCore + Qdrant stack (added by the Phase 6 docker-compose extension).
+**Extra services (Phases 6-9 only):** a `hypermem` container alongside the EverCore + Qdrant stack (added by the Phase 6 docker-compose extension).
 
 ### Phase 1 — Requirement Analysis from LongMemEval (~1 h)
 
