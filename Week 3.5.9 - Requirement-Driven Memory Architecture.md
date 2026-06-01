@@ -104,7 +104,7 @@ Three router patterns from production:
 
 3. **Parallel ensemble + re-rank**. Query all architectures in parallel; re-rank results across stores. Used in production by Mem0's multi-signal retrieval (semantic + BM25 + entity matching, fused by RRF). Cost: parallel infra. Reward: highest accuracy.
 
-Phase 4 implements pattern 1 because the LongMemEval question types are explicit in the data. Pattern 3 is the natural next experiment once Pattern 1 has measured numbers (§5.3 follow-up).
+Phase 4 implements pattern 1 because the LongMemEval question types are explicit in the data. Pattern 3 is the natural next experiment once Pattern 1 has measured numbers (future experiment).
 
 ### 2.4 Decision-matrix template
 
@@ -424,7 +424,7 @@ flowchart TD
 - **Primary backend: 1-tier atomic-fact (homebrewed on Qdrant + bge-m3).** Covers IE + multi-session (5/7 axes if we count abstention as covered).
 - **Secondary backend: 2-tier consolidation (W3.5.8's existing EverCore/Qdrant pipeline).** Covers knowledge-update via its dedup+supersede mechanism.
 - **Router: question-type classifier.** Maps incoming question to backend by `question_type` label. For LongMemEval the label is explicit in source data; in production it would come from a classifier (rule-based regex + small LLM fallback).
-- **Out of scope for §4 Phase 4: graph-tier backend.** Temporal-reasoning is the only axis that wants it, and the chapter's budget doesn't include Graphiti integration. Documented as future work in §9 Cross-References (Foreshadows).
+- **Out of scope for §4 Phase 4: graph-tier backend.** Temporal-reasoning is the only axis that wants it, and the chapter's budget doesn't include Graphiti integration. Documented as future work in §8 Cross-References (Foreshadows).
 
 **Walkthrough:**
 
@@ -1465,9 +1465,9 @@ flowchart TD
 - **The Pareto-frontier framing converts "which is best?" into "which dominates which?".** Production engineering decisions are RARELY about the single best option — they're about which options are on the frontier (acceptable on the axes that matter) vs strictly worse on every axis. The chapter's matrix surfaces this directly; readers carry the discipline into every future architecture-comparison question.
 `─────────────────────────────────────────────────`
 
-## §6 Bad-Case Journal
+## §5 Bad-Case Journal
 
-**Status:** Entries to be populated during Phase 3-9 implementation runs. **No fabricated entries.** Each placeholder below names a candidate failure surface plus where the entry would land in the §6 normative 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`). When the actual run surfaces a failure mode, that mode gets one entry — and only one, not a category-summary entry.
+**Status:** Entries to be populated during Phase 3-9 implementation runs. **No fabricated entries.** Each placeholder below names a candidate failure surface plus where the entry would land in the §5 normative 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`). When the actual run surfaces a failure mode, that mode gets one entry — and only one, not a category-summary entry.
 
 Candidate failure surfaces by phase (drawn from this chapter's design + cross-chapter prior BCJ entries):
 
@@ -1493,9 +1493,9 @@ Candidate failure surfaces by phase (drawn from this chapter's design + cross-ch
 
 Cross-link contract: when an entry surfaces, it also goes into the vault's global `Bad-Case Journal.md`. Other chapters cite by entry number, so once assigned, an entry number is permanent.
 
-## §7 Interview Soundbites
+## §6 Interview Soundbites
 
-**Status:** Soundbites to be populated when Phase 3-9 actual numbers land. **No fabricated quotes.** The four planned soundbites below name the question being answered, the data points the soundbite must cite, and the structural shape (per the §7 normative spec: ~70 words, user-voice, measured-outcome anchored, no hedging).
+**Status:** Soundbites to be populated when Phase 3-9 actual numbers land. **No fabricated quotes.** The four planned soundbites below name the question being answered, the data points the soundbite must cite, and the structural shape (per the §6 normative spec: ~70 words, user-voice, measured-outcome anchored, no hedging).
 
 **Planned Soundbite 1 — *"How do you decide between 1-tier and 2-tier memory?"***
 - *Anchors:* Phase 1's requirement matrix (atomic-fact column ✅ on 6/7 axes); Phase 2's joint-matrix application (1-tier wins 3/7 axes outright, 2-tier wins 1/7, graph-tier wins 1/7); Phase 5's measured per-axis scores (TBD) confirming or refining the prediction.
@@ -1519,7 +1519,7 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 
 **Bar to clear when filling these in.** Each soundbite is a 70-word answer to a real interview question that an interviewer would actually ask. No hedging ("I think", "probably"), no generic advice ("memory matters"), no claims that don't trace to a specific measurement in this chapter. The chapter's §4 phase results are the data; the soundbites are the prepared verbal answers that cite the data.
 
-## §8 References
+## §7 References
 
 - **Mem0** — Wu, Y., Bhansali, T., et al. *Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory.* arXiv:2504.19413. GitHub `mem0ai/mem0`. April 2026 release reports 94.4 on LongMemEval. The benchmark + eval framework is open-sourced at `mem0ai/memory-benchmarks`.
 - **Graphiti / Zep** — Rasmussen, P. et al. (2025). *Zep: A Temporal Knowledge Graph Architecture for Agent Memory.* arXiv:2501.13956. GitHub `getzep/graphiti`. The canonical graph-tier-memory reference.
@@ -1528,7 +1528,7 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 - **Batchelor & Manning (2026).** *Pay-at-Write-Time: a 19-system survey of agent-memory write-time investment patterns.* X/Twitter thread, May 2026. https://x.com/S_BatMan/status/2054872818559361106. Already cited in W3.5.8 — same taxonomy applies here.
 - **HyperMem** — EverOS subcomponent, the L3 relational tier implemented in Phase 6-9. Typed hyperedges over entity nodes; HTTP API at `:1996`. Source: `~/code/EverOS/methods/HyperMem`. The lab's three-tier extension is the chapter's first production-grade hypergraph integration.
 
-## §9 Cross-References
+## §8 Cross-References
 
 - **Builds on:** [[Week 3.5.8 - Two-Tier Memory Architecture]] (the canonical 2-tier implementation evaluated here as one candidate); [[Week 3.5 - Cross-Session Memory]] (single-agent dual-store, the simplest baseline); [[Week 3.5.5 - Multi-Agent Shared Memory]] (provides the multi-agent shape that justifies 2-tier specifically).
 - **Distinguish from:** [[Week 2.5 - GraphRAG]] (graph for RAG over documents, NOT memory over conversations — same primitive, different surface area); [[Week 3.7 - Agentic RAG]] (5-node grade/rewrite graph over RETRIEVAL — orthogonal to memory architecture choice).
