@@ -1076,11 +1076,11 @@ flowchart TD
 
   QQ["incoming probe question + question_type"] --> RQ["RouterMemory.query_context"]
   RQ --> CLS{"question_type<br/>classifier"}
-  CLS -->|single-session-* | A1["AtomicFactMemory.query<br/>(cosine top-k over atomic facts)"]
-  CLS -->|multi-session| A1
-  CLS -->|knowledge-update| A2["TieredMemory.query_context<br/>(W3.5.8 2-tier:<br/>dedup+supersede semantics)"]
-  CLS -->|temporal-reasoning| A1
-  CLS -->|_abs (suffix)| A1
+  CLS -->|"single-session-*"| A1["AtomicFactMemory.query<br/>(cosine top-k over atomic facts)"]
+  CLS -->|"multi-session"| A1
+  CLS -->|"knowledge-update"| A2["TieredMemory.query_context<br/>(W3.5.8 2-tier:<br/>dedup+supersede semantics)"]
+  CLS -->|"temporal-reasoning"| A1
+  CLS -->|"_abs (suffix)"| A1
   A1 --> RES["top-k atomic facts<br/>→ reader"]
   A2 --> RES
 ```
