@@ -1513,41 +1513,207 @@ Two cells are populated from W3.5.8 §7.7's already-measured baseline (qdrant + 
 - **The two-baselines-already-measured cells anchor the rest of the table.** Reading the TBD-heavy template, a reviewer's first thought is "Are the baselines plausible?" The 0/20 + 0/20 in qdrant + evercore columns are LINK-VERIFIED to W3.5.8 §7.7 — the reviewer can click through and see the measured artifact. This forces confidence in the table's measurement methodology before any new number lands.
 `─────────────────────────────────────────────────`
 
-### Phase 6 — HyperMem Service Setup (~30 min)
+### Phase 6 — HyperMem L3 Service (~30 min)
 
-**Goal.** Stand up the L3 relational tier alongside W3.5.8's L1 (guild) + L2 (EverCore / Qdrant). Phase 6-9 implement the architecture decision deferred in Phase 2 as TBD-future — Phase 2's matrix flagged graph-tier as the right primitive for `temporal-reasoning` + multi-entity-intersection queries. This phase makes HyperMem real.
+**Goal.** Stand up the L3 relational tier alongside L1 (guild) + L2 (EverCore / Qdrant). Phase 2's matrix flagged a graph tier as the right primitive for `temporal-reasoning` + multi-entity-intersection queries ("who worked on payments AND postgres?"). This phase makes L3 real and queryable.
 
-**Setup.** Extend the W3.5.8 docker-compose (`lab-03-5-8-two-tier/docker/docker-compose.yml`) with a `hypermem` service alongside the existing `evercore` + Qdrant containers.
+> [!warning] What "HyperMem" is — and what we actually run
+> The published **HyperMem** (`EverOS/methods/HyperMem`, ACL-2026) is an *offline eval pipeline* (`run_eval.sh`, stages 1-6) over a topic->episode->fact hypergraph built from dialogue streams, served by vLLM embedding/reranker models. It has **no HTTP server** and a different data model than this lab needs. So there is no `everos/hypermem:latest` image to `docker compose up`.
+>
+> What L3 actually requires here is small and specific: a service that stores **typed entity hyperedges** and answers **multi-entity intersection** queries — the contract `src/three_tier_memory.py` (`query_relations`) and `consolidate_with_l3` already call. We ship that as a self-contained ~130-LOC shim, `services/hypermem_shim.py` (FastAPI + SQLite). It is the L3 *store* matching the lab's contract, NOT a reimplementation of the paper's algorithm: it does exact structural hyperedge intersection, not embeddings / coarse-to-fine traversal.
 
-```yaml
-# docker-compose.yml — extension
-services:
-  hypermem:
-    image: everos/hypermem:latest  # from ~/code/EverOS/methods/HyperMem
-    ports:
-      - "1996:1996"
-    depends_on:
-      - postgres                  # reuses W3.5.8's Postgres
-    environment:
-      HYPERMEM_DB_URL: postgresql://...
-      HYPERMEM_PORT: 1996
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1996/health"]
-      interval: 10s
-      retries: 5
+**Setup.**
+
+```bash
+cd ~/code/agent-prep/lab-03-5-9-requirement-driven
+uv add fastapi uvicorn          # already in pyproject; `uv sync` also pulls them
+uv run python -m services.hypermem_shim     # serves on :1996 (Ctrl-C to stop)
+```
+
+**Complete `services/hypermem_shim.py`** (copy whole; it is the L3 service the wrapper talks to):
+
+```python
+# services/hypermem_shim.py — L3 HyperMem-compatible shim (lab-local)
+"""A small, self-contained L3 relational store that speaks the API the lab's
+ThreeTierMemory + consolidate_with_l3 expect.
+
+WHY A SHIM, NOT THE PAPER REPO: the real HyperMem (EverOS/methods/HyperMem,
+ACL-2026) is an OFFLINE eval pipeline (run_eval.sh, stages 1-6) over a
+topic->episode->fact hypergraph built from dialogue. It has no HTTP server and a
+different data model than this lab's L3 contract (typed entity hyperedges queried
+by multi-entity intersection). Rather than force-fit the research code, this shim
+implements EXACTLY the three endpoints the lab calls, backed by SQLite. It is the
+L3 STORE, not the paper's algorithm — enough to make Phase 8 (consolidate_with_l3)
+and query_relations() run end-to-end.
+
+Endpoints (match src/three_tier_memory.py + src/consolidation.py):
+  GET  /health                     -> {"status": "healthy"}
+  POST /api/v1/edges               <- {nodes:[{type,id}...], relation, user_id?,
+                                        provenance_scroll?, idempotency_key?}
+  POST /api/v1/query/relations     <- {intersection:[{node:{type,id}}...],
+                                        return_type, limit?, user_id?}
+                                     -> {"results": [{type,id,relation,...}, ...]}
+
+Run:  python -m services.hypermem_shim            (serves on :1996)
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+DB_PATH = Path(os.getenv("HYPERMEM_DB", str(Path(__file__).resolve().parent.parent / ".hypermem_l3.sqlite")))
+PORT = int(os.getenv("HYPERMEM_PORT", "1996"))
+
+app = FastAPI(title="HyperMem L3 shim", version="0.1.0")
+
+
+def _conn() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH)
+    c.execute("""CREATE TABLE IF NOT EXISTS edges (
+        edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key TEXT UNIQUE,
+        relation TEXT,
+        user_id TEXT DEFAULT '',
+        provenance_scroll TEXT DEFAULT ''
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS edge_nodes (
+        edge_id INTEGER, ntype TEXT, nid TEXT,
+        FOREIGN KEY(edge_id) REFERENCES edges(edge_id)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_nodes ON edge_nodes(ntype, nid)")
+    return c
+
+
+# ── request models ───────────────────────────────────────────────────
+class Node(BaseModel):
+    type: str
+    id: str
+
+
+class EdgeIn(BaseModel):
+    nodes: list[Node]
+    relation: str = ""
+    user_id: str = ""
+    provenance_scroll: str = ""
+    idempotency_key: str | None = None
+
+
+class RelQuery(BaseModel):
+    intersection: list[dict[str, Any]]   # [{"node": {"type","id"}}, ...]
+    return_type: str
+    limit: int = 10
+    user_id: str = ""
+
+
+# ── endpoints ────────────────────────────────────────────────────────
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "healthy", "service": "hypermem-l3-shim"}
+
+
+@app.post("/api/v1/edges")
+def create_edge(edge: EdgeIn) -> dict[str, Any]:
+    """Store one typed hyperedge. Idempotent on idempotency_key."""
+    c = _conn()
+    try:
+        if edge.idempotency_key:
+            row = c.execute("SELECT edge_id FROM edges WHERE idempotency_key = ?",
+                            (edge.idempotency_key,)).fetchone()
+            if row:
+                return {"status": "exists", "edge_id": row[0]}
+        cur = c.execute(
+            "INSERT INTO edges (idempotency_key, relation, user_id, provenance_scroll) VALUES (?,?,?,?)",
+            (edge.idempotency_key, edge.relation, edge.user_id, edge.provenance_scroll),
+        )
+        eid = cur.lastrowid
+        c.executemany("INSERT INTO edge_nodes (edge_id, ntype, nid) VALUES (?,?,?)",
+                      [(eid, n.type, n.id) for n in edge.nodes])
+        c.commit()
+        return {"status": "created", "edge_id": eid}
+    finally:
+        c.close()
+
+
+@app.post("/api/v1/query/relations")
+def query_relations(q: RelQuery) -> dict[str, list[dict[str, Any]]]:
+    """Return distinct return_type nodes that co-occur in edges containing ALL
+    of the intersection nodes (for this user)."""
+    pins = [(item["node"]["type"], item["node"]["id"]) for item in q.intersection
+            if item.get("node")]
+    if not pins:
+        return {"results": []}
+    c = _conn()
+    try:
+        # edge_ids containing each pinned node (scoped to user_id), then intersect
+        candidate: set[int] | None = None
+        for ntype, nid in pins:
+            rows = c.execute(
+                """SELECT en.edge_id FROM edge_nodes en JOIN edges e ON e.edge_id = en.edge_id
+                   WHERE en.ntype = ? AND en.nid = ? AND e.user_id = ?""",
+                (ntype, nid, q.user_id),
+            ).fetchall()
+            ids = {r[0] for r in rows}
+            candidate = ids if candidate is None else (candidate & ids)
+            if not candidate:
+                return {"results": []}
+        if not candidate:
+            return {"results": []}
+        # collect return_type nodes from candidate edges, excluding the pins
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set(pins)
+        placeholders = ",".join("?" * len(candidate))
+        rows = c.execute(
+            f"""SELECT DISTINCT en.ntype, en.nid, e.relation, e.provenance_scroll
+                FROM edge_nodes en JOIN edges e ON e.edge_id = en.edge_id
+                WHERE en.edge_id IN ({placeholders}) AND en.ntype = ?""",
+            (*candidate, q.return_type),
+        ).fetchall()
+        for ntype, nid, relation, prov in rows:
+            if (ntype, nid) in seen:
+                continue
+            seen.add((ntype, nid))
+            out.append({"type": ntype, "id": nid, "relation": relation,
+                        "provenance_scroll": prov})
+            if len(out) >= q.limit:
+                break
+        return {"results": out}
+    finally:
+        c.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 ```
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  A["docker-compose up hypermem"] --> B["HyperMem HTTP service<br/>localhost:1996"]
-  B --> C["POST /api/v1/edges<br/>typed hyperedge create"]
-  B --> D["POST /api/v1/query/relations<br/>multi-entity intersection"]
-  B --> E["GET /api/v1/health"]
-  E --> F["smoke test pass: container ready"]
+  A["uv run python -m services.hypermem_shim"] --> B["FastAPI service<br/>localhost:1996 (SQLite-backed)"]
+  W["consolidate_with_l3<br/>(Phase 8)"] -->|"POST /api/v1/edges"| B
+  TT["ThreeTierMemory.query_relations<br/>(Phase 7/9)"] -->|"POST /api/v1/query/relations"| B
+  B --> E["edges table:<br/>relation + idempotency_key + user_id"]
+  B --> N["edge_nodes table:<br/>(edge_id, ntype, nid)"]
+  TT --> Q["intersection: nodes present in<br/>ALL pinned edges -> return_type nodes"]
 ```
+*L3 is a typed-hyperedge store: writes are idempotent edge POSTs; reads are multi-entity intersection queries scoped per user_id.*
 
-**Smoke test.**
+**Walkthrough:**
+
+**Block 1 — Hyperedge, not pairwise edge.** Each POST stores ONE relation linking N typed nodes (`user:alice`, `project:payments`, `tech:postgres`) in `edge_nodes`, keyed to a row in `edges`. A pairwise graph would need 3 edges to say the same thing and lose the "these three co-occurred in one fact" signal. The hyperedge keeps the joint association the paper argues pairwise relations cannot.
+
+**Block 2 — Intersection query is the L3 read primitive.** `query_relations` finds edge_ids containing EVERY pinned node (set-intersection across pins), then returns distinct nodes of `return_type` from those edges, minus the pins. This answers "experts on payments AND postgres" structurally — the multi-entity query L2 vector search handles poorly.
+
+**Block 3 — Idempotency mirrors the L2 dedup discipline.** `idempotency_key` (the `consolidate_with_l3` edge hash) is a UNIQUE column; a re-POST returns `{"status":"exists"}` without duplicating. Same contract as the quest-dedup table in `consolidation.py`, so re-running consolidation never double-writes L3.
+
+**Block 4 — Per-user_id scoping.** Every query filters edges by `user_id`, so one LongMemEval question's hyperedges never leak into another's intersection — the same isolation discipline as the per-question Qdrant collections.
+
+**Smoke test** (start the shim first, in another shell):
 
 ```bash
 # Create a 3-node hyperedge
@@ -1559,16 +1725,15 @@ curl -X POST http://localhost:1996/api/v1/edges \
 curl -X POST http://localhost:1996/api/v1/query/relations \
   -H "Content-Type: application/json" \
   -d '{"intersection":[{"node":{"type":"project","id":"payments"}}, {"node":{"type":"tech","id":"postgres"}}], "return_type":"user"}'
-# Expect: [{"type":"user","id":"alice"}]
+# -> {"results":[{"type":"user","id":"alice","relation":"worked-on-using",...}]}
 ```
 
-**Result** *(measured ON IMPLEMENTATION — TBD)*: smoke-test wall, HyperMem image size, container memory footprint, healthcheck pass time.
+**Result** *(verified 2026-06-02)*: shim starts on :1996; `/health` 200; the smoke-test edge + intersection query return `alice`; negative query (`payments AND mysql`) returns `[]`; duplicate idempotency_key returns `exists` (no double-write).
 
 `★ Insight ─────────────────────────────────────`
-- **HyperMem's HTTP-1996 port is a deliberate sibling to EverCore's HTTP-1995.** Both services expose the same conceptual API surface (imprint + query) but at different abstraction levels: EverCore stores propositions, HyperMem stores typed relations. Both are queryable by the same Python wrapper (Phase 7's `ThreeTierMemory`) without leaking which tier owns which kind of memory.
-- **Reuse Postgres rather than spin a separate DB for HyperMem.** Both services need durable storage, but HyperMem's hyperedge table is small (typically 100× smaller than EverCore's memcell table). Sharing the Postgres instance saves operational overhead + lets backups treat memory state as one unit. Production-shaped pattern: one durable substrate, multiple service-specific schemas.
-- **The healthcheck IS the integration contract.** When `ThreeTierMemory.query_relations()` (Phase 7) calls HyperMem on a fresh boot, it expects the service to be ready. If the healthcheck is missing or wrong, the wrapper's first call hits "connection refused" and the entire lab's debugging starts in the wrong layer. A 5-line healthcheck stanza saves hours.
-`─────────────────────────────────────────────────`
+- **Match the contract, not the paper.** The lab needs a typed-entity-intersection store; the research HyperMem is a dialogue-hypergraph eval pipeline. Building the 130-LOC shim that satisfies `query_relations`/`/api/v1/edges` is faster, runnable, and dependency-light vs. force-fitting a 6-stage offline pipeline behind an HTTP API it was never designed for.
+- **Structural vs semantic retrieval is the L2/L3 division of labour.** L2 (Qdrant) answers "what's similar to this query?" by embedding cosine; L3 answers "what entities co-occur across these specific others?" by set intersection. Multi-entity-intersection questions are exactly where vector similarity underperforms — which is why Phase 2's matrix routed them to a graph tier.
+- **A shim is an honest stand-in when labelled as one.** It runs end-to-end and teaches the L3 read/write contract; it does NOT claim the paper's 92.7% LoCoMo accuracy (no embeddings, no coarse-to-fine). Naming the gap keeps the result interpretable.
 
 ### Phase 7 — `ThreeTierMemory` Python Wrapper (~2h)
 
