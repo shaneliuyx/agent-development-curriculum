@@ -988,6 +988,42 @@ if __name__ == "__main__":
     main()
 ```
 
+**Driver dispatch — per-question eval flow:**
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q["for each question q in the slice<br/>(isolated user_id per q x backend)"] --> SEL{"--backend"}
+  SEL -->|"qdrant / mem0 / atomic_fact /<br/>hybrid / three_tier"| OB["_build_backend(backend, user_id)<br/>-> object: imprint() / query_context()"]
+  SEL -->|evercore| EC["inline HTTP path<br/>_ec_imprint_session / _ec_search"]
+  OB --> SPLIT{"imprint each session"}
+  SPLIT -->|qdrant| SUM["summarize_scroll<br/>-> imprint(summary)"]
+  SPLIT -->|"W3.5.9 backends"| RAW["imprint(raw session scroll)<br/>backend extracts internally"]
+  SUM --> RET["tm.query_context(question, k)"]
+  RAW --> RET
+  EC --> RET
+  RET --> RD["reader LLM<br/>-> short answer"]
+  RD --> JG["judge(question, gold, predicted)<br/>-> correct / score"]
+  JG --> REC["record[backend] = result<br/>append to data/results_w358.jsonl"]
+```
+*The same retrieve -> read -> judge tail runs for every backend; only the WRITE path and the backend object differ. EverCore is the one non-object (HTTP) backend.*
+
+**Driver walkthrough:**
+
+**Block 1 — One dispatch, two backend SHAPES.** `_build_backend()` returns an *object* exposing `imprint()/query_context()` for the five object-backends (`qdrant` + the four W3.5.9 backends, all duck-typed twins of `TieredMemory`). EverCore is the exception: it is an HTTP service with no Python object, so `_run_backend()` special-cases it inline (`_ec_imprint_session` / `_ec_search`). This is why `_build_backend` raises for `evercore` rather than building it — the shape genuinely differs, and pretending otherwise (the `_ec_tm` sketch) would crash.
+
+**Block 2 — Per-question, per-backend isolation.** `user_id = f"lme-{qid}-{backend[:2]}"` gives every (question x backend) pair its own namespace, so one question's haystack can never contaminate another's retrieval, and two backends never share state. The cost is many tiny stores; at slice scale (~24 questions) that is free.
+
+**Block 3 — The imprint-path SPLIT is the load-bearing design choice.** `qdrant` (the W3.5.8 2-tier baseline) summarizes each session scroll *before* imprinting (`summarize_scroll`), because its retrieval works over consolidated summaries. The W3.5.9 backends imprint the **raw session scroll** and do their own extraction internally (atomic-fact extraction, Mem0's pipeline, the router's dispatch). Feeding them a pre-summarized scroll would destroy the very granularity they exist to capture — so the write path forks by backend while the read path stays identical.
+
+**Block 4 — Same reader, same judge, same slice = only the backend varies.** Every backend's retrieved memories flow through the *same* `_read_answer()` (reader LLM) and the *same* `judge()` (claude-sonnet-4-6). The single independent variable is the backend's store+retrieve pipeline, so any score delta is attributable to architecture, not to reader/judge/infra differences. This is the requirement-driven-comparison contract the whole chapter is built to defend.
+
+**Block 5 — Timing + cap.** `_run_backend` records `wall_imprint / wall_retrieve / wall_read` separately so the aggregator can show where each backend spends time (Mem0's multi-signal retrieval vs atomic-fact's single-vector lookup). A `PER_QUESTION_CAP_S` guard returns a `timeout` record instead of hanging the whole run on one pathological question.
+
+`★ Insight ─────────────────────────────────────`
+- **Dispatch by SHAPE, not by name.** The clean split is "object-backend vs HTTP-backend", not "one if-branch per backend". `_build_backend` handles every object-backend uniformly; `_run_backend` forks only where the shape truly differs (HTTP imprint/search, and the summarize-vs-raw write path). New object-backends drop in with one `_build_backend` branch and zero `_run_backend` changes.
+- **The write path is where architectures actually differ; the read path is the control.** Holding reader+judge+slice fixed and varying only imprint+retrieve is what turns "which memory system is better?" from an opinion into a measurement.
+
 **Walkthrough:**
 
 **Block 1 — Why an ADAPTER, not inheritance.** Mem0's `Memory` class isn't a drop-in subclass of the lab's `TieredMemory` — its method names differ (`add` vs `imprint`, `search` vs `query_context`), its arguments differ (messages list vs flat content string), its return shapes differ. Trying to make Mem0 inherit from `TieredMemory` would either force Mem0 to adopt our shape (vendor-coupling) or force `TieredMemory` to accommodate Mem0's shape (bloat). An adapter is the right pattern: two distinct classes, both implement the same DUCK-TYPED interface (`imprint(content, metadata) → str` + `query_context(query, k) → list[dict]`), the eval driver consumes the interface, neither class knows about the other.
