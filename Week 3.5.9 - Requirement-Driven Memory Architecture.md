@@ -599,6 +599,10 @@ class Mem0Adapter:
                     "host": "localhost",
                     "port": 6333,
                     "collection_name": f"mem0_{user_id}",
+                    # bge-m3 emits 1024-dim vectors; mem0 defaults to 1536
+                    # (OpenAI text-embedding-3) and creates the collection at
+                    # that dim, causing "expected dim 1536, got 1024" on add().
+                    "embedding_model_dims": 1024,
                 },
             },
         }
@@ -1194,15 +1198,17 @@ class AtomicFactMemory:
         self, query: str, k: int = 5, **_kwargs: Any
     ) -> list[dict[str, Any]]:
         vector = self._embed(query)
-        hits = self._qdrant.search(
+        # qdrant-client >= 1.12 removed .search(); query_points() is the
+        # replacement and returns a response object with a .points list.
+        resp = self._qdrant.query_points(
             collection_name=self.collection,
-            query_vector=vector,
+            query=vector,
             limit=k,
             with_payload=True,
         )
         return [
             {"content": h.payload["content"], "score": h.score, "metadata": h.payload}
-            for h in hits
+            for h in resp.points
         ]
 ```
 
