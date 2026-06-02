@@ -669,6 +669,49 @@ def _build_backend(backend: str, user_id: str):
         from src.three_tier_memory import ThreeTierMemory       # Phase 7 — L1+L2+L3 (HyperMem)
         return ThreeTierMemory(user_id=user_id)
     raise ValueError(f"unknown object-backend: {backend!r}")
+
+
+# (b) _run_backend — build the object-backend, then imprint. qdrant keeps the
+#     summarize path; the W3.5.9 backends imprint the raw session scroll (they
+#     extract internally). EverCore stays the inline HTTP branch (unchanged).
+        else:  # object-backends: qdrant / mem0 / atomic_fact / hybrid / three_tier
+            tm = _build_backend(backend, user_id)
+            assert tm is not None  # built above — narrows the hoisted Optional
+            for idx, session in enumerate(q["haystack_sessions"]):
+                t0 = time.perf_counter()
+                if backend == "qdrant":
+                    imprinted, info = _qd_imprint_session(tm, qid, idx, session)
+                else:
+                    info = tm.imprint(
+                        _session_to_scroll(session),
+                        metadata={"quest_id": f"{qid}-sess{idx}",
+                                  "subject": f"LongMemEval session {idx}"},
+                    )
+                    imprinted = True
+                imprint_walls.append(time.perf_counter() - t0)
+                imprint_meta.append({"imprinted": imprinted, "info": str(info)[:80]})
+
+
+# (c) run_one() loops the selected backends; main() adds the --backend flag.
+def run_one(q: dict, backends: tuple[str, ...] = ("qdrant", "evercore")) -> dict:
+    record = {...}
+    for backend in backends:
+        ...  # _run_backend(backend, q) -> judge -> record[backend] = result
+    return record
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--smoke", type=int, default=0)
+    ap.add_argument("--skip-evercore", action="store_true")
+    ap.add_argument("--backend", choices=[*ALL_BACKENDS, "all"], default="all",
+                    help="run a single backend, or 'all' for the full comparison")
+    args = ap.parse_args()
+
+    backends = ALL_BACKENDS if args.backend == "all" else (args.backend,)
+    if args.skip_evercore:
+        backends = tuple(b for b in backends if b != "evercore")
+    # ... load slice, then: record = run_one(q, backends)
 ```
 
 **Walkthrough:**
