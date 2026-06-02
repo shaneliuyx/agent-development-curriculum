@@ -640,6 +640,38 @@ class Mem0Adapter:
         return out
 ```
 
+**Walkthrough:**
+
+**Block 1 — Why an ADAPTER, not inheritance.** Mem0's `Memory` class isn't a drop-in subclass of the lab's `TieredMemory` — its method names differ (`add` vs `imprint`, `search` vs `query_context`), its arguments differ (messages list vs flat content string), its return shapes differ. Trying to make Mem0 inherit from `TieredMemory` would either force Mem0 to adopt our shape (vendor-coupling) or force `TieredMemory` to accommodate Mem0's shape (bloat). An adapter is the right pattern: two distinct classes, both implement the same DUCK-TYPED interface (`imprint(content, metadata) → str` + `query_context(query, k) → list[dict]`), the eval driver consumes the interface, neither class knows about the other.
+
+**Block 2 — Why Mem0 is configured to share the lab's Qdrant + oMLX rather than spin up its own.** Mem0's default config talks to OpenAI's API + its own managed Qdrant cluster. We override to point at `localhost:6333` (lab's existing Qdrant) and `OMLX_BASE_URL` (lab's existing oMLX). Three reasons: (1) zero cloud spend — the chapter's local-first contract. (2) Apples-to-apples comparison — Mem0 vs Qdrant-baseline using the SAME vector store + SAME embedding model + SAME LLM means any score gap is due to PIPELINE differences (Mem0's multi-signal retrieval, atomic-fact extraction prompts), NOT infrastructure differences. (3) Easier debug — one Qdrant instance to inspect when something goes wrong.
+
+**Block 3 — Synthesizing a 1-turn message in `imprint()`.** Mem0's `add()` expects a messages LIST (multi-turn dialogue shape). The lab's existing eval driver passes pre-summarized SCROLL TEXT to `imprint()`. The adapter bridges by wrapping the scroll text in a single-turn `[{"role": "user", "content": content}]` list. This is a slight semantic mismatch: Mem0 was designed for dialogue ingestion, we're feeding it pre-processed text. Mem0's fact extractor will still run on the user-role content; whether it extracts SAME facts as it would from real dialogue is an empirical question — to be measured.
+
+**Block 4 — Return-shape translation in `query_context()`.** Mem0's `search()` returns either a list directly OR a dict with `results` key, depending on SDK version. The adapter normalizes both. The output dict shape mirrors the lab's existing pattern: each result has at minimum `content` (used by reader-prompt builder), `score` (for debugging), and `metadata` (for provenance). This adapter LAYER is where SDK-version sensitivity is contained — eval driver stays version-agnostic.
+
+**Block 5 — Why a per-user-id Qdrant collection (`mem0_{user_id}`)**. Mem0 stores all facts in one collection by default. For W3.5.9's eval, each LongMemEval question carries its own user_id, and we want STRICT ISOLATION so facts from one question's haystack don't contaminate another question's retrieval. Per-user collection naming guarantees the isolation at the storage layer, not just at the filter layer. Operational cost: many small collections (~20-24 collections, one per slice question). Qdrant handles this cheaply at lab scale.
+
+**Result** *(to be measured during implementation — explicit TBD)*:
+
+This phase's `Result` section will populate after the actual run lands. The slots to fill:
+
+- Mem0 score on the slice (per-axis breakdown matching Phase 1's matrix).
+- Wall-clock medians per phase (imprint / retrieve / read).
+- Mem0 SDK version measured against (e.g., `mem0ai==0.1.X`).
+- Any environment-config notes that surface during bring-up (Mem0's expected env vars, Qdrant collection format quirks, etc.).
+- Pass/fail of the apples-to-apples invariant: same reader + same judge + same slice = only the backend varies.
+
+**Calibrated expectation:** Mem0's published 94.4 on full LongMemEval is GPT-4o-judge + GPT-4o-class reader. On our M5 Pro + `gpt-oss-20b-MXFP4-Q8` reader + claude-sonnet-4-6 judge, the upper-bound on our slice is constrained by the reader's atomic-fact-extraction quality, not Mem0's. A score in the 40-70% range would be CONSISTENT with reader being the bottleneck; a lower score would suggest Mem0's atomic-fact extraction quality dropped on local-MLX (worth investigating); a higher score would be surprising.
+
+`★ Insight ─────────────────────────────────────`
+- **The adapter pattern is the load-bearing portability move.** Every OSS memory library has its own API shape — Mem0's `add(messages)`, Letta's `insert(text, source)`, Graphiti's `add_episode(episode)`. A lab that wires each one DIRECTLY into the eval driver pays N×M coupling cost (N backends × M eval-stages). An adapter layer pays N+M (one adapter per backend, one stable interface for the driver). For ANY future "swap-the-backend" experiment in this curriculum, write the adapter first.
+- **The "share lab's infrastructure" decision is what makes the comparison fair.** If Mem0 ran on its managed Qdrant cloud + OpenAI API while our other backends ran on local-MLX, the comparison would measure VENDOR INFRASTRUCTURE not BACKEND ARCHITECTURE. By overriding Mem0's config to use the same local Qdrant + same embeddings + same LLM, we isolate the variable that actually differs — Mem0's pipeline shape — from variables we don't want to compare (network latency, model quality across vendors).
+- **The 1-turn-message synthesis is the chapter's most honest acknowledgement of mismatch.** Mem0 was designed for streaming dialogue. We're feeding it pre-summarized scrolls. The adapter makes it WORK but doesn't make it OPTIMAL for our input shape. If Mem0 scores lower than its 94.4 claim by more than reader-quality alone explains, this mismatch is a candidate root cause. Documenting the mismatch up front means the result is interpretable instead of mysterious.
+`─────────────────────────────────────────────────`
+
+#### Eval driver — backend dispatch (shared across Phases 3-9)
+
 **Complete `src/run_longmemeval_slice.py`** (the vendored W3.5.8 driver + the W3.5.9 backend dispatch — copy this whole file into `src/`, it supersedes the base copy):
 
 ```python
@@ -1024,35 +1056,6 @@ flowchart TD
 - **Dispatch by SHAPE, not by name.** The clean split is "object-backend vs HTTP-backend", not "one if-branch per backend". `_build_backend` handles every object-backend uniformly; `_run_backend` forks only where the shape truly differs (HTTP imprint/search, and the summarize-vs-raw write path). New object-backends drop in with one `_build_backend` branch and zero `_run_backend` changes.
 - **The write path is where architectures actually differ; the read path is the control.** Holding reader+judge+slice fixed and varying only imprint+retrieve is what turns "which memory system is better?" from an opinion into a measurement.
 
-**Walkthrough:**
-
-**Block 1 — Why an ADAPTER, not inheritance.** Mem0's `Memory` class isn't a drop-in subclass of the lab's `TieredMemory` — its method names differ (`add` vs `imprint`, `search` vs `query_context`), its arguments differ (messages list vs flat content string), its return shapes differ. Trying to make Mem0 inherit from `TieredMemory` would either force Mem0 to adopt our shape (vendor-coupling) or force `TieredMemory` to accommodate Mem0's shape (bloat). An adapter is the right pattern: two distinct classes, both implement the same DUCK-TYPED interface (`imprint(content, metadata) → str` + `query_context(query, k) → list[dict]`), the eval driver consumes the interface, neither class knows about the other.
-
-**Block 2 — Why Mem0 is configured to share the lab's Qdrant + oMLX rather than spin up its own.** Mem0's default config talks to OpenAI's API + its own managed Qdrant cluster. We override to point at `localhost:6333` (lab's existing Qdrant) and `OMLX_BASE_URL` (lab's existing oMLX). Three reasons: (1) zero cloud spend — the chapter's local-first contract. (2) Apples-to-apples comparison — Mem0 vs Qdrant-baseline using the SAME vector store + SAME embedding model + SAME LLM means any score gap is due to PIPELINE differences (Mem0's multi-signal retrieval, atomic-fact extraction prompts), NOT infrastructure differences. (3) Easier debug — one Qdrant instance to inspect when something goes wrong.
-
-**Block 3 — Synthesizing a 1-turn message in `imprint()`.** Mem0's `add()` expects a messages LIST (multi-turn dialogue shape). The lab's existing eval driver passes pre-summarized SCROLL TEXT to `imprint()`. The adapter bridges by wrapping the scroll text in a single-turn `[{"role": "user", "content": content}]` list. This is a slight semantic mismatch: Mem0 was designed for dialogue ingestion, we're feeding it pre-processed text. Mem0's fact extractor will still run on the user-role content; whether it extracts SAME facts as it would from real dialogue is an empirical question — to be measured.
-
-**Block 4 — Return-shape translation in `query_context()`.** Mem0's `search()` returns either a list directly OR a dict with `results` key, depending on SDK version. The adapter normalizes both. The output dict shape mirrors the lab's existing pattern: each result has at minimum `content` (used by reader-prompt builder), `score` (for debugging), and `metadata` (for provenance). This adapter LAYER is where SDK-version sensitivity is contained — eval driver stays version-agnostic.
-
-**Block 5 — Why a per-user-id Qdrant collection (`mem0_{user_id}`)**. Mem0 stores all facts in one collection by default. For W3.5.9's eval, each LongMemEval question carries its own user_id, and we want STRICT ISOLATION so facts from one question's haystack don't contaminate another question's retrieval. Per-user collection naming guarantees the isolation at the storage layer, not just at the filter layer. Operational cost: many small collections (~20-24 collections, one per slice question). Qdrant handles this cheaply at lab scale.
-
-**Result** *(to be measured during implementation — explicit TBD)*:
-
-This phase's `Result` section will populate after the actual run lands. The slots to fill:
-
-- Mem0 score on the slice (per-axis breakdown matching Phase 1's matrix).
-- Wall-clock medians per phase (imprint / retrieve / read).
-- Mem0 SDK version measured against (e.g., `mem0ai==0.1.X`).
-- Any environment-config notes that surface during bring-up (Mem0's expected env vars, Qdrant collection format quirks, etc.).
-- Pass/fail of the apples-to-apples invariant: same reader + same judge + same slice = only the backend varies.
-
-**Calibrated expectation:** Mem0's published 94.4 on full LongMemEval is GPT-4o-judge + GPT-4o-class reader. On our M5 Pro + `gpt-oss-20b-MXFP4-Q8` reader + claude-sonnet-4-6 judge, the upper-bound on our slice is constrained by the reader's atomic-fact-extraction quality, not Mem0's. A score in the 40-70% range would be CONSISTENT with reader being the bottleneck; a lower score would suggest Mem0's atomic-fact extraction quality dropped on local-MLX (worth investigating); a higher score would be surprising.
-
-`★ Insight ─────────────────────────────────────`
-- **The adapter pattern is the load-bearing portability move.** Every OSS memory library has its own API shape — Mem0's `add(messages)`, Letta's `insert(text, source)`, Graphiti's `add_episode(episode)`. A lab that wires each one DIRECTLY into the eval driver pays N×M coupling cost (N backends × M eval-stages). An adapter layer pays N+M (one adapter per backend, one stable interface for the driver). For ANY future "swap-the-backend" experiment in this curriculum, write the adapter first.
-- **The "share lab's infrastructure" decision is what makes the comparison fair.** If Mem0 ran on its managed Qdrant cloud + OpenAI API while our other backends ran on local-MLX, the comparison would measure VENDOR INFRASTRUCTURE not BACKEND ARCHITECTURE. By overriding Mem0's config to use the same local Qdrant + same embeddings + same LLM, we isolate the variable that actually differs — Mem0's pipeline shape — from variables we don't want to compare (network latency, model quality across vendors).
-- **The 1-turn-message synthesis is the chapter's most honest acknowledgement of mismatch.** Mem0 was designed for streaming dialogue. We're feeding it pre-summarized scrolls. The adapter makes it WORK but doesn't make it OPTIMAL for our input shape. If Mem0 scores lower than its 94.4 claim by more than reader-quality alone explains, this mismatch is a candidate root cause. Documenting the mismatch up front means the result is interpretable instead of mysterious.
-`─────────────────────────────────────────────────`
 
 ### Phase 4 — Homebrew Hybrid Router (~3 h)
 
