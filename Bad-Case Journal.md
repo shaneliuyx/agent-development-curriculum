@@ -1008,6 +1008,50 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 
 ---
 
+## 2026-06-02 — Week 3.5.9 — Counting questions return "I don't know" though needles are extracted; assistant-advice flood buries them
+
+*Symptom:* `atomic_fact` answers the multi-session count question (gold = 3) "I don't know" at every k swept (5…80). A `--grep` probe confirms all 3 answer facts are in the store.
+*Root cause:* Per-message extraction ran over **assistant** turns, flooding the store with generic advice ("use a garment bag to store a blazer"). Those embed closer to the query than the rare user-action facts, so cosine top-k returns 40 distractors, 0 needles (798 of 801 unique facts are advice).
+*Fix:* Extract only from `[USER]`-tagged lines (fallback to all if untagged). 783 → 88 facts (9× less noise), imprint 233s → 24s, all 3 needles by k=40. Memory should record what the *user* said, not assistant advice. **W3.5.9 BCJ Entry 1.**
+
+## 2026-06-02 — Week 3.5.9 — A single dense query cannot gather a count question's scattered needles
+
+*Symptom:* On the clean user-turn store, default `k=5` returns 0 of 3 needles (they sit at ranks 13 / 23 / 37).
+*Root cause:* The answer items are heterogeneous ("dry cleaning", "boots", "green sweater"); none embeds near "how many items of clothing", so the dominant theme outranks every specific item at shallow k.
+*Fix:* Route "how many/much/often" through deeper retrieval (`COUNT_TOP_K=40`) + enumerate-then-count prompt + larger token budget. This is the empirical case FOR the chapter's question-type router. **W3.5.9 BCJ Entry 2.**
+
+## 2026-06-02 — Week 3.5.9 — Reader model is a hidden binding constraint; gemma non-deterministic at temp=0
+
+*Symptom:* With store + prompt + k all correct, `gemma-4-26B-A4B` answers `1` then `2` on identical reruns — both wrong.
+*Root cause:* 4-bit MoE reader too weak/unstable for enumerate+dedup over a noisy 40-fact list; MLX fp4 + KV-cache rounding is non-deterministic even at `temperature=0`. An A/B swapping only the reader showed Haiku 4.5 stable at `3`.
+*Fix:* All LLM roles on Haiku 4.5 via VibeProxy; reader held constant across backends. Diagnostic: a strong reader on bad retrieval fails *honestly* ("0") — distinguishes retrieval bug from reasoning bug. Same mismatched-contract-vs-mechanism shape as [[Week 3.5.8 - Two-Tier Memory Architecture]] commitment-bias finding. **W3.5.9 BCJ Entry 3.**
+
+## 2026-06-02 — Week 3.5.9 — One shared base-URL would redirect embeddings to a chat-only proxy
+
+*Symptom:* Migrating "all LLM → Haiku via VibeProxy" by repointing `OMLX_BASE_URL` breaks every backend — VibeProxy serves chat but has no embedding model, so `embeddings.create(model="bge-m3")` 404s.
+*Root cause:* Modules used one `OMLX_BASE_URL` for BOTH chat and embeddings (same coupling as W3.5.8 BCJ Entry 19). One var can't front two heterogeneous endpoints.
+*Fix:* Split per role — `LLM_BASE_URL` (chat → VibeProxy) + `EMBED_BASE_URL` (embeddings → local oMLX), both falling back to `OMLX_BASE_URL` so unset = fully-local. Applied across 6 modules. (Bonus: `consolidation.py` was missing `import json` for the Phase 8 edge extractor — caught by the same compile pass.) **W3.5.9 BCJ Entry 4.**
+
+## 2026-06-02 — Week 3.5.9 — VibeProxy cloaks as Claude Code on a `system` role, refusing structured extraction
+
+*Symptom:* All-Haiku-via-VibeProxy migration → `mem0` stores 0 facts (`Expecting value: line 1 column 1`); a system-role extraction probe returns *"I'm Claude Code… for personal errands like dry cleaning, handle those directly with Zara"* — persona refusal, not JSON.
+*Root cause:* VibeProxy (:8317) is a Claude Code router; it injects an interactive system prompt, so any caller-supplied `system` role makes the model answer AS Claude Code and refuse non-coding tasks. Recurrence of W3.5.8 BCJ Entry 19 (proxy overwrites `payload.system`). User-only callers (reader, atomic_fact) survived; system-role callers (mem0 internals, consolidation) did not.
+*Fix:* **Use user role, not system role** — fold the instruction into the user turn. consolidation = 2-line change; Mem0 SDK = one monkeypatch on `OpenAILLM.generate_response` folding system→user at its sole chokepoint. mem0 0 → 19 retrieved facts; cloak gone. **W3.5.9 BCJ Entry 5.**
+
+## 2026-06-02 — Week 3.5.9 — three_tier answers "1" because L2 stored whole-session blobs the reader truncated
+
+*Symptom:* `three_tier` returns only the navy blazer (`ANSWER: 1`) while `atomic_fact` finds all items; 18 hits from a 3289-point shared collection.
+*Root cause:* `ThreeTierMemory` inherits `TieredMemory.imprint`, which embeds `content` as ONE point. Fed a session scroll it stores ~4 KB blobs into shared `lab358_memories`; the reader truncates each memory to 400 chars, so only each session's opening survives (only session 0 named an item — the blazer).
+*Fix:* Delegate L2 to `AtomicFactMemory` (per-fact, user-turn-filtered, isolated `af_{user_id}`); keep L3 HyperMem for multi-entity relations. three_tier 1 → 2 (dry cleaning + boots), hits 18 blobs → 40 facts. Bug was L2 granularity, not the graph tier. **W3.5.9 BCJ Entry 6.**
+
+## 2026-06-02 — Week 3.5.9 — Reader returns "I'm Claude Code…" instead of an answer (VibeProxy persona cloak), even with a user-only prompt
+
+*Symptom:* qdrant's reader prediction is a Claude-Code persona refusal, scored wrong — despite the reader sending NO system role, and it repeats across retries for that backend.
+*Root cause:* VibeProxy injects ITS OWN Claude-Code system prompt server-side on every request (proof: "Reply OK" → "OK, I'm ready to help with your software"). The persona refuses input that reads as personal/non-coding. qdrant retrieves NARRATIVE summaries (prose → reads as personal chat → refused); atomic-fact backends retrieve terse data-shaped facts → answer. Content-shape-dependent, not random.
+*Fix (two layers):* (1) frame the reader prompt as a data-extraction task ("information-extraction function in a data pipeline; do not describe your role") → injected persona treats it as text-processing and answers (fixes data-shaped backends via the USER prompt alone); (2) `is_cloak()` detect + temp-nudged retry, then LOCAL-model fallback (no injected persona) for narrative input the framing can't save. Never return persona text or "I don't know". General lesson: when a proxy injects an identity you can't remove, frame the task as something that identity WILL do; keep a no-persona local fallback for the residual. **W3.5.9 BCJ Entry 7.**
+
+---
+
 ## Cross-cutting patterns (fill in as entries accumulate)
 
 > Update this section every ~3 entries to surface recurring shapes. The goal is to stop treating each bad case as one-off.
