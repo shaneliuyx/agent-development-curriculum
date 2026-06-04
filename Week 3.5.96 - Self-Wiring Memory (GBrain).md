@@ -412,20 +412,27 @@ gbrain query  "investments in fintech companies" --limit 5 --explain
 
 **Deliverable:** `~/brain/outputs/rrf_benchmark.md` — a 10-query × {`search`, `query`} Recall@5 table.
 
-### Phase 5 — Synthesis layer + "what we don't know" check [spec — not yet run]
+### Phase 5 — Synthesis layer + "what we don't know" check [executed, measured]
 
-**Goal:** confirm the synthesis layer flags gaps instead of fabricating. *(Not
-executed — we ran `query` and got a correct cited answer (Phase 6, score 0.93),
-but did not run the deliberate gap/absent-fact test below.)*
+**Goal:** confirm the synthesis layer flags gaps instead of fabricating, on a fact the corpus does **not** contain.
+
+> **Two corrections from running it:** (1) synthesis is **`gbrain think`** — *"multi-hop synthesis … cited answer with conflict + gap analysis."* `ask`/`query` are *retrieval* (ranked chunks), not synthesis. (2) `think` needs a **chat LLM**; an embeddings-only install returns retrieval only. We wired the chat model at **VibeProxy → Claude** (the chapter's chat-via-VibeProxy path) while embeddings stayed local on oMLX:
 
 ```bash
-gbrain ask "what did Alice do on 2026-06-15?"   # `ask` = alias for `query`; that date is absent from the corpus
-# Expect: an answer that explicitly names the gap ("no visibility into 2026-06-15 for Alice…"),
-#         not an invented event.
-gbrain query "Alice" --no-expand                 # --no-expand skips LLM query expansion (cheaper, deterministic)
+export OPENROUTER_API_KEY=dummy OPENROUTER_BASE_URL=http://localhost:8317/v1   # VibeProxy (chat)
+gbrain think "What did Alice Chen do on 2026-06-15?" \
+  --model openrouter:claude-sonnet-4-5-20250929        # date ABSENT from the corpus
 ```
 
-**Verification:** the answer surfaces the gap explicitly **and** cites brain pages for what it *does* know; it does not invent a 2026-06-15 event.
+**Result (measured):**
+```
+# What did Alice Chen do on 2026-06-15?
+No information available about Alice Chen's activities on 2026-06-15.
+Model: openrouter:claude-sonnet-4-5-20250929 | Pages: 9 | Citations: 0
+```
+**Gap correctly flagged — no fabrication.** Synthesis pulled 9 candidate pages but honestly reported no info for that date rather than inventing an event. This is the **embeddings-local-oMLX / chat-via-VibeProxy** split working end-to-end (the W3.5.9 topology).
+
+**Verification:** ✅ the absent date returns an explicit "no information," not a fabricated event; for a *present* fact (Phase 6's `query`) the same brain answers with score 0.93.
 
 ### Phase 6 — A future agent uses GBrain as memory over MCP [executed, measured]
 
