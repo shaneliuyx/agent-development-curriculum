@@ -1,7 +1,7 @@
 ---
 tags: [agent-curriculum, debugging, bad-cases, ops-pattern-library]
 created: 2026-04-27
-updated: 2026-05-03
+updated: 2026-06-04
 ---
 
 > **Read order:** Diagnostic Heuristics → Entry Template → Entries → Cross-cutting patterns. The heuristics are pre-debugging discipline (how to think); the template is post-debugging discipline (how to log).
@@ -1274,6 +1274,128 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 **Tags:** #error-analysis #retry-logic #reflection #agent-loop #w4
 
 **Captured in curriculum at:** [[Week 4 - ReAct From Scratch#Bad-Case Journal]]
+
+---
+
+## 2026-06-04 — Week 3.5.95 — Reported a "33% self-attribution leak" from ONE run; 20-run ablation refuted it
+
+**Symptom:** One LEARNING extraction stored 6 facts of which 2 were environmental outcomes phrased first-person ("I keep calling web_search with queries that return HTTP 500 errors" — a 500 is server-side; "I frequently encounter database connection issues" — infra), with `dropped_env=0`. I wrote it up as "33% of self-knowledge is noise; the self-attribution filter never fires." Then I tried to *validate* it — and it evaporated.
+
+**Why it's a bad case:** Reporting a *rate* from a single sample of a nondeterministic process. The original observation was real (2 facts did leak that run) but the generalization ("33%", "never fires") was unsupported — it came from n=1.
+
+**False leads:**
+1. "The filter logic is wrong." — It correctly drops `is_self_caused=false`; the field was just set wrong that run.
+2. "The 7B systematically over-attributes env→self." — The intuitive story, and what I first wrote. The ablation refuted it: same model, same prompt, 0 leaks in 5 reruns.
+
+**Root cause:** `is_self_caused` is filled by the summarizer, and that judgment is **nondeterministic** — temperature=0 does not pin MLX sampling. A 2×2×5 ablation ({7B,14B}×{current,stronger prompt}, `scripts/ablation_filter.py`) leaked **0/20**, including 5 reruns of the exact baseline that originally leaked. The real defect was methodological: I characterized a stochastic filter from one run.
+
+**Fix:** Corrected the write-up to the validated finding; measure LLM-filled filters as a **distribution over N runs**. Stronger prompt / bigger model didn't reduce the (already ~0) leak — they trade recall for precision (facts kept 5→4→3). Left the original observation visible beside the correction (the lab's own thesis — record, then re-examine — applied to the lab's own claim).
+
+**5-second sanity test:** Before quoting a rate from an LLM-judged metric, run it ≥5×. If the number moves run-to-run, you have a distribution, not a rate — n=1 is a single draw, not a measurement.
+
+**Generalizes to:** Any LLM-as-judge metric quoted from one run — eval pass-rates, moderation precision, relevance@k from a single generation. Stochastic judges need repetition before a number means anything; a single green *or* red run characterizes nothing.
+
+**Tags:** #llm-as-judge #nondeterminism #n-equals-1 #self-attribution #measurement #lab-3.5.95
+
+**Captured in curriculum at:** [[Week 3.5.95 - Self-Observability Memory#5. Bad-Case Journal]]
+
+---
+
+## 2026-06-04 — Week 3.5.95 — Metacognitive recall changes zero decisions; the claim looked false
+
+**Symptom:** Paired trial (same task, recall OFF vs ON) showed divergence 0/6 — injecting recalled self-patterns changed not a single decision. The lab's headline claim ("a recalled fact changes the agent's action") appeared dead on arrival.
+
+**Why it's a bad case:** Wrong-experiment-design masquerading as a negative result. The mechanism worked; the *test* couldn't see it.
+
+**False leads:**
+1. "Recall injection is broken" — logged the prompts; the block was present and well-formed in every ON run.
+2. "BM25 isn't matching" — it was; relevant facts were retrieved and injected. The agent just ignored them.
+
+**Root cause:** The probe facts were general best-practices (`rg > grep`, `fd > find`) already in the base model's priors. The OFF run *already* chose the "better" tool, so recall had nothing to change. Recall is only observable when it contradicts what the model would do unaided.
+
+**Fix:** Redesigned probes to **contrarian, environment-specific** facts the model cannot know from training ("rg segfaults on *this* repo's symlinked vendor dirs; use grep here") → divergence jumped to 6/6. This is the finding, not just a fix.
+
+**5-second sanity test:** Run the OFF condition alone first. If it already does the "right" thing, your probe can't measure the intervention — the prior dominates.
+
+**Generalizes to:** Any A/B of an in-context augmentation (RAG, few-shot exemplars, system-prompt nudges). If the base model already behaves correctly, the augmentation shows zero lift — not because it's useless, but because the test chose cases the model already had covered. Test on the model's blind spots, not its strengths.
+
+**Tags:** #evaluation-design #in-context-learning #ab-testing #recall #lab-3.5.95
+
+**Captured in curriculum at:** [[Week 3.5.95 - Self-Observability Memory#5. Bad-Case Journal]]
+
+---
+
+## 2026-06-04 — Week 3.5.95 — smolagents CodeAgent crashes on `</code` SyntaxError with a local MLX model
+
+**Symptom:** Every `CodeAgent` step failed code parsing with `SyntaxError ... </code` (note: no closing `>`). No tool ever executed; only `<step_error>` rows logged; the agent burned all steps and gave up.
+
+**Why it's a bad case:** Library-internal interaction bug that looks like a model failure. Easy to misdiagnose as "the local model can't write code."
+
+**False leads:**
+1. "The model emits bad code" — it didn't; the code between the tags was valid Python.
+2. "Switch to ToolCallingAgent" — tested oMLX for native `tool_calls`: it returns `<function-call>` *text*, not real tool_calls, so ToolCallingAgent wouldn't help either.
+
+**Root cause:** smolagents issue #1851. smolagents 1.26's default code fence is `<code>…</code>`; generation stops on the `</code>` stop sequence, but a partial `</code` (token boundary) leaks into the extracted Python and crashes `ast.parse`. Local/MLX models hit this far more than hosted ones due to token-boundary alignment.
+
+**Fix:** `CodeAgent(..., use_structured_outputs_internally=True)` — the agent forces a `{"thought","code"}` JSON action via `response_format` (verified oMLX supports `json_schema`), bypassing the stop-sequence text scrape. Tool calls then executed. (Two follow-on bugs: `@tool` needs Google-style `Args:` docstrings; and `CodeAgent` runs tools off-thread → SQLite needs `check_same_thread=False`.)
+
+**Time cost:** ~40 min burned; seconds next time (the `</code` with no `>` is the fingerprint).
+
+**5-second sanity test:** A `SyntaxError` whose offending token is a *partial* stop sequence (`</code`, `\`\`\``) = stop-sequence leak, not bad model output. Look at the parser's expected fence format, not the model.
+
+**Generalizes to:** Any agent framework that scrapes code/actions out of free text between delimiters, paired with a model whose output format or token boundaries don't match the framework's stop sequence. Structured outputs (JSON via `response_format`) sidestep the entire class.
+
+**Tags:** #smolagents #stop-sequence #structured-outputs #local-model #integration #lab-3.5.95
+
+**Captured in curriculum at:** [[Week 3.5.95 - Self-Observability Memory#5. Bad-Case Journal]]
+
+---
+
+## 2026-06-04 — Week 3.5.95 — NER-based PII scrub (Presidio) is 1555× slower than regex; check the absolute number
+
+**Symptom:** Replacing a 5-pattern regex PII scrubber with Microsoft Presidio (spaCy NER + recognizers) took per-write scrubbing from 0.0014 ms to 2.25 ms — a 1555× relative slowdown on the OBSERVABILITY hot path (one write per tool call).
+
+**Why it's a bad case:** A scary-looking ratio that tempts a premature "revert / optimize" before checking whether it matters. Relative-vs-absolute confusion.
+
+**False leads:**
+1. "1555× is unacceptable on the hot path — revert to regex." — Wrong frame: the absolute is 2.25 ms, and the thing it gates (a real tool call: grep, web_search) is 10s–1000s of ms. The scrub is <1% of step latency.
+2. "Cache the analyzer per call." — The first naive build reloaded the spaCy model every call (the real waste); a lazy singleton fixed that, leaving 2.25 ms of genuine NER inference.
+
+**Root cause:** NER inference is inherently heavier than compiled regexes; the headline ratio is real but measured against a microsecond baseline, so it inflates. The only cost that mattered (model reload per call) was a fixable build bug, not the NER itself.
+
+**Fix:** Lazy singleton engine (load model once) + small `en_core_web_sm`. Keep a regex fallback so a missing optional dep degrades instead of crashing; expose `backend()` to report which path is live. For extreme volume, move scrubbing to a batched/async lane.
+
+**5-second sanity test:** When a relative slowdown looks alarming, multiply by call frequency and compare to the *enclosing* operation's latency. 2.25 ms × (one scrub per multi-hundred-ms tool call) = noise.
+
+**Generalizes to:** Any "we made X N-times slower" panic — JSON schema validation, structured logging, encryption-at-write. Relative regressions on a microsecond baseline are almost always absolute-negligible; the discipline is to budget against the enclosing operation, not the old micro-baseline.
+
+**Tags:** #performance #relative-vs-absolute #pii #presidio #premature-optimization #lab-3.5.95
+
+**Captured in curriculum at:** [[Week 3.5.95 - Self-Observability Memory#5. Bad-Case Journal]]
+
+---
+
+## 2026-06-04 — Week 3.5.95 — Append-only PK collides on the SECOND run; first run hid the bug
+
+**Symptom:** `python src/smolagents_agent.py` ran clean the first time, then crashed on every rerun with `sqlite3.IntegrityError: UNIQUE constraint failed: observability.agent_run_id, observability.step_idx`. The recall block also printed the same self-pattern three times.
+
+**Why it's a bad case:** A first-run-passes / second-run-fails bug — the most deceptive kind. State that persists between runs makes a demo look correct exactly once. Anyone testing with a fresh DB (or a single run) ships it green.
+
+**False leads:**
+1. "Thread bug again (we just fixed `check_same_thread`)." — No; the write reached SQLite fine, the *value* collided.
+2. "Two writers race (tool wrapper + step callback)." — They share a monotonic counter; within a run there's no collision. The collision is cross-run.
+
+**Root cause:** `main()` hardcoded `run_id="smolagents-demo"` against a **persistent** DB. OBSERVABILITY's append-only PK `(agent_run_id, step_idx)` means run 2's `step0` duplicates run 1's `step0` → IntegrityError. The triple-printed fact was the sibling: `main()` re-`INSERT`ed the seed LEARNING fact every run, so recall (K=3) echoed three copies. Both are the append-only PK working *as designed* — it's supposed to reject duplicate keys.
+
+**Fix:** unique `run_id` per invocation (`f"smolagents-demo-{uuid4()[:8]}"`); DELETE-then-INSERT the demo's seed fact so reruns replace rather than stack. Verified: two consecutive runs both clean, single recall line each.
+
+**5-second sanity test:** Run any stateful demo TWICE before calling it done. First-run-green is not green. (`rm data/*.db && run && run`.)
+
+**Generalizes to:** Any append-only / event-sourced store with a natural-key PK seeded by a fixed-id job — idempotency keys reused across runs, fixtures with hardcoded IDs, "INSERT seed data" migrations re-applied. The durable PK is doing its job; the caller must supply a fresh key per run and idempotent seeds.
+
+**Tags:** #append-only #idempotency #persistent-state #first-run-passes #sqlite #lab-3.5.95
+
+**Captured in curriculum at:** [[Week 3.5.95 - Self-Observability Memory#5. Bad-Case Journal]]
 
 ---
 
