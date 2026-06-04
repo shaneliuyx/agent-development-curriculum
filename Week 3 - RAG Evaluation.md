@@ -1855,11 +1855,29 @@ Parallelizing LLM-backed checks (faithfulness, relevance) recovers ~30% of the l
 
 ## Interview Soundbites
 
-**Soundbite 1 — Three of four RAGAS metrics saturated; bottleneck is answer formulation.** On my W3 lab — 50-question dev set, four RAGAS metrics — the baseline pipeline scored faithfulness=0.99, context_recall=1.00, context_precision=0.98, answer_relevancy=0.75. Three of the four are at or near ceiling; the only remaining gap is answer formulation. The architectural lesson: when context_recall saturates, no retrieval-augmentation strategy can win — I tested HyDE (rejected, answer_relevancy 0.7286/0.7293 vs 0.7494 baseline) and multi-query (rejected, tied) to confirm. Both stay in the codebase as opt-in for future low-recall query clusters; neither ships as default.
+> *Refined 2026-06-03 to principle level — a candidate recalls the principle and the shape of the result, not exact numbers; measured specifics live in the Lab Phases section.*
 
-**Soundbite 2 — What each RAGAS metric actually caught on the dev set.** Each RAGAS metric caught a different failure shape during my prompt-iteration runs. Faithfulness dropped from 0.99 to 0.94 when an enhanced prompt produced over-verbose answers — fix was a strict 1-sentence + <35-word cap, recovered to 0.99. Answer relevancy dropped from 0.89 to 0.65 on the same enhanced-prompt run, catching off-topic synthesis where answers cited correct context but didn't address the question. Context precision and recall both held above 0.98 throughout — confirming the retriever was never the bottleneck. The discipline: only optimize the metric that has headroom; don't tune what's already saturated.
+**Soundbite 1 — *"How do you know which layer of a RAG pipeline to optimize?"***
 
-**Soundbite 3 — The 5-second sanity test that would have saved me an evening of HyDE iteration.** HyDE and multi-query are the textbook recall-augmentation moves; both got rejected on my corpus. HyDE long-prompt scored answer_relevancy=0.7286, short-prompt 0.7293, baseline 0.7494 — both prompts added an extra LLM call and lost. Multi-query was tied on faithfulness, -0.007 on answer_relevancy. The reason is structural: context_recall=1.0000 leaves no recall gap to close, so neither variant can win. The 5-second sanity test before adopting any recall-augmentation strategy: check if baseline context_recall is already at ceiling — if yes, the only way to win is to improve ranking or generation enough to offset the extra LLM call, and that's a much harder bar.
+ANSWER: I run a four-metric eval — faithfulness, context recall, context precision, answer relevancy — and look at where headroom remains. On my W3 lab the retriever metrics all hit near-ceiling on the harder dev set while answer relevancy stayed meaningfully lower. That pattern tells you retrieval is working; the bottleneck is generation. I confirmed it by running HyDE and multi-query — both recall-augmentation moves — and neither improved the weak metric, exactly as you'd predict when recall is already saturated. The principle: read the metric profile before choosing a strategy.
+
+*Principle:* saturated recall metrics are a signal, not a success — they tell you the next dollar of effort belongs in generation, not retrieval.
+
+---
+
+**Soundbite 2 — *"What does each RAGAS metric actually catch in practice?"***
+
+ANSWER: Each metric catches a distinct failure mode, and my prompt-iteration runs made that concrete. When I tested an over-verbose enhanced prompt, faithfulness dropped because verbose answers drifted from the source context — recovering required a strict length cap. Answer relevancy caught a different failure on the same run: answers that were well-grounded but didn't directly address the question. Context precision and recall stayed high throughout, confirming the retriever was never the problem. The discipline is treating the four metrics as a diagnostic panel, not a single score to maximize.
+
+*Principle:* one RAGAS number tells you nothing; the pattern across all four tells you which layer broke.
+
+---
+
+**Soundbite 3 — *"When would you reject HyDE, and how would you know before running it?"***
+
+ANSWER: HyDE closes vocabulary gaps between a short query and a long document — it helps when the retriever is missing evidence the corpus contains. Before running it, I check whether baseline context recall already saturates; if it does, there is no gap to close, and HyDE can only add latency and cost. On my W3 corpus that was exactly the situation: recall was at ceiling, so both a long-form and a short-form HyDE prompt came in below baseline on answer relevancy. The five-second sanity test is free; skipping it cost me an evening of iteration.
+
+*Principle:* diagnose the recall gap before reaching for recall-augmentation — HyDE is a treatment for a specific symptom, not a universal upgrade.
 
 ---
 

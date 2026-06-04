@@ -1,7 +1,7 @@
 ---
 tags: [agent-curriculum, meta-skills, decision-making, working-with-ai, multi-agent, delegation]
 created: 2026-04-28
-updated: 2026-06-02
+updated: 2026-06-03
 ---
 
 # Agent Development Patterns — Memory · Retrieval · Multi-Agent · Eval · LLM-Ops
@@ -226,6 +226,44 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 **Anti-pattern.** Routing every LLM call through the metered gateway "for quality" → cooldown 503s mid-run, persona refusals scored as wrong answers, lost imprints.
 **Conditionality.** Only relevant when the capable model is gateway-mediated; with a clean API key, just rate-limit politely. The local fallback is the read-side mirror of "the gateway might refuse the write."
 
+### Pattern 33 — Route the READ assembly by question type; select, don't union
+
+**Rule.** A memory system answers many question shapes (current-value, count, as-of/ordering, preference, lookup); each needs a DIFFERENT read-time assembly operator, not one reader. Build a read-side operator **router keyed on question type**: latest-`[sN]`-wins (knowledge-update), enumerate-then-count (count), earliest-`[sN]`-wins (temporal ordering), generate-aligned-with-preferences (preference), deeper-k terse lookup (single-session). **W3.5.9 6-axis: read-side operators lifted base 45% → 62% → 79% → 83%** (temporal-reasoning **0/4 → 3/4 → 4/4** from the ordering operator + per-operator `seq` recency), **all without changing storage**. Selection beats union: a per-axis router that picks the right operator/backend per question beats both a blind ensemble (RRF union) and tier-stacking (`three_tier`), which dilute (see Pattern 27).
+**Anti-pattern.** One universal reader prompt for all question types; or routing STORAGE backends (the `hybrid` router, 75%) while leaving the READ assembly generic.
+**Conditionality.** Requires knowing/classifying the question type; a real system classifies it, the eval has it labeled.
+
+**Recency-operator sub-lesson (measured W3.5.9 §4.17).** Recency-signal granularity is **per-operator, not global**. Three tiers: **(1) session-index `[sN]`** — per-session, assumes index=chrono (violated ~17%); correct for current-value / superlative latest-wins (KU); **(2) insert-sequence `seq`** — per-fact monotonic counter at imprint, needs sessions date-sorted; use for temporal-ORDERING operators (fixes intra-session order; validated: `gpt4_2487a7cb` now correct); do NOT apply globally to KU latest-wins — measured regression: global `seq` on a superlative KU question re-exposed a re-mentioned old value that session-level `[sN]` suppressed (4/4→3/4 on `6a1eabeb`); per-operator assignment restores both axes to 4/4 and lifts base 79%→83%; **(3) extracted event-time** — per-fact LLM temporal-expression extraction, highest fidelity, LLM-dependent ceiling. The operator-routing thesis extends to the recency signal: not just "which prompt?" but "which recency resolution?" — both are operator-specific choices.
+
+**Extraction-volume sub-lesson (measured W3.5.9 §4.17 14B run).** Extraction VOLUME must be controlled at READ time, not write time. A more verbose extraction model (14B vs 7B) over-extracted: ~5 near-duplicate restatements of the same item per fact (measured: F-15 model kit restated ~5 ways, 445 total facts). Under a fixed retrieval top-k (40), duplicates crowd the window and rare items fall below the cutoff — the Spitfire kit existed in the store but ranked below #40, so the reader enumerated 4 of 5. Bigger extraction model ≠ better recall when the reader's context window is fixed. The non-destructive remedy is **read-time diversity rerank (MMR or per-entity cap)**, scoped per-operator — it diversifies what the reader sees without altering the store. Do not attempt to control volume by deduplicating at write (see Pattern 34).
+
+**See also:**
+- Pattern 27 — Router Selects / Ensemble Unions (the backend-selection version; this pattern is its read-assembly mirror — selection beats union in both)
+- Pattern 25 — The Reader/Composer Is the Quality Lever (the operators this pattern routes ARE read-side reasoning steps)
+- Pattern 34 — Evidence-Before-Belief Extraction (write-time dedup is the same category of mistake as write-time discard; diversify at read, preserve at write)
+- [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — the 6-axis read-operator runs (45→62→79%→83%) + §4.17 recency-signal tiers + per-operator seq result + 14B over-extraction finding
+
+### Pattern 34 — Evidence-before-belief extraction: tag provenance + chunk; never discard at write
+
+**Rule.** Write-time extraction filters that DISCARD data are irreversible and workload-brittle. **W3.5.9: a user-turn-only extraction filter (built to de-flood multi-session counts) ZEROED the single-session-assistant axis (0/4)** — the answer lived in dropped assistant turns. Fix: extract from all roles, **TAG provenance** (`role=user/assistant`), and filter at READ time per question type — the de-flooding moves to a read-side role filter, **losing no data** (evidence-before-belief). Also: **parse TURNS not lines** (multi-line turns mis-tag if split on raw newlines — measured **283 user / 5 assistant**), and **CHUNK long turns (~700 chars)** so a long narrative turn isn't one extraction call that returns 0 facts (a **2473-char turn: 0 → 47 facts** after chunking). Refs: Eywa evidence-before-belief (arXiv 2605.30771), MemIR provenance (arXiv 2605.25869).
+**Anti-pattern.** Dropping turns/roles at write to reduce noise — it's unrecoverable and breaks the axis whose answer lived there. Splitting role-tagged scrolls on raw newlines (mis-tags multi-line turns). **Write-time fact dedup is the same category of mistake**: "started X" and "finished X" are distinct facts; old and new value of the same attribute are distinct facts; merging at write destroys the signal that knowledge-update and temporal-reasoning operators depend on. Preserve at write; diversify/deduplicate at read.
+**Conditionality.** Read-side role filtering needs the question's provenance need (assistant-stated vs user-stated), routed by type. Read-time diversity rerank (MMR or per-entity cap) is the non-destructive remedy for extraction-volume dilution — it keeps the store intact and scopes the policy per-operator and per-query.
+
+**See also:**
+- Pattern 22 — Lifecycle Position Matters (this is *late-binding the role filter*: keep all roles at write, filter at read so the policy stays iterable)
+- Pattern 26 — Write-Time Primitive Preserves Signal (Pattern 26 = don't erase a *dimension*; Pattern 34 = don't erase a *role* — same write-time-discard hazard, and 26's user-turn-only conditionality is exactly the failure 34 fixes)
+- [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — the role-aware extraction run (37→45%) + the chunking fix
+
+### Pattern 35 — Abstention is a topic-presence question, not an answer-groundedness one
+
+**Rule.** To make a reader abstain on unanswerable questions WITHOUT over-refusing answerable ones, ask *"is the question's SUBJECT present in the records at all?"* (topic-presence) — NOT *"is the answer grounded?"* **W3.5.9: a binary GROUNDED/UNGROUNDED gate over-refused catastrophically (answerable 19/24 → 10/24, −9)** because it conflated "answer not verbatim" with "unanswerable"; a **topic-presence gate** (biased to PRESENT + few-shot) **cut over-refusal to −1 (answerable 18/24)** while lifting abstention **3/8 → 5/8**. Same wiring, same model — only the **epistemic FRAMING of the prompt** changed. Decouple the abstention judgment from answer generation (a separate lightweight classifier pass). Refs: AbstentionBench (arXiv 2506.09038 — a good prompt boosts abstention without precision loss, but prompt-only has a ceiling), Decision-aware Answer/Ask/Abstain (arXiv 2604.04565), Know Your Limits survey (TACL).
+**Anti-pattern.** Tuning a grounding gate's STRICTNESS to fix over-refusal (it's a framing problem, not a threshold). Shipping prompt-only abstention as if it solves the problem (it has a hard ceiling — keep it opt-in, measure precision).
+**Conditionality.** Prompt-only abstention is fundamentally limited; uncertainty/training-based methods (GRACE arXiv 2601.04525, Abstain-R1 arXiv 2604.17073) preserve answerable accuracy by design where prompts can't.
+
+**See also:**
+- Pattern 24 — Structural Index + Faithful-Refusal Contract (24's refusal contract is *answer-groundedness*; Pattern 35 reframes it to *topic-presence* to kill over-refusal — the framing 24 was missing)
+- Pattern 30 — New Complexity Must A/B-Earn Its Keep (the topic-presence gate shipped OPT-IN at marginal +1 — it had to A/B-earn its default-on, and didn't)
+- [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — the abstention gate A/B (grounding −9 vs topic-presence −1)
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
@@ -243,6 +281,9 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 | 30 — New Complexity A/B-Earns Keep | Adding HyDE / multi-query / a tier / longer prompt | Shipping machinery the literature uses without measuring it beats baseline |
 | 31 — Hand-Roll vs Library A/B | Deciding to adopt a memory/RAG library | Adopting on published number; dismissing on one run; not isolating WHY |
 | 32 — Metered-Proxy Role-Split | Capable model behind a rate-limited/cloaking gateway | All-calls-through-gateway → cooldown crash, persona refusals, lost work |
+| 33 — Route the READ Assembly by Question Type | Building a multi-shape memory reader | One universal reader prompt; routing storage but not the read assembly |
+| 34 — Evidence-Before-Belief Extraction | Choosing what to keep/drop at write | Discarding turns/roles at write — unrecoverable, breaks the axis whose answer lived there |
+| 35 — Abstention Is Topic-Presence, Not Groundedness | Making a reader refuse unanswerable questions | Catastrophic over-refusal from a grounding gate; tuning strictness instead of reframing |
 
 These patterns compound. The teams (or solo engineers) who use them feel "calm and deliberate" to work with; the ones who don't feel "frantic and surprising." The difference isn't IQ or experience — it's the discipline of slowing down at the right 5-10% of moments.
 
@@ -251,7 +292,7 @@ These patterns compound. The teams (or solo engineers) who use them feel "calm a
 ## See also
 
 - [[Bad-Case Journal]] — the empirical failure log these patterns are distilled from (W1…W3.5.9 incidents)
-- [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — source of Patterns 25-32 (reader-as-lever, router-vs-ensemble, memory-tier graduation, eval integrity, metered-proxy)
+- [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — source of Patterns 25-35 (reader-as-lever, router-vs-ensemble, memory-tier graduation, eval integrity, metered-proxy, read-assembly routing, evidence-before-belief extraction, topic-presence abstention)
 - [[Week 3.5.8 - Two-Tier Memory Architecture]] — source of Patterns 22, 26, 29-31 (lifecycle, write-time primitive, commitment-bias, volume buffers, hand-roll-vs-library)
 - [[Week 2 - Rerank and Context Compression]] — source of Pattern 23 (cheap-first retrieval ladder)
 - [[Week 2.5 - GraphRAG]] — source of Pattern 24 (structural index + faithful refusal)

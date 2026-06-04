@@ -16,3 +16,6 @@
 # OMC runtime state — session-local, do not track
 .omc/state/
 .omc/project-memory.json
+
+# OMC sessions (session-local tooling state)
+.omc/sessions/

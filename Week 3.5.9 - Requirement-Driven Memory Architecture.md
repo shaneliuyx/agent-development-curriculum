@@ -2,7 +2,7 @@
 title: Week 3.5.9 — Requirement-Driven Memory Architecture and Three-Tier Hypergraph
 created: 2026-05-26
 updated: 2026-06-03
-status: draft (intensive week, ~22h; §1-§3 + Phase 1-2 analysis complete; Phase 3-9 code + design shipped; reader-probe investigation + role-split migration + FULL 20-Q × 7-backend matrix measured 2026-06-03 (clean ~85 min multi-session re-run, crash-free) — see §4.10 result + lab RESULTS.md. Headline: atomic_fact 85% 🥇 / ensemble 80% / mem0 75% / hybrid 75% / three_tier 75% / evercore 30% / qdrant 0%)
+status: "shipped 2026-06-03 — 7-backend matrix in §4.10, 6-axis universal-solution groundwork in §4.17; measured numbers in lab RESULTS.md"
 tags:
   - agent
   - memory
@@ -2499,12 +2499,12 @@ Hard-won constraints from this session — the things a reader reproducing the l
 - **The system-role cloak is prompt-shape-dependent.** VibeProxy refuses some `system`-role requests with a Claude-Code persona reply (mem0, consolidation) but not others (EverCore's extraction, the reader's user-only messages). Rule: **use user-role messages** for structured extraction through this proxy. (Recurrence of [[Week 3.5.8 - Two-Tier Memory Architecture]] BCJ Entry 19.)
 - **Reader is the quality lever; extraction is commodity.** Any competent local model surfaces the answer needles; the counting/dedup reasoning is the reader's job. So extraction can run on a cheap fast local model (Coder-14B: ~2× faster than gemma, cleaner facts, ~½ the RAM) without hurting answer quality — provided the reader is capable (Haiku).
 - **User-turn-only extraction is a workload-dependent tradeoff — and it CONTRADICTS §2.2.** Dropping `[ASSISTANT]` lines (§4.10) is what lifted the multi-session *count* needles out of the assistant-advice flood. But §2.2's requirement matrix flags `single-session-assistant` questions ("what query did the assistant recommend?") as needing assistant-turn facts — *"if only user-turns are imprinted, assistant-recommended facts are lost."* So the filter is **net-positive on this user-centric slice** (mostly multi-session + knowledge-update) but would **hurt** an assistant-recommendation workload. A production system should route the extraction policy by question type (extract assistant turns only when the answer can live there), not hard-code user-turn-only. This is the clearest live tension in the lab.
-- **The knowledge-update latest-wins reader (`[sN]` session-recency tags + "highest session wins") is a SLICE-FIT shortcut, not a universal recency mechanism.** The *principle* generalizes — for latest-value-wins queries, something must encode which fact is newer and expose it to whatever picks the answer (ranker or reader); surfacing recency at READ time is the legitimate read-side mirror of write-time supersession, used when the store is append-only. But this specific implementation is valid only under **four conditions**, all true for `w358` and often false in production:
-  1. **Recency == ingestion order.** `[sN]` is the *session index*, not a timestamp. It breaks when session order ≠ validity order — a fact stated earlier can be valid later ("starting next month I move to Y") — and loses intra-session ordering (multiple facts, same `sN`). Real systems need bitemporal time (event-time vs valid-time), not an integer index.
+- **The knowledge-update latest-wins reader (`[sN]` session-recency tags + "highest session wins") is a SLICE-FIT shortcut, not a universal recency mechanism.** The *principle* generalizes — for latest-value-wins queries, something must encode which fact is newer and expose it to whatever picks the answer (ranker or reader); surfacing recency at READ time is the legitimate read-side mirror of write-time supersession, used when the store is append-only. **Precise mechanism: `[sN]` = session index (`idx` from `enumerate(haystack_sessions)`) stamped at imprint into each fact's payload as `quest_id = "{qid}-sess{idx}"`; `_session_recency` parses `sess(\d+)` back at query time. It is per-session and not a wall-clock timestamp — every fact from session `idx` gets the same `N`.** The slice carries real per-session timestamps in `haystack_dates` that were **unused** by the original imprint loop; in 3 of 18 dated questions (~17%), index order does NOT match chronological order (see §4.17 for the `gpt4_2655b836` example and the tier-1→tier-2 `seq` upgrade). But this specific implementation is valid only under **four conditions**, all true for `w358` and often false in production:
+  1. **Recency == ingestion order.** `[sN]` is the *session index*, not a timestamp. It breaks when session index ≠ chronological order (~17% of dated questions) — and loses intra-session ordering entirely (multiple facts from the same session share one `N`). The tier-2 `seq` fix (§4.17) addresses both by date-sorting sessions before imprint and stamping a per-fact monotonic counter; tier-3 (extracted event-time) is the true ceiling.
   2. **Overwrite semantics.** "Highest wins" is correct for supersede facts ("current job") but WRONG for *accumulate* facts ("bought another car" adds, doesn't replace) — it would silently drop the earlier value. The rule has no supersede-vs-accumulate awareness.
   3. **Per-attribute grouping is left to the reader.** "Highest `[sN]`" is only meaningful among facts about the *same* key; the prompt trusts the reader to group correctly.
   4. **Few candidate values.** A reader scanning `[sN]` tags doesn't scale when a key has many historical values.
-  The robust general form resolves supersession at WRITE time (dedup + `valid_from`/invalidate edges — 2-tier dedup, Graphiti edge invalidation, mem0 update). The irony: `hybrid` routed knowledge-update to exactly that 2-tier dedup path *because the framework treats write-time supersession as the proper KU solution* — and our cheap read-time rule still beat it (100% vs 80%) **on this slice**. That is a workload win, not a refutation of bitemporal; at scale (real timestamps, accumulate facts, many values per key) the write-time approach is more robust. State the four conditions or the technique mis-teaches as universal.
+  The robust general form resolves supersession at WRITE time (dedup + `valid_from`/invalidate edges — 2-tier dedup, Graphiti edge invalidation, mem0 update). The irony: `hybrid` routed knowledge-update to exactly that 2-tier dedup path *because the framework treats write-time supersession as the proper KU solution* — and our cheap read-time rule still beat it (100% vs 80%) **on this slice**. That is a workload win, not a refutation of bitemporal; at scale (real timestamps, accumulate facts, many values per key) the write-time approach is more robust. State the four conditions or the technique mis-teaches as universal. **Per-operator granularity is the measured resolution (§4.17):** applying global per-fact `seq` to KU latest-wins regressed `6a1eabeb` (superlative "personal best 5K", 4/4→3/4) because fine granularity re-exposed a re-mentioned old value that session-level `[sN]` collapse suppresses. Use `seq` for temporal-ordering operators; keep `[sN]` for KU latest-wins / superlatives.
 - **EverCore is a heavy black-box service.** Its `online` memorize mode runs profile/foresight/eventlog/maturity as separate LLM calls per session → ~70-140s/question even on local gemma's fast MoE (and ~507s on dense Coder-14B). It dominates per-question wall. `AGENT_MEMORIZE_MODE=fast_skill` is the speed lever if EverCore's full pipeline isn't needed.
 - **Redundant extraction across backends.** `atomic_fact`, `hybrid`, and `three_tier` each independently run per-message extraction (hybrid's router and three_tier's L2 both use `AtomicFactMemory`). They are distinct backends *under test*, so the 3× cost is intentional for the comparison — but it triples the extraction wall.
 - **`0a995998` is a BROKEN-gold question — EXCLUDED from quality analysis.** No sound-reasoning path reaches its gold (3): strict store items = 2 (blazer + boots); the gold's 3rd is a sweater *lent to a sister* (not a store), contradicting the question's own "from a store" qualifier. The only ways to "3" are counting that sweater (violates the qualifier) or double-counting the boots transaction (a dedup error) — so the question rewards crude reasoning over correct reasoning (a sharper system reliably gets 2 and is marked wrong). It's a clean example of a benchmark item whose gold contradicts its text. Handled via `QUALITY_EXCLUDE = {"0a995998"}` in the driver (still run + inspectable; dropped from accuracy aggregates by `scripts/rejudge.py`). **Replaced by `synth_books_bought_v1`** ("how many books have I bought?", gold = 4: 4 distinct titles bought + 1 borrowed-from-a-friend distractor — no dedup trap, no non-store ambiguity). Validated as clean: 4/7 backends reach 4 by sound reasoning (mem0, evercore, hybrid, ensemble), proving the gold is reachable — unlike `0a995998`. The 2 misses (atomic_fact → 6, three_tier → 5) are genuine extraction double-counts of a "two more books" generic fact, and the **ensemble fixed it (4, correct)** by fusing mem0's consolidated facts — a concrete demonstration of the §2.3 ensemble advantage.
@@ -2671,6 +2671,445 @@ multi-session    → mem0          ( 80% =  8/10)
 - **Fuse for retrieval, route for read-then-count.** Ensemble (union of backends) and three_tier (union of tiers) both inherit fusion's non-monotonicity for a reader that reasons over a fixed window. The single working tier (`atomic_fact`) beats both unions; the per-axis router beats the single tier. Combine by *selection*, not by *union*, when a reader has to reason.
 `─────────────────────────────────────────────────`
 
+## §4.17 — Toward a universal memory solution (6-axis, 2026-06-03)
+
+The §4.10/§4.15/§4.16 work answered the 2-axis question (multi-session + knowledge-update) completely. But LongMemEval has **six question axes + abstention**. Both tested axes happen to be *current-value* shapes — "what is the latest X?" A memory system that only handles current-value shapes is not universal. This section extends the measurement to all six axes plus abstention, isolates what each component contributes, and documents what breaks at each step.
+
+### Setup
+
+**New slice:** `data/longmemeval_slice_6axis.json` — 32 questions total: **24 base (answerable) + 8 abstention**, 4 per axis. Built by `scripts/build_slice.py --all-axes`. The per-axis n=4 is intentionally small for iteration speed.
+
+**Stack (unchanged from §4.10):** 7B extraction (Qwen2.5-Coder-7B-Instruct-MLX-4bit) / Haiku 4.5 reader / Sonnet 4.6 judge.
+
+> **Caveat throughout: n=4 per axis — every ±1 question = 25 percentage points.** Read the SHAPE and per-component deltas; treat per-axis scores as directional, not cardinal.
+
+### Architecture — role-aware write path + read-side operator router
+
+The two components map to the two halves of the pipeline: Component 2 fixes the **write path** (how facts are extracted + tagged), Component 1 + the preference/abstention operators fix the **read path** (how the question type selects an assembly operator). Storage (Qdrant) and models are unchanged.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+    S["Session scroll<br/>USER / ASSISTANT turns"] --> TP["Parse TURNS not lines<br/>(continuation inherits role)"]
+    TP --> CK["Chunk long turns<br/>(max_chars=700)"]
+    CK --> EX["Extract atomic facts<br/>per chunk (7B)"]
+    EX --> TAG["Tag provenance role<br/>user / assistant"]
+    TAG --> QD[("Qdrant<br/>af_lme-qid")]
+
+    Q["Question + question_type"] --> RT{"Read-side<br/>operator router"}
+    QD -.->|"retrieve: k + role<br/>filter by axis"| RT
+    RT -->|knowledge-update| KU["latest-sN-wins"]
+    RT -->|"temporal (ordering)"| TO["earliest-sN-wins"]
+    RT -->|count| CN["enumerate-then-count"]
+    RT -->|preference| PR["generate-aligned"]
+    RT -->|single-session| SU["deep terse lookup"]
+    KU --> ANS["Answer<br/>(Haiku reader)"]
+    TO --> ANS
+    CN --> ANS
+    PR --> ANS
+    SU --> ANS
+
+    Q -.->|"opt-in ABSTAIN_GATE"| AB{"topic-presence<br/>PRESENT / ABSENT"}
+    AB -->|ABSENT| ABST["abstain"]
+    AB -->|PRESENT| RT
+```
+
+*Write path (top): the Component 2 fixes — turn-parsing, chunking, role tagging. Read path (bottom): the question type selects one assembly operator; the optional topic-presence gate abstains before the router when the subject is absent.*
+
+### Cumulative arc — four separate measured runs (base = 24 answerable questions)
+
+| Stage | base acc | what changed |
+|---|---:|---|
+| **baseline** (user-turn-only extraction) | **37% (9/24)** | the prior single-tier reader on the 6-axis slice |
+| **+ Component 2** (role-aware extraction) | **45% (11/24)** | extract from BOTH user + assistant turns, tag provenance role; parse TURNS not lines; chunk long turns (`max_chars=700`) |
+| **+ Component 1** (read-side operators) | **62% (15/24)** | deeper retrieval for single-session (k=5→20) + temporal; temporal-ordering operator (earliest-`[sN]`-wins) |
+| **+ preference operator** | **79% (19/24)** | single-session-preference: generate preference-aligned recommendation instead of extract |
+| **+ per-operator seq** | **83% (20/24)** | temporal-ordering uses `seq` (intra-session order); KU keeps `[sN]` (session-level collapse for superlatives); chrono-sort for both |
+
+Each row is a fresh re-imprint run; no cross-run contamination.
+
+**Per-axis FINAL (the +preference run, 19/24 = 79% base)** + seq increment (see §4.17 recency sub-block):
+
+| Axis | +preference run | after per-operator seq |
+|---|---:|---:|
+| knowledge-update | 4/4 | 4/4 |
+| multi-session | 3/4 | 3/4 |
+| single-session-assistant | 2/4 | 2/4 |
+| single-session-preference | 4/4 | 4/4 |
+| single-session-user | 3/4 | 3/4 |
+| temporal-reasoning | 3/4 | **4/4** ← seq fix |
+| **base total** | **19/24 (79%)** | **20/24 (83%)** |
+
+### Component 2 — role-aware extraction (the debug saga)
+
+The lesson from Component 2 is not the final improvement (+8pp) but the shape of the failure it fixed.
+
+**v1 regressed everything.** The goal was to extract from *both* user and assistant turns (evidence-before-belief: keep all data, filter at read time). v1 implemented this and **dropped accuracy** — a regression, not a tradeoff. Investigation:
+
+- Measured fact distribution: **283 user / 5 assistant** — the role tag was wrong on almost all facts, not just some.
+- Root cause: the extractor split on **raw newlines** within a turn. A multi-line assistant turn produces one line per line-break; each line inherits the last-seen role tag regardless of who spoke. So the bulk of assistant-turn text was being tagged as user-turn text, the role filter was operating on mislabeled data, and the store was flooded exactly as before.
+- **Fix: parse TURNS, not lines.** Build a proper turn list from the session structure before extracting. After the fix, role distribution reflected the actual session shape.
+
+That fix exposed a second failure: **a 2,473-char generated children's book** (qid `89527b6b`, `single-session-assistant` axis) was sent as ONE extraction call. The call returned **0 facts** — the LLM treated a wall of narrative as a single unit and found nothing actionable. The fact *"The Plesiosaur has a blue scaly body"* was in that text; the correct answer was *"Blue."*
+
+- **Fix: chunk long turns** at `max_chars=700`. The same 2,473-char turn became 4 chunks; one chunk contained the Plesiosaur sentence; that chunk yielded the color fact; the question answered correctly.
+- **Tuning:** chunk size 350 → 700 recovers the key detail with 4 chunks instead of 10, cutting imprint wall **73.9s → 46.1s (−37%)**.
+
+The trajectory — regression → mis-tag → chunking → tuning — is the chapter's evidence for "debug to root before shipping." A v1 regression looked like "extraction from assistant turns hurts"; the actual problem was a tag bug that made the feature never work correctly.
+
+**Code — original (`atomic_fact_memory.py`, user-turn-only):**
+
+```python
+# BASELINE: drop everything that isn't a [USER] line. Loses assistant facts
+# entirely (single-session-assistant -> 0/4) and has no provenance tag.
+lines = [ln.strip() for ln in content.splitlines() if len(ln.strip()) > 15]
+user_lines = [ln for ln in lines if ln.upper().startswith("[USER]")]
+messages = user_lines or lines
+for msg in messages:
+    for fact in self._extract_facts(msg):
+        payload = {"content": fact, "user_id": self.user_id, "agent_id": self.agent_id}
+        points.append(PointStruct(id=str(uuid.uuid4()), vector=self._embed(fact), payload=payload))
+```
+
+**Code — updated (parse TURNS, tag role, chunk long turns):**
+
+```python
+# Parse TURNS, not lines: a line WITHOUT a [USER]/[ASSISTANT] prefix is a
+# CONTINUATION of the current turn, not a new user message. (Splitting on raw
+# newlines + defaulting unprefixed lines to "user" mis-tagged assistant
+# continuation text as user -- measured 283 user / 5 assistant facts.)
+tagged: list[tuple[str, str]] = []
+cur_role: str | None = None
+cur_buf: list[str] = []
+
+def _flush() -> None:
+    if cur_role and cur_buf:
+        text = " ".join(cur_buf).strip()
+        if len(text) > 15:
+            tagged.append((text, cur_role))
+
+for raw in content.splitlines():
+    ln = raw.strip()
+    if not ln:
+        continue
+    u = ln.upper()
+    if u.startswith("[USER]") or u.startswith("[ASSISTANT]"):
+        _flush()
+        cur_role = "assistant" if u.startswith("[ASSISTANT]") else "user"
+        cur_buf = [ln.split("]", 1)[1].strip()]   # drop the role prefix
+    elif cur_role is not None:
+        cur_buf.append(ln)                         # continuation of current turn
+_flush()
+
+for text, role in tagged:
+    for chunk in _chunk_text(text):                # long turns -> <=700-char windows
+        for fact in self._extract_facts(chunk):
+            payload = {"content": fact, "user_id": self.user_id,
+                       "agent_id": self.agent_id, "role": role}   # <- provenance tag
+            points.append(PointStruct(id=str(uuid.uuid4()), vector=self._embed(fact), payload=payload))
+```
+
+```python
+def _chunk_text(text: str, max_chars: int = 700) -> list[str]:
+    """Split a turn into <=max_chars windows on paragraph/sentence boundaries.
+    A 2,473-char turn sent as ONE extraction call returns 0 facts; chunked it
+    returns 47, incl. 'the Plesiosaur has a blue scaly body'. Each chunk inherits
+    the TURN's role -- chunking does not re-introduce the line-split mis-tag."""
+    chunks, buf = [], ""
+    for part in re.split(r"\n+", text.strip()):
+        sents = re.split(r"(?<=[.!?])\s+", part) if len(part) > max_chars else [part]
+        for s in sents:
+            s = s.strip()
+            if not s:
+                continue
+            if buf and len(buf) + 1 + len(s) > max_chars:
+                chunks.append(buf); buf = s
+            else:
+                buf = f"{buf} {s}".strip()
+    if buf:
+        chunks.append(buf)
+    return chunks or [text]
+```
+
+**Logic.** Two independent fixes, now visible. **(1) Role tag correctness needs turn reconstruction first:** a state machine flips `cur_role` on a `[USER]`/`[ASSISTANT]` prefix and appends unprefixed lines as continuations, so a multi-line assistant turn stays one assistant-tagged unit (vs the per-line split that mis-tagged 283/5). **(2) `_chunk_text` bounds each extraction call's input** so a long narrative turn isn't one 0-fact call; 700 is the knee from chunk-size tuning (recovers the detail at 4 chunks vs 10). The `role` payload field is what the read-side role filter keys on.
+
+### Component 1 — read-side operators
+
+Deeper retrieval for single-session axes (k=5 → 20) recovered a rank-6 answer that shallow retrieval missed. The new primitive was the **temporal-ordering operator**: mirror of the knowledge-update latest-`[sN]`-wins rule but in reverse — *earliest session wins* ("which did I do first?").
+
+**temporal-reasoning 0/4 → 3/4.** The ordering operator tags retrieved facts with their session index `[sN]` and instructs the reader: lowest `[sN]` = earliest. The 3/4 result validates the approach.
+
+#### How `[sN]` is assigned — the precise mechanism
+
+`N` is the **session index** (`idx` from `enumerate(haystack_sessions)`) stamped at imprint into each fact's Qdrant payload as `quest_id = "{qid}-sess{idx}"`. The reader helper `_session_recency` parses `sess(\d+)` back out of that field at query time.
+
+Three properties follow from this:
+
+- **Per-session, not per-fact.** Every fact extracted from session `idx` gets the same `N`, regardless of which turn inside that session produced it. `[sN]` is a session-level coarsening of time.
+- **Not a wall-clock timestamp.** It is not the DB insert time; it is not the conversation timestamp. It is an ordinal assigned by `enumerate` at imprint time.
+- **Intra-session ordering is impossible.** Two events in the same session share `N` → zero signal for "which happened first inside this session." The `gpt4_2487a7cb` miss is exactly this case: both events are in session 0, so `[s0]` vs `[s0]` gives the reader nothing to distinguish them.
+
+#### Finding: session index ≠ chronological order (~17%)
+
+The slice carries **real per-session timestamps** in `haystack_dates` that were unused by the imprint loop. Inspecting the dated questions (18 of 24 had `haystack_dates`): in **3 of 18 (~17%)**, index order does NOT match chronological order.
+
+Concrete example — `gpt4_2655b836`:
+
+| session idx | timestamp | `[sN]` assigned |
+|---|---|---|
+| s0 | 17:50 | `[s0]` |
+| s1 | 14:47 | `[s1]` |
+| s2 | 17:15 | `[s2]` |
+
+s0 is *later* than s1. The latest-`[sN]`-wins and earliest-`[sN]`-wins operators would both give wrong answers for this question: `[s0]` is indexed first but happened last. This is the second dimension of `[sN]`'s limitation: (1) intra-session — all turns share one N; (2) cross-session — index assumes the dataset was presented in chronological order, which ~17% of questions violate.
+
+#### Recency-signal upgrade: tier-1 `[sN]` → tier-2 `seq`
+
+**Fix implemented:**
+
+1. **`_chrono_sessions(q)`** in `run_longmemeval_slice.py` sorts sessions by parsed `haystack_dates` before the imprint loop (falls back to index order when dates are absent). Verified on `gpt4_2655b836`: reorders to 14:47 → 17:15 → 17:50 before imprint.
+
+2. **Monotonic per-fact `seq` counter** in `AtomicFactMemory`. `self._seq` is an instance counter, incremented once per extracted fact across all the per-session imprint calls for a question. Because sessions are now imprinted in chronological order and turns/chunks are processed in dialogue order, `seq` strictly increases with true time at *both* granularities — cross-session AND intra-session (as far as dialogue order captures it).
+
+3. **Reader prefers `seq` over `[sN]`** at query time. The fallback preserves backward compatibility with backends that do not stamp `seq`:
+
+```python
+# _chrono_sessions: sort haystack_sessions by date before imprint
+def _chrono_sessions(q: dict) -> list[list[dict]]:
+    sessions = q["haystack_sessions"]
+    dates = q.get("haystack_dates", [])
+    if len(dates) == len(sessions):
+        paired = sorted(zip(dates, sessions), key=lambda x: x[0])
+        return [s for _, s in paired]
+    return sessions  # fallback: index order (dates absent or mismatched)
+
+# atomic_fact_memory.py: stamp per-fact seq at write
+for text, role in tagged:
+    for chunk in _chunk_text(text):
+        for fact in self._extract_facts(chunk):
+            self._seq += 1
+            payload = {"content": fact, "user_id": self.user_id,
+                       "agent_id": self.agent_id, "role": role,
+                       "seq": self._seq}          # <- monotonic cross-session counter
+            points.append(PointStruct(...))
+
+# run_longmemeval_slice.py: reader prefers seq, falls back to [sN]
+def _session_recency(meta: dict) -> int:
+    seq = meta.get("seq")
+    if seq is not None:
+        return int(seq)
+    m = re.search(r"sess(\d+)", meta.get("quest_id", ""))
+    return int(m.group(1)) if m else 0
+```
+
+**Result (measured, atomic_fact, 7B, n=4/axis):**
+
+| recency signal | knowledge-update | temporal-reasoning |
+|---|---:|---:|
+| `[sN]` session-index (baseline) | 4/4 | 3/4 |
+| global `seq` (per-fact) | 3/4 | 4/4 |
+| **per-operator** (seq for ordering, `[sN]` for KU) | **4/4** | **4/4** |
+
+`seq` fixed the intra-session miss (`gpt4_2487a7cb` — now correct, "Data Analysis using Python"): temporal-reasoning **3/4 → 4/4**. But global `seq` regressed one KU question (`6a1eabeb`, **4/4 → 3/4**): a "personal best 5K time" superlative (gold 25:50). idx0 (May 25) has the old 27:12; idx1 (May 27, later) has 25:50. Fine per-fact `seq` re-exposed the re-mentioned 27:12 and latest-wins picked it; coarse `[sN]` collapses the session so "latest session = 25:50" wins correctly.
+
+**The per-operator fix.** Use `seq` (fine granularity) for the temporal-ORDERING operator (needs intra-session order); use coarse session `[sN]` for KU latest-wins (superlatives need session-level collapse, not per-fact). Chrono-sort (`_chrono_sessions`) applies to BOTH. Result: temporal 4/4 AND KU 4/4 — **net +1 over the `[sN]` baseline**.
+
+Overall 6-axis base impact: temporal-reasoning 3/4 → 4/4 lifts base from **19/24 (79%) → 20/24 (83%)**.
+
+**The sharper lesson:** recency-signal granularity is **per-operator, not global**. Fine `seq` suits ordering operators (needs intra-session order); coarse session-`[sN]` suits current-value / superlative latest-wins (fine granularity re-exposes old values and fools the "highest wins" heuristic). Same data, two operators, two recency resolutions — extends the operator-routing thesis (EDP Pattern 33) to the recency signal itself.
+
+#### Recency-signal fidelity tiers
+
+The `[sN]` → `seq` upgrade is one step on a three-tier ladder. Tier 2 is **operator-specific**: apply it where fine granularity helps; keep tier 1 where it hurts.
+
+| Tier | Signal | Granularity | Residual limitation |
+|---|---|---|---|
+| **1 — session-index `[sN]`** | `enumerate` order at imprint | per-session | cross-session only; assumes index = chrono (~17% violate); intra-session blind; correct choice for latest-wins / superlative KU |
+| **2 — insert-sequence `seq`** | monotonic counter at imprint | per-fact, dialogue order | per-OPERATOR: helps temporal-ordering; hurts KU superlatives (re-exposes old re-mentions → fine seq misleads latest-wins); needs sessions date-sorted |
+| **3 — extracted event-time** | LLM temporal-expression extraction from fact text | per-fact, event order | highest fidelity; LLM-dependent; normalization pipeline required; out of scope for this lab |
+
+The bitemporal ceiling is tier 3. Tier 2 (`seq`) closes the cross-session ordering gap and adds intra-session ordering for the temporal-ordering operator; it must NOT be applied globally to KU latest-wins. The residual "said-late-about-early" failure (dialogue order ≠ event order) is tier 3's job.
+
+**The `gpt4_2487a7cb` miss is resolved by tier 2** (both events were in the same session but `seq` now distinguishes their intra-session dialogue order — validated: now correct). The tier-3 ceiling (dialogue order ≠ event order) still stands for a different class of temporal question, but is not exercised by the current slice.
+
+This miss and the `6a1eabeb` regression together tie directly to §4.13's caveat on the latest-wins reader. The `seq` upgrade addresses conditions 1 and 2 for the ordering operator; conditions 3 and 4 (per-attribute grouping, few candidate values) remain read-time reader responsibilities for KU.
+
+**Code — the operator dispatch (`run_longmemeval_slice.py`, `_read_answer`):**
+
+```python
+is_ku    = (question_type == "knowledge-update")
+is_order = (question_type == "temporal-reasoning") and _is_ordering_question(question)
+is_single = question_type.startswith("single-session")
+if is_ku:                 # latest-value-wins (recency-tagged)
+    cap, prompt_tmpl, max_tokens = KU_TOP_K, KU_READER_PROMPT, KU_MAX_TOKENS
+elif is_order:            # temporal-ORDER (earliest-[sN]-wins) -- the new operator
+    cap, prompt_tmpl, max_tokens = TEMPORAL_TOP_K, TEMPORAL_READER_PROMPT, TEMPORAL_MAX_TOKENS
+elif is_count:            # enumerate-then-count
+    cap, prompt_tmpl, max_tokens = COUNT_TOP_K, COUNT_READER_PROMPT, COUNT_MAX_TOKENS
+elif is_single:           # single-session lookup -- deeper than terse (k=5 too shallow)
+    cap, prompt_tmpl, max_tokens = SS_TOP_K, READER_PROMPT, READ_MAX_TOKENS
+else:
+    cap, prompt_tmpl, max_tokens = TOP_K, READER_PROMPT, READ_MAX_TOKENS
+tag_recency = is_ku or is_order      # surface the [sN] session tag for BOTH order operators
+```
+
+**Code — the two ordering prompts are the SAME mechanism, opposite direction:**
+
+```text
+# KU (latest-wins), already shipped:
+"... a HIGHER N is MORE RECENT. If records conflict, the answer is the value
+ from the MOST RECENT session (highest [sN]) ..."
+
+# TEMPORAL_READER_PROMPT (earliest-wins), the new operator:
+"... a LOWER N is EARLIER in time. The question asks which happened FIRST/before.
+ The event in the LOWER [sN] session happened first ..."
+```
+
+**Logic.** `_is_ordering_question` detects the shape (`first`/`before`/`after`/`earlier`); the dispatch then swaps in `TEMPORAL_READER_PROMPT`, which is the KU latest-wins prompt with the direction flipped (lowest `[sN]` instead of highest). `tag_recency = is_ku or is_order` is the one-line generalization that surfaces the `[sN]` tag for both. Deeper `ret_k` (single-session `k=5→20`, temporal `→30`) is the other half — `_run_backend` raises the retrieval depth by axis so the answer fact (and, for ordering, BOTH candidate events) lands in the window.
+
+### Preference operator
+
+**single-session-preference 1/4 → 4/4.** The prior operator tried to *extract* a preference fact. The gold answers on this axis are not extractable facts — they are the user's *latent preference* that the answer should align with. Reframing the task from *extract* to *generate-aligned-with-stated-preferences* (retrieve the preference facts, then generate a recommendation that matches them) closed the gap completely.
+
+This is the read-assembly lesson from EDP Pattern 33: preference questions need a DIFFERENT read-time operator, not a deeper version of the same one.
+
+**Code — the dispatch branch + the generate-aligned prompt:**
+
+```python
+# in _read_answer dispatch (before the generic single-session branch):
+elif question_type == "single-session-preference":   # GENERATE, don't extract
+    cap, prompt_tmpl, max_tokens = SS_TOP_K, PREFERENCE_READER_PROMPT, PREFERENCE_MAX_TOKENS
+
+PREFERENCE_READER_PROMPT = """... Infer the user's PREFERENCES from the records
+and produce a concrete recommendation that is CONSISTENT with what they prefer
+(their tools, brands, level, constraints, tastes evident in the records). Do NOT
+answer "I don't know" -- give a preference-aligned suggestion grounded in the
+records. REQUEST: {question}  RECORDS: {memories}  ANSWER:"""
+```
+
+**Logic.** The extraction reader returned "I don't know" on "suggest a hotel" because no record literally *is* the answer — the gold is the user's latent preference the suggestion must match. Swapping the prompt from extract→generate-aligned (same retrieved records, `roles=["user"]`, deeper `SS_TOP_K`) turns the read step into a recommendation generator. 1/4 → 4/4. Same data, different read operator — the Pattern 33 thesis in one axis.
+
+### single-session-assistant (0 → 2/4)
+
+Component 2's turn-parsing fix (the role-aware extraction) was necessary before this axis could move at all — user-turn-only extraction scored 0/4 because the answers lived in assistant turns that were being dropped. After the fix, Component 1's deeper retrieval (k=5→20) recovered a rank-6 answer.
+
+The remaining 2 misses: one (`e9327a54`) is a **retrieval-ranking miss** — the answer entity is not in the top-40 retrieved facts. Deeper k, a better ranker, or a different retrieval strategy could fix this. It is NOT a depth problem (increasing k further didn't help in spot-checks) — it is a ranking problem, a distinct failure mode.
+
+### Abstention (8 questions — the hard axis)
+
+Abstention is the axis where a wrong answer is worse than no answer. Two approaches were tried.
+
+**Binary grounding gate (GROUNDED / UNGROUNDED) — REJECTED.**
+
+The gate judged: "can this answer be grounded in the retrieved records?" If UNGROUNDED → refuse.
+
+Result: answerable **19/24 → 10/24 (−9 over-refusal)**, abstention 3/8 → 6/8. **Net negative** — the 9 correctly-answerable questions it broke far outweighed the 3 extra abstentions it caught.
+
+Root cause: the gate conflated "answer not verbatim in the records" with "unanswerable." Many answerable questions require synthesis, inference, or paraphrase — none of which are verbatim matches. The gate penalised every non-verbatim answer.
+
+**Topic-presence gate (research-driven reframe) — SHIPPED OPT-IN.**
+
+Reframe: ask *"is the question's SUBJECT present in the records at all?"* rather than *"is the answer grounded?"* This is the distinction between *subject coverage* (can we say anything about this topic?) vs *answer verifiability* (is the exact answer there?). The former is a much lighter bar that catches only the hard-zero unanswerable questions.
+
+Prompt adjustments: biased to PRESENT by default (a few-shot with PRESENT examples); decoupled from the answer-generation call (a separate lightweight classification pass).
+
+Result: answerable **18/24 (−1 only)**, abstention **3/8 → 5/8**, total **22 → 23/32 (+1 net)**. Over-refusal collapsed **−9 → −1**.
+
+Shipped as `ABSTAIN_GATE=1`, **OFF by default**. Why opt-in: +1 at n=32 is marginal and adds a per-question LLM call. Research anchors: AbstentionBench (arXiv 2506.09038) establishes that prompt-only abstention helps but has a ceiling; Decision-aware Answer/Ask/Abstain (arXiv 2604.04565) formalises the three-action decomposition this reframe implements.
+
+**Code — the only change is the QUESTION the gate asks:**
+
+```python
+# REJECTED — binary grounding gate (answerable 19->10/24, -9 over-refusal):
+GROUNDING_CHECK_PROMPT = """... do the records contain the SPECIFIC information
+needed to ANSWER the question? Reply GROUNDED or UNGROUNDED ..."""
+return "UNGROUNDED" not in verdict          # abstain on UNGROUNDED
+
+# SHIPPED — topic-presence gate (answerable 18/24, -1; over-refusal -9 -> -1):
+TOPIC_PRESENCE_PROMPT = """... identify the SPECIFIC subject the question asks
+about, then decide whether that subject is mentioned in the records AT ALL.
+Reply PRESENT or ABSENT. Bias strongly to PRESENT; reply ABSENT only when the
+subject is genuinely not mentioned anywhere. [+ 3 few-shot examples] ..."""
+return "ABSENT" not in verdict              # abstain only on ABSENT (subject-absent)
+```
+
+```python
+# The gate is a SEPARATE pass before the answer operators, so the answer path is
+# unchanged — the only regression vector is the gate false-abstaining.
+if ABSTAIN_GATE and memories and not _subject_present(question, body):
+    return ABSTENTION_ANSWER
+# ... otherwise fall through to the normal operator (KU / count / temporal / ...)
+```
+
+**Logic.** Same model, same retrieved `body`, same wiring — the only delta is the prompt's epistemic question. "Is the ANSWER grounded?" flags every synthesis/paraphrase/inference answer as UNGROUNDED (→ −9 false-abstentions). "Is the SUBJECT present at all?" is a far lighter bar that fires only on genuine topic-absence ("you never mentioned a museum"), defaults PRESENT on ambiguity, and is calibrated by few-shot. The gate runs *before* the answer operators (a separate classification pass) so it cannot corrupt the answer path — it can only over-abstain, which is exactly the measured −1.
+
+### 14B-final run — extraction is commodity at full scale
+
+**Full-scale 6-axis result: a WASH. 7B is the default for dev AND final.** The earlier 3-question A/B (n=3 multi-session) showed 14B 2/3 vs 7B 1/3 and prompted the "use 14B for final count/multi-session" guidance. The full 32-Q 6-axis run refutes it: 14B ≈ 7B overall, with axis wins trading off rather than stacking. 14B is ~2× slower (~85-90s/Q imprint vs ~30-46s). **Extraction is commodity, confirmed at full scale** — doubling the extraction model nets ~zero and trades 1-2 questions across axes.
+
+**Measured matrix (base questions, n=4/axis; `0a995998` excluded as broken-gold):**
+
+| Axis | 7B-dev | 14B-final | |
+|---|---:|---:|---|
+| knowledge-update | 4/4 | 4/4 | → |
+| single-session-assistant | 2/4 | **4/4** | ⬆ 14B (more complete extraction over long assistant narrative) |
+| single-session-preference | 4/4 | 4/4 | → |
+| single-session-user | 3/4 | 3/4 | → |
+| multi-session | **3/4** | 1/3 | ⬇ 14B (over-extraction dilution — below) |
+| temporal-reasoning | **4/4** | 3/4 | ⬇ 14B (same dilution) |
+| **base total** | **20/24 (83%)** | **~19/23 (~82%)** | ≈ tied |
+
+(crash-free after the broadened-retry fix below; the 7B-dev column is the per-operator-seq run.)
+
+**Root cause of 14B multi-session + temporal losses — over-extraction, not weaker reasoning.** 14B over-extracts: it generates many near-duplicate facts per item (measured: the F-15 model kit restated ~5 ways; 14B store held ~445 facts). Under a fixed retrieval top-k (40), redundant duplicates crowd the window — a rare item drops below the cutoff. Concrete: on the "how many model kits" count question (gold 5), the Spitfire fact EXISTS in the 14B store (user-tagged) but ranks below #40, crowded out by ~5 F-15 restatements + multiple B-29/Camaro — the reader enumerated 4, not 5. Same mechanism for the temporal "first issue" miss. This is the same flooding mechanism as the original user-turn-only finding (783→88 facts), but the noise source moved from assistant ADVICE to MODEL VERBOSITY — so the role filter cannot de-flood it. **Sharpened lesson: extraction VOLUME must be controlled; more extraction can HURT fixed-window recall of rare items.**
+
+**Fix analysis (documented; not implemented — 7B default retained):**
+
+- **Write-time fact dedup — REJECTED.** Can eliminate genuinely-distinct facts ("started X" vs "finished X"; old vs new value of the same attribute). Destructive — violates evidence-before-belief: same category of mistake as user-turn-only discard-at-write. Do not dedup at write.
+- **Read-time MMR / diversity rerank — the right shape.** Non-destructive (store untouched, per-query reversible); runtime cost negligible (in-memory rerank over already-retrieved embeddings, no extra LLM/embed call). Costs: one tuning knob (λ) hard to validate at n=4; must be scoped per-operator (helps count, would hurt KU-latest-wins / lookup); mild mis-rank risk (can demote a similar-but-distinct needle, reversibly). Not built — dilution shows mainly under 14B verbosity and 7B does not over-extract this badly. Documented as the known remedy; build if a larger slice shows persistent count-dilution on 7B. Throughline: **preserve at write, diversify/resolve at read.**
+
+**Broadened-retry fix (code, shipped).** Transient Qdrant `UnexpectedResponse()` was crashing cells at un-retried paths (collection-setup, query) — earlier retry only covered upsert. A single `_qd_retry` helper now wraps all four client calls (`get_collections` / `create_collection` / `upsert` / `query_points`) with 3× backoff. The 14B run crashed 2 cells mid-run (`75832dbd`, `gpt4_70e84552_abs`); both recovered after the fix.
+
+### Method notes
+
+**`--skip-imprint` flag:** reuse persisted Qdrant stores for read-only re-runs. Read-side operator iteration: **4.5 min vs ~25 min** full re-imprint. This flag is what made it feasible to iterate through four operator configurations in a single session.
+
+**Per-run results + `scripts/aggregate.py`** (latest-per-cell merge) + `--results-dir` isolates the 6-axis runs from the w358 matrix. No cross-run contamination.
+
+### Running this experiment
+
+Full service/`.env` setup is in the lab's [`RESULTS.md` → "Running the lab"](../../code/agent-prep/lab-03-5-9-requirement-driven/RESULTS.md). The §4.17 sequence specifically:
+
+```bash
+# 1. build the 6-axis slice (32 Q = 24 base + 8 abstention, 4/axis)
+uv run python scripts/build_slice.py --all-axes --per-type 4 --include-abstention \
+    --out data/longmemeval_slice_6axis.json
+
+# 2. baseline / component runs (fresh re-imprint each; own results dir)
+uv run python -m src.run_longmemeval_slice --backend atomic_fact \
+    --slice data/longmemeval_slice_6axis.json --results-dir data/results_6axis
+
+# 3. fast read-side iteration — reuse persisted stores, no re-imprint (~4 min vs ~25)
+uv run python -m src.run_longmemeval_slice --backend atomic_fact \
+    --slice data/longmemeval_slice_6axis.json --results-dir data/results_6axis --skip-imprint
+
+# 4. opt-in abstention gate (topic-presence); OFF by default
+ABSTAIN_GATE=1 uv run python -m src.run_longmemeval_slice --backend atomic_fact \
+    --slice data/longmemeval_slice_6axis.json --results-dir data/results_6axis_abstain --skip-imprint
+
+# 5. per-axis matrix
+uv run python -m scripts.aggregate --results-dir data/results_6axis
+```
+
+`MODEL_EXTRACT` selects the extraction model. **7B is the default for dev AND final** — the 14B full-scale run confirmed extraction is commodity (14B ≈ 7B at 83% vs ~82%, with axis wins trading off; see Method notes). Each component run above clears its backend's Qdrant collections first (or use `--skip-imprint` to reuse them for a read-only re-run). Keep each slice in its own `--results-dir` so `aggregate.py` never mixes questions across slices.
+
+`★ Insight ─────────────────────────────────────`
+- **The arc 37% → 79% → 83% came from READ-side operators + role-aware extraction + per-operator recency granularity, not bigger models or more storage.** The model, store engine, and storage volume were all constant. Every gain was a change in how existing data was assembled at read time or tagged at write time — selection over union (EDP Pattern 33), applied axis by axis. The final +4pp (79→83%) came from a single operator-specific detail: `seq` for ordering, `[sN]` for KU latest-wins.
+- **Every gain was debugged to root.** The Component 2 regression looked like "assistant-turn extraction hurts"; the real cause was a turn-parsing bug. The seq regression on `6a1eabeb` looked like "seq hurts KU"; the real cause was that superlative latest-wins needs session-level granularity, not per-fact. The debugging sequence in both cases: measure the specific failure → trace to the mechanism → apply the minimal fix. The chapter's clearest example of "verified, not assumed."
+- **Abstention is a prompt-FRAMING problem, not a strictness-tuning problem.** The grounding gate and the topic-presence gate use the same underlying model and the same retrieved facts. The ONLY difference is the epistemic question the prompt asks — "is the answer grounded?" vs "is the subject present?" That framing change moved over-refusal from −9 to −1. Tuning the grounding gate's threshold would not have fixed it; the category error was in the question, not the threshold.
+- **Recency-signal granularity is per-operator.** Fine `seq` helps temporal-ordering (intra-session order matters); coarse `[sN]` is correct for current-value / superlative latest-wins (fine granularity re-exposes old re-mentions and misleads the "highest wins" heuristic). Same data, two operators, two recency resolutions — the operator-routing thesis extends to the recency signal itself.
+`─────────────────────────────────────────────────`
+
 ## §5 Bad-Case Journal
 
 **Status:** Entries to be populated during Phase 3-9 implementation runs. **No fabricated entries.** Each placeholder below names a candidate failure surface plus where the entry would land in the §5 normative 3-field format (`*Symptom: ... Root cause: ... Fix: ...*`). When the actual run surfaces a failure mode, that mode gets one entry — and only one, not a category-summary entry.
@@ -2731,6 +3170,16 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 *Root cause:* `ThreeTierMemory` inherits `TieredMemory.imprint`, which embeds the supplied `content` as ONE Qdrant point ("store the consolidated fact as-is"). Fed a whole session scroll by the driver, it stored 3 ~4 KB blobs into the shared `lab358_memories` namespace (accumulating across runs). The reader truncates each memory to 400 chars — so only each session's opening line survived, and only session 0 named a concrete item (the blazer).
 *Fix:* Delegate L2 to `AtomicFactMemory` (per-fact, user-turn-filtered, isolated `af_{user_id}` collection) inside `ThreeTierMemory`; keep L3 HyperMem for its real job (multi-entity relation intersection via `query_relations()`). three_tier went 1 → 2 (correct items: dry cleaning + boots), hits 18 blobs → 40 facts. The bug was L2 granularity, never the graph tier.
 
+**Entry 8 — Role-aware extraction v1 regressed all axes (the mis-tag bug).** *(observed 2026-06-03, Phase §4.17)*
+*Symptom:* Adding extraction from assistant turns (to capture assistant-stated facts for `single-session-assistant` questions) caused every axis to drop compared to the user-turn-only baseline. The feature appeared to actively hurt accuracy rather than help it.
+*Root cause:* The extractor split the session scroll on **raw newlines**, not on turn boundaries. A multi-line assistant turn produces N lines, each inheriting the last-seen role tag. Result: assistant text was predominantly tagged as user-turn text (measured distribution: 283 user / 5 assistant from a session with substantial assistant content). The role filter was therefore operating on mislabeled data — the store was flooded with mislabeled assistant-advice facts exactly as before the fix, and the single-session-assistant axis remained at 0/4 because the genuine assistant facts were undetectable under the wrong tags.
+*Fix:* Parse **TURNS, not lines** — build a proper turn list from session structure before extracting, so each chunk carries the role of the turn it came from, not the role of the preceding line. After the fix, fact distribution reflected the actual session shape, and a second failure became visible: a 2,473-char turn sent as one extraction call returned 0 facts (fixed by chunking long turns at `max_chars=700`). The regression was a tag bug, not evidence that assistant-turn extraction hurts.
+
+**Entry 9 — Transient Qdrant crashes at un-retried paths (collection-setup and query) abort mid-run cells.** *(observed 2026-06-03, Phase §4.17 14B run)*
+*Symptom:* Two cells mid-run (`75832dbd`, `gpt4_70e84552_abs`) crashed with `UnexpectedResponse()` and were scored as wrong. The run completed but those cells required a re-run to recover. The earlier per-question retry only covered the `upsert` call.
+*Root cause:* `UnexpectedResponse()` is a transient Qdrant error that can occur on any client call — `get_collections`, `create_collection`, `upsert`, or `query_points` — under OrbStack/Docker resource contention. The retry logic was only wired around `upsert`, leaving the other three call sites unprotected. A crash at collection-setup aborts the entire question's imprint; a crash at `query_points` aborts the retrieve step and scores the cell wrong.
+*Fix:* A single `_qd_retry(fn, *args, **kwargs)` helper with 3× exponential backoff wraps all four Qdrant client calls in `atomic_fact_memory.py`. All call sites share the same retry contract; no per-call special-casing. The 14B run is now crash-free after the fix.
+
 **Entry 7 — The reader returns "I'm Claude Code…" instead of an answer (VibeProxy persona cloak), even with a user-only prompt.** *(observed 2026-06-02, Phase 5/9)*
 *Symptom:* the qdrant reader's prediction is a Claude-Code persona refusal ("I appreciate you sharing, but I'm Claude Code, Anthropic's CLI for software…"), scored wrong. It happens even though the reader sends NO system role — and repeats across retries for that backend.
 *Root cause:* VibeProxy injects ITS OWN Claude-Code system prompt server-side on every request, so the persona is always present regardless of our messages (proof: even "Reply OK" returns "OK, I'm ready to help with your software"). The persona refuses when the input reads as personal/non-coding. **qdrant retrieves narrative summaries (prose) — which read as personal chat and trigger the refusal; atomic-fact backends retrieve terse data-shaped facts and don't.** So it's content-shape-dependent, not random.
@@ -2738,27 +3187,37 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 
 ## §6 Interview Soundbites
 
-**Status:** Populated 2026-06-03 from the clean 20-Q × 7-backend run (§4.10 / Phase 9). **No fabricated quotes** — every number traces to the measured matrix. Each is a ~70-word user-voice answer per the §6 normative spec (measured-outcome anchored, no hedging).
+**Status:** Refined 2026-06-03 to principle level — a candidate recalls the principle and the *shape* of the result, not exact numbers. The measured specifics (matrices, deltas) live in §4; these are the speak-aloud versions.
 
-**Soundbite 1 — *"How do you decide between 1-tier and 2-tier memory?"***
-- *Anchors:* Phase 1's requirement matrix (atomic-fact ✅ on 6/7 axes); Phase 2's joint-matrix; the measured matrix (atomic_fact 85% beats mem0 75%).
-- *Answer:* "I decompose the workload's question types into required memory primitives, then pick the class whose write-time primitive matches the dominant requirement. On a 20-question LongMemEval slice my hand-built 1-tier atomic-fact store scored 85% overall — knowledge-update 100%, multi-session 70% — and actually BEAT the production mem0 SDK at 75%. The summarize-based qdrant baseline scored 0% and EverCore 30%, confirming that for a user-centric workload the atomic-fact primitive is the right default, not episode consolidation."
-- *Interview signal:* the senior engineer talks ABOUT THE DATA, not about the architecture. Architecture is downstream of requirement.
+**Soundbite 1 — *"How do you choose a memory architecture?"***
 
-**Soundbite 2 — *"Tell me about a result that contradicted your own design intuition."***
-- *Anchors:* the knowledge-update latest-wins reader fix (atomic_fact KU 50%→100%, three_tier 40%→90%); the read-time vs write-time distinction.
-- *Answer:* "I'd predicted knowledge-update would be the atomic-fact store's weak axis — a flat fact store has no recency signal, so contradicting facts both look equally valid. I was wrong about WHERE the fix lived. I added session-recency `[sN]` tags and a 'highest session wins' rule at READ time, in the reader, not the store. That lifted atomic_fact's knowledge-update from 50% to 100% and three_tier's from 40% to 90%. The lesson: recency was a read-time reasoning problem, not a write-time storage one."
-- *Interview signal:* you locate fixes at the right layer; you change your mental model when data contradicts it.
+"I start from the workload, not the tech. I break the agent's actual question types into the memory primitives each one needs — atomic-fact recall, recency and supersession, relational joins — then pick the architecture whose write-time primitive matches the dominant requirement. For user-centric memory, atomic facts are the right default; episode summarization throws away the granularity that counting and lookup questions need. On my benchmark a hand-built atomic-fact tier matched a production memory SDK once the read side was right — so I don't reach for a heavy framework before the requirement demands it."
 
-**Soundbite 3 — *"When does combining retrievers help, and when does it hurt?"***
-- *Anchors:* ensemble 80% < atomic_fact 85%; RRF non-monotonic; the 3 measured multi-session losses.
-- *Answer:* "I built an RRF ensemble of two backends expecting it to beat both — the union recovers needles either alone misses. It REFUTED that: 80% overall, below my best single backend's 85%. It tied the knowledge-update ceiling but dropped to 60% on multi-session, under BOTH members. RRF maximizes recall of the union, but the reader reasons over a fixed top-k window — so fusion truncated needles out, diluted a complete set, and injected distractors. Fusion helps pure retrieval; it can hurt read-then-count."
-- *Interview signal:* you know fusion is non-monotonic for read-then-reason — a non-obvious, measured failure mode, not a textbook claim.
+*Principle:* architecture is downstream of requirement, not the other way round.
 
-**Soundbite 4 — *"When would you graduate from two-tier to three-tier memory?"***
-- *Anchors:* three_tier 75% = its L2 (KU 90%, multi-session 60%); L3 never fired; §2.6 graduation trigger.
-- *Answer:* "I shipped a three-tier system with a relational L3 hypergraph, then measured it scoring 75% — identical to its own atomic-fact L2 (knowledge-update 90%, multi-session 60%). L3 never fired once, because this slice had zero multi-entity-intersection questions for it to win. That's the graduation rule: you don't add a tier because it's available, you add it when the workload's multi-entity-intersection query rate crosses ~30%. Mine was zero, so the third tier was pure operational cost. I published the null result rather than chase a synthetic win."
-- *Interview signal:* you add tiers because measurement shows they're earned, and you publish null results honestly.
+**Soundbite 2 — *"What moved the needle most — the model, the storage, or something else?"***
+
+"The reader and the read-side assembly, not the model or the store. I held the extraction model and the vector store constant, and almost all of my gains came from how facts were assembled at read time. The key move was routing by question type: a 'current value' question, a 'how many', a 'which came first', and a 'recommend something' each need a different read operator. Selection beat combination — routing to the right operator per question outperformed both a blind retriever-ensemble and a stacked multi-tier store."
+
+*Principle:* the read-side assembly is the lever; route by question type, don't just fuse or stack.
+
+**Soundbite 3 — *"When does combining retrievers or stacking tiers help versus hurt?"***
+
+"Combining helps pure retrieval and can hurt reasoning. Rank-fusion maximizes recall of the union, but the reader works over a fixed context window — so fusing two retrievers can push out a needle one of them had, or pull the other's distractors in. I measured an ensemble scoring below its own best single backend on multi-step questions, and a stacked relational tier that added nothing because the workload never triggered it. So I fuse for retrieval, but I select — route — for read-then-reason, and I only add a tier when measurement shows the workload earns it."
+
+*Principle:* fusion is non-monotonic for read-then-reason; fuse for recall, select for reasoning.
+
+**Soundbite 4 — *"How do you handle changing facts and temporal order?"***
+
+"Recency is a read-time signal, and its resolution has to match the question. 'What's my current value' wants coarse, session-level ordering; 'which did I do first' wants fine, per-event ordering — use the wrong granularity and you quietly break one of them. And ingestion order isn't chronology: I learned to order by real timestamps, not list position. Resolving 'latest wins' at read time beat committing it at write time for current-value questions — but true point-in-time history needs evidence-grounded bitemporal storage, not an LLM dumping extracted facts into a graph."
+
+*Principle:* match recency granularity to the operator; ingestion order ≠ chronology; read-time resolution beats write-time commitment for current-value.
+
+**Soundbite 5 — *"How do you get a system to know when NOT to answer?"***
+
+"Abstention is a framing problem, not a strictness dial. My first gate asked 'is the answer grounded in the records?' and it over-refused — it flagged every answer that needed synthesis or paraphrase as unanswerable. Reframing the question to 'is the subject even present in the records?' cut the false refusals almost to zero while still catching the genuinely unanswerable ones. And I'm honest about the ceiling: prompt-only abstention only goes so far — the robust fix is uncertainty estimation or training, not a cleverer prompt."
+
+*Principle:* ask topic-presence, not answer-groundedness; prompt-only abstention has a ceiling.
 
 ## §7 References
 
@@ -2775,6 +3234,7 @@ Cross-link contract: when an entry surfaces, it also goes into the vault's globa
 - **Distinguish from:** [[Week 2.5 - GraphRAG]] (graph for RAG over documents, NOT memory over conversations — same primitive, different surface area); [[Week 3.7 - Agentic RAG]] (5-node grade/rewrite graph over RETRIEVAL — orthogonal to memory architecture choice).
 - **Connects to:** [[Week 11 - System Design]] (the production architecture decision happens here; this chapter is the rehearsal); [[Week 12 - Capstone]] (capstone agent will hit multiple LongMemEval-style axes and benefit from a router-based hybrid).
 - **Foreshadows:** future chapters that scale graph-tier (Class 3) implementations beyond HyperMem (e.g., production Graphiti deployments, Neo4j-backed hyperedges). This chapter implements graph-tier via HyperMem in Phase 6-9; the framework + matrix discipline generalizes to any graph-tier substrate.
+- **Engineering Decision Patterns:** [[Engineering Decision Patterns#Pattern 33]] (read-side operator routing — the §4.17 arc 37→79% is this pattern's primary evidence); [[Engineering Decision Patterns#Pattern 34]] (evidence-before-belief extraction — the Component 2 mis-tag regression + chunking fix is this pattern's primary evidence); [[Engineering Decision Patterns#Pattern 35]] (abstention = topic-presence, not groundedness — the grounding-gate −9 vs topic-presence −1 result is this pattern's primary evidence).
 
 ---
 

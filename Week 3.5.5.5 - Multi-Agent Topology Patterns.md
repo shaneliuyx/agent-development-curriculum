@@ -1886,17 +1886,31 @@ The chapter §4 Phase 4 Result table now reports the Option-C-fixed Sonnet 5/5 p
 
 ## 6. Interview Soundbites
 
-**"Walk me through the supervisor pattern and why it wins."**
+> *Refined 2026-06-03 to principle level — a candidate recalls the principle and the shape of the result, not exact numbers; measured specifics live in the Lab Phases section.*
 
-In our lab, a 3-worker supervisor on a multi-agent evolution question ran in 35 seconds total — matching `plan + max(workers) + synth = 35.15s` — while the sequential equivalent would have taken 62 seconds. That 1.77× wall-time speedup is the parallelism win: workers get fresh 200k-token contexts instead of sharing the lead's planning context, and they run concurrently. The ~5× token cost is real — you pay it when the task genuinely decomposes. For a simple "summarise this paper" request, I'd skip the pattern entirely.
+---
 
-**"How do you pick a topology for a novel workload?"**
+**Soundbite — *"Walk me through the supervisor pattern and why it wins."***
 
-I run the six-question matrix from §2.9: is the task decomposable into independent sub-questions? Does it have a second decomposition layer? Is the workflow statically knowable? Is it triage-shaped? Is correctness worth 3-5× cost? Does it need long shared memory? In the lab the selector-versus-model finding sharpened this: the same CODER-REVIEWER-TESTER group-chat with round-robin hit max-rounds (9) on Sonnet because Sonnet hedges, reached TERMINATE in 3 rounds on gpt-oss-20b because it commits, and terminated after 1 round on Qwen-distill because the commit bias bypassed collaboration entirely. Topology choice and model trait choice are a 2D search space — not one dimension.
+The supervisor pattern wins when the task genuinely decomposes into independent sub-questions, because workers run in parallel on fresh, uncrowded contexts rather than sharing the lead's accumulated state. What the lab confirmed is that the wall time collapses to roughly plan-plus-the-slowest-worker-plus-synthesis — not the sum of all workers. Sequential overhead is still real, which means Amdahl's law binds: if planning and synthesis are expensive relative to the workers, you get a fraction of the theoretical speedup. The right lesson is not "supervisor is fast" — it is "supervisor is fast when the parallel fraction dominates."
 
-**"When does voting earn its 3-5× cost?"**
+*Principle:* speedup is bounded by the sequential overhead on both ends; the pattern earns its cost only when workers are the expensive phase.
 
-In Phase 5 we ran 3 independent solvers on 3 factual questions. Every final answer was correct across all 3 models; the interesting finding was WHERE the cost shows up: confidence dropped to 0.67 on Sonnet for `137×23` because one solver formatted the answer as `3,151` with a comma — same value, different surface format, different vote bucket. The majority-vote aggregator is bullet-proof; answer-extraction normalization is the seam. For decisions where correctness genuinely exceeds cost — medical triage routing, security code review — the 3-4× cost-per-correct-answer is the right trade. For cheap-correctness questions, it is not.
+---
+
+**Soundbite — *"How do you pick a topology for a novel workload?"***
+
+Topology choice is a two-dimensional decision, not one. The first dimension is the work's dependency structure: independent sub-questions fan out flat, a pipeline of dependent stages wants a chain, triage routing wants handoffs, contested correctness wants voting. The second dimension — which the lab surfaced concretely — is model trait: the same group-chat topology produced very different termination behavior depending on whether the assigned model commits or hedges. A topology that looks correct on paper can fail in practice because the model's discourse style fights the topology's termination contract. You have to match both.
+
+*Principle:* topology follows the work's dependency structure; model trait is an equally load-bearing second axis.
+
+---
+
+**Soundbite — *"When does voting earn its extra cost?"***
+
+Voting earns its cost when a wrong answer is more expensive than the extra inference budget — security review, routing with downstream consequences, factual decisions without a cheap verification step. What the lab revealed is that the fragile seam is not the aggregator logic itself but the answer-extraction layer: solvers with identical values can land in different vote buckets because of surface-format differences in how they render the answer. The majority-vote mechanism is robust; the normalization contract between system prompt and extractor is where confidence silently degrades. Fix the contract first, then trust the aggregator.
+
+*Principle:* voting is robust in aggregate but fragile at the extraction seam — the system prompt's answer format and the extractor must be co-designed.
 
 ---
 

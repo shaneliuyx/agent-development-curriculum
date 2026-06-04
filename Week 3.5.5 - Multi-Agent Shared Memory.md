@@ -1293,17 +1293,29 @@ Or use unique `quest_id` per test via `uuid.uuid4()` (the lab's `make_quest_id` 
 
 ## Interview Soundbites
 
+> Refined 2026-06-03 to principle level — a candidate recalls the principle and the shape of the result, not exact numbers; measured specifics live in the Lab Phases section.
+
 **Soundbite 1 — "How do you give multiple agents a shared memory substrate?"**
 
-"I'd use `mathomhaus/guild` — single Go binary, embedded SQLite, MCP-protocol-native — to handle the operational layer. Each agent talks to it via MCP stdio; the server enforces atomic-claim via SQLite's `UPDATE quests SET claimed_by=? WHERE claimed_by IS NULL` primitive, which serializes concurrent writes through the WAL-mode file lock. Cross-agent handoff happens via scrolls — structured text attached to quests, queryable by `quest_id` directly (no fuzzy semantic search). In my lab I built a Python MCP client wrapper, ran two terminals racing for the same quest (exactly-one-winner verified across 100 runs), and a three-act handoff where agent A's design scroll informed agent B's implementation informed agent C's tests. The architectural lesson: atomic-claim is the same primitive as Postgres advisory locks, Redis SETNX, and DynamoDB ConditionExpression — same shape, different storage. Building it myself would have taken 12-20h with real risk of subtle race-condition bugs; adopting guild was 4-6h with battle-tested correctness. The build-vs-adopt decision is itself the senior-engineer signal."
+"Don't hand-roll it — the failure modes are well-known and the primitives are solved. I wired a Python MCP client to `mathomhaus/guild`, a Go binary that enforces atomic-claim via a single `UPDATE ... WHERE claimed_by IS NULL` predicate, serialized through SQLite's WAL lock. The same shape appears in every distributed-coordination system — Postgres advisory locks, Redis SETNX, DynamoDB ConditionExpression — different storage, identical compare-and-swap underneath. For handoff, agents leave structured scrolls keyed by quest ID, so the next agent does an exact lookup, not a fuzzy semantic search. In the lab, a two-process race consistently produced exactly one winner and a deterministic rejection for the other."
+
+*Principle:* adopt battle-tested coordination primitives; the compare-and-swap pattern is universal — learn it once, recognize it everywhere.
+
+---
 
 **Soundbite 2 — "Why MCP for memory? Couldn't you just expose an HTTP API?"**
 
-"MCP is the standard 2026 protocol for agent-to-tool communication — Anthropic, OpenAI, and Google all support it. The pragmatic reason to use MCP is that guild's state becomes accessible to EVERY MCP-aware harness simultaneously: Claude Code in one terminal, Cursor in another, my Python client in a third. All three see the same quests and journal entries. With a custom HTTP API I'd have to write a separate adapter for each consumer — and that's exactly what MCP was designed to eliminate. The deeper architectural reason: tool-calling is the canonical agent-substrate interface. Phrasing memory as 'tools' (`quest_accept`, `quest_journal`, `quest_fulfill`) means agents reason about memory operations the same way they reason about file I/O or shell commands. Lower cognitive load for the LLM, fewer special-cased code paths for the engineer."
+"MCP makes the memory substrate harness-agnostic. Because guild exposes its primitives as MCP tools, every MCP-aware process — a Python script, Claude Code, Cursor — sees the same quest state without any per-consumer adapter code. The deeper reason is conceptual alignment: framing memory as tool calls means the agent reasons about `quest_accept` and `quest_journal` the same way it reasons about a file read or a shell command. One protocol, one mental model. In the lab, I confirmed this directly — separate Python processes talking to the same guild server maintained consistent shared state with no coordination code beyond the MCP tool calls themselves."
+
+*Principle:* expose memory as a tool-call interface, not a custom API; the protocol does the adapter work so you don't have to.
+
+---
 
 **Soundbite 3 — "What did reading guild's source teach you?"**
 
-"Three things. First, the atomic-claim primitive is a single UPDATE...WHERE statement — 5 lines of Go. The cleverness isn't in the code; it's in the schema design and the WAL-mode invariant. Second, every distributed-systems atomic-claim primitive is the same shape — SQLite UPDATE-WHERE, Postgres advisory locks, Redis SETNX, DynamoDB ConditionExpression, etcd Txn. Different storage layers; identical compare-and-swap pattern. Third, the application-side handling of `rowcount=0` is where production systems get subtle: livelock under contention, missing backoff, no fairness guarantees. guild does this correctly with exponential backoff + jitter; my one-page deep-dive note articulated what I'd replicate if I had to rebuild it. The reading exercise took an hour and a half; the artifact is a transferable mental model of how task coordination works at the storage layer."
+"That the cleverness is in the schema, not the code. The atomic-claim primitive is a handful of Go lines — the load-bearing piece is the `WHERE claimed_by IS NULL` predicate and the WAL-mode invariant that serializes concurrent writers. What I couldn't have guessed without reading: the application-side handling of a zero-row UPDATE is where production systems get subtle. guild addresses livelock risk with backoff; naive reimplementations don't. I wrote a one-page deep-dive note mapping that primitive to its equivalents across five storage systems. When an interviewer asks about distributed coordination, I can explain the shape, not just say I called an API."
+
+*Principle:* read production source once to extract the invariant; a transferable mental model is worth more than familiarity with one tool's interface.
 
 ---
 

@@ -1296,11 +1296,31 @@ The partial index lets exactly one (user_id, key, archived=0) row exist while ar
 
 ## Interview Soundbites
 
-**Soundbite 1.** Working memory is the conversation buffer — resets every session. Episodic memory stores time-indexed events: "user asked about LangGraph on Tuesday." Semantic memory stores durable facts: "user is vegan, lives in Taipei." Procedural memory encodes learned behavioral patterns and almost always requires fine-tuning or system-prompt augmentation — no off-the-shelf tool gives it to you. The mistake interviewers catch is candidates collapsing all four into "long-term memory." Name the type, pick the right storage.
+*Refined 2026-06-03 to principle level — a candidate recalls the principle and the shape of the result, not exact numbers; measured specifics live in the Lab Phases section.*
 
-**Soundbite 2.** Memory without forgetting is a landfill. Three strategies prevent unbounded growth: TTL evicts stale facts after N days unless reconfirmed; confidence-weighted eviction drops lowest-confidence facts at cap; contradiction-triggered update archives the old fact and writes the new — archive, never delete, because audit trail matters. Naive failure mode: storing every raw turn verbatim. Contradictions accumulate, retrieval returns verbose transcripts instead of crisp facts, token cost scales with conversation history not extracted facts.
+---
 
-**Soundbite 3.** Storage choice follows query shape. Semantic facts ("user.location = Taipei") need exact-match lookups + uniqueness constraint for archive-on-contradiction → relational DB (SQLite, Postgres). Episodic memories are free-form, retrieved by similarity to current message → vector store (Qdrant, pgvector). Graph databases add value when memory is relational ("user A knows user B who prefers X") but carry operational overhead only justified once entity relationships are load-bearing. Start with dual-store: vector for episodes, relational for semantic facts.
+**Soundbite 1 — *"What are the four types of agent memory?"***
+
+"Working, episodic, semantic, procedural — and they are not interchangeable. Working memory is the conversation buffer; it resets every session. Episodic stores time-indexed events. Semantic stores durable facts about the user. Procedural encodes learned behavioral patterns and almost always requires fine-tuning or system-prompt augmentation — no off-the-shelf tool hands it to you. The mistake interviewers catch is candidates collapsing all four into 'long-term memory.' The dual-store pattern — vector for episodes, relational for semantic facts — is how you cover the two you can build today."
+
+*Principle:* Name the type first; storage choice follows from the query shape each type demands.
+
+---
+
+**Soundbite 2 — *"How do you keep memory from becoming a landfill?"***
+
+"Three forgetting strategies matter: TTL evicts stale facts unless reconfirmed; confidence-weighted eviction prunes lowest-confidence entries at capacity; contradiction-triggered update archives the old fact and writes the new — archive, never delete, because audit trail matters. The naive failure mode is storing raw turns verbatim: contradictions accumulate silently, retrieval returns verbose transcripts instead of crisp facts, and token cost scales with conversation history rather than extracted facts. My lab implements contradiction-archival via SCD-2 — one live row plus unbounded archived history."
+
+*Principle:* Forgetting is part of the memory system design, not an afterthought.
+
+---
+
+**Soundbite 3 — *"Walk me through a time you investigated a surprising benchmark result."***
+
+"I ran my hand-rolled dual-store against mem0 on the same recall test suite. mem0 failed a handful of tests and the error logs pointed at a specific model tier. My first hypothesis was that those failures were a small-model quirk. I tested that by swapping to a stronger local model — one env-var change — and got the identical pass/fail set. Hypothesis falsified in minutes. The failures were architectural-contract differences — mem0 collapses the episodic/semantic distinction and archives contradictions differently — not model-quality issues. Testing the cheaper hypothesis first saved hours of wrong-direction patching."
+
+*Principle:* Always test the cheapest falsifying experiment before believing the more complex explanation.
 
 ---
 
