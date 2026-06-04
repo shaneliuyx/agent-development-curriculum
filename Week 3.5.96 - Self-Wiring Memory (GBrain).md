@@ -337,19 +337,73 @@ A fresh, empty brain legitimately shows a few **benign WARNs** — don't chase t
 
 > **Your brain ≠ this repo.** The cloned `gbrain/` is the *tool*. Your actual notes live in a *separate* brain repo (`mkdir ~/brain && cd ~/brain && git init`), organized MECE — `people/ companies/ concepts/ …` per `docs/GBRAIN_RECOMMENDED_SCHEMA.md`. That corpus is Phase 2.
 
-### Phase 2 — Build a ~50-page brain in GBrain's real format (~1 hour)
+### Phase 2 — Ingest heterogeneous content WITHOUT hand-formatting (~1 hour)
 
-**Goal:** create the corpus the deterministic extractor will wire — in a **separate brain repo** (not the tool repo) using GBrain's actual conventions, so `[[wikilinks]]` become typed edges with zero LLM calls.
+**Goal:** get raw, differently-shaped sources (emails, tweets, meeting transcripts) into a structured brain — *without* writing a converter per format, and without hand-authoring pages. **The agent is the formatter; you curate.**
+
+**The model — two layers, two owners** (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`):
+- **Raw sources** — emails, tweets, transcripts, API dumps. **Immutable, any format.** Live in `sources/`; the agent *reads* them, never rewrites them.
+- **The brain** — `people/ meetings/ companies/ concepts/ …` **two-layer** pages (*Compiled Truth* above a `---`, append-only *Timeline* below) linked with `[[dir/slug]]` wikilinks. **The agent owns and writes this layer.**
+
+> **Anti-pattern (BCJ Entry 4):** hand-converting each source format into brain pages does not scale — and is not how GBrain works. You never author the structured pages by hand; the agent does. (The old draft's "create 50 markdown files" + `@alice works_at X;` shorthand was wrong on both counts.)
 
 ```bash
-# The brain (your content) is SEPARATE from the gbrain tool repo (Phase 1).
-mkdir -p ~/brain/{people,companies,deals,meetings,concepts} && cd ~/brain && git init
+# brain repo (your content) is SEPARATE from the gbrain tool repo (Phase 1)
+mkdir -p ~/brain/{sources,people,companies,deals,meetings,concepts} && cd ~/brain && git init
+# drop raw samples — ANY format — under sources/  (e.g. sources/emails/, sources/tweets/, sources/transcripts/)
 ```
 
-GBrain pages are **two-layer** (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`): *Compiled Truth* above a `---`, append-only *Timeline* below. Entities are linked with **path-qualified `[[dir/slug]]` wikilinks** + frontmatter fields — that is what `extract links` turns into typed edges. (The `@alice works_at X; invested_in:- @stripe` shorthand from the old draft is **not** a GBrain format.)
+**Three ways content gets in — none requires you to format it:**
 
-```markdown
-<!-- ~/brain/people/alice.md -->
+1. **`gbrain capture` — dump anything to triage** (lands in `inbox/YYYY-MM-DD-<hash>`, no formatting):
+   ```bash
+   gbrain capture "a raw thought"
+   gbrain capture --file ./sources/emails/acme-thread.txt
+   cat ./sources/transcripts/dinner.txt | gbrain capture --stdin --type meeting
+   ```
+2. **Integration recipes (`gbrain integrations`) — one connector PER source type, cron-driven.** GBrain ships exactly the per-format converters you'd otherwise hand-write: `email-to-brain`, `x-to-brain` (tweets), `meeting-sync`, `calendar-to-brain`, `twilio-voice-brain`. They pull the live source and emit structured pages automatically. Credentialed → the **production** path:
+   ```bash
+   gbrain integrations list                  # available senses/reflexes
+   gbrain integrations show email-to-brain   # recipe detail
+   gbrain integrations status email-to-brain # secrets + health
+   ```
+3. **Ingest skills — the agent converts raw → structured pages.** `meeting-ingestion`, `article-enrichment`, `voice-note-ingest`, `media-ingest`, `idea-ingest`. Each is triggered by a phrase ("process this meeting transcript") and uses GBrain's MCP tools (`put_page`, `add_link`, `add_timeline_entry`) to write the two-layer page **and** wire entities — zero hand-formatting. Needs the agent wired to GBrain over MCP (Phase 6's `gbrain serve`).
+
+**The lab path (no credentials, ~$ cap) — wire your coding agent to GBrain and let it format.** There is **no deterministic `raw → page` command** (that step is irreducibly an LLM judgment: which entities, which directory, which typed edge). So you give your coding agent GBrain's MCP write-tools, then point it at the raw.
+
+1. **Drop raw samples under `~/brain/sources/`** — any format. Two worked fixtures (synthetic, mutually consistent) live in this lab:
+   - `sources/emails/acme-thread.txt` — an email thread (`From:/To:/Subject:` + reply chain)
+   - `sources/transcripts/dinner.txt` — a timestamped speaker transcript
+   Deliberately different shapes — the point is one agent handles both.
+
+2. **(OpenClaw hosts only) scaffold the ingest skills.** `gbrain skillpack scaffold` copies the "fat markdown" ingest procedures into an **OpenClaw-style agent workspace** (`--workspace <path>` or `$OPENCLAW_WORKSPACE`):
+   ```bash
+   gbrain skillpack scaffold meeting-ingestion article-enrichment voice-note-ingest --workspace <path>
+   ```
+   On a **Claude Code / Codex** host, **skip this** — there's no OpenClaw workspace, so bare `scaffold --all` fails with `could not auto-detect a target workspace` (expected). The MCP server (step 3) already exposes the write tools; you give the agent the procedure inline (step 4), or have it read the recipe directly from `~/code/agent-prep/gbrain/skills/meeting-ingestion/SKILL.md`.
+
+3. **Register GBrain's MCP server with your coding agent.** An MCP server is a *separate process* — it does NOT inherit your shell env, so pass the oMLX + DB env at registration:
+   ```bash
+   claude mcp add gbrain \
+     --env GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain \
+     --env OLLAMA_BASE_URL=http://localhost:8000/v1 \
+     --env OLLAMA_API_KEY=<your-oMLX-key> \
+     -- gbrain serve
+   ```
+   Restart the agent → it now has `mcp__gbrain__*` tools (`put_page`, `add_link`, `add_timeline_entry`, `search`, `query`).
+
+4. **Trigger the conversion** in the agent:
+   > *"Using the gbrain MCP tools, read `~/brain/sources/` and create structured two-layer pages per `docs/GBRAIN_RECOMMENDED_SCHEMA.md` — `put_page` each entity, `add_link` the typed edges, `add_timeline_entry` with a `source:` citation back to the raw file."*
+
+   The agent **generates** the pages via `put_page` — you review, you don't type them. (With the scaffolded skill loaded, the trigger phrase *"process this meeting transcript"* routes the same flow automatically.)
+
+> **Gotcha (MCP env):** forget the `--env` flags and `gbrain serve` starts but can't embed what it writes — silent until the first `put_page` fails. MCP servers are spawned processes; declare their env at `claude mcp add`, never assume your terminal's exports.
+> **Do NOT hand-author the pages** (BCJ Entry 4). The block below is the *shape the agent produces*, shown so you can review its output — not a template for you to fill 50× by hand.
+
+**The target shape the agent produces** (a `people/` page — you *read* these, the agent *writes* them):
+
+```text
+<!-- ~/brain/people/alice.md  (written BY THE AGENT from a raw email/transcript) -->
 # Alice Chen
 
 Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]. Angel in
@@ -364,11 +418,11 @@ Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]. Angel i
 - 2026-04-30 — angel check into [[companies/stripe]].
 ```
 
-Compose ~50 pages: 20 `meetings/`, 15 tweets, 10 emails, 5 `people/` contacts — every page linking entities via `[[dir/slug]]`. The repo's `examples/` has templates; MECE directory rules live in each dir's `README.md` resolver.
+Two-layer (*Compiled Truth* / `---` / *Timeline*); `[[dir/slug]]` wikilinks become typed edges via `extract links` (Phase 3). MECE directory rules live in each dir's `README.md` resolver; `examples/` has templates the agent follows.
 
-> **Gotcha:** bare `[[alice]]` (no directory) does NOT resolve unless you enable basename linking — prefer path-qualified `[[people/alice]]` so the graph wires out of the box.
+> **Gotcha:** bare `[[alice]]` (no directory) doesn't resolve unless you enable basename linking — the agent should emit path-qualified `[[people/alice]]` so the graph wires out of the box.
 
-**Verification:** `find ~/brain -name '*.md' | wc -l` ≈ 50; every page has a `---` separating Compiled Truth from Timeline.
+**Verification:** `gbrain list -n 10` shows agent-written pages; `gbrain get people/<slug>` on one — it has the two-layer `---` split + `[[dir/slug]]` wikilinks you did **not** hand-author. (`gbrain stats` for counts once Phase 3 imports/embeds.)
 
 ### Phase 3 — Import, embed, wire the graph, verify (~1 hour)
 
@@ -426,22 +480,210 @@ gbrain query "Alice" --no-expand                 # --no-expand skips LLM query e
 
 **Verification:** the answer surfaces the gap explicitly **and** cites brain pages for what it *does* know; it does not invent a 2026-06-15 event.
 
-### Phase 6 — MCP integration with the W7 agent (~30 min)
+### Phase 6 — A future agent uses GBrain as memory over MCP (~1.5 hours)
 
-**Goal:** expose GBrain to your W7 ReAct agent over MCP, then A/B answer quality with vs without brain context.
+**Goal:** the transferable skill behind this whole chapter — a **standalone agent
+you build** (here: smolagents, *not* Claude Code) uses GBrain as its memory layer
+over **MCP**: read raw → LLM-extract structured pages → `put_page` → `query`. Lab
+repo: `~/code/agent-prep/lab-03-5-96-gbrain/` (full source + `RESULTS.md`).
 
-```bash
-gbrain serve                         # stdio MCP server (Claude Code / local agent)
-# or HTTP MCP (OAuth 2.1):
-gbrain serve --http --port 8765
-gbrain connect <mcp-url> --token <t> # wire a remote gbrain into Claude Code
+**Framework choice (researched).** The agent's brain is local **oMLX, which has no
+native tool-calling**. smolagents' `CodeAgent` — the LLM writes Python that calls
+tools — is purpose-built for that; it doesn't need function-calling. (PydanticAI and
+the OpenAI Agents SDK are cleaner/typed but *require* a tool-calling model — you'd
+route the brain through VibeProxy→Haiku for those.) `use_structured_outputs_internally=True`
+sidesteps oMLX's `<code>` parsing (smolagents issue #1851).
+
+**Design: thin agent, fat tools.** A 14B can't reliably read files **and** write a
+good extractor **and** compose markdown in one code loop — and the `CodeAgent` sandbox
+blocks `pathlib`/`json`. So the hard work lives in tools (`read_sources`,
+`extract_pages`); the agent's own code is ~4 lines of orchestration.
+
+#### Probe first — can plain Python drive GBrain's MCP?
+
+The smallest proof (`src/probe_mcp.py`, core): a Python MCP client spawns `gbrain
+serve` over stdio and lists its tools. **An MCP server is a separate process — it
+does NOT inherit your shell env**, so DB + oMLX vars are injected at spawn:
+
+```python
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+def _server_env() -> dict[str, str]:
+    env = dict(os.environ)                                   # inherit, then add:
+    env["PATH"] = os.path.expanduser("~/.bun/bin") + os.pathsep + env["PATH"]
+    for k in ("GBRAIN_DATABASE_URL", "OLLAMA_BASE_URL", "OLLAMA_API_KEY"):
+        if os.getenv(k): env[k] = os.environ[k]
+    return env
+
+params = StdioServerParameters(command=GBRAIN, args=["serve"], env=_server_env())
+async with stdio_client(params) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools = (await session.list_tools()).tools           # ~70 tools
 ```
 
-Point the W7 agent at GBrain's MCP tools (`search`, `query`, `graph-query`, `get`, `put`, …). Run 3 queries that benefit from brain memory + 3 that don't, and compare.
+**Result:** ~70 tools exposed; `put_page, add_link, add_timeline_entry, query, search` all present. The MCP path works from non-Claude-Code Python.
 
-> **Gotcha:** for **remote** callers the search mode is the server's *configured* mode (`--mode` is local-callers-only) — set it with `gbrain config set search.mode <tier>` before `serve`.
+#### The agent
 
-**Verification:** memory-augmented queries are more grounded (they cite brain pages); non-memory queries are equivalent with or without GBrain.
+**Code:** `src/ingest_agent.py` (full)
+
+```python
+"""W3.5.96 — a memory-augmented agent (smolagents) that uses GBrain as its memory
+layer over MCP. The transferable pattern for FUTURE agent development.
+
+Design = idiomatic smolagents: **thin agent, fat tools.** A small local model can't
+reliably read files AND write a good extractor AND compose markdown in one code loop
+(and the CodeAgent sandbox blocks `pathlib`/`json` anyway). So the hard work lives in
+TOOLS; the agent just orchestrates:
+
+  tools given to the agent:
+    - read_sources()        local  — returns the raw text of ~/brain/sources/*
+    - extract_pages(raw)    local  — LLM (oMLX) raw → structured GBrain pages (list)
+    - put_page, query, ...  MCP    — GBrain, loaded via ToolCollection.from_mcp
+
+  the agent's whole job (a few lines of code it writes itself):
+    raw = read_sources(); pages = extract_pages(raw)
+    for p in pages: put_page(slug=p['slug'], content=p['content'])
+    answer = query(query="..."); final_answer(answer)
+
+Brain = oMLX (no native tool-calls) → CodeAgent + use_structured_outputs_internally.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+
+from dotenv import load_dotenv
+from mcp import StdioServerParameters
+from openai import OpenAI
+from smolagents import CodeAgent, OpenAIServerModel, ToolCollection, tool
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / ".env")
+
+SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
+_BUN_BIN = os.path.expanduser("~/.bun/bin")
+_GBRAIN = os.getenv("GBRAIN_BIN", "gbrain")
+if _GBRAIN == "gbrain":
+    _GBRAIN = os.path.join(_BUN_BIN, "gbrain")
+
+NEEDED_TOOLS = {"put_page", "query"}   # the MCP tools the agent calls
+
+_EXTRACT_PROMPT = """Convert raw notes into GBrain pages. One page per entity.
+
+Slug: path-qualified kebab-case — people/<name>, companies/<name>, deals/<name>, meetings/<name>.
+
+content MUST follow this exact two-layer shape:
+
+# <Title>
+
+<one-paragraph summary. EVERY other entity you mention MUST be a path-qualified
+wikilink [[dir/slug]], e.g. [[people/alice-chen]], [[companies/acme-ai]].>
+
+---
+## Timeline
+- YYYY-MM-DD — <event, also using [[dir/slug]] wikilinks> (source: <raw filename>)
+
+HARD RULES (a page that breaks these is WRONG):
+- The separator between summary and Timeline is a line that is EXACTLY `---` (three hyphens). Never an HTML comment.
+- EVERY mention of another entity is a [[dir/slug]] wikilink. A page with zero wikilinks is invalid.
+- If you mention an entity, also emit its page, and link to it by the SAME slug.
+- Deduplicate across docs (one page per entity). Use ONLY facts in the raw text.
+
+Worked example of one page's content field:
+"# Alice Chen\\n\\nFounder & CEO of [[companies/acme-ai]]; angel in [[companies/stripe]]; raising [[deals/acme-seed]] with [[people/sam-okafor]].\\n\\n---\\n## Timeline\\n- 2026-05-12 — dinner with [[people/sam-okafor]] re [[deals/acme-seed]] (source: sources/transcripts/dinner.txt)"
+
+Output ONLY JSON: {"pages":[{"slug":"people/alice-chen","content":"..."}]}.
+
+RAW:
+{raw}
+"""
+
+
+@tool
+def read_sources() -> str:
+    """Read every raw file under ~/brain/sources/ and return their concatenated text,
+    each prefixed with its relative path as a header."""
+    parts = []
+    for f in sorted(SOURCES.rglob("*")):
+        if f.is_file():
+            parts.append(f"===== {f.relative_to(SOURCES.parent)} =====\n{f.read_text()}")
+    return "\n\n".join(parts)
+
+
+@tool
+def extract_pages(raw: str) -> list:
+    """Turn raw source text into structured GBrain pages via the local LLM.
+
+    Args:
+        raw: concatenated raw source text (from read_sources).
+    """
+    client = OpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
+                    api_key=os.getenv("LLM_API_KEY", "dummy"))
+    resp = client.chat.completions.create(
+        model=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+        messages=[{"role": "user", "content": _EXTRACT_PROMPT.replace("{raw}", raw)}],
+        temperature=0.0, max_tokens=4000, response_format={"type": "json_object"})
+    data = json.loads(resp.choices[0].message.content or "{}")
+    return [p for p in data.get("pages", []) if p.get("slug") and p.get("content")]
+
+
+def _server_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = _BUN_BIN + os.pathsep + env.get("PATH", "")
+    for k in ("GBRAIN_DATABASE_URL", "OLLAMA_BASE_URL", "OLLAMA_API_KEY"):
+        if (v := os.getenv(k)):
+            env[k] = v
+    return env
+
+
+TASK = """Build the brain, then answer a question, using ONLY the provided tools:
+1. raw = read_sources()
+2. pages = extract_pages(raw)
+3. for each page in pages: call put_page(slug=page["slug"], content=page["content"])
+4. answer = query(query="Who is anchoring the acme-seed round and on what terms?")
+5. return answer via final_answer.
+"""
+
+
+def main() -> None:
+    server = StdioServerParameters(command=_GBRAIN, args=["serve"], env=_server_env())
+    model = OpenAIServerModel(
+        model_id=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+        api_base=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
+        api_key=os.getenv("LLM_API_KEY", "dummy"))
+
+    with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
+        mcp_tools = [t for t in tc.tools if t.name in NEEDED_TOOLS]
+        print(f">>> GBrain MCP tools: {sorted(t.name for t in mcp_tools)}")
+        agent = CodeAgent(
+            tools=[read_sources, extract_pages, *mcp_tools],
+            model=model, max_steps=6,
+            use_structured_outputs_internally=True, verbosity_level=1)
+        answer = agent.run(TASK)
+        print("\n>>> agent final answer:\n" + str(answer))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **`ToolCollection.from_mcp` + filter.** smolagents loads GBrain's MCP tools straight in (needs `smolagents[mcp]`). We pass only the ~2 the agent calls — GBrain exposes ~70, and handing all to a 14B blows its context and confuses tool selection.
+- **The two `@tool`s are where the intelligence lives.** `read_sources` does file I/O (the agent can't — sandbox blocks `pathlib`); `extract_pages` makes the one focused oMLX call that turns raw text into structured pages with wikilinks. The agent itself just loops `put_page` and calls `query`.
+- **The extraction prompt is the load-bearing part.** It *hard-mandates* `[[wikilinks]]` with a worked example — because without that the model writes prose and the graph never wires (see Result).
+
+**Result:** `uv run python src/ingest_agent.py` — the agent wrote **10 pages** via `put_page`, then `gbrain extract links --source db` produced **11 typed edges**. `query "who is anchoring acme-seed?"` → top hit `deals/acme-seed` (**score 0.93**): *"Seed round for `[[companies/acme-ai]]`… `[[people/sam-okafor]]` is anchoring the remainder."* `graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5).
+
+**Critical finding — graph quality = extraction quality.** Run 1 (extraction prompt *without* the wikilink mandate): 5 pages stored fine, but `extract links` → **`Links: 0`** — the 14B wrote "Alice Chen, founder of Acme AI" as plain prose. Run 2 (few-shot + "zero wikilinks = invalid"): **`Links: 11`**. The framework + MCP plumbing was the easy part; the graph only materialized once the prompt enforced the typed-link contract.
+
+`★ Insight ─────────────────────────────────────`
+- This is the answer to "how do I use a memory system in my own agent?": wire its **MCP tools** into a framework (smolagents here), keep the agent **thin** (orchestrate), and put capability in **tools**. You don't build a bespoke converter and you don't hand-author pages — the agent + a disciplined extraction prompt is the converter.
+- A capable-but-small local model will **silently** store well-written prose and produce a zero-edge "graph," because it dropped the wikilinks. Measure **edges, not pages** — the storage call succeeding tells you nothing about whether the graph wired.
+`─────────────────────────────────────────────────`
 
 ---
 
@@ -452,6 +694,10 @@ _Observed during the real Phase-1 run (GBrain 0.42.25.0):_
 - **Entry 1 — `llama-server` provider is a catch-22 for registry-known embed models (OBSERVED).** `--embedding-model llama-server:bge-m3` (and `:nomicai-modernbert-embed-base-bf16`) refuses *both* ways: **with** `--embedding-dimensions` → "does not support custom dimensions N (this model only emits its default vector size)"; **without** → "llama-server requires --embedding-dimensions <N> (user-driven recipes have no default dimension)." No value satisfies both → init impossible. *Fix:* use the **`ollama` provider** pointed at oMLX (`OLLAMA_BASE_URL=http://localhost:8000/v1`, `OLLAMA_API_KEY=<key>`, `--embedding-model ollama:<model>`, **no** `--embedding-dimensions`) — it *probes* the endpoint for the dim instead of demanding/rejecting it. (Worth a GBrain issue; strip keys before filing.)
 - **Entry 2 — init is stateful + greedy; a botched first run poisons every retry (OBSERVED).** Three compounding traps: (a) `--supabase` runs the *interactive Supabase flow* and ignores `GBRAIN_DATABASE_URL` — use `--url`; (b) a present `OPENROUTER_API_KEY` makes init **auto-pick openrouter for embeddings** (probe failed 404 on a dummy key) even with `--embedding-model` set — keep it commented until post-init; (c) a wrong first init persists `~/.gbrain/config.json` + a baked vector-column width, so re-init fails citing the *stale* dimension. *Fix (0 pages → safe):* `DROP DATABASE gbrain; CREATE DATABASE gbrain;` + `rm ~/.gbrain/config.json`, then re-init. Lesson: **GBrain init is stateful and greedy — reset clean if anything looks off, and read the "Using …" line, not the green migration checkmarks.**
 - **Entry 3 — `gbrain` not found after `bun link` (OBSERVED).** `bun link` symlinks the CLI into `~/.bun/bin` but does not add it to PATH; the installer often doesn't persist the PATH line either. *Fix:* `echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc`. Tell-apart: `ls ~/.bun/bin/gbrain` exists ⇒ pure PATH issue, not a broken install.
+- **Entry 4 — trying to hand-format every source type into brain pages (DESIGN anti-pattern).** Emails, tweets, and meeting transcripts each have a different shape; writing a per-format converter (or authoring the 50 pages by hand) does not scale and is *not* GBrain's model. *Root cause:* mistaking who owns the structured layer. GBrain splits **raw sources** (immutable, any format, in `sources/`) from **the brain** (two-layer pages the **agent** writes). *Fix:* never author structured pages manually — drop raw under `sources/` (or `gbrain capture`), then let the agent convert via **ingest skills** (`meeting-ingestion`, `article-enrichment`, `voice-note-ingest` → `put_page`/`add_link`) or, in production, the credentialed **integration recipes** (`email-to-brain`, `x-to-brain`, `meeting-sync`). The agent is the universal formatter; you curate. (Drove the Phase 2 rewrite.)
+
+- **Entry 5 — the agent stored pages fine but the graph had zero edges (OBSERVED, Phase 6).** A smolagents `CodeAgent` (oMLX) drove GBrain over MCP and wrote 5 well-formed pages via `put_page`, yet `gbrain extract links` reported `Links: 0`. *Root cause:* the LLM extraction wrote entity mentions as **plain prose** ("Alice Chen, founder of Acme AI") and used `<!-- timeline -->` instead of `---`, so there were no `[[wikilinks]]` to extract. The framework + MCP plumbing worked; the *contract* didn't. *Fix:* the extraction prompt must **hard-mandate** path-qualified `[[dir/slug]]` wikilinks with a worked example + "a page with zero wikilinks is invalid" → `Links: 0 → 11`. **Graph quality = extraction quality; measure edges, not pages.**
+- **Entry 6 — fully-autonomous `CodeAgent` failed on a 14B (OBSERVED, Phase 6).** Asking the agent to read files + write an extractor + compose markdown in one code loop produced a naive regex placeholder + `InterpreterError: import pathlib not allowed` (the CodeAgent sandbox blocks `pathlib`/`json`). *Fix:* **thin agent, fat tools** — move file I/O and extraction into `@tool`s (`read_sources`, `extract_pages`); the agent only orchestrates. Also: filter `ToolCollection.from_mcp` to the ~few tools needed (GBrain exposes ~70; a 14B drowns), depend on `smolagents[mcp]` (mcpadapt), pass DB/oMLX env via `StdioServerParameters(env=…)` (an MCP server is a separate process), and use `use_structured_outputs_internally=True` (oMLX has no native tool_calls). Lab: `~/code/agent-prep/lab-03-5-96-gbrain/`.
 
 _Projected (to confirm during Phases 3–6):_
 
