@@ -138,9 +138,18 @@ flowchart TD
 
 ---
 
-## 4. Lab Phases (executable, ~5h)
+## 4. Lab Phases
 
-### Phase 1 — Install GBrain + provision Postgres (~1 hour)
+> **Executed vs spec (this records only what was actually run).** Phases marked
+> **[executed]** were run and measured on this machine; **[spec — not yet run]**
+> phases are specified but not executed. The real flow we ran: **install (P1) → drop
+> raw files in `sources/` (P2) → a standalone smolagents agent converts raw→pages
+> over MCP (P6) → verify the wired graph (P3)**. The earlier Claude-Code-driven
+> ingestion path (scaffold skills + `claude mcp add` + trigger) was **dropped** in
+> favor of that standalone agent — so Phase 2 below is just corpus prep, and the
+> conversion lives in Phase 6.
+
+### Phase 1 — Install GBrain + provision Postgres [executed]
 
 > **Engine choice.** GBrain ships two storage engines (`docs/ENGINES.md`): **PGLite**
 > (embedded Postgres via WASM, the zero-config default — `gbrain init`, no server) and
@@ -337,121 +346,57 @@ A fresh, empty brain legitimately shows a few **benign WARNs** — don't chase t
 
 > **Your brain ≠ this repo.** The cloned `gbrain/` is the *tool*. Your actual notes live in a *separate* brain repo (`mkdir ~/brain && cd ~/brain && git init`), organized MECE — `people/ companies/ concepts/ …` per `docs/GBRAIN_RECOMMENDED_SCHEMA.md`. That corpus is Phase 2.
 
-### Phase 2 — Ingest heterogeneous content WITHOUT hand-formatting (~1 hour)
+### Phase 2 — Prepare the raw corpus [executed]
 
-**Goal:** get raw, differently-shaped sources (emails, tweets, meeting transcripts) into a structured brain — *without* writing a converter per format, and without hand-authoring pages. **The agent is the formatter; you curate.**
+**Goal:** stage raw, differently-shaped sources for the agent to convert. You do **not** format them — the conversion is the agent's job (Phase 6).
 
-**The model — two layers, two owners** (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`):
-- **Raw sources** — emails, tweets, transcripts, API dumps. **Immutable, any format.** Live in `sources/`; the agent *reads* them, never rewrites them.
-- **The brain** — `people/ meetings/ companies/ concepts/ …` **two-layer** pages (*Compiled Truth* above a `---`, append-only *Timeline* below) linked with `[[dir/slug]]` wikilinks. **The agent owns and writes this layer.**
+**Two layers, two owners** (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`):
+- **Raw sources** — emails, transcripts, any format. **Immutable**, kept in `sources/`; the agent *reads* them, never rewrites them.
+- **The brain** — two-layer pages (*Compiled Truth* / `---` / *Timeline*) with `[[dir/slug]]` wikilinks. **The agent writes this layer** (Phase 6).
 
-> **Anti-pattern (BCJ Entry 4):** hand-converting each source format into brain pages does not scale — and is not how GBrain works. You never author the structured pages by hand; the agent does. (The old draft's "create 50 markdown files" + `@alice works_at X;` shorthand was wrong on both counts.)
+> **Anti-pattern (BCJ Entry 4):** hand-converting each source format, or hand-authoring the pages, does not scale and is not how GBrain works. The agent is the formatter; you curate.
 
 ```bash
-# brain repo (your content) is SEPARATE from the gbrain tool repo (Phase 1)
 mkdir -p ~/brain/{sources,people,companies,deals,meetings,concepts} && cd ~/brain && git init
-# drop raw samples — ANY format — under sources/  (e.g. sources/emails/, sources/tweets/, sources/transcripts/)
+# drop raw samples (any format) under sources/
 ```
 
-**Three ways content gets in — none requires you to format it:**
+**What we staged** — two synthetic, mutually-consistent fixtures, deliberately different shapes so one agent must handle both:
+- `sources/emails/acme-thread.txt` — email thread (`From:/To:/Subject:` + reply chain)
+- `sources/transcripts/dinner.txt` — timestamped speaker transcript
 
-1. **`gbrain capture` — dump anything to triage** (lands in `inbox/YYYY-MM-DD-<hash>`, no formatting):
-   ```bash
-   gbrain capture "a raw thought"
-   gbrain capture --file ./sources/emails/acme-thread.txt
-   cat ./sources/transcripts/dinner.txt | gbrain capture --stdin --type meeting
-   ```
-2. **Integration recipes (`gbrain integrations`) — one connector PER source type, cron-driven.** GBrain ships exactly the per-format converters you'd otherwise hand-write: `email-to-brain`, `x-to-brain` (tweets), `meeting-sync`, `calendar-to-brain`, `twilio-voice-brain`. They pull the live source and emit structured pages automatically. Credentialed → the **production** path:
-   ```bash
-   gbrain integrations list                  # available senses/reflexes
-   gbrain integrations show email-to-brain   # recipe detail
-   gbrain integrations status email-to-brain # secrets + health
-   ```
-3. **Ingest skills — the agent converts raw → structured pages.** `meeting-ingestion`, `article-enrichment`, `voice-note-ingest`, `media-ingest`, `idea-ingest`. Each is triggered by a phrase ("process this meeting transcript") and uses GBrain's MCP tools (`put_page`, `add_link`, `add_timeline_entry`) to write the two-layer page **and** wire entities — zero hand-formatting. Needs the agent wired to GBrain over MCP (Phase 6's `gbrain serve`).
-
-**The lab path (no credentials, ~$ cap) — wire your coding agent to GBrain and let it format.** There is **no deterministic `raw → page` command** (that step is irreducibly an LLM judgment: which entities, which directory, which typed edge). So you give your coding agent GBrain's MCP write-tools, then point it at the raw.
-
-1. **Drop raw samples under `~/brain/sources/`** — any format. Two worked fixtures (synthetic, mutually consistent) live in this lab:
-   - `sources/emails/acme-thread.txt` — an email thread (`From:/To:/Subject:` + reply chain)
-   - `sources/transcripts/dinner.txt` — a timestamped speaker transcript
-   Deliberately different shapes — the point is one agent handles both.
-
-2. **(OpenClaw hosts only) scaffold the ingest skills.** `gbrain skillpack scaffold` copies the "fat markdown" ingest procedures into an **OpenClaw-style agent workspace** (`--workspace <path>` or `$OPENCLAW_WORKSPACE`):
-   ```bash
-   gbrain skillpack scaffold meeting-ingestion article-enrichment voice-note-ingest --workspace <path>
-   ```
-   On a **Claude Code / Codex** host, **skip this** — there's no OpenClaw workspace, so bare `scaffold --all` fails with `could not auto-detect a target workspace` (expected). The MCP server (step 3) already exposes the write tools; you give the agent the procedure inline (step 4), or have it read the recipe directly from `~/code/agent-prep/gbrain/skills/meeting-ingestion/SKILL.md`.
-
-3. **Register GBrain's MCP server with your coding agent.** An MCP server is a *separate process* — it does NOT inherit your shell env, so pass the oMLX + DB env at registration:
-   ```bash
-   claude mcp add gbrain \
-     --env GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain \
-     --env OLLAMA_BASE_URL=http://localhost:8000/v1 \
-     --env OLLAMA_API_KEY=<your-oMLX-key> \
-     -- gbrain serve
-   ```
-   Restart the agent → it now has `mcp__gbrain__*` tools (`put_page`, `add_link`, `add_timeline_entry`, `search`, `query`).
-
-4. **Trigger the conversion** in the agent:
-   > *"Using the gbrain MCP tools, read `~/brain/sources/` and create structured two-layer pages per `docs/GBRAIN_RECOMMENDED_SCHEMA.md` — `put_page` each entity, `add_link` the typed edges, `add_timeline_entry` with a `source:` citation back to the raw file."*
-
-   The agent **generates** the pages via `put_page` — you review, you don't type them. (With the scaffolded skill loaded, the trigger phrase *"process this meeting transcript"* routes the same flow automatically.)
-
-> **Gotcha (MCP env):** forget the `--env` flags and `gbrain serve` starts but can't embed what it writes — silent until the first `put_page` fails. MCP servers are spawned processes; declare their env at `claude mcp add`, never assume your terminal's exports.
-> **Do NOT hand-author the pages** (BCJ Entry 4). The block below is the *shape the agent produces*, shown so you can review its output — not a template for you to fill 50× by hand.
-
-**The target shape the agent produces** (a `people/` page — you *read* these, the agent *writes* them):
+The raw→structured conversion is **not** a deterministic command (it's an LLM judgment — which entities, which directory, which typed edge), so it's done by the standalone agent in **Phase 6**, which emits pages shaped like:
 
 ```text
-<!-- ~/brain/people/alice.md  (written BY THE AGENT from a raw email/transcript) -->
 # Alice Chen
-
-Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]. Angel in
-[[companies/stripe]]. Primary contact for the [[deals/acme-seed]] round.
-
-- role: founder
-- works_at: [[companies/acme-ai]]
-
+Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]; angel in [[companies/stripe]].
 ---
 ## Timeline
-- 2026-05-12 — dinner; discussed [[deals/acme-seed]]. (source: [[meetings/dinner-2026-05-12]])
-- 2026-04-30 — angel check into [[companies/stripe]].
+- 2026-05-12 — dinner re [[deals/acme-seed]] (source: sources/transcripts/dinner.txt)
 ```
 
-Two-layer (*Compiled Truth* / `---` / *Timeline*); `[[dir/slug]]` wikilinks become typed edges via `extract links` (Phase 3). MECE directory rules live in each dir's `README.md` resolver; `examples/` has templates the agent follows.
+**Verification:** the raw fixtures exist under `~/brain/sources/`; the structured `people/…`, `companies/…`, `deals/…` pages appear only after the Phase 6 agent runs (then Phase 3 verifies the graph).
 
-> **Gotcha:** bare `[[alice]]` (no directory) doesn't resolve unless you enable basename linking — the agent should emit path-qualified `[[people/alice]]` so the graph wires out of the box.
+### Phase 3 — Verify the self-wiring graph [executed, measured]
 
-**Verification:** `gbrain list -n 10` shows agent-written pages; `gbrain get people/<slug>` on one — it has the two-layer `---` split + `[[dir/slug]]` wikilinks you did **not** hand-author. (`gbrain stats` for counts once Phase 3 imports/embeds.)
-
-### Phase 3 — Import, embed, wire the graph, verify (~1 hour)
-
-**Goal:** load the corpus, embed it (local oMLX from Phase 1), backfill the typed-link graph, and confirm the edges are deterministic.
+**Goal:** confirm the `[[wikilinks]]` the agent wrote (Phase 6) became typed graph edges — deterministically, with zero LLM calls. **Run after Phase 6** (it operates on the pages the agent produced).
 
 ```bash
-export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain   # if not already exported
-gbrain import ~/brain/               # imports + embeds (default). Large corpus → `import --no-embed` then `gbrain embed --stale`
-gbrain extract links --source db     # backfill typed edges from wikilinks (existing files)
-gbrain extract timeline --source db  # dated timeline events
-gbrain stats                         # pages · entities · links · embedded chunks
+export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
+gbrain extract links --source db     # backfill typed edges from the agent's wikilinks
+gbrain stats                         # pages · links · embedded chunks
+gbrain graph-query deals/acme-seed   # typed-edge traversal
 ```
 
-> **Gotcha:** importing *existing* markdown does **not** auto-wire the graph — `extract links` is the backfill. (Only pages written later via `gbrain put` auto-link.) If `gbrain stats` shows `links: 0`, you skipped this step.
-> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get` below).
+> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get`). `links: 0` means either you skipped `extract links` **or** the agent's pages had no wikilinks — the real failure we hit (BCJ Entry 5).
 
-Inspect one entity's wired edges:
+**Result (measured):** on the agent's output — **10 pages → `extract links` created 11 typed edges**. `gbrain graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5). **Deterministic:** re-running `extract` yields identical edges (regex/parser, zero LLM calls). The first run produced `links: 0` until the extraction prompt was made to mandate wikilinks (BCJ Entry 5) — *graph quality = extraction quality.*
 
-```bash
-gbrain graph-query people/alice --depth 2   # typed-edge traversal (works_at, attended, invested_in…)
-gbrain backlinks people/alice               # incoming links
-gbrain get people/alice                     # the page itself
-```
+### Phase 4 — Keyword vs hybrid-RRF benchmark [spec — not yet run]
 
-**Verification:** `gbrain stats` shows ~50 pages, 30+ people, 10+ companies, 50+ links; `graph-query people/alice` returns ≥5 typed edges that match your hand-trace. **Deterministic:** re-running `import` + `extract` yields identical edges (extraction is regex/parser, zero LLM calls).
-
-### Phase 4 — Keyword vs hybrid-RRF benchmark (~1.5 hours)
-
-**Goal:** measure the RRF lift on a labeled 10-query set.
+**Goal:** measure the RRF lift on a labeled 10-query set. *(Not executed — the corpus
+so far is the ~10-page demo brain, too small for a meaningful Recall@5 benchmark.
+Commands + method below for when the brain is larger.)*
 
 > **Spec correction:** GBrain has no `--mode vector-only|rrf`. `query` is *always* hybrid (vector + keyword + RRF + query expansion); `search` is keyword-only (tsvector). The honest A/B is **`search` vs `query`**. `--mode` selects the cost tier (`conservative|balanced|tokenmax`); `--limit` sets K (default 20); `--explain` shows per-stage scoring.
 
@@ -467,9 +412,11 @@ gbrain query  "investments in fintech companies" --limit 5 --explain
 
 **Deliverable:** `~/brain/outputs/rrf_benchmark.md` — a 10-query × {`search`, `query`} Recall@5 table.
 
-### Phase 5 — Synthesis layer + "what we don't know" check (~30 min)
+### Phase 5 — Synthesis layer + "what we don't know" check [spec — not yet run]
 
-**Goal:** confirm the synthesis layer flags gaps instead of fabricating.
+**Goal:** confirm the synthesis layer flags gaps instead of fabricating. *(Not
+executed — we ran `query` and got a correct cited answer (Phase 6, score 0.93),
+but did not run the deliberate gap/absent-fact test below.)*
 
 ```bash
 gbrain ask "what did Alice do on 2026-06-15?"   # `ask` = alias for `query`; that date is absent from the corpus
@@ -480,7 +427,12 @@ gbrain query "Alice" --no-expand                 # --no-expand skips LLM query e
 
 **Verification:** the answer surfaces the gap explicitly **and** cites brain pages for what it *does* know; it does not invent a 2026-06-15 event.
 
-### Phase 6 — A future agent uses GBrain as memory over MCP (~1.5 hours)
+### Phase 6 — A future agent uses GBrain as memory over MCP [executed, measured]
+
+> **This is the ingestion engine for the whole lab.** It converts the Phase 2 raw
+> fixtures into structured pages; Phase 3 then verifies the graph it wired. (Logically
+> it runs *before* Phase 3 — kept at number 6 so the heavy code stays in one place.)
+
 
 **Goal:** the transferable skill behind this whole chapter — a **standalone agent
 you build** (here: smolagents, *not* Claude Code) uses GBrain as its memory layer
