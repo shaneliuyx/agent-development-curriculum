@@ -34,13 +34,13 @@ estimated_time: "~5-7 hours"
 
 ---
 
-## 1. Why This Week Matters (~150 words — REQUIRED)
+## 1. Why This Week Matters 
 
 W3.5.9 introduced the three-class memory taxonomy (1-tier atomic-fact / 2-tier consolidation / 3-tier graph) + HyperMem L3 as the worked-example graph-tier implementation. GBrain — built by Garry Tan (Y Combinator CEO) to run his actual agents — introduces a 4th class: MARKDOWN-FIRST, deterministic-extraction graph. The thesis: most agent memory is ALREADY structured (people, companies, events, meetings). Markdown can carry that structure NATIVELY; deterministic regex + parser passes can extract typed edges with ZERO LLM calls. Result: reproducible, auditable, cheap entity graphs. Measured production impact: 83% → 95% Recall@5 via HNSW + Postgres keyword RRF on a 240-page corpus. Powers Garry Tan's OpenClaw + Hermes deployments at 146K-page scale. For local-first engineers, GBrain is the "production memory layer you can self-host on $5/mo Postgres." Engineers who can articulate "deterministic extraction beats LLM extraction when the data structure is already known" move 10× faster than engineers who reflexively LLM-extract everything.
 
 ---
 
-## 2. Theory Primer (~1000 words — REQUIRED)
+## 2. Theory Primer
 
 ### 2.1 The deterministic-Markdown thesis
 
@@ -119,7 +119,7 @@ This is a Y Combinator CEO's actual operational memory layer; not a research dem
 
 ---
 
-## 3. System Architecture (REQUIRED — Mermaid)
+## 3. System Architecture 
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -142,27 +142,171 @@ flowchart TD
 
 ### Phase 1 — Install GBrain + provision Postgres (~1 hour)
 
+> **Engine choice.** GBrain ships two storage engines (`docs/ENGINES.md`): **PGLite**
+> (embedded Postgres via WASM, the zero-config default — `gbrain init`, no server) and
+> **Postgres + pgvector** (the scale path). This lab uses the **Postgres engine** so you
+> exercise the production wiring; the DB runs in a throwaway Docker container.
+> Note GBrain is a **Bun + TypeScript** CLI (not Python), and its embeddings are
+> **hosted** (ZeroEntropy default, or OpenAI/Voyage) — not local MLX. Without an
+> embedding key, keyword search still works.
+
 ```bash
-# Postgres + pgvector
-brew install postgresql@16
-brew services start postgresql@16
-psql -c "CREATE DATABASE gbrain;"
-psql -d gbrain -c "CREATE EXTENSION vector;"
+# 1) Bun runtime (GBrain is a Bun + TypeScript CLI — no Python/uv/pip)
+curl -fsSL https://bun.sh/install | bash
+export PATH="$HOME/.bun/bin:$PATH"
 
-# Clone GBrain
+# 2) Postgres + pgvector via Docker. OrbStack supplies the Docker engine on macOS
+#    (`brew install orbstack`, then the standard `docker` CLI — no Docker Desktop).
+docker run -d --name gbrain-pg \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain \
+  -p 5432:5432 \
+  pgvector/pgvector:pg16            # the same image GBrain's own CI uses; ships pgvector
+# wait until it accepts connections, then ensure the extension (init also creates it)
+until docker exec gbrain-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+docker exec gbrain-pg psql -U postgres -d gbrain -c "CREATE EXTENSION IF NOT EXISTS vector;"
+# teardown:  docker rm -f gbrain-pg   (data is ephemeral — re-run to reset)
+
+# 3) Install GBrain. Deterministic clone path (robust for a lab; the README's
+#    `bun install -g github:garrytan/gbrain` also works — see INSTALL_FOR_AGENTS.md).
 cd ~/code/agent-prep
-git clone https://github.com/garrytan/gbrain.git    # adjust org if different
-cd gbrain
-uv venv && source .venv/bin/activate
-pip install -e .
+git clone https://github.com/garrytan/gbrain.git
+cd gbrain && bun install && bun link    # `gbrain` now on PATH
 
-# Configure
-cp .env.example .env
-# Set: DATABASE_URL=postgresql://localhost/gbrain
-# Set: EMBEDDING_MODEL=mlx-community/bge-m3-en
+# 4) Point GBrain at the Postgres engine + create the schema
+export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
+gbrain init --supabase                  # `--supabase` selects the Postgres engine
+                                        # (named for its origin; works with any pgvector Postgres)
+
+# 5) Embedding provider (hosted). Pick one; without a key, keyword search still works.
+export OPENAI_API_KEY=sk-...            # or:  export ZEROENTROPY_API_KEY=ze-...
+gbrain config set embedding_model openai:text-embedding-3-small
 ```
 
-**Verification:** `gbrain status` returns "OK — 0 pages ingested."
+**Verification:** `gbrain doctor` — all checks pass (engine reachable, schema migrated, embedding provider resolved).
+
+#### Detailed walkthrough
+
+Each step below = command + what it does + how to confirm + the gotcha that bites. Canonical sources in the repo: `INSTALL_FOR_AGENTS.md` (9-step), `docs/ENGINES.md`, `docs/GBRAIN_VERIFY.md`.
+
+**1. Bun runtime.** GBrain's `package.json` declares `engines: { bun: ">=1.3.10" }` and `bin: { gbrain: "src/cli.ts" }` — it runs on Bun, not Node, not Python.
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+export PATH="$HOME/.bun/bin:$PATH"      # add to ~/.zshrc so it survives new shells
+bun --version                           # must be ≥ 1.3.10
+```
+
+> **Gotcha:** if `bun` or later `gbrain` is "command not found," the PATH export didn't reach your profile — restart the shell or append the export to `~/.zshrc`.
+
+**2. Postgres + pgvector container (OrbStack).** OrbStack is a lightweight Docker-engine replacement for macOS; once it's running the commands are plain `docker`.
+
+```bash
+brew install orbstack                    # one-time; starts the Docker engine
+docker run -d --name gbrain-pg \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain \
+  -p 5432:5432 \
+  -v gbrain-pgdata:/var/lib/postgresql/data \   # named volume → survives restarts
+  pgvector/pgvector:pg16
+until docker exec gbrain-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+docker exec gbrain-pg psql -U postgres -d gbrain -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+> **Gotcha (port conflict):** GBrain's own CI deliberately maps Postgres to ports 5434–5437 because 5432/5433 are "manual / sibling-project" ports that often clash. If `docker run` fails with "port already allocated," map a free host port (`-p 5433:5432`) and put that port in the `GBRAIN_DATABASE_URL` below.
+> **Gotcha (readiness):** `docker run -d` returns when the container *starts*, not when Postgres *accepts connections* — the `until pg_isready` loop is what stops the next command racing the DB boot. Without it, `CREATE EXTENSION` fails intermittently.
+> **Persistence:** the `-v gbrain-pgdata:` named volume keeps data across `docker restart`. Drop it for a pure throwaway; full reset is `docker rm -f gbrain-pg && docker volume rm gbrain-pgdata`.
+
+**3. Install the GBrain CLI.** The deterministic clone path is the most robust for a lab; the README's `bun install -g github:garrytan/gbrain` is the one-liner alternative.
+
+```bash
+cd ~/code/agent-prep
+git clone https://github.com/garrytan/gbrain.git
+cd gbrain && bun install && bun link     # compiles deps, puts `gbrain` on PATH
+gbrain --version                         # prints a version (e.g. 0.42.x)
+```
+
+> **Gotcha (#218):** Bun occasionally blocks the global-install postinstall hook, so schema migrations don't auto-run and `gbrain doctor` reports `schema_version: 0`. Fix: `gbrain apply-migrations --yes`. The deterministic clone+`bun link` path above avoids it.
+
+**4. Configure via `.env`, then create the schema.** GBrain runs on Bun, which **auto-loads `.env`** from the working directory — so put settings in a file instead of `export`-ing each shell (the repo ships `.env.testing.example` as precedent). The `PostgresEngine` reads `GBRAIN_DATABASE_URL` (pooler override: `GBRAIN_DIRECT_DATABASE_URL`).
+
+##### The `.env` file (copy-paste)
+
+Create `~/code/agent-prep/gbrain/.env` with the block below, then fill the two
+`<…>` placeholders. **Required** = the lab won't run without it; **optional** =
+enables vector/hybrid search and query expansion (skip and you still get keyword
+search). `.env` holds secrets — it's already in GBrain's `.gitignore`; never commit it.
+
+```bash
+cat > ~/code/agent-prep/gbrain/.env <<'EOF'
+# ─── REQUIRED ────────────────────────────────────────────────────────────────
+# Postgres engine = the Docker container from step 2
+GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
+
+# ─── EMBEDDINGS (required for vector/hybrid search; pick ONE provider) ────────
+# Default: oMLX, local, OpenAI-compatible (curriculum's "embeddings stay local").
+LLAMA_SERVER_BASE_URL=http://localhost:8000/v1     # oMLX endpoint
+LLAMA_SERVER_API_KEY=<your-oMLX-key>               # oMLX needs a real key
+#   alt — ollama (local, free):   OLLAMA_BASE_URL=http://localhost:11434/v1
+#   alt — hosted OpenAI:          OPENAI_API_KEY=sk-...
+#   alt — hosted ZeroEntropy:     ZEROENTROPY_API_KEY=ze-...
+
+# ─── CHAT / QUERY EXPANSION (optional; sharpens search) ──────────────────────
+# VibeProxy = OpenAI-compatible proxy → Haiku. Routes the chat/LLM calls only
+# (it canNOT do embeddings — Anthropic has no /v1/embeddings).
+OPENROUTER_API_KEY=dummy                           # VibeProxy ignores it; any non-empty value
+OPENROUTER_BASE_URL=http://localhost:8317/v1       # VibeProxy port
+#   alt — direct Anthropic:       ANTHROPIC_API_KEY=sk-ant-...
+
+# ─── OPTIONAL OVERRIDES ──────────────────────────────────────────────────────
+# GBRAIN_DIRECT_DATABASE_URL=postgresql://...       # bypass a pooler for DDL/bulk
+EOF
+```
+
+Init the Postgres engine, **fixing the embedding model at init time** (it can't be changed later — step 5):
+
+```bash
+gbrain init --supabase \
+  --embedding-model llama-server:bge-m3 \
+  --embedding-dimensions 1024            # MUST equal your oMLX embed model's width
+# `--supabase` selects the Postgres engine (works with ANY pgvector Postgres),
+# runs the DDL (pgvector ext, pg_trgm, tables, triggers, HNSW index), and applies
+# a default search mode. Zero-config alternative: `gbrain init` → embedded PGLite.
+gbrain providers test --model llama-server:bge-m3   # smoke-test the oMLX endpoint
+```
+
+**5. Providers — the local-first / VibeProxy split.** GBrain uses providers for two *different* jobs that proxy differently:
+
+- **Embeddings** need an embedding-capable endpoint. **VibeProxy can NOT serve these** — it proxies to Claude/Haiku, and Anthropic has no `/v1/embeddings`. Use a real embedder:
+  - **Local (recommended, $0 — the W3.5.9 "embeddings stay local" pattern):** point GBrain's `llama-server` provider at **oMLX** (OpenAI-compatible) — `LLAMA_SERVER_BASE_URL=http://localhost:8000/v1` + `LLAMA_SERVER_API_KEY`, then `--embedding-model llama-server:<oMLX-model> --embedding-dimensions <N>` (N = the model's real width: bge-m3 1024, nomic 768). oMLX must expose `/v1/embeddings` with an embedding model loaded. Alternative: `ollama:nomic-embed-text` (768d, free). Smoke-test either with `gbrain providers test --model <provider:model>`.
+  - **Hosted:** `openai:text-embedding-3-small` (1536d) or ZeroEntropy — match `--embedding-dimensions`.
+  - **Gotcha:** the embedding model is baked into the vector-column width, so `gbrain config set embedding_model` is **refused**. Choose it at `init`; change later only via `gbrain reinit-pglite …` (PGLite) or `docs/embedding-migrations.md` (Postgres).
+- **Chat / query expansion** (optional, sharpens search): **VibeProxy works here** — it's OpenAI-compatible. Route it through the `openrouter` provider, explicitly designed to "point at a self-hosted OR-compatible proxy": `OPENROUTER_BASE_URL=http://localhost:8317/v1` (in the `.env` above) + an `openrouter:<model>` chat model.
+
+> **So "can VibeProxy replace OpenAI?" — half.** Yes for the chat/LLM calls; no for embeddings (Anthropic has no embedding endpoint). Keep embeddings on a local embedder (oMLX/ollama). With no embedding provider at all, keyword (BM25/tsvector) search still works.
+
+**6. Confirm the search mode (controls per-query cost).** `gbrain init` auto-applies a mode; do NOT silently accept it — the corner-to-corner cost spread is ~25×. For a budget-capped lab, `balanced` is the sane middle.
+
+```bash
+gbrain config set search.mode balanced   # conservative | balanced | tokenmax
+gbrain search modes                      # confirm the active mode
+```
+
+| mode | budget | LLM expansion | chunks | fits |
+|------|--------|---------------|--------|------|
+| conservative | 4K | off | 10 | Haiku / high-volume / cost-sensitive |
+| balanced | 12K | off | 25 | Sonnet-tier sweet spot |
+| tokenmax | none | on | 50 | Opus / frontier, max recall |
+
+**7. Verify the install** (`docs/GBRAIN_VERIFY.md`):
+
+```bash
+gbrain doctor --json     # connection (N pages) · pgvector installed · rls enabled ·
+                         # schema_version current · embeddings coverage %
+gbrain check-update --json
+```
+
+All checks should read `"ok"`. If `pgvector` fails, step 2's `CREATE EXTENSION` didn't run; if `schema_version: 0`, run `gbrain apply-migrations --yes` (gotcha #218).
+
+> **Your brain ≠ this repo.** The cloned `gbrain/` is the *tool*. Your actual notes live in a *separate* brain repo (`mkdir ~/brain && cd ~/brain && git init`), organized MECE — `people/ companies/ concepts/ …` per `docs/GBRAIN_RECOMMENDED_SCHEMA.md`. That corpus is Phase 2.
 
 ### Phase 2 — Prepare 50-page Markdown corpus (~1 hour)
 
