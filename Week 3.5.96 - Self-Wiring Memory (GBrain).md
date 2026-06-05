@@ -1064,7 +1064,8 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 | --------------------------------------------------------- | ----------------------------------------------------------------- |
 | Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                  |
 | 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` |
-| Run dies on file 4,000 = lose everything                  | per-file disk checkpoint (`~/brain/.ingest_stage/<file>.json`) → resume |
+| Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done |
+| One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent   |
 | Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)          |
 | Wasted embedding on throwaway staging                     | stage on DISK (no embed); GBrain embeds only canonical → **each entity embedded ONCE** |
 | Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)         |
@@ -1074,6 +1075,7 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 - **Staging is on DISK** (`~/brain/.ingest_stage/<file>.json`), **not in GBrain** — so the throwaway intermediate is never embedded. A staged file IS the per-file checkpoint: re-run skips files already staged (`rm -rf` the dir to restart).
 - **`merge_from_disk()`** groups staged pages by entity across files, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), and yields canonical pages.
 - The **agent writes only the CANONICAL pages** via `put_page` over MCP, in bounded batches → **each entity embedded exactly once**. (The agent still uses GBrain as memory — it writes the finals and queries them; only the disposable staging left the store.)
+- A **write checkpoint** (`~/brain/.ingest_written.json`) records written canonical slugs, marked after each batch lands. A resumed run re-embeds **only un-written pages**, so "embed once" survives a crash — not just an uninterrupted run. Oversized pages (> `BIG_PAGE_CHARS`) skip the agent and write **driver-side** (no 30s limit on a single big embed).
 - Then **`reconcile_graph()`** wires the `[[wikilinks]]`.
 
 ```mermaid
@@ -1114,13 +1116,22 @@ The "agent uses GBrain as memory" lesson is intact: the agent still WRITES the
 canonical pages and QUERIES them over MCP. Only the throwaway intermediate left
 the embedded store.
 
-Run: python src/resumable_ingest.py   (re-run to resume; rm -rf ~/brain/.ingest_stage to restart)
+Two checkpoints, both on disk, so resume re-does no expensive work:
+  - EXTRACTION: a file with a stage JSON is skipped (no re-extract).
+  - WRITES: ~/brain/.ingest_written.json records written canonical slugs, so a
+    resumed run re-embeds ONLY un-written pages — "embed once" survives a crash.
+Oversized pages (> BIG_PAGE_CHARS) are written driver-side (no 30s sandbox) since
+one such page's single embed could approach the agent's per-step limit.
+
+Run: python src/resumable_ingest.py   (re-run to resume)
+Restart from scratch: rm -rf ~/brain/.ingest_stage ~/brain/.ingest_written.json
 """
 from __future__ import annotations
 
 import json
 import os
 import pathlib
+import subprocess
 
 from mcp import StdioServerParameters
 from openai import OpenAI
@@ -1132,7 +1143,9 @@ from ingest_agent import (
 
 SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
 STAGE_DIR = pathlib.Path(os.path.expanduser("~/brain/.ingest_stage"))   # disk staging
+WRITTEN = pathlib.Path(os.path.expanduser("~/brain/.ingest_written.json"))  # write checkpoint
 BATCH = 8                 # canonical pages per agent write call (bounded < 30s)
+BIG_PAGE_CHARS = 8000     # bigger pages are written driver-side (one page's embed may near 30s)
 
 _CURRENT: list = []       # the current write batch; the agent's tool reads this
 
@@ -1154,6 +1167,25 @@ def _files() -> list[tuple[str, str]]:
 def _llm() -> OpenAI:
     return OpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
                   api_key=os.getenv("LLM_API_KEY", "dummy"))
+
+
+# ── write checkpoint (so a resumed run re-embeds only un-written pages) ──────
+def _written_done() -> set[str]:
+    if WRITTEN.exists():
+        return set(json.loads(WRITTEN.read_text()).get("done", []))
+    return set()
+
+
+def _mark_written(slugs: list[str]) -> None:
+    done = _written_done() | set(slugs)
+    WRITTEN.write_text(json.dumps({"done": sorted(done)}))
+
+
+def _gbrain_put(slug: str, content: str) -> None:
+    """Driver-side write (no 30s sandbox) — used for oversized pages whose single
+    embed could approach the agent's per-step limit."""
+    subprocess.run([_GBRAIN, "put", slug], input=content, capture_output=True,
+                   text=True, env=_server_env())
 
 
 # ── per-file extraction → DISK staging (no embedding) ───────────────────────
@@ -1249,12 +1281,27 @@ def main() -> None:
             tools=[current_pages, *mcp_tools], model=model, max_steps=3,
             use_structured_outputs_internally=True, verbosity_level=1)
 
-        # 3. WRITE canonical pages to GBrain via the agent, in bounded batches
-        # (each page embedded EXACTLY ONCE — staging never touched the store).
-        for i in range(0, len(canonical), BATCH):
-            _CURRENT = canonical[i:i + BATCH]
-            print(f">>> write batch {i // BATCH + 1} ({len(_CURRENT)} pages) -> "
+        # 3. WRITE canonical pages to GBrain — embedded EXACTLY ONCE, and the
+        # write checkpoint means a resumed run re-embeds only un-written pages.
+        written = _written_done()
+        pending = [p for p in canonical if p["slug"] not in written]
+        print(f">>> {len(canonical)} canonical, {len(canonical) - len(pending)} "
+              f"already written (resume), {len(pending)} to write")
+
+        # Oversized pages → driver-side (a single big embed could near the 30s
+        # sandbox limit); normal pages → agent, in bounded batches.
+        big = [p for p in pending if len(p["content"]) > BIG_PAGE_CHARS]
+        small = [p for p in pending if len(p["content"]) <= BIG_PAGE_CHARS]
+        for p in big:
+            _gbrain_put(p["slug"], p["content"])
+            _mark_written([p["slug"]])
+            print(f">>> big page driver-side: {p['slug']} ({len(p['content'])} chars)")
+        for i in range(0, len(small), BATCH):
+            batch = small[i:i + BATCH]
+            _CURRENT = batch
+            print(f">>> write batch {i // BATCH + 1} ({len(batch)} pages) -> "
                   + str(agent.run(WRITE_TASK)))
+            _mark_written([p["slug"] for p in batch])   # checkpoint AFTER the batch lands
 
         # 4. RECONCILE links, then the agent queries its memory.
         print(">>> reconcile graph: " + reconcile_graph())
@@ -1270,7 +1317,7 @@ if __name__ == "__main__":
 - **Block 1 — `_files()` skips dotted *path parts*, not just dotted filenames.** A real source directory accumulates `.DS_Store` (binary → `UnicodeDecodeError`) and, here, `.omc-state/` *directories* a tool wrote in. Skipping `f.name.startswith(".")` misses files *inside* a dotted dir; `any(part.startswith("."))` over the relative parts catches both (BCJ Entry 13).
 - **Block 2 — extraction is driver-side, writes are agent-side.** `extract_file` runs in `main()` (no sandbox), so the ~per-file LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
 - **Block 3 — disk staging defers the dedup AND keeps it out of the embedded store.** Each file's pages go to `~/brain/.ingest_stage/<file>.json` — no embedding. `merge_from_disk` groups by base slug across files; only entities in >1 file pay an LLM merge, singletons pass through. GBrain only ever sees the canonical result.
-- **Block 4 — staged files are the resumability contract.** A file whose stage JSON exists is skipped on re-run, so an interrupted run re-extracts only the unfinished files. The agent's canonical `put_page` writes are idempotent, so re-running the write phase is safe too.
+- **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file (skip staged files); writes are checkpointed per canonical slug (`.ingest_written.json`, marked after each batch). Both expensive ops — the per-file LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
 
 **Result (measured, 8-file corpus, 2026-06-05):**
 
@@ -1283,13 +1330,21 @@ staging_in_db = 0          # the throwaway staging never hit the embedded store
 query -> people/sam-okafor (top hit)
 ```
 
-**0 sandbox timeouts; embedding calls 65 → 18.** Two proofs the design is right: (1) **`14 merged from 19 entities`** — 14 entities spanned multiple files and were consolidated into one canonical page each (the cross-file dedup one-big-prompt did implicitly, now explicit in `merge_from_disk`); (2) **`staging_in_db = 0`** — the disposable per-file variants never touched GBrain, so each entity is embedded exactly once instead of once-per-file-mention. Re-running skips files already staged on disk.
+**0 sandbox timeouts; embedding calls 65 → 18.** Two proofs the design is right: (1) **`14 merged from 19 entities`** — 14 entities spanned multiple files and were consolidated into one canonical page each (the cross-file dedup one-big-prompt did implicitly, now explicit in `merge_from_disk`); (2) **`staging_in_db = 0`** — the disposable per-file variants never touched GBrain, so each entity is embedded exactly once instead of once-per-file-mention.
+
+**Resume proof (write checkpoint):**
+```text
+run #1:  18 canonical, 0 already written, 18 to write   → .ingest_written.json = 18 slugs
+run #2:  18 canonical, 18 already written (resume), 0 to write   → 0 write batches, 0 re-embeds
+```
+The second run re-embeds nothing — "embed once" holds across a crash, not just an uninterrupted run.
 
 `★ Insight ─────────────────────────────────────`
 - **At scale the 30s sandbox was a red herring.** The real walls are the *extraction context limit*, *cross-file dedup*, and *embedding throughput*. Moving extraction to the driver dissolves the timeout as a side effect; the architecture is driven by those three, not by the sandbox.
 - **Staging belongs in a cheap, disposable layer — not the embedded store.** v1 staged into GBrain and embedded every file-variant, then deleted them at merge: ~71% wasted embedding (65 calls for 18 final pages). Disk staging drops that to 18 — embed only the canonical. Don't make a throwaway intermediate pay the final state's cost; embedding is the one expensive op here, so optimize against *embedding count*, not DB writes.
 - **`merge_from_disk` is the dedup-on-write pattern, deferred.** "Entity in file 7 already exists from file 2 → merge" is exactly `dedup_synthesis.decide_action` (W3.5.8/3.5.9). Batched post-pass vs on-every-write trades freshness for far fewer LLM calls — only multi-file entities merge. Same lesson, different lifecycle position ([[Engineering Decision Patterns#Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)|Pattern 22]]).
 - **The teaching point survives the optimization.** The agent still writes the canonical pages and queries them over MCP — it uses GBrain as memory. Only the disposable staging moved to disk. Efficiency and the "agent-uses-GBrain" lesson aren't in tension; the *query* is what needs GBrain, and that never moved.
+- **Checkpoint at the unit of *expensive work*, not just the loop boundary.** The first cut checkpointed only extraction (per file) and leaned on `put_page` idempotency for the rest — but idempotent ≠ free: a resumed write re-embeds everything. The fix was a *second* checkpoint at the write/embed boundary. Rule: every expensive op needs its own resume marker; "the writes are idempotent" hides a full re-embed behind a true-but-irrelevant claim.
 `─────────────────────────────────────────────────`
 
 **Deliverable:** `src/resumable_ingest.py` + the measured run above (also in the lab's `RESULTS.md`).
@@ -1346,6 +1401,10 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything).
 *Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free."
 *Fix:* per-file streaming + **disk** staging (no embedding) + a final `merge_from_disk()` (the deferred dedup-on-write) + agent writes only canonical pages (embedded once) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, embeds each entity once, scales with file count.
+
+**Entry 15 — a resumed bulk-ingest silently re-embeds everything (OBSERVED, Phase 8).** The first resumable cut checkpointed only EXTRACTION (per file); the write phase relied on `put_page` idempotency. A crash mid-write → resume re-writes ALL canonical → every page embedded a *second* time, quietly negating "embed once."
+*Root cause:* **idempotent ≠ resumable.** Re-running is *correct* but not *cheap* — the expensive op (embedding) had no resume marker, only the outer extraction loop did.
+*Fix:* a write checkpoint `~/brain/.ingest_written.json` (written canonical slugs), marked after each batch; the write loop skips done slugs. Proven: a resumed run does **0 write batches, 0 re-embeds**. Checkpoint every *expensive* op, not just the outer loop — "the writes are idempotent" hides a full re-embed behind a true-but-irrelevant claim.
 
 _Projected (to confirm during Phases 3–6):_
 
