@@ -1061,17 +1061,17 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 
 **The large-file architecture at a glance — each scale problem maps to one mechanism:**
 
-| Scale problem                                             | Solution                                                          |
-| --------------------------------------------------------- | ----------------------------------------------------------------- |
-| Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                  |
-| One *file* too big for the extract context                | split into deterministic line-aligned chunks `<file>#0/#1/…` (`CHUNK_CHARS`); resume per chunk |
+| Scale problem                                             | Solution                                                                                                                                                                        |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                                                                                                                                |
+| One *file* too big for the extract context                | split into deterministic line-aligned chunks `<file>#0/#1/…` (`CHUNK_CHARS`); resume per chunk                                                                                  |
 | 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` (the 30s is `executor_kwargs={"timeout_seconds": N}`-configurable, but a no-kill thread timeout — see BCJ 12) |
-| Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done |
-| One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent   |
-| Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)          |
-| Resume re-runs the (LLM) merge every time                 | cache merged canonical (`.ingest_merged.json`) keyed by a stage fingerprint → unchanged stage = skip re-merge |
-| Wasted embedding on throwaway staging                     | stage on DISK (no embed); GBrain embeds only canonical → **each entity embedded ONCE** |
-| Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)         |
+| Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done                                         |
+| One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent                                                                                                                 |
+| Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)                                                                                                                        |
+| Resume re-runs the (LLM) merge every time                 | cache merged canonical (`.ingest_merged.json`) keyed by a stage fingerprint → unchanged stage = skip re-merge                                                                   |
+| Wasted embedding on throwaway staging                     | stage on DISK (no embed); GBrain embeds only canonical → **each entity embedded ONCE**                                                                                          |
+| Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)                                                                                                                       |
 
 **The shape:** stream **per file**, stage on **disk**, merge, then write **only canonical** pages to GBrain.
 - **Extraction is driver-side** (no 30s sandbox). A file bigger than the extract context is **split into deterministic, line-aligned chunks** `<file>#0/#1/…` (`CHUNK_CHARS`); a small file is just a 1-chunk file. So "many files" and "one huge file" are the same problem — the unit is a *chunk*.
@@ -1530,9 +1530,11 @@ agent = CodeAgent(tools=[...], model=model,
                   executor_kwargs={"timeout_seconds": 120})   # raise it; or None to disable
 ```
 Two reasons we still move the slow work out of the sandbox instead of bumping: (1) it's a **thread timeout with no kill** — on timeout it raises `ExecutionTimeoutError` but the runaway thread keeps running in the background (Python can't force-kill a thread), so a bigger number just lets slow code *finish*, it adds no real preemption (and it's the *local* executor only; a remote E2B/Docker executor has its own). (2) A bigger timeout solves *nothing* of the actual scale walls — extraction context limit, cross-file dedup, embed-once, resume — and extraction time varies with corpus + model, so you'd keep chasing the number. Moving extraction driver-side makes the timeout value **irrelevant** and is required for the other walls anyway.
+
 **Entry 13 — ingest crashes on `.DS_Store` / picks up `.omc-state/` as "files" (OBSERVED, Phase 8).** `read_sources` threw `UnicodeDecodeError` on a binary `.DS_Store`; the resumable driver also checkpointed two `.omc-state-*` entries (0 pages each).
 *Root cause:* the walk skipped dotted *filenames* but rglob descended into dotted *directories* and grabbed the non-dotted files inside; binary files aren't UTF-8.
 *Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
+
 **Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything).
 *Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free."
 *Fix:* per-file streaming + **disk** staging (no embedding) + a final `merge_from_disk()` (the deferred dedup-on-write) + agent writes only canonical pages (embedded once) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, embeds each entity once, scales with file count.
@@ -1553,12 +1555,12 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 *Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't.
 *Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
 
-_Projected (to confirm during Phases 3–6):_
+_Projected before the runs — **resolved** after Phases 3–6 executed (most did NOT occur; the real failures are the observed entries above):_
 
-- **Phase 3 — Agent over-relies on GBrain for general knowledge.** Likely surface: agent uses GBrain context for questions GBrain shouldn't know (general world facts). Fix: agent prompt distinguishes "questions about MY people/companies/events" (use GBrain) vs "general questions" (use base LLM knowledge).
-- **Phase 4 — Markdown convention mismatch.** Likely surface: your `# Meeting with Alice` doesn't trigger the `attended` edge because GBrain's parser expects `# Dinner with @alice`. Fix: read GBrain's parser regex; adopt the `@handle` convention consistently.
-- **Phase 5 — Synthesis layer hallucinates a "we don't know" caveat that's wrong.** Likely surface: gap-flagging logic uses a heuristic that triggers on missing entities even when the answer IS in the corpus. Fix: synthesis prompt includes the retrieved citations explicitly; gap-flag triggers only when retrieval returned zero matches.
-- **Phase 6 — RRF lift smaller than 12pts.** Likely surface: corpus too short OR queries too name-specific (both retrievers already agree). Fix: expand corpus to 200+ pages OR pick queries with mix of semantic + exact-phrase types.
+- **Phase 3 — Agent over-relies on GBrain for general knowledge.** ✗ **Did not occur.** The actual Phase-3 failures were different and more basic: zero graph edges (Entry 5) and the autonomous `CodeAgent` crashing on a 14B (Entry 6). Over-reliance on general knowledge never surfaced at this scale; the closest test — the Ground-Truth A/B (Phase 7) — showed the agent answering *from* the brain, the desired behavior.
+- **Phase 4 — Markdown convention mismatch (`@handle`).** ✗ **Did not occur.** The agent emits path-qualified `[[dir/slug]]` wikilinks, which GBrain's parser extracts directly — no `@handle` convention needed (45 edges materialized). The real Phase-4 issue was unrelated: MCP `put_page` skips inline auto-link, so the graph needs an `extract links --source db` reconcile pass (Entry 7).
+- **Phase 5 — Synthesis hallucinates a wrong "we don't know."** ✗ **Did not occur.** Gap-honesty worked as designed: an absent date returned an explicit "no information," while a present fact answered with score 0.93 (Phase 5 §Verification). No false abstention observed.
+- **Phase 6 — RRF lift smaller than 12pts.** ✓ **Confirmed — and stronger than projected.** Not merely a smaller lift: on the small, semantic-heavy corpus **pure vector beat hybrid-RRF outright** (Entry 9). The projected cause (corpus too short / queries converge) was right; the remediation (larger, exact-term-heavy corpus) stands.
 
 ---
 
