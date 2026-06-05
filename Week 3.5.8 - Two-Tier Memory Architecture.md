@@ -1,7 +1,7 @@
 ---
 title: Week 3.5.8 — Two-Tier Memory Architecture (guild + EverCore)
 created: 2026-05-11
-updated: 2026-05-26
+updated: 2026-06-05
 tags:
   - agent
   - memory
@@ -4236,7 +4236,7 @@ The bitemporal extension splits the contradiction action into three:
 | Action | Old fact's truth status | Storage outcome |
 |---|---|---|
 | `update` | False (was always wrong, same world-state) | Old hard-deleted, new replaces it. Single truth. |
-| `supersede` | True at t₀, no longer true at t₁ (state evolved) | Old marked `superseded_by`, new pointer-linked. Both retained for audit (Step 3 wires soft-delete; Step 1+2 ship hard-delete + metadata pointer). |
+| `supersede` | True at t₀, no longer true at t₁ (state evolved) | Old soft-deleted (payload-patched `superseded_by`), new pointer-linked. Both retained for audit; superseded facts filtered from live recall by default (soft-delete WIRED 2026-06-05; was hard-delete + metadata pointer in Step 1+2). |
 | `coexist` | True under a different scope (e.g. web auth vs M2M API) | Both retained as separate facts, `relates_to` cross-link added. |
 | `delete` | False (hallucination, never true) | Old hard-deleted, new replaces it. Rare; prefer supersede on temporal ambiguity. |
 
@@ -4244,7 +4244,7 @@ Three load-bearing claims this extension makes:
 
 1. **The classifier can distinguish update from supersede if and only if it sees timestamps.** Step 2 wires `timestamp` into every Qdrant payload (and surfaces existing `created_at` on the EverCore side); Step 1 teaches the prompt to read the temporal gap. Together they're one delivery — neither alone moves the classification rate.
 2. **`coexist` is the action most flat-write systems lack entirely.** Naive dedup classifies "API keys never expire" against "auth tokens last 30 min" as `delete` (contradiction). With `coexist`, the system learns scope is a first-class dimension orthogonal to time — preserves both facts under distinct contexts.
-3. **The Step 3 swap is contract-free.** Until soft-delete (`_qdrant_supersede` payload-patch) lands, supersede uses hard-delete + `supersedes` pointer in the new fact's metadata. Downstream chain traversal walks forward through `supersedes` edges. Step 3 swaps `_qdrant_delete(old)` → `_qdrant_supersede(old, new_id)` at one call site — zero changes to `decide_action`, `DedupAction`, prompt, or callers.
+3. **The Step 3 swap was contract-free (confirmed when it landed).** Step 1+2 shipped supersede as hard-delete + a `supersedes` pointer in the new fact's metadata (forward-only chain). Step 3 (wired 2026-06-05) swapped `_qdrant_delete(old)` → imprint-new-first + `_qdrant_supersede(old, {superseded_by: new_id, …})` at one call site — zero changes to `decide_action`, `DedupAction`, prompt, or callers, exactly as predicted. The chain is now bidirectional (`supersedes` ⇄ `superseded_by`).
 
 #### Bundle A — Prompt + DedupAction extension (`src/dedup_synthesis.py`)
 
@@ -4485,12 +4485,11 @@ def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
         return counts
 
     if action.action == "supersede" and action.target_id:
-        # NOTE (Step 3 deferred): hard-delete + supersedes-pointer for now.
-        # Step 3 swaps `_qdrant_delete` -> payload-patch with zero contract
-        # change at this layer. Classification IS preserved via the new
-        # fact's `supersedes` pointer metadata, so chain traversal still
-        # walks forward — just can't recover old content yet.
-        _qdrant_delete(tm, [action.target_id])
+        # Step 3 WIRED: payload-patch SOFT-DELETE. Imprint the new fact FIRST
+        # (its id is the old fact's back-pointer), then patch the OLD point
+        # with `superseded_by` instead of deleting it. query_context filters
+        # superseded facts out of live recall by default, so the old content
+        # is recoverable for audit (include_superseded=True) at no recall cost.
         supersede_meta = {
             **(metadata or {}),
             "supersedes": action.target_id,
@@ -4498,7 +4497,12 @@ def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
             "supersede_category": action.supersede_category,
             "fact_kind": "state_evolution",
         }
-        tm.imprint(content=new_fact, metadata=supersede_meta)
+        new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
+        _qdrant_supersede(tm, action.target_id, {
+            "superseded_by": new_id,
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+            "supersede_reason": action.supersede_reason,
+        })
         counts["superseded"] += 1
         counts["imprinted"] += 1
         return counts
@@ -4556,7 +4560,7 @@ result.facts_coexisted += counts.get("coexisted", 0)
 
 **Block 2 — `supersede` branch carries 4 metadata fields.** `supersedes` (the target_id pointer), `supersede_reason` (LLM-emitted prose), `supersede_category` (categorical: preference / status / config / scope / identity / other), `fact_kind="state_evolution"` (the discriminator). Why all four: downstream queries differ. Audit traversal needs `supersedes`. UI filtering needs `supersede_category`. The `fact_kind` is the single field a query writer would filter on to find "all state-evolution facts in the last 30 days." `supersede_reason` is for human review — never machine-filtered, so it sits in metadata not as a structured field.
 
-**Block 3 — Step 3 deferred comment is load-bearing.** Future-self (or another reader who picks up the chapter) sees exactly which line will change in Step 3 (`_qdrant_delete` call) and what stays the same (everything else). Production rule from the curriculum: comments explain WHY decisions were deferred, not WHAT the code does. This comment block names the deferral and the swap point.
+**Block 3 — the deferral comment named the swap point, and Step 3 landed exactly there (2026-06-05).** The original comment marked precisely which line would change (`_qdrant_delete` → payload-patch) and what would stay the same (everything else). When Step 3 was wired, that prediction held to the letter — one storage primitive swapped, plus an `include_superseded` recall flag, zero caller changes. Production rule from the curriculum: comments explain WHY a decision was deferred and WHERE the future change lands — a good deferral comment is a contract with future-self, and this one paid out.
 
 **Block 4 — `coexist` branch handles `relates_to` OR `target_id` fallback.** LLM may emit `relates_to` (per the prompt's explicit instruction) or it may default to populating `target_id` and leaving `relates_to` null. Branch accepts either. Why: the prompt asks for `relates_to`, but real LLM output drift means relying on a single-field emission breaks the action in practice. Fallback to `target_id` is the safety net — measured pattern from gpt-oss-20b's actual output during the first probe runs.
 
@@ -4698,19 +4702,25 @@ Measured 2026-05-15 against live oMLX after sourcing repo `.env`:
 - **Single timestamp source-of-truth is the architectural win.** Qdrant payload → query result → `_format_candidates` → prompt → classifier. No transformation, no parsing, no timezone conversion anywhere in the chain. The ISO 8601 UTC string IS the protocol. Reverses neatly: any future need to compute a precise gap (Python `timedelta`) reads the same string and parses once at the use site.
 `─────────────────────────────────────────────────`
 
-#### Step 3 carve-out — what soft-delete adds without changing this layer
+#### Step 3 carve-out — soft-delete, wired (2026-06-05) without changing this layer
 
-Once `_qdrant_supersede(tm, old_id, new_id, reason)` lands as a payload-patch primitive (POST `/collections/<c>/points/payload` with `must` filter on point ID, `payload: {superseded_by, superseded_at, supersede_reason}`), the only line that changes in `execute_action`'s supersede branch is:
+Step 3 landed exactly as the carve-out predicted — the supersede branch swapped one storage primitive, nothing else moved. `_qdrant_supersede(tm, point_id, patch)` is a payload-patch primitive (POST `/collections/<c>/points/payload`, `{payload: {superseded_by, superseded_at, supersede_reason}, points: [old_id]}`). Because we now need the new fact's id for the back-pointer, the branch also reorders to **imprint-new-first**, then patch:
 
 ```python
-# Before (Step 1+2 — current):
+# Before (Step 1+2 — hard-delete):
 _qdrant_delete(tm, [action.target_id])
+new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
 
-# After (Step 3 — deferred):
-_qdrant_supersede(tm, action.target_id, new_point_id, reason=action.supersede_reason)
+# After (Step 3 — soft-delete, WIRED):
+new_id = tm.imprint(content=new_fact, metadata=supersede_meta)   # imprint first
+_qdrant_supersede(tm, action.target_id, {                        # then patch old
+    "superseded_by": new_id,
+    "superseded_at": datetime.now(timezone.utc).isoformat(),
+    "supersede_reason": action.supersede_reason,
+})
 ```
 
-Plus the `query_context()` filter (`is_empty: {key: superseded_by}` on default queries, `include_history=True` flag to bypass). Caller code, `decide_action`, `DedupAction`, prompt, counters, test — all unchanged. That is what "ship Step 1+2 without blocking on Step 3" buys: classification + temporal signal accrue value immediately; soft-delete adds audit fidelity later under zero contract risk.
+Plus the `query_context()` filter: `include_superseded: bool = False` (default), which appends `{"is_empty": {"key": "superseded_by"}}` to the Qdrant `must` so superseded facts drop out of live recall; pass `include_superseded=True` to walk history. `decide_action`, `DedupAction`, prompt, counters, callers — all unchanged, exactly as the carve-out promised. The contract-free prediction held: classification + temporal signal shipped first and accrued value immediately; soft-delete added audit fidelity later at zero contract risk. (Verified live: `tests/test_supersede_soft_delete.py` — old fact excluded from recall, retrievable via `include_superseded`, bidirectional `supersedes`/`superseded_by` chain intact.)
 
 ---
 
@@ -4865,10 +4875,12 @@ Scoped to the Qdrant TieredMemory variant for clean composition (EverCore
 has its own internal extraction pipeline that doesn't expose delete/update
 hooks cleanly).
 
-Step 3 (deferred): supersede currently uses HARD-DELETE for the old fact.
-Once `_qdrant_supersede` (payload-patch soft-delete) lands, the new fact's
-`supersedes` pointer + query-time filter give true bitemporal semantics
-without losing the old content.
+Step 3 (WIRED 2026-06-05): supersede uses payload-patch SOFT-DELETE. The old
+fact is kept and patched with `superseded_by` (the new fact's id); the new fact
+carries the `supersedes` back-pointer. `query_context` excludes superseded facts
+by default (`is_empty: superseded_by`) so live recall is identical to the old
+hard-delete behavior, while `include_superseded=True` walks the full history —
+true bitemporal semantics without losing the old content.
 """
 from __future__ import annotations
 
@@ -5123,20 +5135,25 @@ def execute_action(tm: TieredMemoryLike, action: DedupAction, new_fact: str,
         return counts
 
     if action.action == "supersede" and action.target_id:
-        # NOTE (Step 3 deferred): the soft-delete payload-patch path
-        # `_qdrant_supersede` is not yet wired. Until then, hard-delete
-        # old + new fact with `supersedes` pointer + supersede_reason
-        # metadata. Classification IS preserved via the new fact's
-        # supersedes pointer — chain traversal walks forward. Step 3
-        # swaps _qdrant_delete -> payload-patch with zero contract
-        # change at this layer.
-        _qdrant_delete(tm, [action.target_id])
+        # Step 3 WIRED: payload-patch SOFT-DELETE (was hard-delete). Imprint
+        # the new fact FIRST (we need its id for the old fact's back-pointer),
+        # then patch the OLD point with `superseded_by` instead of deleting it.
+        # query_context filters superseded facts out of live recall by default
+        # (is_empty: superseded_by), so accuracy is identical to the hard-delete
+        # era; include_superseded=True walks the chain both ways for audit.
+        superseded_at = datetime.now(timezone.utc).isoformat()
         new_id = tm.imprint(content=new_fact, metadata={
             **md,
             "supersedes": action.target_id,
             "supersede_reason": action.supersede_reason,
             "supersede_category": action.supersede_category,
             "fact_kind": "state_evolution",
+        })
+        _qdrant_supersede(tm, action.target_id, {                         # SOFT-DELETE (§8.6 Step 3)
+            "superseded_by": new_id,
+            "superseded_at": superseded_at,
+            "supersede_reason": action.supersede_reason,
+            "supersede_category": action.supersede_category,
         })
         counts["superseded"] += 1
         counts["imprinted"] += 1
@@ -5222,10 +5239,9 @@ def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
         return counts
 
     if action.action == "supersede" and action.target_id:
-        # NOTE Step 3 deferred: hard-delete old + new with supersedes pointer.
-        # Step 3 swaps _qdrant_delete -> _qdrant_supersede payload-patch
-        # with zero contract change at this layer.
-        _qdrant_delete(tm, [action.target_id])
+        # Step 3 WIRED: soft-delete. Imprint new first (for the back-pointer),
+        # then _qdrant_supersede payload-patches the old point with
+        # `superseded_by` — zero contract change at this layer.
         supersede_meta = {
             **md,
             "supersedes": action.target_id,
@@ -5234,6 +5250,11 @@ def _qdrant_delete(tm: TieredMemoryLike, point_ids: list[str]) -> None:
             "fact_kind": "state_evolution",
         }
         new_id = tm.imprint(content=new_fact, metadata=supersede_meta)
+        _qdrant_supersede(tm, action.target_id, {
+            "superseded_by": new_id,
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+            "supersede_reason": action.supersede_reason,
+        })
         counts["superseded"] += 1
         counts["imprinted"] += 1
         record_audit(AuditEntry(

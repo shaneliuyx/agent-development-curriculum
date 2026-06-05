@@ -1,7 +1,7 @@
 ---
 title: Week 3.5.9 — Requirement-Driven Memory Architecture and Three-Tier Hypergraph
 created: 2026-05-26
-updated: 2026-06-03
+updated: 2026-06-05
 status: "shipped 2026-06-03 — 7-backend matrix in §4.10, 6-axis universal-solution groundwork in §4.17; measured numbers in lab RESULTS.md"
 tags:
   - agent
@@ -53,7 +53,7 @@ Real production agent memory falls into three architecture classes. Each makes a
 
 1. **Find prior.** The new fact's write path runs `tm.query_context(new_fact, k=5)` to surface semantically near candidates — same `query_context` call the dedup pipeline already makes for duplicate detection, so the find-prior step is FREE (no new infrastructure, no extra round-trip).
 2. **Classify.** The dedup LLM (`decide_action`) sees prior candidates with timestamps + the new fact + the temporal gap, and emits one of: `supersede` (state evolved — prior was true, now false), `coexist` (different scope — both still true), `delete` (prior was never true — hallucination), or `update`/`add`/`no-op`. Classification returns the `target_id` of the matched prior.
-3. **Patch + write.** The execute step patches the prior record's `valid_to = now()` (closing the prior's validity window) AND writes the new fact with `valid_from = now()`, `valid_to = None`, plus a `supersedes` pointer back to `target_id`. W3.5.8 §8.6 Step 3 ships this as `_qdrant_supersede(prior_id, new_id)` — a Qdrant `points/payload` PATCH (no embed change, no document rewrite, ~10ms wall). Step 1+2 of §8.6 launched with HARD-delete instead of payload-patch and shipped the same `supersedes` chain via metadata; Step 3 is a contract-free swap at the executor layer.
+3. **Patch + write.** The execute step patches the prior record's `valid_to = now()` (closing the prior's validity window) AND writes the new fact with `valid_from = now()`, `valid_to = None`, plus a `supersedes` pointer back to `target_id`. W3.5.8 §8.6 Step 3 ships this as `_qdrant_supersede(prior_id, {superseded_by: new_id, …})` — a Qdrant `points/payload` PATCH (no embed change, no document rewrite, ~10ms wall), wired 2026-06-05 in both the canonical `lab-03-5-8-two-tier` and this lab's vendored copy. Step 1+2 of §8.6 launched with HARD-delete and shipped the `supersedes` chain via metadata; Step 3 swapped that for soft-delete (old fact kept, patched `superseded_by`; `query_context` excludes superseded facts by default, `include_superseded=True` for audit) — a contract-free swap at the executor layer, exactly as predicted.
 
 Concrete worked example:
 
