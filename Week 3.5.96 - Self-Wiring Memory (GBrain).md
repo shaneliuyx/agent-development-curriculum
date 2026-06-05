@@ -1099,24 +1099,20 @@ Each layer has a checkpoint so resume *skips* what's already built; if a layer i
 | **no** | yes | skip — done, content was discarded (fine) |
 | **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
-Four derived layers (the top row, left→right); each is gated by a checkpoint diamond whose **"skip" arrow** is taken on resume and whose **"do" arrow** drops to the work node below:
+Four derived layers, each a rebuildable cache of the one above. Every edge carries its **resume rule** — the work is skipped when that layer's checkpoint says it's already done:
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'22px'}, 'flowchart':{'useMaxWidth':false, 'nodeSpacing':45, 'rankSpacing':60}}}%%
-flowchart LR
-  L0["LAYER 0<br/>source files<br/>(ground truth)"] --> C1{"chunk staged?<br/>.ingest_stage/<br/>&lt;file&gt;#idx.json"}
-  C1 -->|"skip (resume)"| L1["LAYER 1<br/>staged chunk<br/>JSON"]
-  C1 -->|"do"| EX["extract_file(chunk)<br/>driver-side · NO embed<br/>(big file → chunks)"]
-  EX --> L1
-  L1 --> C2{"merge cache<br/>valid?<br/>(stage fingerprint)"}
-  C2 -->|"skip (resume)"| L2["LAYER 2<br/>merged<br/>canonical"]
-  C2 -->|"do"| MG["merge_from_disk()<br/>merge multi-file (LLM)<br/>→ .ingest_merged.json"]
-  MG --> L2
-  L2 --> C3{"slug written?<br/>.ingest_written.json<br/>(verify-then-mark)"}
-  C3 -->|"skip (resume)"| L3["LAYER 3<br/>embedded<br/>in GBrain"]
-  C3 -->|"do"| PUT["put_page · embed ONCE<br/>oversized → driver-side<br/>→ verify → mark"]
-  PUT --> L3
-  L3 --> RC["reconcile_graph()<br/>wire [[wikilinks]]"] --> Q["query"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  L0["<b>LAYER 0 · source files</b><br/>~/brain/sources/* — ground truth"]
+  L0 -->|"per file chunk · skip if already staged"| L1
+  L1["<b>LAYER 1 · staged chunk JSON</b><br/>extract_file (driver-side, NO embed; big file → chunks)<br/>checkpoint: .ingest_stage/&lt;file&gt;#idx.json"]
+  L1 -->|"skip if merge cache valid"| L2
+  L2["<b>LAYER 2 · merged canonical</b><br/>merge_from_disk — merge multi-file entities (LLM)<br/>cache: .ingest_merged.json (stage fingerprint)"]
+  L2 -->|"skip if slug already written"| L3
+  L3["<b>LAYER 3 · embedded in GBrain</b><br/>agent put_page (embed ONCE; oversized → driver-side)<br/>verify-then-mark · checkpoint: .ingest_written.json"]
+  L3 --> RC["reconcile_graph() — wire [[wikilinks]] → typed edges"]
+  RC --> Q["query"]
 ```
 
 **Code:** `src/resumable_ingest.py`:
