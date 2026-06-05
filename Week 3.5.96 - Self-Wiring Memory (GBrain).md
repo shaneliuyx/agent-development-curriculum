@@ -1099,20 +1099,44 @@ Each layer has a checkpoint so resume *skips* what's already built; if a layer i
 | **no** | yes | skip — done, content was discarded (fine) |
 | **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
-Four derived layers, each a rebuildable cache of the one above. Every edge carries its **resume rule** — the work is skipped when that layer's checkpoint says it's already done:
+Stages stack top→down — **one row per stage** (colored band). Inside each row the **checkpoint** (orange ◆) routes to *do* (the blue work node) or *skip* (resume — already done), producing that stage's **layer** (green). Source is Layer 0; the green boxes are Layers 1–3.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
-flowchart TD
-  L0["<b>LAYER 0 · source files</b><br/>~/brain/sources/* — ground truth"]
-  L0 -->|"per file chunk · skip if already staged"| L1
-  L1["<b>LAYER 1 · staged chunk JSON</b><br/>extract_file (driver-side, NO embed; big file → chunks)<br/>checkpoint: .ingest_stage/&lt;file&gt;#idx.json"]
-  L1 -->|"skip if merge cache valid"| L2
-  L2["<b>LAYER 2 · merged canonical</b><br/>merge_from_disk — merge multi-file entities (LLM)<br/>cache: .ingest_merged.json (stage fingerprint)"]
-  L2 -->|"skip if slug already written"| L3
-  L3["<b>LAYER 3 · embedded in GBrain</b><br/>agent put_page (embed ONCE; oversized → driver-side)<br/>verify-then-mark · checkpoint: .ingest_written.json"]
-  L3 --> RC["reconcile_graph() — wire [[wikilinks]] → typed edges"]
-  RC --> Q["query"]
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'34px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':16,'bottom':24}, 'nodeSpacing':45, 'rankSpacing':55}}}%%
+flowchart TB
+  SRC["📄 LAYER 0 · source files · ground truth"]
+  subgraph S1["① EXTRACT"]
+    direction LR
+    C1{"chunk<br/>staged?"}
+    C1 -->|do| E1["extract_file<br/>driver · no embed"]
+    C1 -->|skip| L1["LAYER 1<br/>staged chunk"]
+    E1 --> L1
+  end
+  subgraph S2["② MERGE"]
+    direction LR
+    C2{"merge cache<br/>valid?"}
+    C2 -->|do| E2["merge_from_disk<br/>multi-file · LLM"]
+    C2 -->|skip| L2["LAYER 2<br/>merged canonical"]
+    E2 --> L2
+  end
+  subgraph S3["③ WRITE"]
+    direction LR
+    C3{"slug<br/>written?"}
+    C3 -->|do| E3["put_page · embed ONCE<br/>verify → mark"]
+    C3 -->|skip| L3["LAYER 3<br/>embedded"]
+    E3 --> L3
+  end
+  SRC --> C1
+  L1 --> C2
+  L2 --> C3
+  L3 --> RC["reconcile_graph · wire [[wikilinks]]"]
+  RC --> Q(["query"])
+  classDef ckpt fill:#fff7ed,stroke:#f59e0b,stroke-width:2px
+  classDef work fill:#eef2ff,stroke:#6366f1
+  classDef layer fill:#ecfdf5,stroke:#10b981,stroke-width:2px
+  class C1,C2,C3 ckpt
+  class E1,E2,E3 work
+  class SRC,L1,L2,L3 layer
 ```
 
 **Code:** `src/resumable_ingest.py`:
