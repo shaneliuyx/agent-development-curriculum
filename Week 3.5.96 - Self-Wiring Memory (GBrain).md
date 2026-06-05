@@ -1099,44 +1099,33 @@ Each layer has a checkpoint so resume *skips* what's already built; if a layer i
 | **no** | yes | skip — done, content was discarded (fine) |
 | **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
-Stages stack top→down — **one row per stage** (colored band). Inside each row the **checkpoint** (orange ◆) routes to *do* (the blue work node) or *skip* (resume — already done), producing that stage's **layer** (green). Source is Layer 0; the green boxes are Layers 1–3.
+Drawn **C4-style**: each **layer is a colored box** (bold title · «role» · `[tool]` · what it does + its on-disk checkpoint). The **edge label is the resume rule** — work is skipped when that layer's checkpoint says it's already done. Dark blue = the operator (person); blue = pipeline containers (Layers 1–3, inside the dashed system boundary); grey = external (Layer 0 source of truth, GBrain store). Single top→down column, so every step's skip-gate reads in order.
 
 ```mermaid
-%%{init: {'theme':'default', 'themeVariables': {'fontSize':'34px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':16,'bottom':24}, 'nodeSpacing':45, 'rankSpacing':55}}}%%
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'24px','lineColor':'#888','primaryBorderColor':'#888'}, 'flowchart':{'useMaxWidth':false,'nodeSpacing':50,'rankSpacing':58,'padding':12}}}%%
 flowchart TB
-  SRC["📄 LAYER 0 · source files · ground truth"]
-  subgraph S1["① EXTRACT"]
-    direction LR
-    C1{"chunk<br/>staged?"}
-    C1 -->|do| E1["extract_file<br/>driver · no embed"]
-    C1 -->|skip| L1["LAYER 1<br/>staged chunk"]
-    E1 --> L1
+  OP["<b>Operator</b> «person»<br/>re-runs resumable_ingest.py after a crash<br/>each layer resumes from its checkpoint"]
+  L0["<b>Layer 0 · Source files</b> «external»<br/>~/brain/sources/* — ground truth"]
+  subgraph PIPE["Resumable Ingest Pipeline «system»"]
+    direction TB
+    L1["<b>Layer 1 · Staged chunks</b><br/><i>extract_file · driver-side · no embed</i><br/>big files → chunks<br/>checkpoint .ingest_stage/{file}#idx.json"]
+    L2["<b>Layer 2 · Merged canonical</b><br/><i>merge_from_disk · LLM</i><br/>one entity merged across files<br/>cache .ingest_merged.json · stage fingerprint"]
+    L3["<b>Layer 3 · Embedded</b><br/><i>put_page · embed ONCE</i><br/>oversized → driver-side · verify-then-mark<br/>checkpoint .ingest_written.json"]
+    L1 -->|"merge by entity<br/>skip if cached"| L2
+    L2 -->|"write canonical<br/>skip if written"| L3
   end
-  subgraph S2["② MERGE"]
-    direction LR
-    C2{"merge cache<br/>valid?"}
-    C2 -->|do| E2["merge_from_disk<br/>multi-file · LLM"]
-    C2 -->|skip| L2["LAYER 2<br/>merged canonical"]
-    E2 --> L2
-  end
-  subgraph S3["③ WRITE"]
-    direction LR
-    C3{"slug<br/>written?"}
-    C3 -->|do| E3["put_page · embed ONCE<br/>verify → mark"]
-    C3 -->|skip| L3["LAYER 3<br/>embedded"]
-    E3 --> L3
-  end
-  SRC --> C1
-  L1 --> C2
-  L2 --> C3
-  L3 --> RC["reconcile_graph · wire [[wikilinks]]"]
-  RC --> Q(["query"])
-  classDef ckpt fill:#fff7ed,stroke:#f59e0b,stroke-width:2px
-  classDef work fill:#eef2ff,stroke:#6366f1
-  classDef layer fill:#ecfdf5,stroke:#10b981,stroke-width:2px
-  class C1,C2,C3 ckpt
-  class E1,E2,E3 work
-  class SRC,L1,L2,L3 layer
+  GB[("<b>GBrain store</b> «external»<br/>Postgres + Qdrant<br/>embedded pages + typed wikilink edges")]
+  Q(["query"])
+  OP -->|ingest| L0
+  L0 -->|"per-file chunk<br/>skip if staged"| L1
+  L3 -->|"put_page + reconcile_graph<br/>embed once"| GB
+  GB -->|after reconcile| Q
+  classDef person fill:#08427b,stroke:#052e56,color:#fff;
+  classDef ext fill:#8a8a8a,stroke:#5f5f5f,color:#fff;
+  classDef cont fill:#438dd5,stroke:#2e6295,color:#fff;
+  class OP person
+  class L0,GB ext
+  class L1,L2,L3 cont
 ```
 
 **Code:** `src/resumable_ingest.py`:
