@@ -1068,6 +1068,7 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 | Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done |
 | One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent   |
 | Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)          |
+| Resume re-runs the (LLM) merge every time                 | cache merged canonical (`.ingest_merged.json`) keyed by a stage fingerprint → unchanged stage = skip re-merge |
 | Wasted embedding on throwaway staging                     | stage on DISK (no embed); GBrain embeds only canonical → **each entity embedded ONCE** |
 | Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)         |
 
@@ -1078,6 +1079,24 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 - The **agent writes only the CANONICAL pages** via `put_page` over MCP, in bounded batches → **each entity embedded exactly once**. (The agent still uses GBrain as memory — it writes the finals and queries them; only the disposable staging left the store.)
 - A **write checkpoint** (`~/brain/.ingest_written.json`) records a canonical slug **only after `_verify_written` confirms its page is actually in GBrain** (verify-then-mark) — so a silently-failed `put_page` stays un-checkpointed and retries; the checkpoint can never claim a page that isn't there. A resumed run re-embeds **only un-written pages**, so "embed once" survives a crash. Oversized pages (> `BIG_PAGE_CHARS`) skip the agent and write **driver-side** (no 30s limit on a single big embed).
 - Then **`reconcile_graph()`** wires the `[[wikilinks]]`.
+
+**The pipeline is 4 derived layers — each a rebuildable cache of the one above.** This is what makes the whole thing resumable *and* crash-recoverable: losing any derived layer is regenerated from the layer above; the only unrecoverable loss is the source corpus itself.
+
+```text
+source files            ~/brain/sources/*                 ← ground truth (only true loss)
+  └─ stage chunks        ~/brain/.ingest_stage/<file>#<idx>.json   ← gone → re-extract from source
+       └─ merged canonical  ~/brain/.ingest_merged.json            ← gone/stale → re-merge from stage
+            └─ embedded     GBrain pages (Postgres+pgvector)       ← gone → re-write from canonical
+```
+
+Each layer has a checkpoint so resume *skips* what's already built; if a layer is *missing*, it's *rebuilt* from the one above. The full state machine, per unit:
+
+| derived layer present? | recorded in its checkpoint? | action on resume |
+|---|---|---|
+| yes | yes | skip (already done) |
+| yes | no | (re-)build from this layer |
+| **no** | yes | skip — done, content was discarded (fine) |
+| **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -1121,8 +1140,13 @@ A big file is split into deterministic chunks (`<file>#0`, `#1`, … by CHUNK_CH
 line-aligned), each its own staging unit — so "one file too big for the extract
 context" is handled, and resume works at chunk granularity.
 
-Two checkpoints, both on disk, so resume re-does no expensive work:
-  - EXTRACTION: a file CHUNK with a stage JSON (`<file>#<idx>.json`) is skipped.
+Each derived layer is a cache of the one above, rebuildable from it — so resume
+re-does no expensive work, and losing a derived layer is recoverable, not fatal:
+  source files (ground truth) → stage chunks → merged canonical → embedded
+  - EXTRACTION: a file CHUNK with a stage JSON (`<file>#<idx>.json`) is skipped;
+    a MISSING chunk is re-extracted from its source file (not a dead end).
+  - MERGE: cached to ~/brain/.ingest_merged.json keyed by a stage fingerprint;
+    unchanged staging → load cache, skip the (LLM-costly) re-merge.
   - WRITES: ~/brain/.ingest_written.json records written canonical slugs — but a
     slug is recorded only after its page is VERIFIED present in GBrain
     (verify-then-mark), so a silently-failed write stays un-checkpointed and is
@@ -1132,7 +1156,7 @@ Oversized pages (> BIG_PAGE_CHARS) are written driver-side (no 30s sandbox) sinc
 one such page's single embed could approach the agent's per-step limit.
 
 Run: python src/resumable_ingest.py   (re-run to resume)
-Restart from scratch: rm -rf ~/brain/.ingest_stage ~/brain/.ingest_written.json
+Restart: rm -rf ~/brain/.ingest_stage ~/brain/.ingest_merged.json ~/brain/.ingest_written.json
 """
 from __future__ import annotations
 
@@ -1151,6 +1175,7 @@ from ingest_agent import (
 
 SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
 STAGE_DIR = pathlib.Path(os.path.expanduser("~/brain/.ingest_stage"))   # disk staging
+MERGED = pathlib.Path(os.path.expanduser("~/brain/.ingest_merged.json"))  # merge cache
 WRITTEN = pathlib.Path(os.path.expanduser("~/brain/.ingest_written.json"))  # write checkpoint
 BATCH = 8                 # canonical pages per agent write call (bounded < 30s)
 BIG_PAGE_CHARS = 8000     # bigger pages are written driver-side (one page's embed may near 30s)
@@ -1281,9 +1306,33 @@ def _merge(base: str, contents: list[str]) -> str:
     return (resp.choices[0].message.content or contents[0]).strip()
 
 
+def _stage_key() -> str:
+    """Fingerprint of the staged chunks (name + mtime + size). If it's unchanged
+    since the cached merge, the merge result is still valid — so resume can skip
+    the (LLM-costly) re-merge. Any re-extracted chunk changes its mtime → miss."""
+    parts = []
+    for f in sorted(STAGE_DIR.glob("*.json")):
+        st = f.stat()
+        parts.append(f"{f.name}:{int(st.st_mtime)}:{st.st_size}")
+    return "|".join(parts)
+
+
 def merge_from_disk() -> list:
     """Group staged pages by entity across all files; return CANONICAL pages.
-    Single-file entities pass through; multi-file entities are merged once."""
+    Single-file entities pass through; multi-file entities are merged once (LLM).
+
+    Cached: the merge (its per-entity LLM calls) is expensive, so the result is
+    cached to MERGED keyed by the stage fingerprint. A resume whose staging is
+    unchanged loads the cache and skips re-merging; if any chunk was re-extracted
+    (fingerprint differs) it re-merges and re-caches."""
+    key = _stage_key()
+    if MERGED.exists():
+        cached = json.loads(MERGED.read_text())
+        if cached.get("key") == key:
+            canonical = cached["canonical"]
+            print(f">>> merge cache HIT: {len(canonical)} canonical (skipped re-merge)")
+            return canonical
+
     groups: dict[str, list[str]] = {}
     for jf in sorted(STAGE_DIR.glob("*.json")):
         for p in json.loads(jf.read_text()):
@@ -1294,7 +1343,8 @@ def merge_from_disk() -> list:
         if len(contents) > 1:
             merged += 1
         canonical.append({"slug": slug, "content": content})
-    print(f">>> merge_from_disk: {len(canonical)} canonical ({merged} merged from >1 file)")
+    MERGED.write_text(json.dumps({"key": key, "canonical": canonical}))
+    print(f">>> merge_from_disk: {len(canonical)} canonical ({merged} merged from >1 file), cached")
     return canonical
 
 
@@ -1376,6 +1426,7 @@ if __name__ == "__main__":
 - **Block 3 — disk staging defers the dedup AND keeps it out of the embedded store.** Each file's pages go to `~/brain/.ingest_stage/<file>.json` — no embedding. `merge_from_disk` groups by base slug across files; only entities in >1 file pay an LLM merge, singletons pass through. GBrain only ever sees the canonical result.
 - **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file **chunk** (skip staged `<file>#<idx>.json`); writes are checkpointed per canonical slug (`.ingest_written.json`). Both expensive ops — the per-chunk LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
 - **Block 5 — verify-then-mark: the checkpoint can't lie.** A slug enters `.ingest_written.json` only after `_verify_written` confirms its page is actually in `pages` (existence == a successful embed+upsert). Marking a whole batch right after `agent.run` returned would *trust the agent loop* — a silently-swallowed `put_page` error would checkpoint a page that never landed, and resume would skip it forever. Verify-then-mark makes the invariant exact: **a slug is in the checkpoint iff its page is really in the store**, so an un-landed page stays un-checkpointed and retries.
+- **Block 6 — the merge is cached, keyed by a stage fingerprint.** Resume re-reads stage chunks to rebuild `canonical` — but the merge's per-entity LLM calls are expensive, so `merge_from_disk` caches its result to `.ingest_merged.json` under `_stage_key()` (each chunk's name+mtime+size). Unchanged staging → cache HIT, skip the re-merge entirely; re-extract any chunk and its mtime changes → fingerprint differs → MISS → re-merge + re-cache. The fingerprint is the invalidation: the cache is valid exactly while its inputs are.
 
 **Result (measured, 8-file corpus, 2026-06-05):**
 
@@ -1479,6 +1530,10 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 17 — the write checkpoint marked a page that never landed (OBSERVED-class, Phase 8).** Marking a whole batch right after `agent.run` returned trusts the agent loop; if a `put_page` failed silently (agent swallows the error, still returns a final answer), the slug gets checkpointed → resume skips it → the page is lost, with no error anywhere.
 *Root cause:* the checkpoint recorded "the agent's batch code finished," not "the page is in the store." Those differ exactly in the silent-failure case.
 *Fix:* **verify-then-mark** — `_verify_written` queries `pages` (existence == successful embed+upsert) and the loop checkpoints only the verified subset; un-landed slugs stay un-checkpointed and retry. Invariant: a slug is in the write checkpoint IFF its page is really in GBrain. Gate tested: `_verify_written([real, fake]) → [real]`. Lesson: a checkpoint must record *confirmed durable state*, not "the code that should have written it returned."
+
+**Entry 18 — resume re-ran the (LLM) merge every time (OBSERVED, Phase 8).** Resume re-reads stage chunks to rebuild the canonical list, which re-fired `merge_from_disk`'s per-entity LLM merges — correct but wasteful (same "idempotent ≠ cheap" as the write phase, one layer up).
+*Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't.
+*Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
 
 _Projected (to confirm during Phases 3–6):_
 
