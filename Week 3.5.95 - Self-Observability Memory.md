@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.95 — Self-Observability Memory"
 created: 2026-05-14
-updated: 2026-06-04
+updated: 2026-06-05
 tags:
   - agent
   - memory
@@ -1438,6 +1438,177 @@ This is the **expected** shape for a seams demo with stub tools — the chapter'
 
 ---
 
+### Phase 7 — Bounding the store: heat-scored eviction (~1 hour) [executed, measured]
+
+**Goal:** leverage a mechanism from **BAI-LAB/MemoryOS** — `metacog_recall` (Phase 4) *ranks* facts at read time but never *prunes* them, so the `learning` store grows unbounded: recall slows and stale patterns accumulate. MemoryOS keeps memory bounded with a **heat** score (visits + recency + importance) and evicts the coldest, guarded by **importance-exemption** (high-confidence facts never evicted) and **dedup** (near-duplicates collapse to the strongest copy). We add that as a retention pass over the same SQLite store.
+
+> **Provenance (kept honest):** heat/eviction is **BAI-LAB/MemoryOS**'s mechanism. The sibling *Ground-Truth Hierarchy* principle leveraged in [[Week 3.5.96 - Self-Wiring Memory (GBrain)]] is a *different* repo, **ClaudioDrews/memory-os** — don't conflate them. We keep `metacog_recall`'s pure-code/no-LLM ethos; dedup uses lexical TF-cosine as a cheap **local proxy** for the semantic embedding-cosine MemoryOS actually uses (the proxy's limit is BCJ Entry 9).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  L["learning store<br/>(unbounded)"] --> EN["enforce(budget)"]
+  EN --> D["dedup<br/>TF-cosine ≥ 0.92"]
+  D --> H["heat = visits<br/>+ recency + importance"]
+  H --> EX{"confidence ≥ 0.85?"}
+  EX -->|"yes"| K["keep (exempt)"]
+  EX -->|"no"| EV["evict coldest<br/>until ≤ budget"]
+  K --> B["bounded store"]
+  EV --> B
+```
+
+**Code:** `src/heat_eviction.py` (pure code, no LLM — matches `metacog_recall`):
+
+```python
+"""W3.5.95 — Heat-scored eviction for the LEARNING store (leverages BAI-LAB/MemoryOS).
+
+`metacog_recall` RANKS facts at read time but never PRUNES them — the `learning`
+table grows unbounded, so recall slows and stale patterns accumulate. BAI-LAB's
+MemoryOS keeps memory bounded with a HEAT score (visits + recency + importance)
+and evicts the coldest, guarded by two rules:
+
+  - importance-exempt: high-confidence facts are NEVER evicted (a rarely-recalled
+    but high-confidence "I deadlock on nested locks" must survive a quiet month);
+  - dedup: near-duplicate patterns collapse to the single strongest copy.
+
+Pure code, no LLM — matches `metacog_recall`'s ethos. Dedup uses lexical TF-cosine
+as a cheap LOCAL proxy for the semantic embedding-cosine BAI-LAB uses; note the
+substitution honestly rather than pulling in an embedding dependency here.
+
+Provenance: heat/eviction is BAI-LAB/MemoryOS. (The Ground-Truth Hierarchy in
+W3.5.96 is the *other* repo, ClaudioDrews/memory-os — don't conflate them.)
+"""
+from __future__ import annotations
+
+import math
+import sqlite3
+import time
+from collections import Counter
+
+from metacog_recall import RECENCY_HALFLIFE_S, _tok
+
+# Heat weights — visits, recency, importance. Tunable; equal-weighted by default.
+ALPHA_VISITS = 1.0
+BETA_RECENCY = 1.0
+GAMMA_IMPORTANCE = 1.0
+IMPORTANCE_FLOOR = 0.85   # confidence ≥ floor ⇒ eviction-exempt
+DEDUP_THRESHOLD = 0.92    # TF-cosine ≥ threshold ⇒ near-duplicate
+
+
+def ensure_heat_columns(conn: sqlite3.Connection) -> None:
+    """Add visit-tracking columns if absent (idempotent migration)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(learning)")}
+    if "recall_count" not in cols:
+        conn.execute("ALTER TABLE learning ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0")
+    if "last_recalled_ts" not in cols:
+        conn.execute("ALTER TABLE learning ADD COLUMN last_recalled_ts REAL")
+    conn.commit()
+
+
+def touch(conn: sqlite3.Connection, ids: list[int], now: float | None = None) -> None:
+    """Record a recall 'visit' — the heat signal. `recall()` calls this for the
+    facts it injects (one-line wire-in); the demo calls it to simulate history."""
+    now = now or time.time()
+    conn.executemany(
+        "UPDATE learning SET recall_count = recall_count + 1, last_recalled_ts = ? WHERE id = ?",
+        [(now, i) for i in ids],
+    )
+    conn.commit()
+
+
+def heat(row: sqlite3.Row, now: float | None = None) -> float:
+    """visits (log-damped) + recency (decay since last touch/write) + importance."""
+    now = now or time.time()
+    last_seen = row["last_recalled_ts"] or row["ts"]
+    recency = 0.5 ** ((now - last_seen) / RECENCY_HALFLIFE_S)
+    return (
+        ALPHA_VISITS * math.log1p(row["recall_count"])
+        + BETA_RECENCY * recency
+        + GAMMA_IMPORTANCE * row["confidence"]
+    )
+
+
+def _cosine(a: Counter, b: Counter) -> float:
+    common = set(a) & set(b)
+    dot = sum(a[t] * b[t] for t in common)
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def dedup(conn: sqlite3.Connection, threshold: float = DEDUP_THRESHOLD,
+          now: float | None = None) -> int:
+    """Collapse near-duplicate patterns to the hottest copy. Returns rows removed."""
+    now = now or time.time()
+    rows = conn.execute("SELECT * FROM learning").fetchall()
+    tfs = {r["id"]: Counter(_tok(r["pattern_text"])) for r in rows}
+    removed: set[int] = set()
+    for i, a in enumerate(rows):
+        if a["id"] in removed:
+            continue
+        for b in rows[i + 1:]:
+            if b["id"] in removed:
+                continue
+            if _cosine(tfs[a["id"]], tfs[b["id"]]) >= threshold:
+                loser = a if heat(a, now) < heat(b, now) else b
+                removed.add(loser["id"])
+    if removed:
+        conn.executemany("DELETE FROM learning WHERE id = ?", [(i,) for i in removed])
+        conn.commit()
+    return len(removed)
+
+
+def evict(conn: sqlite3.Connection, budget: int, now: float | None = None,
+          importance_floor: float = IMPORTANCE_FLOOR) -> int:
+    """Evict the coldest eviction-eligible facts until total ≤ budget.
+    Facts with confidence ≥ importance_floor are exempt. Returns rows removed."""
+    now = now or time.time()
+    total = conn.execute("SELECT COUNT(*) AS n FROM learning").fetchone()["n"]
+    if total <= budget:
+        return 0
+    eligible = [r for r in conn.execute("SELECT * FROM learning").fetchall()
+                if r["confidence"] < importance_floor]
+    eligible.sort(key=lambda r: heat(r, now))  # coldest first
+    to_remove = eligible[: total - budget]
+    if to_remove:
+        conn.executemany("DELETE FROM learning WHERE id = ?", [(r["id"],) for r in to_remove])
+        conn.commit()
+    return len(to_remove)
+
+
+def enforce(conn: sqlite3.Connection, budget: int, now: float | None = None) -> dict[str, int]:
+    """Dedup, then evict to budget. The single entry point a retention job calls."""
+    ensure_heat_columns(conn)
+    deduped = dedup(conn, now=now)
+    evicted = evict(conn, budget, now=now)
+    final = conn.execute("SELECT COUNT(*) AS n FROM learning").fetchone()["n"]
+    return {"deduped": deduped, "evicted": evicted, "final": final}
+```
+
+**Walkthrough:**
+- **Block 1 — `heat()` is three signals, not one.** Visits are `log1p`-damped so a fact recalled 50 times doesn't dwarf everything (diminishing returns on popularity); recency decays on the same 2-week half-life as `metacog_recall`'s read-time decay (one decay constant for the whole chapter); importance is raw confidence. Equal weights are a starting point — the knob a real system tunes against eviction-regret.
+- **Block 2 — `touch()` separates the visit signal from ranking.** `metacog_recall.recall()` is pure-read by design; heat needs a *write* (which facts got injected). `touch()` is that one-line wire-in — call it on the IDs `recall()` returns. The demo calls it directly to simulate a usage history without running hundreds of agent steps.
+- **Block 3 — `evict()` puts importance ABOVE heat.** The eviction-eligible set is *only* facts below the confidence floor; a cold, never-recalled "I deadlock on nested locks" (high confidence) is exempt and survives a quiet month. This is the key design choice: heat decides *order* among the unimportant, never overrides importance. If even evicting all eligible facts can't meet budget, the store stays over-budget rather than dropping a high-value fact — fail toward keeping signal.
+- **Block 4 — `dedup()` keeps the hottest copy.** Pairwise TF-cosine over the small store (O(n²) is fine at this scale); when two patterns match, the *lower-heat* one is dropped so visits/recency/confidence survive the merge. The honest catch is in the result.
+
+**Result** (`python3 src/heat_eviction_demo.py`, 14 seeded facts → budget 8, 2026-06-05):
+
+```text
+seeded 14 facts → budget 8
+  deduped : 1     # lexical near-dup collapsed to hotter copy
+  evicted : 5     # coldest low-confidence facts
+  final   : 8
+```
+
+The behavior that matters is *which* facts survived: the hot low-confidence fact (9 visits, heat 3.95) outranked higher-confidence ones, **and** the cold high-confidence "deadlock" fact (heat 0.98) survived **even though it's colder than two evicted facts** (heat 1.56–1.81) — importance-exemption overrode pure heat, exactly as intended. `recall()` still returned the right fact post-eviction.
+
+`★ Insight ─────────────────────────────────────`
+- **Eviction order ≠ keep/drop decision.** Heat ranks *candidates*, but importance is a veto. A pure-heat policy would have dropped the cold high-confidence "deadlock" fact (it's colder than facts that got evicted) — which is precisely the rare-but-critical pattern you most want to keep. Exemption-above-heat is the difference between a cache and a memory.
+- **The lexical-cosine dedup has a real blind spot (BCJ Entry 9).** It catches *reworded* duplicates but misses *semantic paraphrases* ("retry with no backoff" vs "re-issue without any backoff" share too few tokens). BAI-LAB uses embedding cosine for exactly that reason; the lexical proxy keeps the lab dependency-free but is honestly weaker — a one-line swap to oMLX embeddings closes the gap when it matters.
+`─────────────────────────────────────────────────`
+
+---
+
 ## 5. Bad-Case Journal
 
 *Every entry below is a real symptom → root cause → fix observed building this lab. No hypothetical entries.*
@@ -1482,6 +1653,11 @@ This is the **expected** shape for a seams demo with stub tools — the chapter'
 *Root cause:* `main()` hardcoded `run_id="smolagents-demo"` and the DB persists between runs. OBSERVABILITY's append-only PK is `(agent_run_id, step_idx)`, so run 2's `step0` collided with run 1's `step0`. The triple-printed fact was the sibling bug: `main()` re-`INSERT`ed the contrarian LEARNING fact every run, so recall (K=3) returned three copies. Both are the append-only discipline working exactly as designed — a fixed key + a non-idempotent seed against a durable store.
 *Fix:* a **unique `run_id` per invocation** (`f"smolagents-demo-{uuid4]:8}"`) so OBSERVABILITY rows never collide across runs, and **DELETE-then-INSERT** the demo's LEARNING fact so reruns replace rather than stack it. The deeper lesson the chapter is about: append-only memory makes *re-running* a first-class concern — every writer needs a fresh key, and any seed must be idempotent, or the durable store surfaces the duplicate (which is the point of the PK).
 
+**Entry 9 — heat-eviction dedup keeps obvious duplicates but misses semantic paraphrases (OBSERVED, Phase 7).**
+*Symptom:* the first `heat_eviction_demo.py` run reported `deduped: 0` despite a seeded "near-duplicate" pair ("I retry failed API calls immediately with no backoff" vs "I re-issue failed API requests instantly without any backoff").
+*Root cause:* `dedup()` uses lexical TF-cosine; the paraphrase shares only `failed`/`api`/`backoff`, so cosine ≈ 0.3 — far below the 0.92 threshold. Lexical overlap ≠ semantic similarity, and the two phrasings are lexically distant.
+*Fix:* accepted and documented the limit honestly — a *reworded-but-lexically-similar* pair IS caught (`deduped: 1`), which is the realistic dedup case; true paraphrase dedup needs **embedding cosine** (what BAI-LAB/MemoryOS uses). The lab keeps lexical cosine to stay dependency-free; swapping in the oMLX embedder is a one-line change when paraphrase collisions actually matter. Don't claim semantic dedup from a lexical metric.
+
 ---
 
 ## 6. Interview Soundbites
@@ -1506,6 +1682,7 @@ This is the **expected** shape for a seams demo with stub tools — the chapter'
 - **Daniel Miessler — Personal AI Infrastructure (PAI), Memory v7.6.** `https://github.com/danielmiessler/Personal_AI_Infrastructure` — the WORK / KNOWLEDGE / LEARNING / OBSERVABILITY split this chapter borrows and validates.
 - **Hugging Face — smolagents.** `https://github.com/huggingface/smolagents` (v1.26.0). The agent framework used in Phase 6. Issue **#1851** (partial stop-sequence `</code` → `SyntaxError`) and the blog *CodeAgents + Structure* (`use_structured_outputs_internally`) are the production references behind BCJ Entry 5.
 - **Microsoft Presidio.** `https://microsoft.github.io/presidio/` (presidio-analyzer + presidio-anonymizer). The PII detection + anonymization engine behind the Phase 1 write-boundary scrubber — spaCy NER + custom `PatternRecognizer`s, replacing detected spans with typed placeholders. Catches named-entity PII a fixed regex cannot.
+- **BAI-LAB — MemoryOS.** `https://github.com/BAI-LAB/MemoryOS` — segmented STM→MTM→LPM memory with a heat score (visits + recency + interaction) driving eviction, plus near-duplicate consolidation. The mechanism Phase 7's `heat_eviction.py` ports onto the LEARNING store. (Distinct from ClaudioDrews/memory-os — see W3.5.96.)
 
 ---
 
@@ -1513,7 +1690,7 @@ This is the **expected** shape for a seams demo with stub tools — the chapter'
 
 - **Builds on:** [[Week 3.5.8 - Two-Tier Memory]] (hot/warm consolidation pattern, applied here to *self*-data); [[Week 4 - ReAct From Scratch]] (`obs.py` SQLite logger; tool-call loop being instrumented).
 - **Distinguish from:** [[Week 3.5 - Cross-Session Memory]] and [[Week 3.5.8 - Two-Tier Memory]] and [[Week 3.5.9 - Three-Tier Hypergraph]] (all world-facing — store facts ABOUT the domain; this chapter is self-facing — stores facts ABOUT the agent itself); logging-as-debug-tool (logs are for humans reading after a failure; OBSERVABILITY is for the agent reading before its next decision — §2.4).
-- **Connects to:** [[Week 5.5 - Metacognition]] **heavily** — reflection (write to LEARNING in-the-moment) and metacognitive recall (read from LEARNING at decision time) are the two W5.5 primitives that ride on top of this chapter's substrate; [[Week 6.7 - Agent Skills]] (PAI's skill registry uses the same hook architecture this chapter borrows from).
+- **Connects to:** [[Week 5.5 - Metacognition]] **heavily** — reflection (write to LEARNING in-the-moment) and metacognitive recall (read from LEARNING at decision time) are the two W5.5 primitives that ride on top of this chapter's substrate; [[Week 6.7 - Agent Skills]] (PAI's skill registry uses the same hook architecture this chapter borrows from); [[Week 3.5.96 - Self-Wiring Memory (GBrain)]] — the *sibling* memory-os leverage: Phase 7 here ports BAI-LAB/MemoryOS's heat/eviction, while W3.5.96 Phase 7 ports ClaudioDrews/memory-os's Ground-Truth Hierarchy (two different "memory-os" repos, two different lessons).
 - **Foreshadows:** [[Week 11 - System Design]] production observability stack (OBSERVABILITY scales to OTel + ClickHouse in production; same memory-not-log discipline); [[Week 12 - Capstone]] self-improving agent loop.
 
 ---

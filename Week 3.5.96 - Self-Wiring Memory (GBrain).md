@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.96 — Self-Wiring Memory (GBrain — Garry Tan's Production Memory Layer for AI Agents)"
 created: 2026-05-28
-updated: 2026-05-28
+updated: 2026-06-04
 status: SPEC + executable lab
 tags:
   - agent
@@ -28,7 +28,7 @@ estimated_time: "~5-7 hours"
 2. Identify the 5 canonical typed edges GBrain extracts deterministically: `attended`, `works_at`, `invested_in`, `founded`, `advises`. Why these 5: they cover ~80% of person-company-event knowledge graphs without needing LLM disambiguation.
 3. Explain why "zero LLM calls" matters at write time: deterministic extraction is reproducible + auditable + cheap; LLM-based extraction is non-deterministic + expensive + opaque. GBrain's choice mirrors W3.5.9's "atomic-fact write-time" thesis applied to graph extraction.
 4. Install GBrain locally + ingest a 50-page Markdown corpus (mix of meeting notes, tweets, emails). Verify auto-wired graph: query for one entity, see its typed-edge connections.
-5. Run 10 queries comparing pure-vector search vs RRF (vector + keyword) on the same corpus. Measure Recall@5 delta — expect ~12pt improvement matching the published 83→95% claim.
+5. Run 10 queries comparing keyword vs pure-vector vs RRF on the same corpus (at the *engine* layer — the CLI can't A/B them). Measure recall@3 + MRR. On a small, semantic-heavy corpus, expect **pure vector to win** and RRF to add nothing or slightly hurt — the published 83→95 RRF lift needs a larger, exact-term-heavy corpus (Phase 6).
 6. Identify GBrain's place in the W3.5.x memory taxonomy: it's a 4th class (alongside W3.5.9's 1-tier atomic-fact, 2-tier consolidation, 3-tier graph). GBrain = markdown-first deterministic-graph; complements rather than replaces.
 7. Defend "GBrain vs HyperMem" in interview answer: when is deterministic-Markdown the right substrate vs LLM-extracted hyperedges?
 
@@ -144,10 +144,10 @@ flowchart TD
 > **[executed]** were run and measured on this machine; **[spec — not yet run]**
 > phases are specified but not executed. The real flow we ran: **install (P1) → drop
 > raw files in `sources/` (P2) → a standalone smolagents agent converts raw→pages
-> over MCP (P6) → verify the wired graph (P3)**. The earlier Claude-Code-driven
+> over MCP (P3) → verify the wired graph (P4)**. The earlier Claude-Code-driven
 > ingestion path (scaffold skills + `claude mcp add` + trigger) was **dropped** in
 > favor of that standalone agent — so Phase 2 below is just corpus prep, and the
-> conversion lives in Phase 6.
+> conversion lives in Phase 3.
 
 ### Phase 1 — Install GBrain + provision Postgres [executed]
 
@@ -348,11 +348,11 @@ A fresh, empty brain legitimately shows a few **benign WARNs** — don't chase t
 
 ### Phase 2 — Prepare the raw corpus [executed]
 
-**Goal:** stage raw, differently-shaped sources for the agent to convert. You do **not** format them — the conversion is the agent's job (Phase 6).
+**Goal:** stage raw, differently-shaped sources for the agent to convert. You do **not** format them — the conversion is the agent's job (Phase 3).
 
 **Two layers, two owners** (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`):
 - **Raw sources** — emails, transcripts, any format. **Immutable**, kept in `sources/`; the agent *reads* them, never rewrites them.
-- **The brain** — two-layer pages (*Compiled Truth* / `---` / *Timeline*) with `[[dir/slug]]` wikilinks. **The agent writes this layer** (Phase 6).
+- **The brain** — two-layer pages (*Compiled Truth* / `---` / *Timeline*) with `[[dir/slug]]` wikilinks. **The agent writes this layer** (Phase 3).
 
 > **Anti-pattern (BCJ Entry 4):** hand-converting each source format, or hand-authoring the pages, does not scale and is not how GBrain works. The agent is the formatter; you curate.
 
@@ -365,7 +365,7 @@ mkdir -p ~/brain/{sources,people,companies,deals,meetings,concepts} && cd ~/brai
 - `sources/emails/acme-thread.txt` — email thread (`From:/To:/Subject:` + reply chain)
 - `sources/transcripts/dinner.txt` — timestamped speaker transcript
 
-The raw→structured conversion is **not** a deterministic command (it's an LLM judgment — which entities, which directory, which typed edge), so it's done by the standalone agent in **Phase 6**, which emits pages shaped like:
+The raw→structured conversion is **not** a deterministic command (it's an LLM judgment — which entities, which directory, which typed edge), so it's done by the standalone agent in **Phase 3**, which emits pages shaped like:
 
 ```text
 # Alice Chen
@@ -375,71 +375,12 @@ Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]; angel i
 - 2026-05-12 — dinner re [[deals/acme-seed]] (source: sources/transcripts/dinner.txt)
 ```
 
-**Verification:** the raw fixtures exist under `~/brain/sources/`; the structured `people/…`, `companies/…`, `deals/…` pages appear only after the Phase 6 agent runs (then Phase 3 verifies the graph).
+**Verification:** the raw fixtures exist under `~/brain/sources/`; the structured `people/…`, `companies/…`, `deals/…` pages appear only after the Phase 3 agent runs (then Phase 4 verifies the graph).
 
-### Phase 3 — Verify the self-wiring graph [executed, measured]
-
-**Goal:** confirm the `[[wikilinks]]` the agent wrote (Phase 6) became typed graph edges — deterministically, with zero LLM calls. **Run after Phase 6** (it operates on the pages the agent produced).
-
-```bash
-export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
-gbrain extract links --source db     # backfill typed edges from the agent's wikilinks
-gbrain stats                         # pages · links · embedded chunks
-gbrain graph-query deals/acme-seed   # typed-edge traversal
-```
-
-> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get`). `links: 0` means either you skipped `extract links` **or** the agent's pages had no wikilinks — the real failure we hit (BCJ Entry 5).
-
-**Result (measured):** on the agent's output — **10 pages → `extract links` created 11 typed edges**. `gbrain graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5). **Deterministic:** re-running `extract` yields identical edges (regex/parser, zero LLM calls). The first run produced `links: 0` until the extraction prompt was made to mandate wikilinks (BCJ Entry 5) — *graph quality = extraction quality.*
-
-### Phase 4 — Keyword vs hybrid-RRF benchmark [spec — not yet run]
-
-**Goal:** measure the RRF lift on a labeled 10-query set. *(Not executed — the corpus
-so far is the ~10-page demo brain, too small for a meaningful Recall@5 benchmark.
-Commands + method below for when the brain is larger.)*
-
-> **Spec correction:** GBrain has no `--mode vector-only|rrf`. `query` is *always* hybrid (vector + keyword + RRF + query expansion); `search` is keyword-only (tsvector). The honest A/B is **`search` vs `query`**. `--mode` selects the cost tier (`conservative|balanced|tokenmax`); `--limit` sets K (default 20); `--explain` shows per-stage scoring.
-
-```bash
-# keyword-only baseline (tsvector / BM25-style)
-gbrain search "investments in fintech companies" --limit 5
-# hybrid (vector + keyword + RRF + expansion)
-gbrain query  "investments in fintech companies" --limit 5 --explain
-# repeat across 10 queries: name-specific, semantic-only, exact-phrase, mixed
-```
-
-**Measurement:** label the expected hits per query, then compute Recall@5 for `search` vs `query`. Garry Tan's published figure is **83% → 95% Recall@5** (graph-disabled vs hybrid+graph, 240-page corpus) — reproduce the *direction* on your corpus; treat the exact delta as **projected until you run it** (this chapter is a SPEC; no end-to-end run yet).
-
-**Deliverable:** `~/brain/outputs/rrf_benchmark.md` — a 10-query × {`search`, `query`} Recall@5 table.
-
-### Phase 5 — Synthesis layer + "what we don't know" check [executed, measured]
-
-**Goal:** confirm the synthesis layer flags gaps instead of fabricating, on a fact the corpus does **not** contain.
-
-> **Two corrections from running it:** (1) synthesis is **`gbrain think`** — *"multi-hop synthesis … cited answer with conflict + gap analysis."* `ask`/`query` are *retrieval* (ranked chunks), not synthesis. (2) `think` needs a **chat LLM**; an embeddings-only install returns retrieval only. We wired the chat model at **VibeProxy → Claude** (the chapter's chat-via-VibeProxy path) while embeddings stayed local on oMLX:
-
-```bash
-export OPENROUTER_API_KEY=dummy OPENROUTER_BASE_URL=http://localhost:8317/v1   # VibeProxy (chat)
-gbrain think "What did Alice Chen do on 2026-06-15?" \
-  --model openrouter:claude-sonnet-4-5-20250929        # date ABSENT from the corpus
-```
-
-**Result (measured):**
-```
-# What did Alice Chen do on 2026-06-15?
-No information available about Alice Chen's activities on 2026-06-15.
-Model: openrouter:claude-sonnet-4-5-20250929 | Pages: 9 | Citations: 0
-```
-**Gap correctly flagged — no fabrication.** Synthesis pulled 9 candidate pages but honestly reported no info for that date rather than inventing an event. This is the **embeddings-local-oMLX / chat-via-VibeProxy** split working end-to-end (the W3.5.9 topology).
-
-**Verification:** ✅ the absent date returns an explicit "no information," not a fabricated event; for a *present* fact (Phase 6's `query`) the same brain answers with score 0.93.
-
-### Phase 6 — A future agent uses GBrain as memory over MCP [executed, measured]
+### Phase 3 — A future agent uses GBrain as memory over MCP [executed, measured]
 
 > **This is the ingestion engine for the whole lab.** It converts the Phase 2 raw
-> fixtures into structured pages; Phase 3 then verifies the graph it wired. (Logically
-> it runs *before* Phase 3 — kept at number 6 so the heavy code stays in one place.)
-
+> fixtures into structured pages; Phase 4 then verifies the graph it wired.
 
 **Goal:** the transferable skill behind this whole chapter — a **standalone agent
 you build** (here: smolagents, *not* Claude Code) uses GBrain as its memory layer
@@ -646,31 +587,452 @@ if __name__ == "__main__":
 
 ---
 
-## 6. Bad-Case Journal (3-5 entries — SPEC)
+### Phase 4 — Verify the self-wiring graph [executed, measured]
 
-_Observed during the real Phase-1 run (GBrain 0.42.25.0):_
+**Goal:** confirm the `[[wikilinks]]` the agent wrote (Phase 3) became typed graph edges — deterministically, with zero LLM calls. **Run after Phase 3** (it operates on the pages the agent produced).
 
-- **Entry 1 — `llama-server` provider is a catch-22 for registry-known embed models (OBSERVED).** `--embedding-model llama-server:bge-m3` (and `:nomicai-modernbert-embed-base-bf16`) refuses *both* ways: **with** `--embedding-dimensions` → "does not support custom dimensions N (this model only emits its default vector size)"; **without** → "llama-server requires --embedding-dimensions <N> (user-driven recipes have no default dimension)." No value satisfies both → init impossible. *Fix:* use the **`ollama` provider** pointed at oMLX (`OLLAMA_BASE_URL=http://localhost:8000/v1`, `OLLAMA_API_KEY=<key>`, `--embedding-model ollama:<model>`, **no** `--embedding-dimensions`) — it *probes* the endpoint for the dim instead of demanding/rejecting it. (Worth a GBrain issue; strip keys before filing.)
-- **Entry 2 — init is stateful + greedy; a botched first run poisons every retry (OBSERVED).** Three compounding traps: (a) `--supabase` runs the *interactive Supabase flow* and ignores `GBRAIN_DATABASE_URL` — use `--url`; (b) a present `OPENROUTER_API_KEY` makes init **auto-pick openrouter for embeddings** (probe failed 404 on a dummy key) even with `--embedding-model` set — keep it commented until post-init; (c) a wrong first init persists `~/.gbrain/config.json` + a baked vector-column width, so re-init fails citing the *stale* dimension. *Fix (0 pages → safe):* `DROP DATABASE gbrain; CREATE DATABASE gbrain;` + `rm ~/.gbrain/config.json`, then re-init. Lesson: **GBrain init is stateful and greedy — reset clean if anything looks off, and read the "Using …" line, not the green migration checkmarks.**
-- **Entry 3 — `gbrain` not found after `bun link` (OBSERVED).** `bun link` symlinks the CLI into `~/.bun/bin` but does not add it to PATH; the installer often doesn't persist the PATH line either. *Fix:* `echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc`. Tell-apart: `ls ~/.bun/bin/gbrain` exists ⇒ pure PATH issue, not a broken install.
-- **Entry 4 — trying to hand-format every source type into brain pages (DESIGN anti-pattern).** Emails, tweets, and meeting transcripts each have a different shape; writing a per-format converter (or authoring the 50 pages by hand) does not scale and is *not* GBrain's model. *Root cause:* mistaking who owns the structured layer. GBrain splits **raw sources** (immutable, any format, in `sources/`) from **the brain** (two-layer pages the **agent** writes). *Fix:* never author structured pages manually — drop raw under `sources/` (or `gbrain capture`), then let the agent convert via **ingest skills** (`meeting-ingestion`, `article-enrichment`, `voice-note-ingest` → `put_page`/`add_link`) or, in production, the credentialed **integration recipes** (`email-to-brain`, `x-to-brain`, `meeting-sync`). The agent is the universal formatter; you curate. (Drove the Phase 2 rewrite.)
+```bash
+export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
+gbrain extract links --source db     # backfill typed edges from the agent's wikilinks
+gbrain stats                         # pages · links · embedded chunks
+gbrain graph-query deals/acme-seed   # typed-edge traversal
+```
 
-- **Entry 5 — the agent stored pages fine but the graph had zero edges (OBSERVED, Phase 6).** A smolagents `CodeAgent` (oMLX) drove GBrain over MCP and wrote 5 well-formed pages via `put_page`, yet `gbrain extract links` reported `Links: 0`. *Root cause:* the LLM extraction wrote entity mentions as **plain prose** ("Alice Chen, founder of Acme AI") and used `<!-- timeline -->` instead of `---`, so there were no `[[wikilinks]]` to extract. The framework + MCP plumbing worked; the *contract* didn't. *Fix:* the extraction prompt must **hard-mandate** path-qualified `[[dir/slug]]` wikilinks with a worked example + "a page with zero wikilinks is invalid" → `Links: 0 → 11`. **Graph quality = extraction quality; measure edges, not pages.**
-- **Entry 6 — fully-autonomous `CodeAgent` failed on a 14B (OBSERVED, Phase 6).** Asking the agent to read files + write an extractor + compose markdown in one code loop produced a naive regex placeholder + `InterpreterError: import pathlib not allowed` (the CodeAgent sandbox blocks `pathlib`/`json`). *Fix:* **thin agent, fat tools** — move file I/O and extraction into `@tool`s (`read_sources`, `extract_pages`); the agent only orchestrates. Also: filter `ToolCollection.from_mcp` to the ~few tools needed (GBrain exposes ~70; a 14B drowns), depend on `smolagents[mcp]` (mcpadapt), pass DB/oMLX env via `StdioServerParameters(env=…)` (an MCP server is a separate process), and use `use_structured_outputs_internally=True` (oMLX has no native tool_calls). Lab: `~/code/agent-prep/lab-03-5-96-gbrain/`.
+> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get`). `links: 0` means either you skipped `extract links` **or** the agent's pages had no wikilinks — the real failure we hit (BCJ Entry 5).
+
+**Result (measured):** on the agent's output — **10 pages → `extract links` created 11 typed edges**. `gbrain graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5). **Deterministic:** re-running `extract` yields identical edges (regex/parser, zero LLM calls). The first run produced `links: 0` until the extraction prompt was made to mandate wikilinks (BCJ Entry 5) — *graph quality = extraction quality.*
+
+### Phase 5 — Synthesis layer + "what we don't know" check [executed, measured]
+
+**Goal:** confirm the synthesis layer flags gaps instead of fabricating, on a fact the corpus does **not** contain.
+
+> **Two corrections from running it:** (1) synthesis is **`gbrain think`** — *"multi-hop synthesis … cited answer with conflict + gap analysis."* `ask`/`query` are *retrieval* (ranked chunks), not synthesis. (2) `think` needs a **chat LLM**; an embeddings-only install returns retrieval only. We wired the chat model at **VibeProxy → Claude** (the chapter's chat-via-VibeProxy path) while embeddings stayed local on oMLX:
+
+```bash
+export OPENROUTER_API_KEY=dummy OPENROUTER_BASE_URL=http://localhost:8317/v1   # VibeProxy (chat)
+gbrain think "What did Alice Chen do on 2026-06-15?" \
+  --model openrouter:claude-sonnet-4-5-20250929        # date ABSENT from the corpus
+```
+
+**Result (measured):**
+```
+# What did Alice Chen do on 2026-06-15?
+No information available about Alice Chen's activities on 2026-06-15.
+Model: openrouter:claude-sonnet-4-5-20250929 | Pages: 9 | Citations: 0
+```
+**Gap correctly flagged — no fabrication.** Synthesis pulled 9 candidate pages but honestly reported no info for that date rather than inventing an event. This is the **embeddings-local-oMLX / chat-via-VibeProxy** split working end-to-end (the W3.5.9 topology).
+
+**Verification:** ✅ the absent date returns an explicit "no information," not a fabricated event; for a *present* fact (Phase 3's `query`) the same brain answers with score 0.93.
+
+### Phase 6 — Keyword vs vector vs hybrid-RRF benchmark [executed, measured]
+
+**Goal:** measure, on a labeled 10-query set, whether hybrid-RRF actually beats its component retrievers (keyword FTS, pure vector). **Result: it did not** — on this corpus pure vector won, and RRF's keyword arm was dead weight. The reproducible path below is more important than the headline, because two traps make the *naive* version of this benchmark silently wrong.
+
+**Step A — scale the corpus (2 → 8 raw sources, 19 pages).** Two sources can't exercise retrieval. Drop four more differently-shaped fixtures under `~/brain/sources/` (two intro emails, a CTO email, a seed-deal email, a VC's tweets, two meeting transcripts), then re-run the Phase-3 agent over the whole `sources/` tree:
+
+```bash
+# fixtures already staged under ~/brain/sources/{emails,tweets,transcripts}/
+cd ~/code/agent-prep/lab-03-5-96-gbrain
+python3 src/ingest_agent.py      # Phase-3 agent, now over 8 sources → 19 pages
+```
+
+**Step B — materialize the graph (the first trap).** The agent writes `[[wikilinks]]` into page *text* via `put_page`, but on the expanded run the link **count stayed at 11** while the text held ~68 wikilinks. Self-wiring is **not** a `put_page` side-effect — it is a deliberate batch pass, and for pages written over MCP (not from files) you must point it at the DB, not a brain directory:
+
+```bash
+export PATH="$HOME/.bun/bin:$PATH" \
+  GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain \
+  OLLAMA_BASE_URL=http://localhost:8000/v1 OLLAMA_API_KEY=<key>
+cd ~/brain
+gbrain extract links              # → "No brain directory configured" — the trap
+gbrain extract links --source db  # → "created 34 links from 19 pages" → 45 total
+```
+
+> **Why `--source db`?** The bare `extract links` walks a registered brain *directory* of `.md` files; our pages live only in Postgres because the agent wrote them through the MCP `put_page` tool. `--source db` re-parses the stored `compiled_truth`/`timeline` columns. (Aside: it does **not** stamp `pages.links_extracted_at` — that column tracks the file-source path only — so don't use that column to decide whether DB-source extraction ran.)
+
+**Step C — the second trap: the CLI cannot A/B keyword vs hybrid.** The obvious benchmark is `gbrain search` (keyword) vs `gbrain query` (hybrid). It is **invalid**: both subcommands fall through to the *same* handler (`src/cli.ts:771-772 — case 'search': case 'query':`), so they return byte-identical rankings, scores included. The real keyword/vector/hybrid split lives one layer down — `engine.searchKeyword` / `engine.searchVector` / `hybridSearch` — exposed only through GBrain's own eval harness, `src/core/search/eval.ts:runEval()`. The benchmark must call that directly.
+
+Below: the harness bootstraps the engine + AI gateway exactly as the CLI does, then runs `runEval()` once per strategy on one qrel set.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q["10 labeled qrels<br/>(query → gold slug)"] --> RE["runEval()<br/>gbrain eval engine"]
+  RE --> KW["strategy: keyword<br/>engine.searchKeyword<br/>(tsvector FTS)"]
+  RE --> VEC["strategy: vector<br/>embed(q) + searchVector<br/>(oMLX 768-d HNSW)"]
+  RE --> HY["strategy: hybrid<br/>hybridSearch<br/>(vector+keyword+RRF)"]
+  KW --> M["recall@3 / MRR / nDCG@3"]
+  VEC --> M
+  HY --> M
+```
+
+**Code:** `src/bench_strategies.ts` (run with `bun`, not `python` — it imports GBrain's TypeScript engine directly):
+
+```typescript
+/**
+ * Phase 6 benchmark (CORRECT path) — keyword FTS vs pure vector vs hybrid-RRF.
+ *
+ * WHY this exists: `gbrain search` and `gbrain query` CLI commands fall through
+ * to the SAME hybrid handler (cli.ts:771-772), so they cannot be A/B'd from the
+ * shell — they return byte-identical rankings. The real keyword/vector/hybrid
+ * split lives one layer down in gbrain's own eval harness (src/core/search/eval.ts),
+ * which calls engine.searchKeyword / engine.searchVector / hybridSearch directly.
+ * This script bootstraps the engine + AI gateway exactly as the CLI does, then
+ * runs runEval() three times on one labeled qrel set.
+ *
+ * Run: bun src/bench_strategies.ts   (needs GBRAIN_DATABASE_URL + OLLAMA_* env)
+ */
+const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { runEval } = await import(`${GB}/core/search/eval.ts`);
+
+// (query, relevant-slug, kind) — single gold per query; kind documents intent.
+const QRELS = [
+  { query: "Lin Zhao",                          relevant: ["people/lin-zhao"],             kind: "exact" },
+  { query: "Ridgeline Capital",                 relevant: ["companies/ridgeline-capital"], kind: "exact" },
+  { query: "Northstar Ventures",                relevant: ["companies/northstar-ventures"],kind: "exact" },
+  { query: "Marcus Webb",                       relevant: ["people/marcus-webb"],          kind: "exact" },
+  { query: "dinner at Tartine",                 relevant: ["meetings/tartine-dinner"],     kind: "exact" },
+  { query: "who runs serving infrastructure",   relevant: ["people/lin-zhao"],             kind: "semantic" },
+  { query: "protein design foundation models",  relevant: ["companies/helix-bio"],         kind: "semantic" },
+  { query: "inference optimization startup",    relevant: ["companies/quanta-labs"],       kind: "semantic" },
+  { query: "early-stage bio funding round",     relevant: ["deals/helix-series-a"],        kind: "semantic" },
+  { query: "payments company angel investment", relevant: ["companies/stripe"],            kind: "semantic" },
+];
+
+const K = 3;
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+const { reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+await reconfigureGatewayWithEngine(engine);
+
+const qrels = QRELS.map(({ query, relevant }) => ({ query, relevant }));
+const strategies = ["keyword", "vector", "hybrid"] as const;
+
+// Per-query rank table (rank of the gold slug under each strategy).
+const reports: Record<string, any> = {};
+for (const strategy of strategies) {
+  reports[strategy] = await runEval(engine, qrels, { strategy, expand: false }, K);
+}
+
+const pad = (s: string, n: number) => s.padEnd(n);
+console.log(pad("query", 38) + pad("kind", 10) + pad("keyword", 10) + pad("vector", 10) + pad("hybrid", 10));
+console.log("-".repeat(78));
+QRELS.forEach((q, i) => {
+  let row = pad(q.query, 38) + pad(q.kind, 10);
+  for (const s of strategies) {
+    const hits: string[] = reports[s].queries[i].hits;
+    const rank = hits.indexOf(q.relevant[0]) + 1; // 0 → not found
+    row += pad(rank > 0 ? `@${rank}` : "MISS", 10);
+  }
+  console.log(row);
+});
+console.log("-".repeat(78));
+console.log("\n" + pad("strategy", 12) + pad(`recall@${K}`, 12) + pad("MRR", 10) + pad(`nDCG@${K}`, 10));
+for (const s of strategies) {
+  const r = reports[s];
+  console.log(pad(s, 12) + pad(r.mean_recall.toFixed(3), 12) + pad(r.mean_mrr.toFixed(3), 10) + pad(r.mean_ndcg.toFixed(3), 10));
+}
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+- **Block 1 — dynamic imports of GBrain internals.** The harness lives in the lab repo but `await import()`s GBrain's `.ts` modules by absolute path. Bun resolves transitive deps (postgres.js, the gateway) from GBrain's own `node_modules`, so no install is needed in the lab. We import `runEval` (the eval engine), plus the four bootstrap functions the CLI uses.
+- **Block 2 — the qrel set.** Ten queries split 50/50 between **exact** (proper nouns a keyword index can match) and **semantic** (paraphrases with *no shared surface token* — `who runs serving infrastructure` shares nothing lexical with the `lin-zhao` page that answers it). The split is the whole experiment: it's designed to expose where keyword and vector diverge.
+- **Block 3 — CLI-identical bootstrap.** `loadConfig()` → `configureGateway(buildGatewayConfig())` → `createEngine` → `connectWithRetry` → `reconfigureGatewayWithEngine`. This exact sequence (from `cli.ts:1962-2050`) is what makes `embed(query)` work: the vector strategy must embed the *query string* at run-time via oMLX, and that needs the gateway configured. Skip it and vector search silently no-ops (`hybrid.ts:975` — "skip vector search if the gateway has no embedding provider").
+- **Block 4 — three runs, `expand:false`.** One `runEval` per strategy. Expansion is off for eval stability (it's an LLM call that adds variance); we're measuring the retrievers, not the query rewriter. `rank = hits.indexOf(gold)+1` turns each result list into the gold slug's rank for the per-query table.
+
+**Result** (19-page brain, oMLX `nomicai-modernbert` 768-d embeddings, 2026-06-04):
+
+| strategy | recall@3 | MRR | nDCG@3 |
+|---|---|---|---|
+| keyword (tsvector FTS) | 0.600 | 0.500 | 0.526 |
+| **vector (HNSW)** | **0.900** | **0.917** | **0.900** |
+| hybrid (RRF) | 0.900 | 0.783 | 0.813 |
+
+Per-query: keyword **MISSED all four** purely-semantic queries (no lexical overlap); vector found 9/10 in the top-3; **RRF matched vector's recall but lost MRR and nDCG** because fusing the dead keyword arm pushed strong vector hits down a rank (`dinner at Tartine` vector @1 → hybrid @3; `early-stage bio` vector @1 → hybrid @2).
+
+**Conclusion (refutes the original projection):** on a small, semantic-heavy corpus, **pure vector beats hybrid-RRF**. RRF is not a free upgrade — it helps only when *both* arms are individually competitive and complementary. Garry Tan's published **83→95 Recall@5** lift was on a 240-page corpus with enough exact-term traffic that the keyword arm earns its weight; do not assume that direction transfers to a 19-page brain. (To see RRF win here you'd need more proper-noun / exact-phrase queries, or a corpus large enough that vector recall degrades and keyword starts catching the tail.)
+
+`★ Insight ─────────────────────────────────────`
+- **Two silent traps gate this benchmark, and both look like "it worked".** (1) Wikilinks in `put_page` text don't become edges until `extract links --source db` runs — the graph reads as built when it isn't. (2) `gbrain search` and `gbrain query` are the same CLI handler — an A/B between them shows zero difference and reads as "no lift," when in fact you never measured two different things. Always benchmark at the engine layer (`runEval`), never the CLI.
+- **RRF can lose to its own input.** The reflexive "hybrid > vector > keyword" ranking is corpus-dependent. Here the keyword arm is net-negative for 40% of queries, so RRF's fusion *demotes* correct vector hits. Measure before claiming the lift; a hybrid that includes a weak arm can underperform that arm's strong sibling alone.
+`─────────────────────────────────────────────────`
+
+**Deliverable:** `src/bench_strategies.ts` in the lab repo + the table above (also in the lab's `RESULTS.md`).
+
+### Phase 7 — Ground-Truth Hierarchy: memory-as-authoritative A/B [executed, measured]
+
+**Goal:** leverage a principle from **ClaudioDrews/memory-os** — the *Ground-Truth Hierarchy*: injected memory is **authoritative**; an agent must not re-derive or re-fetch facts it already holds. memory-os names the anti-pattern **"memory-zero"** (re-establishing context from scratch every turn). GBrain is the authoritative store, so this is a natural fit: we A/B a 5-turn conversation that chains on overlapping entities (`Lin Zhao → Acme AI → its seed → investors`), comparing a memory-zero agent (re-query every turn) against a ground-truth agent (retrieve the subgraph once, inject it as authoritative, reuse).
+
+> **Provenance (kept honest):** the *Ground-Truth Hierarchy* principle is **ClaudioDrews/memory-os**'s. The sibling heat/eviction mechanism (W3.5.95) comes from a *different* repo, **BAI-LAB/MemoryOS** — don't conflate them.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  subgraph MZ["Mode A — memory-zero"]
+    A1["turn 1..5"] --> A2["fresh gbrain query<br/>per turn"]
+    A2 --> A3["top-3 pages<br/>(this turn only)"]
+    A3 --> A4["answer<br/>(no carried context)"]
+  end
+  subgraph GT["Mode B — ground-truth"]
+    B1["retrieve subgraph<br/>ONCE"] --> B2["inject full pages<br/>as authoritative"]
+    B2 --> B3["reuse across turns<br/>via history"]
+    B3 --> B4["answer<br/>(coreference resolved)"]
+  end
+  MZ ~~~ GT
+```
+
+**Code:** `src/ground_truth_ab.py` (chat via VibeProxy→Haiku; retrieval + embeddings local):
+
+```python
+"""Phase 7 — Ground-Truth Hierarchy A/B (memory-os principle, leveraged).
+
+Principle (ClaudioDrews/memory-os): injected memory is AUTHORITATIVE — an agent
+must not re-derive or re-fetch facts it already holds. The anti-pattern memory-os
+names is "memory-zero": re-establishing context from scratch every turn.
+
+We test it as an A/B over the live GBrain brain — a 5-turn conversation whose
+turns chain on overlapping entities (Lin Zhao → Acme AI → its seed → investors):
+
+  - Mode A "memory-zero": every turn issues a FRESH `gbrain query`, fetches the
+    top pages, and feeds only that turn's retrieval. Overlapping entities get
+    re-retrieved, and per-turn retrieval variance lets the same fact drift.
+  - Mode B "ground-truth": retrieve the conversation's subgraph ONCE, inject the
+    full pages as authoritative context, and reuse them across turns via history.
+
+Measures: retrieval calls, retrieved-context tokens, total LLM prompt tokens.
+Chat LLM via VibeProxy (:8317 → Claude); retrieval + embeddings stay local (oMLX).
+
+Two gotchas this script encodes (both cost a debugging round):
+  1. `gbrain query --json` returns only a TRUNCATED snippet — useless as grounding.
+     Pull full page bodies with `gbrain get <slug>`.
+  2. VibeProxy injects a "you are Claude Code" identity that overrides the system
+     role and makes the model REFUSE "questions about people." Frame the task as
+     grounded document Q&A in the USER message; don't rely on the system prompt.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+
+from openai import OpenAI
+
+_BUN = os.path.expanduser("~/.bun/bin")
+_GBRAIN = os.path.join(_BUN, "gbrain")
+_LINE = re.compile(r"^\[[-\d.]+\]\s+(\S+)\s+--")
+_CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-haiku-4-5-20251001")
+
+# Turns deliberately chain on shared entities so a memory-holding agent can reuse.
+TURNS = [
+    "Who is Lin Zhao?",
+    "What company does he lead, and what does it do?",
+    "Who invested in that company's seed round?",
+    "What other deals is that investor involved in?",
+    "Summarize Lin Zhao's professional network in two sentences.",
+]
+
+# The instruction lives in the USER turn (system role is overridden by the proxy).
+_MEMZERO_TMPL = (
+    "You are answering questions from a personal knowledge base (markdown notes). "
+    "Using ONLY the notes below, answer the question. If a fact is not in the notes, "
+    "say you don't have it.\n\nNOTES:\n{ctx}\n\nQUESTION: {q}"
+)
+_GROUNDTRUTH_PREAMBLE = (
+    "You are answering a short series of questions about a personal knowledge base. "
+    "The NOTES below are AUTHORITATIVE ground truth — trust them, never contradict "
+    "them, and do not ask to re-fetch anything already present. Answer concisely "
+    "from the notes and the conversation so far.\n\nNOTES (authoritative):\n{ctx}"
+)
+
+
+def _server_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = _BUN + os.pathsep + env.get("PATH", "")
+    env.setdefault("GBRAIN_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/gbrain")
+    env.setdefault("OLLAMA_BASE_URL", "http://localhost:8000/v1")
+    return env
+
+
+def _run(args: list[str]) -> str:
+    return subprocess.run(args, capture_output=True, text=True, env=_server_env()).stdout
+
+
+def gbrain_query_slugs(q: str, limit: int) -> list[str]:
+    """Hybrid retrieval — one call. Returns ranked slugs (snippets are too thin)."""
+    slugs: list[str] = []
+    for line in _run([_GBRAIN, "query", q, "--json", "--limit", str(limit)]).splitlines():
+        m = _LINE.match(line.strip())
+        if m:
+            slugs.append(m.group(1))
+    return slugs
+
+
+def gbrain_get(slug: str) -> str:
+    """Full page body — the actual grounding `query`'s snippet lacks."""
+    body = _run([_GBRAIN, "get", slug])
+    return "\n".join(ln for ln in body.splitlines() if not ln.startswith(("Starting", "[gbrain")))
+
+
+def _context(slugs: list[str]) -> str:
+    return "\n\n".join(gbrain_get(s) for s in slugs)
+
+
+def _client() -> OpenAI:
+    return OpenAI(
+        base_url=os.getenv("OPENROUTER_BASE_URL", "http://localhost:8317/v1"),
+        api_key=os.getenv("OPENROUTER_API_KEY", "vibeproxy"),
+    )
+
+
+def _ask(client: OpenAI, messages: list[dict]) -> tuple[str, int]:
+    r = client.chat.completions.create(model=_CHAT_MODEL, messages=messages, temperature=0)
+    return (r.choices[0].message.content or "").strip(), (r.usage.prompt_tokens if r.usage else 0)
+
+
+def run_memory_zero(client: OpenAI) -> dict:
+    """Re-query + re-fetch every turn; feed only that turn's retrieval."""
+    calls, ctx_chars, prompt_tokens, answers = 0, 0, 0, []
+    for q in TURNS:
+        ctx = _context(gbrain_query_slugs(q, limit=3))
+        calls += 1
+        ctx_chars += len(ctx)
+        ans, ptok = _ask(client, [{"role": "user", "content": _MEMZERO_TMPL.format(ctx=ctx, q=q)}])
+        prompt_tokens += ptok
+        answers.append(ans)
+    return {"calls": calls, "ctx_tokens": ctx_chars // 4, "prompt_tokens": prompt_tokens, "answers": answers}
+
+
+def run_ground_truth(client: OpenAI) -> dict:
+    """Retrieve the subgraph ONCE, inject full pages as authoritative, reuse."""
+    ctx = _context(gbrain_query_slugs("Lin Zhao Acme AI seed round investors network", limit=6))
+    calls, ctx_chars = 1, len(ctx)
+    history: list[dict] = [{"role": "user", "content": _GROUNDTRUTH_PREAMBLE.format(ctx=ctx)},
+                           {"role": "assistant", "content": "Understood — I'll answer from those notes."}]
+    prompt_tokens, answers = 0, []
+    for q in TURNS:
+        history.append({"role": "user", "content": q})
+        ans, ptok = _ask(client, history)
+        prompt_tokens += ptok
+        history.append({"role": "assistant", "content": ans})
+        answers.append(ans)
+    return {"calls": calls, "ctx_tokens": ctx_chars // 4, "prompt_tokens": prompt_tokens, "answers": answers}
+
+
+def main() -> None:
+    client = _client()
+    a = run_memory_zero(client)
+    b = run_ground_truth(client)
+
+    def row(name: str, d: dict) -> str:
+        return f"{name:<16}{d['calls']:<14}{d['ctx_tokens']:<16}{d['prompt_tokens']:<14}"
+
+    print(f"{'mode':<16}{'retrievals':<14}{'retr. ctx tok':<16}{'LLM prompt tok':<14}")
+    print("-" * 60)
+    print(row("memory-zero", a))
+    print(row("ground-truth", b))
+    print(
+        f"\nre-query waste avoided by treating memory as ground truth: "
+        f"{a['calls'] - b['calls']} retrievals, ~{a['ctx_tokens'] - b['ctx_tokens']} retrieval-context tokens"
+    )
+    for i, q in enumerate(TURNS):
+        print(f"\nQ{i + 1}: {q}")
+        print(f"  [memory-zero ] {a['answers'][i][:170]}")
+        print(f"  [ground-truth] {b['answers'][i][:170]}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **Block 1 — `gbrain_query_slugs` + `gbrain_get` (two-step retrieval).** A copy-paster's first instinct is to feed `gbrain query --json` straight to the LLM — but that output is ranked *snippets* (slug + first line), and the model correctly complains it "doesn't include the actual content." So we use `query` only to *rank* slugs, then `gbrain get <slug>` to pull full page bodies. Retrieval and grounding are two different calls.
+- **Block 2 — instruction in the USER turn, not `system`.** VibeProxy fronts a Claude-Code identity that overrides the `system` role; with the instruction in `system`, the model refuses ("I'm Claude Code, I can't help with questions about people"). Moving the instruction + notes into the USER message reframes it as grounded document Q&A — which the same model answers happily.
+- **Block 3 — the two policies.** `run_memory_zero` re-queries and re-fetches on *every* turn, passing only that turn's pages with no conversation history — so coreference ("he", "that company") has no antecedent and the fresh query can drift to the wrong entity cluster. `run_ground_truth` retrieves the subgraph *once*, injects the full pages as authoritative, and carries them in `history` — every later turn resolves against the same anchored context.
+- **Block 4 — what's measured.** Retrieval *calls* (the expensive embedding+search+fetch round-trip), retrieval-context *tokens* (`chars//4` proxy), and total LLM `prompt_tokens` from `usage`. The split matters: the win is in retrieval, not total tokens.
+
+**Result** (live 19-page brain, VibeProxy→Haiku 4.5, 2026-06-05):
+
+| mode | retrievals | retr. ctx tokens | LLM prompt tokens |
+|---|---|---|---|
+| memory-zero | 5 | 11,167 | 22,254 |
+| **ground-truth** | **1** | **2,233** | 23,001 |
+
+The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates the real finding, which is in the **answers**: memory-zero **failed 3 of 5 turns** — Q2 and Q4 lost coreference ("you haven't specified who 'he' is"), and **Q3 retrieved the wrong company** (Quanta/Ridgeline instead of Acme/Northstar) because a standalone query for "*that company's* seed round" has no anchor and drifts. Ground-truth answered all five correctly, resolving every "he/that company/that investor" against the injected subgraph. Note the honest nuance: total LLM prompt tokens are **roughly equal** (ground-truth's accumulating history ≈ memory-zero's repeated per-turn context) — the win is retrieval cost *and correctness*, not raw token count.
+
+`★ Insight ─────────────────────────────────────`
+- **memory-zero's failure mode isn't cost — it's drift + lost coreference.** Re-retrieving per turn means "that company" embeds with no anchor and lands on the wrong cluster; the agent then answers confidently about the wrong entity. Treating memory as authoritative + persistent is what keeps multi-turn reasoning *correct*, which is exactly memory-os's Ground-Truth Hierarchy claim — here measured on a real brain.
+- **Don't oversell the token math.** A naive write-up would claim "ground-truth is cheaper." It isn't, on total prompt tokens — history accumulation roughly cancels the per-turn-retrieval savings. The defensible claims are: 80% less *retrieval* work, and a correctness lift on coreference-heavy conversations. Precision here is the difference between a real result and a demo-gamed one.
+`─────────────────────────────────────────────────`
+
+**Deliverable:** `src/ground_truth_ab.py` + the table above (also in the lab's `RESULTS.md`).
+
+## 6. Bad-Case Journal (real, observed)
+
+_Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
+
+**Entry 1 — `llama-server` provider is a catch-22 for registry-known embed models (OBSERVED).** `--embedding-model llama-server:bge-m3` (and `:nomicai-modernbert-embed-base-bf16`) refuses *both* ways: **with** `--embedding-dimensions` → "does not support custom dimensions N (this model only emits its default vector size)"; **without** → "llama-server requires --embedding-dimensions <N> (user-driven recipes have no default dimension)." No value satisfies both → init impossible.
+*Fix:* use the **`ollama` provider** pointed at oMLX (`OLLAMA_BASE_URL=http://localhost:8000/v1`, `OLLAMA_API_KEY=<key>`, `--embedding-model ollama:<model>`, **no** `--embedding-dimensions`) — it *probes* the endpoint for the dim instead of demanding/rejecting it. (Worth a GBrain issue; strip keys before filing.)
+
+**Entry 2 — init is stateful + greedy; a botched first run poisons every retry (OBSERVED).** Three compounding traps: (a) `--supabase` runs the *interactive Supabase flow* and ignores `GBRAIN_DATABASE_URL` — use `--url`; (b) a present `OPENROUTER_API_KEY` makes init **auto-pick openrouter for embeddings** (probe failed 404 on a dummy key) even with `--embedding-model` set — keep it commented until post-init; (c) a wrong first init persists `~/.gbrain/config.json` + a baked vector-column width, so re-init fails citing the *stale* dimension.
+*Fix (0 pages → safe):* `DROP DATABASE gbrain; CREATE DATABASE gbrain;` + `rm ~/.gbrain/config.json`, then re-init. Lesson: **GBrain init is stateful and greedy — reset clean if anything looks off, and read the "Using …" line, not the green migration checkmarks.**
+
+**Entry 3 — `gbrain` not found after `bun link` (OBSERVED).** `bun link` symlinks the CLI into `~/.bun/bin` but does not add it to PATH; the installer often doesn't persist the PATH line either.
+*Fix:* `echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc`. Tell-apart: `ls ~/.bun/bin/gbrain` exists ⇒ pure PATH issue, not a broken install.
+
+**Entry 4 — trying to hand-format every source type into brain pages (DESIGN anti-pattern).** Emails, tweets, and meeting transcripts each have a different shape; writing a per-format converter (or authoring the 50 pages by hand) does not scale and is *not* GBrain's model.
+*Root cause:* mistaking who owns the structured layer. GBrain splits **raw sources** (immutable, any format, in `sources/`) from **the brain** (two-layer pages the **agent** writes).
+*Fix:* never author structured pages manually — drop raw under `sources/` (or `gbrain capture`), then let the agent convert via **ingest skills** (`meeting-ingestion`, `article-enrichment`, `voice-note-ingest` → `put_page`/`add_link`) or, in production, the credentialed **integration recipes** (`email-to-brain`, `x-to-brain`, `meeting-sync`). The agent is the universal formatter; you curate. (Drove the Phase 2 rewrite.)
+
+**Entry 5 — the agent stored pages fine but the graph had zero edges (OBSERVED, Phase 3).** A smolagents `CodeAgent` (oMLX) drove GBrain over MCP and wrote 5 well-formed pages via `put_page`, yet `gbrain extract links` reported `Links: 0`.
+*Root cause:* the LLM extraction wrote entity mentions as **plain prose** ("Alice Chen, founder of Acme AI") and used `<!-- timeline -->` instead of `---`, so there were no `[[wikilinks]]` to extract. The framework + MCP plumbing worked; the *contract* didn't.
+*Fix:* the extraction prompt must **hard-mandate** path-qualified `[[dir/slug]]` wikilinks with a worked example + "a page with zero wikilinks is invalid" → `Links: 0 → 11`. **Graph quality = extraction quality; measure edges, not pages.**
+
+**Entry 6 — fully-autonomous `CodeAgent` failed on a 14B (OBSERVED, Phase 3).** Asking the agent to read files + write an extractor + compose markdown in one code loop produced a naive regex placeholder + `InterpreterError: import pathlib not allowed` (the CodeAgent sandbox blocks `pathlib`/`json`).
+*Fix:* **thin agent, fat tools** — move file I/O and extraction into `@tool`s (`read_sources`, `extract_pages`); the agent only orchestrates. Also: filter `ToolCollection.from_mcp` to the ~few tools needed (GBrain exposes ~70; a 14B drowns), depend on `smolagents[mcp]` (mcpadapt), pass DB/oMLX env via `StdioServerParameters(env=…)` (an MCP server is a separate process), and use `use_structured_outputs_internally=True` (oMLX has no native tool_calls). Lab: `~/code/agent-prep/lab-03-5-96-gbrain/`.
+
+**Entry 7 — graph reads as "built" but has no new edges (OBSERVED, Phase 6).** After re-ingesting an expanded corpus, `gbrain stats` showed **19 pages but Links: 11** — unchanged from the 10-page run — even though the new pages' text held ~68 `[[wikilinks]]`.
+*Root cause:* self-wiring is a **batch extraction pass, not a `put_page` side-effect**. Pages written over MCP live only in Postgres; bare `gbrain extract links` walks a brain *directory* of `.md` files and errors `No brain directory configured`, so extraction never ran on them.
+*Fix:* `gbrain extract links --source db` re-parses the stored `compiled_truth`/`timeline` columns → `created 34 links from 19 pages` → 45 total. Do **not** gate on `pages.links_extracted_at` — that column tracks the file-source path only and stays null after DB-source extraction.
+
+**Entry 8 — keyword-vs-hybrid benchmark shows zero difference (OBSERVED, Phase 6).** `gbrain search "<q>"` and `gbrain query "<q>"` returned byte-identical rankings *and* scores; an A/B "keyword vs hybrid" read as "no lift."
+*Root cause:* both subcommands fall through to the **same handler** (`src/cli.ts:771-772 — case 'search': case 'query':`). The CLI has no pure-keyword command; `keywordSearch` is an internal building block *inside* the hybrid pipeline, not a separate path.
+*Fix:* benchmark at the **engine layer** via `src/core/search/eval.ts:runEval()` with `strategy: 'keyword'|'vector'|'hybrid'`, bootstrapping engine + gateway exactly as the CLI does. **Never A/B retrievers through the CLI.**
+
+**Entry 9 — hybrid-RRF underperformed pure vector (OBSERVED, Phase 6).** On the 19-page brain, RRF scored recall@3 = 0.90 but MRR **0.78** — *worse* than pure vector (0.90 / **0.92**). The expected 83→95 RRF win was a slight regression instead.
+*Root cause:* the keyword arm missed all four purely-semantic queries (no lexical overlap); RRF fusion folded that dead arm back in, demoting correct vector hits a rank (`dinner at Tartine` vector @1 → hybrid @3). RRF helps only when *both* arms are individually competitive and complementary.
+*Fix:* on a small, semantic-heavy corpus, **prefer pure vector**; reserve RRF for corpora with enough exact-term / proper-noun traffic that keyword earns its weight. Always measure on your own corpus before quoting the published lift.
+
+**Entry 10 — retrieved "context" is just a slug + one-line snippet; the LLM can't answer (OBSERVED, Phase 7).** The first Ground-Truth A/B fed `gbrain query --json` straight to the model, which replied "the context shows `[[people/lin-zhao]]` but doesn't include the actual content."
+*Root cause:* `gbrain query` returns ranked **snippets** (slug + compiled-truth first line) for *display*, not full page bodies for grounding.
+*Fix:* use `query` only to *rank* slugs, then pull each body with `gbrain get <slug>` before injecting. Retrieval (rank) and grounding (fetch) are two separate calls.
+**Entry 11 — the chat model refuses the task, insisting it's "Claude Code" (OBSERVED, Phase 7).** With the task instruction in the `system` role, VibeProxy→Claude answered every turn with "I'm Claude Code… I can't help with questions about people."
+*Root cause:* VibeProxy fronts the Claude-Code CLI identity and **overrides the caller's `system` prompt**, so a "you are a knowledge-base assistant" system message is discarded and the model falls back to refusing non-coding requests.
+*Fix:* put the instruction *and* the grounding notes in the **USER** message as a document-Q&A task ("using ONLY these notes, answer…"); don't depend on `system`. The same model then answers correctly.
 
 _Projected (to confirm during Phases 3–6):_
 
-- **Phase 3 — Markdown convention mismatch.** Likely surface: your `# Meeting with Alice` doesn't trigger the `attended` edge because GBrain's parser expects `# Dinner with @alice`. Fix: read GBrain's parser regex; adopt the `@handle` convention consistently.
-- **Phase 4 — RRF lift smaller than 12pts.** Likely surface: corpus too short OR queries too name-specific (both retrievers already agree). Fix: expand corpus to 200+ pages OR pick queries with mix of semantic + exact-phrase types.
+- **Phase 3 — Agent over-relies on GBrain for general knowledge.** Likely surface: agent uses GBrain context for questions GBrain shouldn't know (general world facts). Fix: agent prompt distinguishes "questions about MY people/companies/events" (use GBrain) vs "general questions" (use base LLM knowledge).
+- **Phase 4 — Markdown convention mismatch.** Likely surface: your `# Meeting with Alice` doesn't trigger the `attended` edge because GBrain's parser expects `# Dinner with @alice`. Fix: read GBrain's parser regex; adopt the `@handle` convention consistently.
 - **Phase 5 — Synthesis layer hallucinates a "we don't know" caveat that's wrong.** Likely surface: gap-flagging logic uses a heuristic that triggers on missing entities even when the answer IS in the corpus. Fix: synthesis prompt includes the retrieved citations explicitly; gap-flag triggers only when retrieval returned zero matches.
-- **Phase 6 — Agent over-relies on GBrain for general knowledge.** Likely surface: agent uses GBrain context for questions GBrain shouldn't know (general world facts). Fix: agent prompt distinguishes "questions about MY people/companies/events" (use GBrain) vs "general questions" (use base LLM knowledge).
+- **Phase 6 — RRF lift smaller than 12pts.** Likely surface: corpus too short OR queries too name-specific (both retrievers already agree). Fix: expand corpus to 200+ pages OR pick queries with mix of semantic + exact-phrase types.
 
 ---
 
 ## 7. Interview Soundbites (2-3 entries — SPEC)
 
 - **Planned Soundbite 1 — "Why deterministic extraction over LLM extraction?"** Anchors: §2.1 + §2.4. 70 words: when data is already structured (Markdown notes, calendar events, contact lists), deterministic parsing is cheap, reproducible, auditable. LLM extraction is the right tool for UNSTRUCTURED text (raw conversations, scraped web). GBrain's choice is workload-driven, not philosophical. Many production stacks use both: GBrain for structured operational data + LLM-extracted graphs for unstructured conversations.
-- **Planned Soundbite 2 — "Walk me through the 83→95 Recall@5 lift."** Anchors: Phase 4 measurement. 70 words: pure HNSW vector search recall@5 = 83% on 240-page corpus. RRF (HNSW + Postgres keyword) recall@5 = 95%. The +12pt lift comes from exact-term queries (names, acronyms, proper nouns) that pure-vector underweights. Production rule: RRF is the cheapest hybrid-search upgrade; ~50 LOC of Postgres + RRF math on top of any vector store.
+- **Soundbite 2 — "Does hybrid-RRF always beat plain vector search?"** Anchors: Phase 6 measurement. ~70 words: No — and I measured it rather than assume. On my 19-page brain, pure vector hit recall@3 = 0.90, MRR 0.92; RRF *matched* the recall but dropped MRR to 0.78, because the keyword arm missed every purely-semantic query and fusing it demoted strong vector hits a rank. RRF only wins when both arms are individually competitive — on a small, semantic-heavy corpus it's net-negative. I don't trust the published 83→95 lift without re-running on my own corpus.
 - **Planned Soundbite 3 — "Where does GBrain fit vs HyperMem in your taxonomy?"** Anchors: §2.4 + W3.5.9 cross-link. 70 words: GBrain is Class 4 — markdown-first deterministic-graph. HyperMem is Class 3 — LLM-extracted hyperedges. Complementary: GBrain for the structured operational data you control (meetings, contacts, internal docs); HyperMem-class for unstructured conversational data. Many production systems run both with a thin router routing by data shape.
 
 ---
@@ -683,6 +1045,8 @@ _Projected (to confirm during Phases 3–6):_
 - **Vectorize — What Is GBrain? Garry Tan's AI Agent Memory System Explained.** https://vectorize.io/articles/what-is-gbrain.
 - **Cormack et al. (2009).** *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods.* SIGIR 2009. Foundational RRF paper.
 - **MarkTechPost tutorial repo.** https://github.com/Marktechpost/AI-Agents-Projects-Tutorials. Contains `gbrain-tutorial.ipynb`.
+- **ClaudioDrews — memory-os.** `https://github.com/ClaudioDrews/memory-os`. The 7-layer memory stack (built for the Hermes Agent) whose **Ground-Truth Hierarchy** principle Phase 7 leverages — injected memory is authoritative; the "memory-zero" anti-pattern re-establishes context every turn. NOT a library/MCP/REST; we port the *principle*, not the code.
+- **BAI-LAB — MemoryOS.** `https://github.com/BAI-LAB/MemoryOS`. A *different* "MemoryOS" — segmented memory with a heat/eviction mechanism, leveraged in [[Week 3.5.95 - Self-Observability Memory]] Phase 7. Listed here only to flag the easy name collision.
 
 ---
 
@@ -690,7 +1054,7 @@ _Projected (to confirm during Phases 3–6):_
 
 - **Builds on:** [[Week 3.5.5 - Multi-Agent Shared Memory]] (multi-agent memory foundations); [[Week 3.5.8 - Two-Tier Memory Architecture]] (two-tier consolidation pattern); [[Week 3.5.9 - Requirement-Driven Memory Architecture]] (architecture-choice meta-skill — this chapter is Class 4).
 - **Distinguish from:** [[Week 3.5.9 - Requirement-Driven Memory Architecture]] §2 three-class taxonomy (Class 1/2/3 are LLM-extracted; GBrain is Class 4 deterministic).
-- **Connects to:** [[Week 6.65 - MCP Production Transports]] (GBrain exposes 74 MCP tools); [[Week 6.5 - Hermes Agent Hands-On]] (Hermes is one of GBrain's downstream consumers); [[Week 12 - Capstone]] (capstones with structured operational data can use GBrain as memory layer).
+- **Connects to:** [[Week 6.65 - MCP Production Transports]] (GBrain exposes 74 MCP tools); [[Week 6.5 - Hermes Agent Hands-On]] (Hermes is one of GBrain's downstream consumers); [[Week 12 - Capstone]] (capstones with structured operational data can use GBrain as memory layer); [[Week 3.5.95 - Self-Observability Memory]] — the *sibling* memory-os leverage: Phase 7 here ports ClaudioDrews/memory-os's Ground-Truth Hierarchy, while W3.5.95 Phase 7 ports BAI-LAB/MemoryOS's heat/eviction.
 - **Foreshadows:** continued production memory-layer evolution; expect GBrain v2 with broader typed-edge vocabulary (skills, contracts, transactions).
 
 ---
