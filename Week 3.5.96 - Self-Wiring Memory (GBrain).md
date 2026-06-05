@@ -1076,7 +1076,7 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 - **Staging is on DISK** (`~/brain/.ingest_stage/<file>#<idx>.json`), **not in GBrain** — so the throwaway intermediate is never embedded. A staged chunk JSON IS the checkpoint: re-run skips chunks already staged (`rm -rf` the dir to restart). A crash mid-file re-extracts only the unfinished chunk.
 - **`merge_from_disk()`** groups staged pages by entity across files, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), and yields canonical pages.
 - The **agent writes only the CANONICAL pages** via `put_page` over MCP, in bounded batches → **each entity embedded exactly once**. (The agent still uses GBrain as memory — it writes the finals and queries them; only the disposable staging left the store.)
-- A **write checkpoint** (`~/brain/.ingest_written.json`) records written canonical slugs, marked after each batch lands. A resumed run re-embeds **only un-written pages**, so "embed once" survives a crash — not just an uninterrupted run. Oversized pages (> `BIG_PAGE_CHARS`) skip the agent and write **driver-side** (no 30s limit on a single big embed).
+- A **write checkpoint** (`~/brain/.ingest_written.json`) records a canonical slug **only after `_verify_written` confirms its page is actually in GBrain** (verify-then-mark) — so a silently-failed `put_page` stays un-checkpointed and retries; the checkpoint can never claim a page that isn't there. A resumed run re-embeds **only un-written pages**, so "embed once" survives a crash. Oversized pages (> `BIG_PAGE_CHARS`) skip the agent and write **driver-side** (no 30s limit on a single big embed).
 - Then **`reconcile_graph()`** wires the `[[wikilinks]]`.
 
 ```mermaid
@@ -1123,8 +1123,11 @@ context" is handled, and resume works at chunk granularity.
 
 Two checkpoints, both on disk, so resume re-does no expensive work:
   - EXTRACTION: a file CHUNK with a stage JSON (`<file>#<idx>.json`) is skipped.
-  - WRITES: ~/brain/.ingest_written.json records written canonical slugs, so a
-    resumed run re-embeds ONLY un-written pages — "embed once" survives a crash.
+  - WRITES: ~/brain/.ingest_written.json records written canonical slugs — but a
+    slug is recorded only after its page is VERIFIED present in GBrain
+    (verify-then-mark), so a silently-failed write stays un-checkpointed and is
+    retried on resume. A resumed run re-embeds ONLY un-written pages — "embed
+    once" survives a crash; the checkpoint can never claim a page that isn't there.
 Oversized pages (> BIG_PAGE_CHARS) are written driver-side (no 30s sandbox) since
 one such page's single embed could approach the agent's per-step limit.
 
@@ -1192,6 +1195,25 @@ def _gbrain_put(slug: str, content: str) -> None:
     embed could approach the agent's per-step limit."""
     subprocess.run([_GBRAIN, "put", slug], input=content, capture_output=True,
                    text=True, env=_server_env())
+
+
+def _verify_written(slugs: list[str]) -> list[str]:
+    """Return the subset of `slugs` that ACTUALLY landed in GBrain. Existence in
+    `pages` (deleted_at IS NULL) is the proof of a successful put_page (embed +
+    upsert); only verified slugs get checkpointed, so a silently-failed write
+    stays un-checkpointed → retried on resume. The invariant: a slug is in the
+    write checkpoint IFF its page is really in the store."""
+    if not slugs:
+        return []
+    cont = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                          capture_output=True, text=True).stdout
+    name = next((n for n in cont.splitlines() if "gbrain-pg" in n), "gbrain-pg")
+    arr = "{" + ",".join(slugs) + "}"   # slugs are kebab + '/', safe in a PG array literal
+    sql = f"select slug from pages where deleted_at is null and slug = any('{arr}');"
+    out = subprocess.run(["docker", "exec", "-i", name, "psql", "-U", "postgres",
+                          "-d", "gbrain", "-tAc", sql], capture_output=True, text=True).stdout
+    got = {s.strip() for s in out.splitlines() if s.strip()}
+    return [s for s in slugs if s in got]
 
 
 # ── per-file extraction → DISK staging (no embedding) ───────────────────────
@@ -1322,14 +1344,21 @@ def main() -> None:
         small = [p for p in pending if len(p["content"]) <= BIG_PAGE_CHARS]
         for p in big:
             _gbrain_put(p["slug"], p["content"])
-            _mark_written([p["slug"]])
+            _mark_written(_verify_written([p["slug"]]))  # checkpoint ONLY if it landed
             print(f">>> big page driver-side: {p['slug']} ({len(p['content'])} chars)")
         for i in range(0, len(small), BATCH):
             batch = small[i:i + BATCH]
             _CURRENT = batch
             print(f">>> write batch {i // BATCH + 1} ({len(batch)} pages) -> "
                   + str(agent.run(WRITE_TASK)))
-            _mark_written([p["slug"] for p in batch])   # checkpoint AFTER the batch lands
+            # Verify-then-mark: checkpoint ONLY slugs confirmed present in GBrain.
+            # A silently-failed put_page stays un-checkpointed → retried on resume.
+            landed = _verify_written([p["slug"] for p in batch])
+            _mark_written(landed)
+            if len(landed) < len(batch):
+                missing = sorted(set(p["slug"] for p in batch) - set(landed))
+                print(f">>> WARNING: {len(missing)} page(s) did not land, left un-checkpointed "
+                      f"(retry on resume): {missing}")
 
         # 4. RECONCILE links, then the agent queries its memory.
         print(">>> reconcile graph: " + reconcile_graph())
@@ -1345,7 +1374,8 @@ if __name__ == "__main__":
 - **Block 1 — `_files()` skips dotted *path parts*, not just dotted filenames.** A real source directory accumulates `.DS_Store` (binary → `UnicodeDecodeError`) and, here, `.omc-state/` *directories* a tool wrote in. Skipping `f.name.startswith(".")` misses files *inside* a dotted dir; `any(part.startswith("."))` over the relative parts catches both (BCJ Entry 13).
 - **Block 2 — extraction is driver-side, writes are agent-side; big files chunk.** `extract_file` runs in `main()` (no sandbox), so a per-file (or per-chunk) LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). `_chunk_text` splits a file over `CHUNK_CHARS` into deterministic line-aligned chunks so even one huge file fits the extract context; each chunk stages independently. This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
 - **Block 3 — disk staging defers the dedup AND keeps it out of the embedded store.** Each file's pages go to `~/brain/.ingest_stage/<file>.json` — no embedding. `merge_from_disk` groups by base slug across files; only entities in >1 file pay an LLM merge, singletons pass through. GBrain only ever sees the canonical result.
-- **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file **chunk** (skip staged `<file>#<idx>.json`); writes are checkpointed per canonical slug (`.ingest_written.json`, marked after each batch). Both expensive ops — the per-chunk LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
+- **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file **chunk** (skip staged `<file>#<idx>.json`); writes are checkpointed per canonical slug (`.ingest_written.json`). Both expensive ops — the per-chunk LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
+- **Block 5 — verify-then-mark: the checkpoint can't lie.** A slug enters `.ingest_written.json` only after `_verify_written` confirms its page is actually in `pages` (existence == a successful embed+upsert). Marking a whole batch right after `agent.run` returned would *trust the agent loop* — a silently-swallowed `put_page` error would checkpoint a page that never landed, and resume would skip it forever. Verify-then-mark makes the invariant exact: **a slug is in the checkpoint iff its page is really in the store**, so an un-landed page stays un-checkpointed and retries.
 
 **Result (measured, 8-file corpus, 2026-06-05):**
 
@@ -1445,6 +1475,10 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 16 — a single file too big for the extract context (OBSERVED, Phase 8).** Per-file staging assumed one file fits one extract prompt; a huge file (log, book, long transcript) breaks that and is un-resumable mid-file.
 *Root cause:* the resume unit was the whole *file*; the binding limit (extract context) is hit *within* a file.
 *Fix:* `_chunk_text` splits a file > `CHUNK_CHARS` into deterministic, line-aligned chunks `<file>#0/#1/…`, each its own staging unit. **Chose deterministic chunk-index over a `{file: last_line}` offset** — chunk-file existence is an atomic checkpoint (can't be half-written), reuses the per-file resume mechanism unchanged, and collapses "many files" + "one huge file" into one concept (a chunk; a small file = 1 chunk). Cross-chunk entities are reunited by `merge_from_disk` (same path as cross-file). Proven: 13.9 KB → 3 chunks; delete #1 → only #1 re-extracts.
+
+**Entry 17 — the write checkpoint marked a page that never landed (OBSERVED-class, Phase 8).** Marking a whole batch right after `agent.run` returned trusts the agent loop; if a `put_page` failed silently (agent swallows the error, still returns a final answer), the slug gets checkpointed → resume skips it → the page is lost, with no error anywhere.
+*Root cause:* the checkpoint recorded "the agent's batch code finished," not "the page is in the store." Those differ exactly in the silent-failure case.
+*Fix:* **verify-then-mark** — `_verify_written` queries `pages` (existence == successful embed+upsert) and the loop checkpoints only the verified subset; un-landed slugs stay un-checkpointed and retry. Invariant: a slug is in the write checkpoint IFF its page is really in GBrain. Gate tested: `_verify_written([real, fake]) → [real]`. Lesson: a checkpoint must record *confirmed durable state*, not "the code that should have written it returned."
 
 _Projected (to confirm during Phases 3–6):_
 
