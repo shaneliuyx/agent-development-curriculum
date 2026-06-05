@@ -1566,11 +1566,16 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC)
+## 7. Interview Soundbites
 
-- **Planned Soundbite 1 — "Why deterministic extraction over LLM extraction?"** Anchors: §2.1 + §2.4. 70 words: when data is already structured (Markdown notes, calendar events, contact lists), deterministic parsing is cheap, reproducible, auditable. LLM extraction is the right tool for UNSTRUCTURED text (raw conversations, scraped web). GBrain's choice is workload-driven, not philosophical. Many production stacks use both: GBrain for structured operational data + LLM-extracted graphs for unstructured conversations.
-- **Soundbite 2 — "Does hybrid-RRF always beat plain vector search?"** Anchors: Phase 6 measurement. ~70 words: No — and I measured it rather than assume. On my 19-page brain, pure vector hit recall@3 = 0.90, MRR 0.92; RRF *matched* the recall but dropped MRR to 0.78, because the keyword arm missed every purely-semantic query and fusing it demoted strong vector hits a rank. RRF only wins when both arms are individually competitive — on a small, semantic-heavy corpus it's net-negative. I don't trust the published 83→95 lift without re-running on my own corpus.
-- **Planned Soundbite 3 — "Where does GBrain fit vs HyperMem in your taxonomy?"** Anchors: §2.4 + W3.5.9 cross-link. 70 words: GBrain is Class 4 — markdown-first deterministic-graph. HyperMem is Class 3 — LLM-extracted hyperedges. Complementary: GBrain for the structured operational data you control (meetings, contacts, internal docs); HyperMem-class for unstructured conversational data. Many production systems run both with a thin router routing by data shape.
+**(a) "Why deterministic extraction over LLM extraction for the graph?"**
+> Because my data was already structured, so I let the structure do the work. The agent writes Markdown pages with `[[dir/slug]]` wikilinks; GBrain turns those into typed edges by regex — zero LLM calls — so re-running extraction yields identical edges every time. On my corpus that was 45 reproducible edges from the agent's wikilinks. LLM extraction is the right tool for *unstructured* text — raw conversations, scraped web — not for notes that already carry their own links. It's a workload decision, not philosophy; production stacks run both tiers.
+
+**(b) "Does hybrid-RRF always beat plain vector search?"**
+> No — and I measured it rather than assume. On my 19-page brain, pure vector hit recall@3 = 0.90, MRR 0.92; RRF *matched* the recall but dropped MRR to 0.78, because the keyword arm missed every purely-semantic query and fusing it demoted strong vector hits a rank. RRF only wins when both arms are individually competitive — on a small, semantic-heavy corpus it's net-negative. I don't trust the published 83→95 lift without re-running on my own corpus.
+
+**(c) "How do you make a bulk ingest into a memory store crash-resumable?"**
+> Checkpoint every *expensive* layer, not just the outer loop. Mine has three on disk: per-file-chunk extraction (skip staged chunks), a fingerprint-keyed merge cache, and a verify-then-mark write checkpoint — a page's slug is recorded only after I confirm it's actually in the store. Killed mid-run, the resume re-embedded nothing already done — zero write batches on the second pass. The trap I hit: "the writes are idempotent" hides a full re-embed. Idempotent isn't cheap; checkpoint against confirmed durable state.
 
 ---
 
