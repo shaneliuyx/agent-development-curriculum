@@ -5762,17 +5762,22 @@ def memory_query(tm: TieredMemory, *, query: str, k: int = 5,
 # ─── Task 3: Supersede ────────────────────────────────────────────────────
 def memory_supersede(tm: TieredMemory, *, old_id: str, new_content: str,
                      reason: str, user_id: str, agent_id: str = "") -> str:
-    """Mark `old_id` superseded by a fresh imprint. §8.6 Step 1+2 shape
-    (hard-delete + supersedes-pointer + supersede AuditEntry). Step 3
-    soft-delete swap is contract-free — same call site, different
-    `_qdrant_delete` impl."""
-    _qdrant_delete(tm, [old_id])
+    """Mark `old_id` superseded by a fresh imprint. §8.6 Step 3 (WIRED
+    2026-06-05): SOFT-DELETE — imprint the new fact first (for the back-pointer),
+    then payload-patch the old point with `superseded_by` instead of deleting it.
+    query_context excludes superseded facts by default; include_superseded=True
+    walks the history. (Was hard-delete + supersedes-pointer in Step 1+2.)"""
     metadata = {
         "supersedes": old_id,
         "supersede_reason": reason,
         "fact_kind": "state_evolution",
     }
     new_id = tm.imprint(content=new_content, metadata=metadata)
+    _qdrant_supersede(tm, old_id, {
+        "superseded_by": new_id,
+        "superseded_at": datetime.now(timezone.utc).isoformat(),
+        "supersede_reason": reason,
+    })
     record_audit(AuditEntry(
         operation="supersede",
         actor_agent_id=agent_id,
