@@ -1065,7 +1065,7 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 | --------------------------------------------------------- | ----------------------------------------------------------------- |
 | Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                  |
 | One *file* too big for the extract context                | split into deterministic line-aligned chunks `<file>#0/#1/…` (`CHUNK_CHARS`); resume per chunk |
-| 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` |
+| 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` (the 30s is `executor_kwargs={"timeout_seconds": N}`-configurable, but a no-kill thread timeout — see BCJ 12) |
 | Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done |
 | One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent   |
 | Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)          |
@@ -1523,6 +1523,13 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 12 — every agent step "Code execution exceeded the maximum execution time of 30 seconds"; ingest never finishes (OBSERVED, Phase 3/8).** Scaling to 8 sources, the agent burned all 6 steps timing out, re-extracting each time, ~6 min wasted.
 *Root cause:* `extract_pages` is a ~60s oMLX call, but smolagents' CodeAgent kills any single step's code at **30s** — and the agent re-runs its whole `read_sources(); extract_pages(...)` block every step. The heavy LLM call can never complete inside the sandbox.
 *Fix:* warm `extract_pages` **once outside the sandbox** (module-level cache in `main()`); the agent's call then returns instantly → ingest finishes in 1 step, 7.5s. At true scale, move extraction fully driver-side and stream per file (Phase 8 / `resumable_ingest.py`).
+*The 30s IS configurable — but a bump is the wrong fix.* The limit is `MAX_EXECUTION_TIME_SECONDS = 30` in smolagents' `local_python_executor.py`, overridable per agent:
+```python
+from smolagents import CodeAgent
+agent = CodeAgent(tools=[...], model=model,
+                  executor_kwargs={"timeout_seconds": 120})   # raise it; or None to disable
+```
+Two reasons we still move the slow work out of the sandbox instead of bumping: (1) it's a **thread timeout with no kill** — on timeout it raises `ExecutionTimeoutError` but the runaway thread keeps running in the background (Python can't force-kill a thread), so a bigger number just lets slow code *finish*, it adds no real preemption (and it's the *local* executor only; a remote E2B/Docker executor has its own). (2) A bigger timeout solves *nothing* of the actual scale walls — extraction context limit, cross-file dedup, embed-once, resume — and extraction time varies with corpus + model, so you'd keep chasing the number. Moving extraction driver-side makes the timeout value **irrelevant** and is required for the other walls anyway.
 **Entry 13 — ingest crashes on `.DS_Store` / picks up `.omc-state/` as "files" (OBSERVED, Phase 8).** `read_sources` threw `UnicodeDecodeError` on a binary `.DS_Store`; the resumable driver also checkpointed two `.omc-state-*` entries (0 pages each).
 *Root cause:* the walk skipped dotted *filenames* but rglob descended into dotted *directories* and grabbed the non-dotted files inside; binary files aren't UTF-8.
 *Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
