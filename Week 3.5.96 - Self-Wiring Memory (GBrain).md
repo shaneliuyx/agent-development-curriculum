@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.96 — Self-Wiring Memory (GBrain — Garry Tan's Production Memory Layer for AI Agents)"
 created: 2026-05-28
-updated: 2026-06-04
+updated: 2026-06-05
 status: SPEC + executable lab
 tags:
   - agent
@@ -448,6 +448,12 @@ TOOLS; the agent just orchestrates:
     for p in pages: put_page(slug=p['slug'], content=p['content'])
     answer = query(query="..."); final_answer(answer)
 
+After the agent run, main() calls reconcile_graph() — a deterministic, zero-LLM
+`gbrain extract links --source db` pass that materializes the [[wikilinks]] into
+typed edges. This is infra, NOT an agent tool: put_page over MCP skips inline
+auto-link (remote caller) and inline auto-link can't wire forward references
+anyway, so the graph must be reconciled once the full corpus exists.
+
 Brain = oMLX (no native tool-calls) → CodeAgent + use_structured_outputs_internally.
 """
 from __future__ import annotations
@@ -455,6 +461,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import subprocess
 
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
@@ -509,18 +516,36 @@ def read_sources() -> str:
     each prefixed with its relative path as a header."""
     parts = []
     for f in sorted(SOURCES.rglob("*")):
-        if f.is_file():
-            parts.append(f"===== {f.relative_to(SOURCES.parent)} =====\n{f.read_text()}")
+        if not f.is_file() or f.name.startswith("."):
+            continue  # skip dirs + dotfiles (.DS_Store etc. are not source text)
+        try:
+            text = f.read_text()
+        except UnicodeDecodeError:
+            continue  # skip binary / non-UTF-8 files rather than crash the ingest
+        parts.append(f"===== {f.relative_to(SOURCES.parent)} =====\n{text}")
     return "\n\n".join(parts)
+
+
+_PAGES_CACHE: list | None = None
 
 
 @tool
 def extract_pages(raw: str) -> list:
     """Turn raw source text into structured GBrain pages via the local LLM.
 
+    Cached: the ~60s oMLX extraction exceeds smolagents' 30s per-step sandbox
+    timeout, and the agent re-runs its whole code block on each step. main()
+    warms this cache ONCE before the agent loop (outside the sandbox, no
+    timeout), so the agent's `extract_pages(raw)` call returns instantly and
+    ingest finishes in one step. Single-corpus assumption: the cache ignores
+    `raw` after the first compute.
+
     Args:
         raw: concatenated raw source text (from read_sources).
     """
+    global _PAGES_CACHE
+    if _PAGES_CACHE is not None:
+        return _PAGES_CACHE
     client = OpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
                     api_key=os.getenv("LLM_API_KEY", "dummy"))
     resp = client.chat.completions.create(
@@ -528,7 +553,8 @@ def extract_pages(raw: str) -> list:
         messages=[{"role": "user", "content": _EXTRACT_PROMPT.replace("{raw}", raw)}],
         temperature=0.0, max_tokens=4000, response_format={"type": "json_object"})
     data = json.loads(resp.choices[0].message.content or "{}")
-    return [p for p in data.get("pages", []) if p.get("slug") and p.get("content")]
+    _PAGES_CACHE = [p for p in data.get("pages", []) if p.get("slug") and p.get("content")]
+    return _PAGES_CACHE
 
 
 def _server_env() -> dict[str, str]:
@@ -540,12 +566,35 @@ def _server_env() -> dict[str, str]:
     return env
 
 
-TASK = """Build the brain, then answer a question, using ONLY the provided tools:
+def reconcile_graph() -> str:
+    """Deterministic post-ingest pass (zero LLM): materialize the `[[wikilinks]]`
+    the agent wrote into typed graph edges. REQUIRED after an agent/MCP ingest,
+    for two reasons baked into GBrain:
+      1. `put_page` over MCP is a *remote* caller, so GBrain skips inline auto-link
+         (operations.ts -> `skipped: 'remote'`); nothing wires on write.
+      2. Even inline auto-link only wires targets that ALREADY exist (FK-safety),
+         so the forward references a single-pass ingest creates would be dropped.
+    `extract links --source db` reconciles the FINISHED corpus (all pages present),
+    resolving every forward ref. Run it once, after all put_page writes."""
+    out = subprocess.run(
+        [_GBRAIN, "extract", "links", "--source", "db"],
+        capture_output=True, text=True, env=_server_env(),
+    )
+    lines = [ln for ln in (out.stdout or out.stderr).splitlines() if ln.strip()]
+    return lines[-1] if lines else "(no output)"
+
+
+# Two phases on purpose: WRITE, then (infra reconcile), then READ. The query must
+# run AFTER reconcile_graph() or it reads a graph whose edges aren't materialized.
+INGEST_TASK = """Build the brain using ONLY the provided tools:
 1. raw = read_sources()
 2. pages = extract_pages(raw)
 3. for each page in pages: call put_page(slug=page["slug"], content=page["content"])
-4. answer = query(query="Who is anchoring the acme-seed round and on what terms?")
-5. return answer via final_answer.
+4. return the number of pages written via final_answer.
+"""
+QUERY_TASK = """Answer using ONLY the query tool:
+1. answer = query(query="Who is anchoring the acme-seed round and on what terms?")
+2. return answer via final_answer.
 """
 
 
@@ -563,7 +612,24 @@ def main() -> None:
             tools=[read_sources, extract_pages, *mcp_tools],
             model=model, max_steps=6,
             use_structured_outputs_internally=True, verbosity_level=1)
-        answer = agent.run(TASK)
+
+        # 0. WARM the extraction cache OUTSIDE the agent sandbox. The oMLX
+        # extraction is ~60s; smolagents kills any single step's code at 30s, so
+        # if the agent triggered it inside its loop every step would time out and
+        # re-extract. Running it once here (no sandbox) means the agent's
+        # extract_pages(raw) call returns the cached result instantly.
+        extract_pages(read_sources())
+
+        # 1. WRITE — the agent ingests raw sources into GBrain pages (cache-fast).
+        print(">>> ingest: " + str(agent.run(INGEST_TASK)))
+
+        # 2. RECONCILE — deterministic, zero-LLM. NOT an agent tool (must not depend
+        # on the LLM remembering). Materializes the [[wikilinks]] into typed edges
+        # BEFORE the read, so the query sees the wired graph. See reconcile_graph().
+        print(">>> reconcile graph: " + reconcile_graph())
+
+        # 3. READ — query now runs over the reconciled graph.
+        answer = agent.run(QUERY_TASK)
         print("\n>>> agent final answer:\n" + str(answer))
 
 
@@ -589,18 +655,24 @@ if __name__ == "__main__":
 
 ### Phase 4 — Verify the self-wiring graph [executed, measured]
 
-**Goal:** confirm the `[[wikilinks]]` the agent wrote (Phase 3) became typed graph edges — deterministically, with zero LLM calls. **Run after Phase 3** (it operates on the pages the agent produced).
+**Goal:** confirm the `[[wikilinks]]` the agent wrote became typed graph edges — deterministically, zero LLM. As of the wired agent, **Phase 3 already reconciles**: its `main()` calls `reconcile_graph()` (`gbrain extract links --source db`) after the writes and before the query. So this phase *verifies* the materialized graph and explains **why that pass is required, not automatic.**
+
+**Why the reconcile pass is required (by design, not a glitch):**
+1. The agent writes via MCP `put_page` — a **remote** caller — so GBrain *skips inline auto-link* (`operations.ts` → `skipped: 'remote'`); nothing wires on write.
+2. Even inline auto-link only wires targets that **already exist** (FK-safety), so the *forward references* a single-pass ingest creates (`people/lin-zhao` cites `companies/acme-ai` before that page exists) would be dropped anyway.
+
+`extract links --source db` reconciles the **finished** corpus — every page present, every forward ref resolvable. That's why our links went **11 → 45** only after the batch pass (BCJ Entry 7).
 
 ```bash
-export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain
-gbrain extract links --source db     # backfill typed edges from the agent's wikilinks
+# the agent already ran reconcile_graph(); these VERIFY it (re-running extract is idempotent)
 gbrain stats                         # pages · links · embedded chunks
-gbrain graph-query deals/acme-seed   # typed-edge traversal
+gbrain graph-query deals/acme-seed   # typed-edge traversal: --invested_in-> / --works_at-> / --mentions->
+gbrain extract links --source db     # idempotent re-check — "0 new links" if already reconciled
 ```
 
-> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get`). `links: 0` means either you skipped `extract links` **or** the agent's pages had no wikilinks — the real failure we hit (BCJ Entry 5).
+> **Gotcha:** there is no `gbrain ingest` (it's `import`) and no `gbrain entity` (use `graph-query` / `backlinks` / `get`). `links: 0` means the agent's pages had no wikilinks (the real failure we hit — BCJ Entry 5), since the reconcile pass is now automatic.
 
-**Result (measured):** on the agent's output — **10 pages → `extract links` created 11 typed edges**. `gbrain graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5). **Deterministic:** re-running `extract` yields identical edges (regex/parser, zero LLM calls). The first run produced `links: 0` until the extraction prompt was made to mandate wikilinks (BCJ Entry 5) — *graph quality = extraction quality.*
+**Result (measured):** the wired agent reconciles automatically — small-corpus **10 pages → 11 edges**; scaled 8-source run **19 pages → 45 edges** (`extract links --source db` created 34); the large-corpus `resumable_ingest.py` run reached **23 pages / 63 links** with per-file merge. `gbrain graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` (depth 1–5). **Deterministic:** re-running `extract` yields identical edges (regex/parser, zero LLM). The first run produced `links: 0` until the extraction prompt mandated wikilinks (BCJ Entry 5) — *graph quality = extraction quality.*
 
 ### Phase 5 — Synthesis layer + "what we don't know" check [executed, measured]
 
@@ -977,6 +1049,278 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 
 **Deliverable:** `src/ground_truth_ab.py` + the table above (also in the lab's `RESULTS.md`).
 
+### Phase 8 — Large-corpus ingest: per-file streaming + checkpoint + merge [executed, measured]
+
+**Goal:** scale the Phase 3 agent to a *large* number of files. Phase 3 warms one extraction over **all** files concatenated — fine for 8 files, fatal at scale: the single prompt blows the context window and is un-resumable. The fix is a different shape, not a bigger prompt.
+
+**The three scale problems (the 30s sandbox limit is *not* the main one):**
+1. **Extraction context wall** — you cannot put thousands of files in one LLM call.
+2. **Cross-file entity dedup** — the same entity appears in many files; one-big-prompt merged them "for free," per-file extraction can't.
+3. **Throughput** — at thousands of files the ceiling is embedding calls + DB upserts, not the agent loop.
+
+**The shape:** stream **per file**, checkpoint **per file**, defer cross-file merge to one pass.
+- **Extraction is driver-side** (one small file → fits context, no 30s sandbox).
+- The **agent writes** each file's pages via `put_page` over MCP, to a per-file **staging namespace** (`staging/<file>/<entity>`) so files never overwrite a shared entity. Bounded → never hits 30s.
+- **Checkpoint after each file** (`~/brain/.ingest_files.json`) → kill it, re-run, it resumes; `put_page` idempotency is the safety net.
+- **`merge_pass()`** groups staging variants by base entity, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), promotes to the canonical slug, drops staging.
+- Then **`reconcile_graph()`** wires the `[[wikilinks]]`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  F["for each file<br/>NOT in checkpoint"] --> E["extract_file()<br/>DRIVER-side, no sandbox"]
+  E --> W["agent: put_page each<br/>→ staging/&lt;file&gt;/&lt;entity&gt;"]
+  W --> C["checkpoint the file<br/>(resumable)"]
+  C --> F
+  F -->|"all files done"| M["merge_pass()<br/>group by entity → merge<br/>multi-file → canonical slug"]
+  M --> R["reconcile_graph()<br/>wire [[wikilinks]]"]
+  R --> Q["query"]
+```
+
+**Code:** `src/resumable_ingest.py`:
+
+```python
+"""W3.5.96 — LARGE-CORPUS ingest: per-file streaming + per-file checkpoint +
+final reconcile-merge. The scale variant of ingest_agent.py.
+
+ingest_agent.py warms ONE extraction over ALL files concatenated — fine for a
+handful of files, but at scale that single prompt blows the context window and is
+un-resumable. This driver instead processes ONE FILE AT A TIME:
+
+  driver: for each file NOT in the checkpoint:          # resumable
+    pages = extract_file(file)        # extraction is DRIVER-side (no 30s sandbox),
+                                      # and one small file always fits the context
+    agent.run(WRITE_TASK)             # the AGENT writes this file's pages via
+                                      # put_page over MCP (bounded → never hits 30s)
+    mark_file_done(file)              # checkpoint after each file
+  merge_pass()                        # consolidate entities seen across files
+  reconcile_graph(); query
+
+Cross-file dedup is DEFERRED to merge_pass: each file writes to a per-file staging
+namespace (`staging/<file>/<entity>`) so files never overwrite each other; the
+merge pass then groups variants by base entity, merges multi-file entities (one
+LLM call each — the only place merge cost is paid), promotes to the canonical
+slug, and drops the staging copies. Then reconcile wires the [[wikilinks]].
+
+Run: python src/resumable_ingest.py   (re-run to resume; delete the checkpoint to restart)
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+from collections import defaultdict
+
+from mcp import StdioServerParameters
+from openai import OpenAI
+from smolagents import CodeAgent, OpenAIServerModel, ToolCollection, tool
+
+from ingest_agent import (
+    NEEDED_TOOLS, QUERY_TASK, _EXTRACT_PROMPT, _GBRAIN, _server_env, reconcile_graph,
+)
+
+SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
+CHECKPOINT = pathlib.Path(os.path.expanduser("~/brain/.ingest_files.json"))
+STAGE = "staging"          # per-file slug namespace: staging/<file-stem>/<entity-slug>
+
+_CURRENT: list = []        # the current file's staged pages; the agent's tool reads this
+
+
+# ── files + checkpoint ──────────────────────────────────────────────────────
+def _files() -> list[tuple[str, str]]:
+    """(stem, text) for every readable source file. Stem is a slug-safe id."""
+    out = []
+    for f in sorted(SOURCES.rglob("*")):
+        # skip non-files AND anything under a dotted dir (.DS_Store, .omc-state/…)
+        if not f.is_file() or any(part.startswith(".") for part in f.relative_to(SOURCES).parts):
+            continue
+        try:
+            text = f.read_text()
+        except UnicodeDecodeError:
+            continue
+        stem = str(f.relative_to(SOURCES)).replace("/", "-").rsplit(".", 1)[0]
+        out.append((stem, text))
+    return out
+
+
+def _done_files() -> set[str]:
+    if CHECKPOINT.exists():
+        return set(json.loads(CHECKPOINT.read_text()).get("done", []))
+    return set()
+
+
+def _mark_file(stem: str) -> None:
+    done = _done_files() | {stem}
+    CHECKPOINT.write_text(json.dumps({"done": sorted(done)}))
+
+
+def _llm() -> OpenAI:
+    return OpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
+                  api_key=os.getenv("LLM_API_KEY", "dummy"))
+
+
+# ── per-file extraction (DRIVER-side: no 30s sandbox, one small file) ────────
+def extract_file(stem: str, text: str) -> list:
+    """LLM-extract ONE file into pages, slugs rewritten into this file's staging
+    namespace so concurrent files never overwrite a shared entity."""
+    resp = _llm().chat.completions.create(
+        model=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+        messages=[{"role": "user", "content": _EXTRACT_PROMPT.replace("{raw}", text)}],
+        temperature=0.0, max_tokens=4000, response_format={"type": "json_object"})
+    data = json.loads(resp.choices[0].message.content or "{}")
+    pages = []
+    for p in data.get("pages", []):
+        if p.get("slug") and p.get("content"):
+            pages.append({"slug": f"{STAGE}/{stem}/{p['slug']}", "content": p["content"]})
+    return pages
+
+
+@tool
+def current_pages() -> list:
+    """Return the current file's staged pages ({slug, content}) for the agent to
+    write. The driver sets these before each agent.run."""
+    return _CURRENT
+
+
+WRITE_TASK = """Write the current file's pages using ONLY the provided tools:
+1. pages = current_pages()
+2. for each page in pages: call put_page(slug=page["slug"], content=page["content"])
+3. call final_answer with how many you wrote.
+"""
+
+
+# ── final reconcile-merge (DRIVER-side) ─────────────────────────────────────
+def _base_slug(staged: str) -> str:
+    """staging/<stem>/people/alice-chen -> people/alice-chen"""
+    return staged.split("/", 2)[2]
+
+
+def _gbrain_get(slug: str) -> str:
+    body = subprocess.run([_GBRAIN, "get", slug], capture_output=True, text=True,
+                          env=_server_env()).stdout
+    return "\n".join(ln for ln in body.splitlines() if not ln.startswith(("Starting", "[gbrain")))
+
+
+def _gbrain_put(slug: str, content: str) -> None:
+    subprocess.run([_GBRAIN, "put", slug], input=content, capture_output=True,
+                   text=True, env=_server_env())
+
+
+def _gbrain_delete(slug: str) -> None:
+    subprocess.run([_GBRAIN, "delete", slug], capture_output=True, text=True, env=_server_env())
+
+
+def _merge(base: str, contents: list[str]) -> str:
+    """Merge multiple per-file variants of one entity into a single page (one LLM
+    call). Only invoked when an entity appears in >1 file."""
+    joined = "\n\n--- VARIANT ---\n\n".join(contents)
+    prompt = (
+        f"These are {len(contents)} notes about the SAME entity ({base}), extracted "
+        "from different source files. Merge them into ONE GBrain page with the exact "
+        "two-layer shape (summary with [[dir/slug]] wikilinks, then a line that is "
+        "exactly `---`, then `## Timeline` with the UNION of all timeline lines, "
+        "deduplicated, chronological). Keep every distinct fact. Output ONLY the "
+        f"merged markdown.\n\n{joined}"
+    )
+    resp = _llm().chat.completions.create(
+        model=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+        messages=[{"role": "user", "content": prompt}], temperature=0.0, max_tokens=2000)
+    return (resp.choices[0].message.content or contents[0]).strip()
+
+
+def _list_staging() -> list[str]:
+    """All staging slugs, via the DB (slugs are top-level, reliable to list)."""
+    sql = "select slug from pages where deleted_at is null and slug like 'staging/%';"
+    cont = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True,
+                          text=True).stdout
+    name = next((n for n in cont.splitlines() if "gbrain-pg" in n), "gbrain-pg")
+    out = subprocess.run(["docker", "exec", "-i", name, "psql", "-U", "postgres",
+                          "-d", "gbrain", "-tAc", sql], capture_output=True, text=True).stdout
+    return [s.strip() for s in out.splitlines() if s.strip()]
+
+
+def merge_pass() -> str:
+    """Consolidate per-file staging pages into canonical entity pages."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for staged in _list_staging():
+        groups[_base_slug(staged)].append(staged)
+
+    merged, promoted = 0, 0
+    for base, variants in groups.items():
+        contents = [_gbrain_get(v) for v in variants]
+        if len(contents) == 1:
+            _gbrain_put(base, contents[0]); promoted += 1
+        else:
+            _gbrain_put(base, _merge(base, contents)); merged += 1
+        for v in variants:
+            _gbrain_delete(v)
+    return f"merge_pass: {promoted} promoted, {merged} merged from {len(groups)} entities"
+
+
+def main() -> None:
+    server = StdioServerParameters(command=_GBRAIN, args=["serve"], env=_server_env())
+    model = OpenAIServerModel(
+        model_id=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+        api_base=os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"),
+        api_key=os.getenv("LLM_API_KEY", "dummy"))
+
+    global _CURRENT
+    files = _files()
+    done = _done_files()
+    print(f">>> {len(files)} files; {len(done)} already done (checkpoint)")
+
+    with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
+        mcp_tools = [t for t in tc.tools if t.name in NEEDED_TOOLS]
+        agent = CodeAgent(
+            tools=[current_pages, *mcp_tools], model=model, max_steps=3,
+            use_structured_outputs_internally=True, verbosity_level=1)
+
+        # Per-file loop: extract (driver) → write (agent, bounded) → checkpoint.
+        for stem, text in files:
+            if stem in done:
+                continue
+            _CURRENT = extract_file(stem, text)       # driver-side, no sandbox limit
+            print(f">>> {stem}: {len(_CURRENT)} pages -> " + str(agent.run(WRITE_TASK)))
+            _mark_file(stem)                          # checkpoint after each file
+
+        # Cross-file consolidation, then deterministic link reconciliation.
+        print(">>> " + merge_pass())
+        print(">>> reconcile graph: " + reconcile_graph())
+        answer = agent.run(QUERY_TASK)
+        print("\n>>> agent final answer:\n" + str(answer))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **Block 1 — `_files()` skips dotted *path parts*, not just dotted filenames.** A real source directory accumulates `.DS_Store` (binary → `UnicodeDecodeError`) and, here, `.omc-state/` *directories* a tool wrote in. Skipping `f.name.startswith(".")` misses files *inside* a dotted dir; `any(part.startswith("."))` over the relative parts catches both (BCJ Entry 13).
+- **Block 2 — extraction is driver-side, writes are agent-side.** `extract_file` runs in `main()` (no sandbox), so the ~per-file LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
+- **Block 3 — staging namespace defers the dedup.** Each file writes `staging/<stem>/<entity>`, so file 7's `alice-chen` can't clobber file 2's. `merge_pass` later groups by `_base_slug`, and only entities that actually appear in >1 file pay an LLM merge; singletons are promoted with a cheap copy.
+- **Block 4 — the checkpoint is the resumability contract.** `_mark_file` after each file means an interrupted run re-runs only the unfinished files. `put_page` idempotency makes even a mid-file re-run safe.
+
+**Result (measured, 8-file corpus, 2026-06-05):**
+
+```text
+8 files; 0 already done (checkpoint)
+emails-acme-cto: 7 pages -> 7 ... (per file) ... tweets-marcus-webb: 5 pages -> 5
+merge_pass: 5 promoted, 14 merged from 19 entities
+reconcile graph: 23 pages, 63 links
+query -> people/sam-okafor (top hit)
+```
+
+**0 sandbox timeouts** (extraction left the sandbox). **`14 merged from 19 entities`** is the proof the design is correct: 14 entities appeared across *multiple files* and were consolidated into one canonical page each — the cross-file dedup that one-big-prompt extraction did implicitly, now done explicitly in `merge_pass`. Re-running after an interrupt skips checkpointed files.
+
+`★ Insight ─────────────────────────────────────`
+- **At scale the 30s sandbox was a red herring.** The real walls are the *extraction context limit* and *cross-file dedup*. Moving extraction to the driver dissolves the timeout as a side effect; the architecture is driven by context + dedup, not by the sandbox.
+- **`merge_pass` is the dedup-on-write pattern, deferred.** "Entity in file 7 already exists from file 2 → merge" is exactly `dedup_synthesis.decide_action` (W3.5.8/3.5.9). Doing it as a batch post-pass (vs on every write) trades freshness for far fewer LLM calls — only multi-file entities merge. Same lesson, different lifecycle position ([[Engineering Decision Patterns#Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)|Pattern 22]]).
+- **Checkpoint + idempotency = the only honest way to bulk-ingest.** Any large ingest will be interrupted (OOM, rate limit, a crash on file 4,000). Per-unit checkpoint + idempotent writes turn "start over" into "resume," which is the difference between a demo and an operable pipeline.
+`─────────────────────────────────────────────────`
+
+**Deliverable:** `src/resumable_ingest.py` + the measured run above (also in the lab's `RESULTS.md`).
+
 ## 6. Bad-Case Journal (real, observed)
 
 _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
@@ -1019,6 +1363,16 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 11 — the chat model refuses the task, insisting it's "Claude Code" (OBSERVED, Phase 7).** With the task instruction in the `system` role, VibeProxy→Claude answered every turn with "I'm Claude Code… I can't help with questions about people."
 *Root cause:* VibeProxy fronts the Claude-Code CLI identity and **overrides the caller's `system` prompt**, so a "you are a knowledge-base assistant" system message is discarded and the model falls back to refusing non-coding requests.
 *Fix:* put the instruction *and* the grounding notes in the **USER** message as a document-Q&A task ("using ONLY these notes, answer…"); don't depend on `system`. The same model then answers correctly.
+
+**Entry 12 — every agent step "Code execution exceeded the maximum execution time of 30 seconds"; ingest never finishes (OBSERVED, Phase 3/8).** Scaling to 8 sources, the agent burned all 6 steps timing out, re-extracting each time, ~6 min wasted.
+*Root cause:* `extract_pages` is a ~60s oMLX call, but smolagents' CodeAgent kills any single step's code at **30s** — and the agent re-runs its whole `read_sources(); extract_pages(...)` block every step. The heavy LLM call can never complete inside the sandbox.
+*Fix:* warm `extract_pages` **once outside the sandbox** (module-level cache in `main()`); the agent's call then returns instantly → ingest finishes in 1 step, 7.5s. At true scale, move extraction fully driver-side and stream per file (Phase 8 / `resumable_ingest.py`).
+**Entry 13 — ingest crashes on `.DS_Store` / picks up `.omc-state/` as "files" (OBSERVED, Phase 8).** `read_sources` threw `UnicodeDecodeError` on a binary `.DS_Store`; the resumable driver also checkpointed two `.omc-state-*` entries (0 pages each).
+*Root cause:* the walk skipped dotted *filenames* but rglob descended into dotted *directories* and grabbed the non-dotted files inside; binary files aren't UTF-8.
+*Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
+**Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything).
+*Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free."
+*Fix:* per-file streaming + per-file checkpoint + staging-namespace writes + a final `merge_pass()` (the deferred dedup-on-write) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, scales with file count.
 
 _Projected (to confirm during Phases 3–6):_
 
