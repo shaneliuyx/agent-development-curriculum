@@ -1063,6 +1063,7 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 | Scale problem                                             | Solution                                                          |
 | --------------------------------------------------------- | ----------------------------------------------------------------- |
 | Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                  |
+| One *file* too big for the extract context                | split into deterministic line-aligned chunks `<file>#0/#1/…` (`CHUNK_CHARS`); resume per chunk |
 | 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` |
 | Run dies on file 4,000 = lose everything                  | TWO disk checkpoints — extraction (`.ingest_stage/<file>.json`) + writes (`.ingest_written.json`) → resume re-does nothing already done |
 | One page so big its single embed nears 30s                | write that page **driver-side** (no sandbox), not via the agent   |
@@ -1071,8 +1072,8 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 | Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)         |
 
 **The shape:** stream **per file**, stage on **disk**, merge, then write **only canonical** pages to GBrain.
-- **Extraction is driver-side** (one small file → fits context, no 30s sandbox).
-- **Staging is on DISK** (`~/brain/.ingest_stage/<file>.json`), **not in GBrain** — so the throwaway intermediate is never embedded. A staged file IS the per-file checkpoint: re-run skips files already staged (`rm -rf` the dir to restart).
+- **Extraction is driver-side** (no 30s sandbox). A file bigger than the extract context is **split into deterministic, line-aligned chunks** `<file>#0/#1/…` (`CHUNK_CHARS`); a small file is just a 1-chunk file. So "many files" and "one huge file" are the same problem — the unit is a *chunk*.
+- **Staging is on DISK** (`~/brain/.ingest_stage/<file>#<idx>.json`), **not in GBrain** — so the throwaway intermediate is never embedded. A staged chunk JSON IS the checkpoint: re-run skips chunks already staged (`rm -rf` the dir to restart). A crash mid-file re-extracts only the unfinished chunk.
 - **`merge_from_disk()`** groups staged pages by entity across files, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), and yields canonical pages.
 - The **agent writes only the CANONICAL pages** via `put_page` over MCP, in bounded batches → **each entity embedded exactly once**. (The agent still uses GBrain as memory — it writes the finals and queries them; only the disposable staging left the store.)
 - A **write checkpoint** (`~/brain/.ingest_written.json`) records written canonical slugs, marked after each batch lands. A resumed run re-embeds **only un-written pages**, so "embed once" survives a crash — not just an uninterrupted run. Oversized pages (> `BIG_PAGE_CHARS`) skip the agent and write **driver-side** (no 30s limit on a single big embed).
@@ -1116,8 +1117,12 @@ The "agent uses GBrain as memory" lesson is intact: the agent still WRITES the
 canonical pages and QUERIES them over MCP. Only the throwaway intermediate left
 the embedded store.
 
+A big file is split into deterministic chunks (`<file>#0`, `#1`, … by CHUNK_CHARS,
+line-aligned), each its own staging unit — so "one file too big for the extract
+context" is handled, and resume works at chunk granularity.
+
 Two checkpoints, both on disk, so resume re-does no expensive work:
-  - EXTRACTION: a file with a stage JSON is skipped (no re-extract).
+  - EXTRACTION: a file CHUNK with a stage JSON (`<file>#<idx>.json`) is skipped.
   - WRITES: ~/brain/.ingest_written.json records written canonical slugs, so a
     resumed run re-embeds ONLY un-written pages — "embed once" survives a crash.
 Oversized pages (> BIG_PAGE_CHARS) are written driver-side (no 30s sandbox) since
@@ -1146,6 +1151,7 @@ STAGE_DIR = pathlib.Path(os.path.expanduser("~/brain/.ingest_stage"))   # disk s
 WRITTEN = pathlib.Path(os.path.expanduser("~/brain/.ingest_written.json"))  # write checkpoint
 BATCH = 8                 # canonical pages per agent write call (bounded < 30s)
 BIG_PAGE_CHARS = 8000     # bigger pages are written driver-side (one page's embed may near 30s)
+CHUNK_CHARS = 6000        # a file > this is split into <file>#0, #1, … (extract context budget)
 
 _CURRENT: list = []       # the current write batch; the agent's tool reads this
 
@@ -1200,17 +1206,39 @@ def extract_file(text: str) -> list:
     return [p for p in data.get("pages", []) if p.get("slug") and p.get("content")]
 
 
+def _chunk_text(text: str, max_chars: int) -> list[str]:
+    """Split into ≤max_chars chunks on LINE boundaries (never mid-line). A file
+    that fits returns one chunk; a big file returns several. Deterministic: the
+    same input always yields the same chunks, so chunk N == the same bytes."""
+    chunks, cur, n = [], [], 0
+    for line in text.splitlines(keepends=True):
+        if n + len(line) > max_chars and cur:
+            chunks.append("".join(cur)); cur, n = [], 0
+        cur.append(line); n += len(line)
+    if cur:
+        chunks.append("".join(cur))
+    return chunks or [""]
+
+
 def stage_all() -> None:
-    """Extract every not-yet-staged file to ~/brain/.ingest_stage/<stem>.json.
-    Resumable: a file whose stage JSON already exists is skipped."""
+    """Extract every not-yet-staged file CHUNK to ~/brain/.ingest_stage/<stem>#<idx>.json.
+
+    A file > CHUNK_CHARS is split into deterministic chunks (extract context budget);
+    each chunk is its own staging unit. Resumable at CHUNK granularity for free —
+    the existing 'skip if the JSON exists' check now skips already-staged chunks,
+    so a crash mid-file re-extracts only the unfinished chunk(s). Cross-chunk
+    entities are reunited later by merge_from_disk (same path as cross-file)."""
     STAGE_DIR.mkdir(parents=True, exist_ok=True)
     for stem, text in _files():
-        out = STAGE_DIR / f"{stem}.json"
-        if out.exists():
-            continue
-        pages = extract_file(text)
-        out.write_text(json.dumps(pages))
-        print(f">>> staged {stem}: {len(pages)} pages (disk, no embedding)")
+        chunks = _chunk_text(text, CHUNK_CHARS)
+        for idx, chunk in enumerate(chunks):
+            out = STAGE_DIR / f"{stem}#{idx}.json"
+            if out.exists():
+                continue
+            pages = extract_file(chunk)
+            out.write_text(json.dumps(pages))
+            tag = f"{stem}#{idx}" + (f" of {len(chunks)}" if len(chunks) > 1 else "")
+            print(f">>> staged {tag} ({len(chunk)} chars): {len(pages)} pages (disk, no embedding)")
 
 
 # ── merge across files (disk, no DB reads) ──────────────────────────────────
@@ -1315,9 +1343,9 @@ if __name__ == "__main__":
 
 **Walkthrough:**
 - **Block 1 — `_files()` skips dotted *path parts*, not just dotted filenames.** A real source directory accumulates `.DS_Store` (binary → `UnicodeDecodeError`) and, here, `.omc-state/` *directories* a tool wrote in. Skipping `f.name.startswith(".")` misses files *inside* a dotted dir; `any(part.startswith("."))` over the relative parts catches both (BCJ Entry 13).
-- **Block 2 — extraction is driver-side, writes are agent-side.** `extract_file` runs in `main()` (no sandbox), so the ~per-file LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
+- **Block 2 — extraction is driver-side, writes are agent-side; big files chunk.** `extract_file` runs in `main()` (no sandbox), so a per-file (or per-chunk) LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). `_chunk_text` splits a file over `CHUNK_CHARS` into deterministic line-aligned chunks so even one huge file fits the extract context; each chunk stages independently. This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
 - **Block 3 — disk staging defers the dedup AND keeps it out of the embedded store.** Each file's pages go to `~/brain/.ingest_stage/<file>.json` — no embedding. `merge_from_disk` groups by base slug across files; only entities in >1 file pay an LLM merge, singletons pass through. GBrain only ever sees the canonical result.
-- **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file (skip staged files); writes are checkpointed per canonical slug (`.ingest_written.json`, marked after each batch). Both expensive ops — the per-file LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
+- **Block 4 — TWO disk checkpoints, because the cost lives in two phases.** Extraction is checkpointed per file **chunk** (skip staged `<file>#<idx>.json`); writes are checkpointed per canonical slug (`.ingest_written.json`, marked after each batch). Both expensive ops — the per-chunk LLM extract and the per-page embed — are protected, so a resumed run re-does *neither*. Idempotency alone wasn't enough: without the write checkpoint a crash mid-write re-embeds every page on resume, silently breaking "embed once."
 
 **Result (measured, 8-file corpus, 2026-06-05):**
 
@@ -1338,6 +1366,14 @@ run #1:  18 canonical, 0 already written, 18 to write   → .ingest_written.json
 run #2:  18 canonical, 18 already written (resume), 0 to write   → 0 write batches, 0 re-embeds
 ```
 The second run re-embeds nothing — "embed once" holds across a crash, not just an uninterrupted run.
+
+**Big-file chunk resume (one file too big for the extract context):** a synthetic 13.9 KB file → `_chunk_text` → 3 chunks [5937, 5941, 1984] (≤budget, lossless, line-aligned, deterministic).
+```text
+RUN 1 (fresh):  staged #0:13, #1:13, #2:10 pages
+delete #1 (simulate crash)
+RUN 2 (resume): skip #0, staged #1, skip #2     # only the lost chunk re-extracts
+13 entities span >1 chunk (sam-okafor/lin-zhao/… in [0,1,2]) → merge_from_disk consolidates
+```
 
 `★ Insight ─────────────────────────────────────`
 - **At scale the 30s sandbox was a red herring.** The real walls are the *extraction context limit*, *cross-file dedup*, and *embedding throughput*. Moving extraction to the driver dissolves the timeout as a side effect; the architecture is driven by those three, not by the sandbox.
@@ -1405,6 +1441,10 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 **Entry 15 — a resumed bulk-ingest silently re-embeds everything (OBSERVED, Phase 8).** The first resumable cut checkpointed only EXTRACTION (per file); the write phase relied on `put_page` idempotency. A crash mid-write → resume re-writes ALL canonical → every page embedded a *second* time, quietly negating "embed once."
 *Root cause:* **idempotent ≠ resumable.** Re-running is *correct* but not *cheap* — the expensive op (embedding) had no resume marker, only the outer extraction loop did.
 *Fix:* a write checkpoint `~/brain/.ingest_written.json` (written canonical slugs), marked after each batch; the write loop skips done slugs. Proven: a resumed run does **0 write batches, 0 re-embeds**. Checkpoint every *expensive* op, not just the outer loop — "the writes are idempotent" hides a full re-embed behind a true-but-irrelevant claim.
+
+**Entry 16 — a single file too big for the extract context (OBSERVED, Phase 8).** Per-file staging assumed one file fits one extract prompt; a huge file (log, book, long transcript) breaks that and is un-resumable mid-file.
+*Root cause:* the resume unit was the whole *file*; the binding limit (extract context) is hit *within* a file.
+*Fix:* `_chunk_text` splits a file > `CHUNK_CHARS` into deterministic, line-aligned chunks `<file>#0/#1/…`, each its own staging unit. **Chose deterministic chunk-index over a `{file: last_line}` offset** — chunk-file existence is an atomic checkpoint (can't be half-written), reuses the per-file resume mechanism unchanged, and collapses "many files" + "one huge file" into one concept (a chunk; a small file = 1 chunk). Cross-chunk entities are reunited by `merge_from_disk` (same path as cross-file). Proven: 13.9 KB → 3 chunks; delete #1 → only #1 re-extracts.
 
 _Projected (to confirm during Phases 3–6):_
 
