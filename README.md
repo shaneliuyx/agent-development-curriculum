@@ -22,8 +22,8 @@ Week 3.5.5 — Multi-Agent Shared Memory          ← guild MCP integration + at
 Week 3.5.5.5 — Multi-Agent Topology Patterns    ← supervisor / hierarchical / group-chat / handoffs / voting (Anthropic 90.2% measurement)
 Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCore semantic + Phase 8.6 bitemporal supersede/coexist (5/5 tests)
 Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval decomposition + 6-backend matrix (1-tier / 2-tier / hybrid / three-tier HyperMem L3)
-Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes (SPEC, v0)
-Week 3.5.96 — Self-Wiring Memory (GBrain)       ← markdown-first deterministic graph + HNSW+keyword RRF (83→95% Recall@5) + 74 MCP tools (Garry Tan / YC, MIT, SPEC+lab v0)
+Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes + Phase 7 heat-scored eviction (BAI-LAB/MemoryOS leverage; importance-exempt) — lab executed, tests 6/6
+Week 3.5.96 — Self-Wiring Memory (GBrain)       ← markdown-first deterministic graph + hybrid retrieval (measured: pure-vector > RRF on 19-page corpus — 83→95 is corpus-dependent, not universal) + Ground-Truth Hierarchy A/B (ClaudioDrews/memory-os) (Garry Tan / YC, MIT, lab executed)
 Week 3.7 — Agentic RAG                          ← canonical 5-node graph
 Week 4  — ReAct From Scratch                    ← + §1.5 MLX Studio gateway role-map (2026-05-15 sync)
 Week 4.5 — Model Routing and Effort Tiering     ← local Qwen-1.5B classifier + cost-latency Pareto front (SPEC, v0)
