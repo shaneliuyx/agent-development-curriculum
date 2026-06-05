@@ -1555,12 +1555,14 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 *Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't.
 *Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
 
-_Projected before the runs — **resolved** after Phases 3–6 executed (most did NOT occur; the real failures are the observed entries above):_
+**Pre-run predictions vs. what actually happened** (these were guessed *before* Phases 3–6 ran; now resolved against the measured outcomes — **3 of 4 missed**, which is the honest record: predictions are cheap, the observed Entries above are the truth).
 
-- **Phase 3 — Agent over-relies on GBrain for general knowledge.** ✗ **Did not occur.** The actual Phase-3 failures were different and more basic: zero graph edges (Entry 5) and the autonomous `CodeAgent` crashing on a 14B (Entry 6). Over-reliance on general knowledge never surfaced at this scale; the closest test — the Ground-Truth A/B (Phase 7) — showed the agent answering *from* the brain, the desired behavior.
-- **Phase 4 — Markdown convention mismatch (`@handle`).** ✗ **Did not occur.** The agent emits path-qualified `[[dir/slug]]` wikilinks, which GBrain's parser extracts directly — no `@handle` convention needed (45 edges materialized). The real Phase-4 issue was unrelated: MCP `put_page` skips inline auto-link, so the graph needs an `extract links --source db` reconcile pass (Entry 7).
-- **Phase 5 — Synthesis hallucinates a wrong "we don't know."** ✗ **Did not occur.** Gap-honesty worked as designed: an absent date returned an explicit "no information," while a present fact answered with score 0.93 (Phase 5 §Verification). No false abstention observed.
-- **Phase 6 — RRF lift smaller than 12pts.** ✓ **Confirmed — and stronger than projected.** Not merely a smaller lift: on the small, semantic-heavy corpus **pure vector beat hybrid-RRF outright** (Entry 9). The projected cause (corpus too short / queries converge) was right; the remediation (larger, exact-term-heavy corpus) stands.
+| Predicted bad case | Outcome | What actually happened |
+|---|---|---|
+| **Phase 3** — agent over-relies on GBrain for general knowledge | ✗ didn't occur | Real Phase-3 failures were more basic: zero graph edges (Entry 5) + `CodeAgent` crash on a 14B (Entry 6). The Ground-Truth A/B (Phase 7) showed correct answering-*from*-brain. |
+| **Phase 4** — `@handle` markdown-convention mismatch | ✗ didn't occur | Agent emits `[[dir/slug]]` wikilinks → GBrain parses them directly (45 edges). Real issue: MCP `put_page` skips inline auto-link → needs an `extract links --source db` reconcile (Entry 7). |
+| **Phase 5** — synthesis emits a wrong "we don't know" | ✗ didn't occur | Gap-honesty worked: absent date → "no information"; present fact → 0.93 (Phase 5 §Verification). |
+| **Phase 6** — RRF lift smaller than 12pts | ✓ confirmed, *stronger* | Not just a smaller lift — pure vector **beat** RRF on the small corpus (Entry 9). Projected cause (short corpus / converging queries) was right. |
 
 ---
 
