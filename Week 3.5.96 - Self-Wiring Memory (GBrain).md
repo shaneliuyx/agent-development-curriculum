@@ -1099,16 +1099,28 @@ Each layer has a checkpoint so resume *skips* what's already built; if a layer i
 | **no** | yes | skip — done, content was discarded (fine) |
 | **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
+Four derived layers, each gated by a checkpoint that's *skipped* on resume (the diamond's "yes" arrow) and *done* otherwise:
+
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  F["for each file<br/>NOT staged on disk"] --> E["extract_file()<br/>DRIVER-side, no sandbox"]
-  E --> S["write pages → disk<br/>.ingest_stage/&lt;file&gt;.json<br/>(NO embedding)"]
-  S --> F
-  F -->|"all files staged"| M["merge_from_disk()<br/>group by entity →<br/>merge multi-file variants"]
-  M --> W["agent: put_page each<br/>CANONICAL page (embed ONCE)"]
-  W --> R["reconcile_graph()<br/>wire [[wikilinks]]"]
-  R --> Q["query"]
+  L0["LAYER 0 — source files<br/>~/brain/sources/* · ground truth"]
+  L0 --> LOOP["for each file chunk<br/>(big file split by CHUNK_CHARS)"]
+  LOOP --> C1{"chunk staged on disk?<br/>.ingest_stage/&lt;file&gt;#idx.json"}
+  C1 -->|"yes · skip (resume)"| L1
+  C1 -->|"no"| EX["extract_file(chunk)<br/>DRIVER-side · no sandbox · NO embed"]
+  EX --> L1["LAYER 1 — staged chunk JSON"]
+  L1 --> C2{"merge cache valid?<br/>.ingest_merged.json · stage fingerprint"}
+  C2 -->|"hit · skip (resume)"| L2
+  C2 -->|"miss"| MG["merge_from_disk()<br/>group by entity · merge multi-file (LLM)"]
+  MG --> L2["LAYER 2 — merged canonical pages"]
+  L2 --> C3{"slug written?<br/>.ingest_written.json · verify-then-mark"}
+  C3 -->|"yes · skip (resume)"| RC
+  C3 -->|"no"| PUT["agent put_page · embed ONCE<br/>(oversized → driver-side)"]
+  PUT --> VER["verify page in GBrain → mark written"]
+  VER --> L3["LAYER 3 — embedded in GBrain"]
+  L3 --> RC["reconcile_graph()<br/>wire [[wikilinks]] → typed edges"]
+  RC --> Q["query"]
 ```
 
 **Code:** `src/resumable_ingest.py`:
