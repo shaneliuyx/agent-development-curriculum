@@ -1058,6 +1058,17 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 2. **Cross-file entity dedup** — the same entity appears in many files; one-big-prompt merged them "for free," per-file extraction can't.
 3. **Throughput** — at thousands of files the ceiling is embedding calls + DB upserts, not the agent loop.
 
+**The large-file architecture at a glance — each scale problem maps to one mechanism:**
+
+| Scale problem | Solution |
+|---|---|
+| Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side |
+| 30s agent sandbox | extraction leaves the sandbox; agent only does bounded `put_page` |
+| Run dies on file 4,000 = lose everything | per-file checkpoint (`~/brain/.ingest_files.json`) → resume |
+| Same entity across many files | staging namespace + one `merge_pass()` (deferred dedup) |
+| Files never overwrite each other | `staging/<file>/<entity>` slugs |
+| Throughput at thousands of files | batch embeds + bulk upsert (next ceiling beyond this lab) |
+
 **The shape:** stream **per file**, checkpoint **per file**, defer cross-file merge to one pass.
 - **Extraction is driver-side** (one small file → fits context, no 30s sandbox).
 - The **agent writes** each file's pages via `put_page` over MCP, to a per-file **staging namespace** (`staging/<file>/<entity>`) so files never overwrite a shared entity. Bounded → never hits 30s.
