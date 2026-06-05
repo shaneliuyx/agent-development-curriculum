@@ -1099,27 +1099,27 @@ Each layer has a checkpoint so resume *skips* what's already built; if a layer i
 | **no** | yes | skip — done, content was discarded (fine) |
 | **no** | no | **rebuild from the layer ABOVE** (e.g. stage gone + unwritten → re-extract from source) — *not* a dead end |
 
-Drawn **C4-style**: each **layer is a colored box** (bold title · «role» · `[tool]` · what it does + its on-disk checkpoint). The **edge label is the resume rule** — work is skipped when that layer's checkpoint says it's already done. Dark blue = the operator (person); blue = pipeline containers (Layers 1–3, inside the dashed system boundary); grey = external (Layer 0 source of truth, GBrain store). Single top→down column, so every step's skip-gate reads in order.
+Drawn **C4-style, left→right**: each **layer is a colored box** (bold title · «role» · `[tool]` · what it does + its on-disk checkpoint). The **pink edge labels are the resume rule** — work is skipped when that layer's checkpoint says it's already done. Dark blue = the operator (person); blue = pipeline containers (Layers 1–3, inside the dashed system boundary); grey = external (Layer 0 source of truth, GBrain store). Reads as one pipeline left→right: `ingest → stage → merge → embed → query`. *(Wide diagram — scroll horizontally; `useMaxWidth:false` keeps the text at full size rather than shrinking to fit the column.)*
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'fontSize':'24px','lineColor':'#888','primaryBorderColor':'#888'}, 'flowchart':{'useMaxWidth':false,'nodeSpacing':50,'rankSpacing':58,'padding':12}}}%%
-flowchart TB
-  OP["<b>Operator</b> «person»<br/>re-runs resumable_ingest.py after a crash<br/>each layer resumes from its checkpoint"]
-  L0["<b>Layer 0 · Source files</b> «external»<br/>~/brain/sources/* — ground truth"]
+%%{init: {'theme':'base', 'themeVariables': {'fontSize':'26px','lineColor':'#888','primaryBorderColor':'#888'}, 'flowchart':{'useMaxWidth':false,'nodeSpacing':38,'rankSpacing':55,'padding':14}}}%%
+flowchart LR
+  OP["<b>Operator</b> «person»<br/>re-runs after a crash<br/>resumes from checkpoint"]
+  L0["<b>Layer 0 · Source</b> «external»<br/>~/brain/sources/*<br/>ground truth"]
   subgraph PIPE["Resumable Ingest Pipeline «system»"]
-    direction TB
-    L1["<b>Layer 1 · Staged chunks</b><br/><i>extract_file · driver-side · no embed</i><br/>big files → chunks<br/>checkpoint .ingest_stage/{file}#idx.json"]
-    L2["<b>Layer 2 · Merged canonical</b><br/><i>merge_from_disk · LLM</i><br/>one entity merged across files<br/>cache .ingest_merged.json · stage fingerprint"]
-    L3["<b>Layer 3 · Embedded</b><br/><i>put_page · embed ONCE</i><br/>oversized → driver-side · verify-then-mark<br/>checkpoint .ingest_written.json"]
+    direction LR
+    L1["<b>Layer 1 · Staged chunks</b><br/><i>extract_file · no embed</i><br/>big files → chunks<br/>ckpt .ingest_stage/<br/>{file}#idx.json"]
+    L2["<b>Layer 2 · Merged</b><br/><i>merge_from_disk · LLM</i><br/>entity merged<br/>across files<br/>cache .ingest_merged.json"]
+    L3["<b>Layer 3 · Embedded</b><br/><i>put_page · embed ONCE</i><br/>verify-then-mark<br/>ckpt .ingest_written.json"]
     L1 -->|"merge by entity<br/>skip if cached"| L2
     L2 -->|"write canonical<br/>skip if written"| L3
   end
-  GB[("<b>GBrain store</b> «external»<br/>Postgres + Qdrant<br/>embedded pages + typed wikilink edges")]
+  GB[("<b>GBrain store</b> «external»<br/>Postgres + Qdrant<br/>pages + wikilink edges")]
   Q(["query"])
   OP -->|ingest| L0
   L0 -->|"per-file chunk<br/>skip if staged"| L1
-  L3 -->|"put_page + reconcile_graph<br/>embed once"| GB
-  GB -->|after reconcile| Q
+  L3 -->|"put_page +<br/>reconcile_graph"| GB
+  GB -->|"after<br/>reconcile"| Q
   classDef person fill:#08427b,stroke:#052e56,color:#fff;
   classDef ext fill:#8a8a8a,stroke:#5f5f5f,color:#fff;
   classDef cont fill:#438dd5,stroke:#2e6295,color:#fff;
