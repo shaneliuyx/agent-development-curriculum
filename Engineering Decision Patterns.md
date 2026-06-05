@@ -264,6 +264,20 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 - Pattern 30 — New Complexity Must A/B-Earn Its Keep (the topic-presence gate shipped OPT-IN at marginal +1 — it had to A/B-earn its default-on, and didn't)
 - [[Week 3.5.9 - Requirement-Driven Memory Architecture]] — the abstention gate A/B (grounding −9 vs topic-presence −1)
 
+### Pattern 36 — Close the Read/Retention Loop (the read path records usage; retention consumes it)
+
+**Rule.** When a store has both a READ ranker and a WRITE/retention policy, wire the read to *record what it used* so retention acts on real signal — not a synthetic proxy. **W3.5.95: `metacog_recall.recall_block` reads a self-pattern AND records the visit (`track=True`) → heat (visits + recency + importance) accrues → `enforce(budget)` dedups + evicts by heat → bounded store.** Before the wiring, heat was demo-only: eviction ran on *simulated* visits, so retention had no connection to what the agent actually reached for. Closing the loop is what makes eviction **earned** (survivors are the facts recall kept using) rather than arbitrary. The general shape: a bounded store needs its keep/drop decision fed by its own access pattern, or it's guessing.
+
+**Sub-rule A — Default by SEAM, not by caller (so wiring a side-effect changes no caller).** The READ primitive (`recall`) defaults `track=False` — pure-read keeps tests and ablation harnesses side-effect-free; the live-loop *convenience wrapper* (`recall_block`) defaults `track=True` because that's the path that should record usage. Behavior follows the layer, so every existing caller got the right default for free and nothing had to change. When adding a side-effect to a widely-called primitive, put the opt-in on the primitive and the opt-out on the wrapper that fans out to it (or vice-versa) — never force every call site to update.
+
+**Sub-rule B — Lazy import is the escape hatch for a legitimate two-way dependency.** `heat_eviction` imports `metacog_recall` (shared tokenizer + decay constant); wiring `recall → touch` creates a genuine cycle. A top-level *reverse* import would deadlock at module load. Defer it: `from heat_eviction import touch` *inside* `recall()`, resolved at call-time when both modules are fully loaded. Don't refactor a real bidirectional dependency into a fake one-way one just to satisfy the import graph — defer resolution instead.
+
+**Anti-pattern.** Shipping a retention/eviction policy whose signal is seeded by a demo or a heuristic, never by live reads — the store looks bounded but evicts by guesswork. Also: breaking a legitimate two-way module dependency by hoisting a constant into a third "util" module purely to dodge a cycle the language already lets you defer.
+
+**See also:**
+- Pattern 28 — Memory-Tier Graduation Triggers + Null-Result Discipline (graduation/eviction are the two ends of the same bounded-store lifecycle)
+- [[Week 3.5.95 - Self-Observability Memory#Phase 7 — Bounding the store: heat-scored eviction|W3.5.95 Phase 7]] — the heat/eviction mechanism + the `recall(track=)` wiring (BAI-LAB/MemoryOS leverage)
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
