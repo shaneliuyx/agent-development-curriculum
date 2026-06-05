@@ -1060,68 +1060,67 @@ The headline number (4 retrievals / ~8.9K retrieval-tokens avoided) understates 
 
 **The large-file architecture at a glance — each scale problem maps to one mechanism:**
 
-| Scale problem | Solution |
-|---|---|
-| Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side |
-| 30s agent sandbox | extraction leaves the sandbox; agent only does bounded `put_page` |
-| Run dies on file 4,000 = lose everything | per-file checkpoint (`~/brain/.ingest_files.json`) → resume |
-| Same entity across many files | staging namespace + one `merge_pass()` (deferred dedup) |
-| Files never overwrite each other | `staging/<file>/<entity>` slugs |
-| Throughput at thousands of files | batch embeds + bulk upsert (next ceiling beyond this lab) |
+| Scale problem                                             | Solution                                                          |
+| --------------------------------------------------------- | ----------------------------------------------------------------- |
+| Extraction context wall (can't fit N files in one prompt) | per-file extraction, driver-side                                  |
+| 30s agent sandbox                                         | extraction leaves the sandbox; agent only does bounded `put_page` |
+| Run dies on file 4,000 = lose everything                  | per-file disk checkpoint (`~/brain/.ingest_stage/<file>.json`) → resume |
+| Same entity across many files                             | group on disk + one `merge_from_disk()` (deferred dedup)          |
+| Wasted embedding on throwaway staging                     | stage on DISK (no embed); GBrain embeds only canonical → **each entity embedded ONCE** |
+| Throughput at thousands of files                          | batch embeds + bulk upsert (next ceiling beyond this lab)         |
 
-**The shape:** stream **per file**, checkpoint **per file**, defer cross-file merge to one pass.
+**The shape:** stream **per file**, stage on **disk**, merge, then write **only canonical** pages to GBrain.
 - **Extraction is driver-side** (one small file → fits context, no 30s sandbox).
-- The **agent writes** each file's pages via `put_page` over MCP, to a per-file **staging namespace** (`staging/<file>/<entity>`) so files never overwrite a shared entity. Bounded → never hits 30s.
-- **Checkpoint after each file** (`~/brain/.ingest_files.json`) → kill it, re-run, it resumes; `put_page` idempotency is the safety net.
-- **`merge_pass()`** groups staging variants by base entity, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), promotes to the canonical slug, drops staging.
+- **Staging is on DISK** (`~/brain/.ingest_stage/<file>.json`), **not in GBrain** — so the throwaway intermediate is never embedded. A staged file IS the per-file checkpoint: re-run skips files already staged (`rm -rf` the dir to restart).
+- **`merge_from_disk()`** groups staged pages by entity across files, merges multi-file entities (one LLM call each — the *only* place merge cost is paid), and yields canonical pages.
+- The **agent writes only the CANONICAL pages** via `put_page` over MCP, in bounded batches → **each entity embedded exactly once**. (The agent still uses GBrain as memory — it writes the finals and queries them; only the disposable staging left the store.)
 - Then **`reconcile_graph()`** wires the `[[wikilinks]]`.
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  F["for each file<br/>NOT in checkpoint"] --> E["extract_file()<br/>DRIVER-side, no sandbox"]
-  E --> W["agent: put_page each<br/>→ staging/&lt;file&gt;/&lt;entity&gt;"]
-  W --> C["checkpoint the file<br/>(resumable)"]
-  C --> F
-  F -->|"all files done"| M["merge_pass()<br/>group by entity → merge<br/>multi-file → canonical slug"]
-  M --> R["reconcile_graph()<br/>wire [[wikilinks]]"]
+  F["for each file<br/>NOT staged on disk"] --> E["extract_file()<br/>DRIVER-side, no sandbox"]
+  E --> S["write pages → disk<br/>.ingest_stage/&lt;file&gt;.json<br/>(NO embedding)"]
+  S --> F
+  F -->|"all files staged"| M["merge_from_disk()<br/>group by entity →<br/>merge multi-file variants"]
+  M --> W["agent: put_page each<br/>CANONICAL page (embed ONCE)"]
+  W --> R["reconcile_graph()<br/>wire [[wikilinks]]"]
   R --> Q["query"]
 ```
 
 **Code:** `src/resumable_ingest.py`:
 
 ```python
-"""W3.5.96 — LARGE-CORPUS ingest: per-file streaming + per-file checkpoint +
-final reconcile-merge. The scale variant of ingest_agent.py.
+"""W3.5.96 — LARGE-CORPUS ingest: per-file streaming + on-DISK staging + final
+merge, so GBrain (the embedded store) only ever sees CANONICAL pages — each entity
+is embedded exactly once. The scale variant of ingest_agent.py.
 
-ingest_agent.py warms ONE extraction over ALL files concatenated — fine for a
-handful of files, but at scale that single prompt blows the context window and is
-un-resumable. This driver instead processes ONE FILE AT A TIME:
+Earlier draft staged into GBrain itself (one put_page per file-variant). That made
+the store embed every variant and then throw it away at merge — ~71% wasted
+embedding on the 8-file run (46 staging embeds for 19 final pages). Embedding is
+the throughput ceiling at scale, so staging must NOT touch the embedded store.
 
-  driver: for each file NOT in the checkpoint:          # resumable
-    pages = extract_file(file)        # extraction is DRIVER-side (no 30s sandbox),
-                                      # and one small file always fits the context
-    agent.run(WRITE_TASK)             # the AGENT writes this file's pages via
-                                      # put_page over MCP (bounded → never hits 30s)
-    mark_file_done(file)              # checkpoint after each file
-  merge_pass()                        # consolidate entities seen across files
+This version stages on disk (cheap, no embedding) and only writes finals to GBrain:
+
+  driver, per file (resumable — skip files already staged on disk):
+    pages = extract_file(file)                 # DRIVER-side LLM (no 30s sandbox)
+    write pages -> ~/brain/.ingest_stage/<file>.json   # disk staging, NO embedding
+  merge_from_disk(): group by entity across files, merge multi-file entities (one
+    LLM call each) -> a list of CANONICAL pages
+  agent: put_page each canonical page over MCP, in bounded batches  # embedded ONCE
   reconcile_graph(); query
 
-Cross-file dedup is DEFERRED to merge_pass: each file writes to a per-file staging
-namespace (`staging/<file>/<entity>`) so files never overwrite each other; the
-merge pass then groups variants by base entity, merges multi-file entities (one
-LLM call each — the only place merge cost is paid), promotes to the canonical
-slug, and drops the staging copies. Then reconcile wires the [[wikilinks]].
+The "agent uses GBrain as memory" lesson is intact: the agent still WRITES the
+canonical pages and QUERIES them over MCP. Only the throwaway intermediate left
+the embedded store.
 
-Run: python src/resumable_ingest.py   (re-run to resume; delete the checkpoint to restart)
+Run: python src/resumable_ingest.py   (re-run to resume; rm -rf ~/brain/.ingest_stage to restart)
 """
 from __future__ import annotations
 
 import json
 import os
 import pathlib
-import subprocess
-from collections import defaultdict
 
 from mcp import StdioServerParameters
 from openai import OpenAI
@@ -1132,38 +1131,24 @@ from ingest_agent import (
 )
 
 SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
-CHECKPOINT = pathlib.Path(os.path.expanduser("~/brain/.ingest_files.json"))
-STAGE = "staging"          # per-file slug namespace: staging/<file-stem>/<entity-slug>
+STAGE_DIR = pathlib.Path(os.path.expanduser("~/brain/.ingest_stage"))   # disk staging
+BATCH = 8                 # canonical pages per agent write call (bounded < 30s)
 
-_CURRENT: list = []        # the current file's staged pages; the agent's tool reads this
+_CURRENT: list = []       # the current write batch; the agent's tool reads this
 
 
-# ── files + checkpoint ──────────────────────────────────────────────────────
 def _files() -> list[tuple[str, str]]:
-    """(stem, text) for every readable source file. Stem is a slug-safe id."""
+    """(stem, text) for every readable source file (skip dotted parts + binaries)."""
     out = []
     for f in sorted(SOURCES.rglob("*")):
-        # skip non-files AND anything under a dotted dir (.DS_Store, .omc-state/…)
         if not f.is_file() or any(part.startswith(".") for part in f.relative_to(SOURCES).parts):
             continue
         try:
             text = f.read_text()
         except UnicodeDecodeError:
             continue
-        stem = str(f.relative_to(SOURCES)).replace("/", "-").rsplit(".", 1)[0]
-        out.append((stem, text))
+        out.append((str(f.relative_to(SOURCES)).replace("/", "-").rsplit(".", 1)[0], text))
     return out
-
-
-def _done_files() -> set[str]:
-    if CHECKPOINT.exists():
-        return set(json.loads(CHECKPOINT.read_text()).get("done", []))
-    return set()
-
-
-def _mark_file(stem: str) -> None:
-    done = _done_files() | {stem}
-    CHECKPOINT.write_text(json.dumps({"done": sorted(done)}))
 
 
 def _llm() -> OpenAI:
@@ -1171,68 +1156,42 @@ def _llm() -> OpenAI:
                   api_key=os.getenv("LLM_API_KEY", "dummy"))
 
 
-# ── per-file extraction (DRIVER-side: no 30s sandbox, one small file) ────────
-def extract_file(stem: str, text: str) -> list:
-    """LLM-extract ONE file into pages, slugs rewritten into this file's staging
-    namespace so concurrent files never overwrite a shared entity."""
+# ── per-file extraction → DISK staging (no embedding) ───────────────────────
+def extract_file(text: str) -> list:
+    """LLM-extract ONE file into pages (canonical base slugs — no DB namespacing
+    needed; the disk filename records which file)."""
     resp = _llm().chat.completions.create(
         model=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
         messages=[{"role": "user", "content": _EXTRACT_PROMPT.replace("{raw}", text)}],
         temperature=0.0, max_tokens=4000, response_format={"type": "json_object"})
     data = json.loads(resp.choices[0].message.content or "{}")
-    pages = []
-    for p in data.get("pages", []):
-        if p.get("slug") and p.get("content"):
-            pages.append({"slug": f"{STAGE}/{stem}/{p['slug']}", "content": p["content"]})
-    return pages
+    return [p for p in data.get("pages", []) if p.get("slug") and p.get("content")]
 
 
-@tool
-def current_pages() -> list:
-    """Return the current file's staged pages ({slug, content}) for the agent to
-    write. The driver sets these before each agent.run."""
-    return _CURRENT
+def stage_all() -> None:
+    """Extract every not-yet-staged file to ~/brain/.ingest_stage/<stem>.json.
+    Resumable: a file whose stage JSON already exists is skipped."""
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    for stem, text in _files():
+        out = STAGE_DIR / f"{stem}.json"
+        if out.exists():
+            continue
+        pages = extract_file(text)
+        out.write_text(json.dumps(pages))
+        print(f">>> staged {stem}: {len(pages)} pages (disk, no embedding)")
 
 
-WRITE_TASK = """Write the current file's pages using ONLY the provided tools:
-1. pages = current_pages()
-2. for each page in pages: call put_page(slug=page["slug"], content=page["content"])
-3. call final_answer with how many you wrote.
-"""
-
-
-# ── final reconcile-merge (DRIVER-side) ─────────────────────────────────────
-def _base_slug(staged: str) -> str:
-    """staging/<stem>/people/alice-chen -> people/alice-chen"""
-    return staged.split("/", 2)[2]
-
-
-def _gbrain_get(slug: str) -> str:
-    body = subprocess.run([_GBRAIN, "get", slug], capture_output=True, text=True,
-                          env=_server_env()).stdout
-    return "\n".join(ln for ln in body.splitlines() if not ln.startswith(("Starting", "[gbrain")))
-
-
-def _gbrain_put(slug: str, content: str) -> None:
-    subprocess.run([_GBRAIN, "put", slug], input=content, capture_output=True,
-                   text=True, env=_server_env())
-
-
-def _gbrain_delete(slug: str) -> None:
-    subprocess.run([_GBRAIN, "delete", slug], capture_output=True, text=True, env=_server_env())
-
-
+# ── merge across files (disk, no DB reads) ──────────────────────────────────
 def _merge(base: str, contents: list[str]) -> str:
-    """Merge multiple per-file variants of one entity into a single page (one LLM
-    call). Only invoked when an entity appears in >1 file."""
+    """Merge per-file variants of one entity into a single page (one LLM call)."""
     joined = "\n\n--- VARIANT ---\n\n".join(contents)
     prompt = (
-        f"These are {len(contents)} notes about the SAME entity ({base}), extracted "
-        "from different source files. Merge them into ONE GBrain page with the exact "
-        "two-layer shape (summary with [[dir/slug]] wikilinks, then a line that is "
-        "exactly `---`, then `## Timeline` with the UNION of all timeline lines, "
-        "deduplicated, chronological). Keep every distinct fact. Output ONLY the "
-        f"merged markdown.\n\n{joined}"
+        f"These are {len(contents)} notes about the SAME entity ({base}), from "
+        "different source files. Merge into ONE GBrain page with the exact two-layer "
+        "shape (summary with [[dir/slug]] wikilinks, then a line that is exactly "
+        "`---`, then `## Timeline` with the UNION of all timeline lines, deduplicated, "
+        "chronological). Keep every distinct fact. Output ONLY the merged markdown.\n\n"
+        f"{joined}"
     )
     resp = _llm().chat.completions.create(
         model=os.getenv("LLM_MODEL", "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
@@ -1240,33 +1199,35 @@ def _merge(base: str, contents: list[str]) -> str:
     return (resp.choices[0].message.content or contents[0]).strip()
 
 
-def _list_staging() -> list[str]:
-    """All staging slugs, via the DB (slugs are top-level, reliable to list)."""
-    sql = "select slug from pages where deleted_at is null and slug like 'staging/%';"
-    cont = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True,
-                          text=True).stdout
-    name = next((n for n in cont.splitlines() if "gbrain-pg" in n), "gbrain-pg")
-    out = subprocess.run(["docker", "exec", "-i", name, "psql", "-U", "postgres",
-                          "-d", "gbrain", "-tAc", sql], capture_output=True, text=True).stdout
-    return [s.strip() for s in out.splitlines() if s.strip()]
+def merge_from_disk() -> list:
+    """Group staged pages by entity across all files; return CANONICAL pages.
+    Single-file entities pass through; multi-file entities are merged once."""
+    groups: dict[str, list[str]] = {}
+    for jf in sorted(STAGE_DIR.glob("*.json")):
+        for p in json.loads(jf.read_text()):
+            groups.setdefault(p["slug"], []).append(p["content"])
+    canonical, merged = [], 0
+    for slug, contents in groups.items():
+        content = contents[0] if len(contents) == 1 else _merge(slug, contents)
+        if len(contents) > 1:
+            merged += 1
+        canonical.append({"slug": slug, "content": content})
+    print(f">>> merge_from_disk: {len(canonical)} canonical ({merged} merged from >1 file)")
+    return canonical
 
 
-def merge_pass() -> str:
-    """Consolidate per-file staging pages into canonical entity pages."""
-    groups: dict[str, list[str]] = defaultdict(list)
-    for staged in _list_staging():
-        groups[_base_slug(staged)].append(staged)
+@tool
+def current_pages() -> list:
+    """Return the current batch of canonical pages ({slug, content}) for the agent
+    to write. The driver sets this before each agent.run."""
+    return _CURRENT
 
-    merged, promoted = 0, 0
-    for base, variants in groups.items():
-        contents = [_gbrain_get(v) for v in variants]
-        if len(contents) == 1:
-            _gbrain_put(base, contents[0]); promoted += 1
-        else:
-            _gbrain_put(base, _merge(base, contents)); merged += 1
-        for v in variants:
-            _gbrain_delete(v)
-    return f"merge_pass: {promoted} promoted, {merged} merged from {len(groups)} entities"
+
+WRITE_TASK = """Write the current pages using ONLY the provided tools:
+1. pages = current_pages()
+2. for each page in pages: call put_page(slug=page["slug"], content=page["content"])
+3. call final_answer with how many you wrote.
+"""
 
 
 def main() -> None:
@@ -1277,9 +1238,10 @@ def main() -> None:
         api_key=os.getenv("LLM_API_KEY", "dummy"))
 
     global _CURRENT
-    files = _files()
-    done = _done_files()
-    print(f">>> {len(files)} files; {len(done)} already done (checkpoint)")
+    # 1. EXTRACT every file to disk staging (resumable, no embedding).
+    stage_all()
+    # 2. MERGE across files → canonical pages (driver-side, no DB).
+    canonical = merge_from_disk()
 
     with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
         mcp_tools = [t for t in tc.tools if t.name in NEEDED_TOOLS]
@@ -1287,16 +1249,14 @@ def main() -> None:
             tools=[current_pages, *mcp_tools], model=model, max_steps=3,
             use_structured_outputs_internally=True, verbosity_level=1)
 
-        # Per-file loop: extract (driver) → write (agent, bounded) → checkpoint.
-        for stem, text in files:
-            if stem in done:
-                continue
-            _CURRENT = extract_file(stem, text)       # driver-side, no sandbox limit
-            print(f">>> {stem}: {len(_CURRENT)} pages -> " + str(agent.run(WRITE_TASK)))
-            _mark_file(stem)                          # checkpoint after each file
+        # 3. WRITE canonical pages to GBrain via the agent, in bounded batches
+        # (each page embedded EXACTLY ONCE — staging never touched the store).
+        for i in range(0, len(canonical), BATCH):
+            _CURRENT = canonical[i:i + BATCH]
+            print(f">>> write batch {i // BATCH + 1} ({len(_CURRENT)} pages) -> "
+                  + str(agent.run(WRITE_TASK)))
 
-        # Cross-file consolidation, then deterministic link reconciliation.
-        print(">>> " + merge_pass())
+        # 4. RECONCILE links, then the agent queries its memory.
         print(">>> reconcile graph: " + reconcile_graph())
         answer = agent.run(QUERY_TASK)
         print("\n>>> agent final answer:\n" + str(answer))
@@ -1309,25 +1269,27 @@ if __name__ == "__main__":
 **Walkthrough:**
 - **Block 1 — `_files()` skips dotted *path parts*, not just dotted filenames.** A real source directory accumulates `.DS_Store` (binary → `UnicodeDecodeError`) and, here, `.omc-state/` *directories* a tool wrote in. Skipping `f.name.startswith(".")` misses files *inside* a dotted dir; `any(part.startswith("."))` over the relative parts catches both (BCJ Entry 13).
 - **Block 2 — extraction is driver-side, writes are agent-side.** `extract_file` runs in `main()` (no sandbox), so the ~per-file LLM call can take as long as it needs; the agent only loops `put_page` (bounded, never near 30s). This is the inversion that kills the timeout: the slow thing leaves the sandbox, the bounded thing stays.
-- **Block 3 — staging namespace defers the dedup.** Each file writes `staging/<stem>/<entity>`, so file 7's `alice-chen` can't clobber file 2's. `merge_pass` later groups by `_base_slug`, and only entities that actually appear in >1 file pay an LLM merge; singletons are promoted with a cheap copy.
-- **Block 4 — the checkpoint is the resumability contract.** `_mark_file` after each file means an interrupted run re-runs only the unfinished files. `put_page` idempotency makes even a mid-file re-run safe.
+- **Block 3 — disk staging defers the dedup AND keeps it out of the embedded store.** Each file's pages go to `~/brain/.ingest_stage/<file>.json` — no embedding. `merge_from_disk` groups by base slug across files; only entities in >1 file pay an LLM merge, singletons pass through. GBrain only ever sees the canonical result.
+- **Block 4 — staged files are the resumability contract.** A file whose stage JSON exists is skipped on re-run, so an interrupted run re-extracts only the unfinished files. The agent's canonical `put_page` writes are idempotent, so re-running the write phase is safe too.
 
 **Result (measured, 8-file corpus, 2026-06-05):**
 
 ```text
-8 files; 0 already done (checkpoint)
-emails-acme-cto: 7 pages -> 7 ... (per file) ... tweets-marcus-webb: 5 pages -> 5
-merge_pass: 5 promoted, 14 merged from 19 entities
-reconcile graph: 23 pages, 63 links
+staged 8 files to disk (no embedding)
+merge_from_disk: 18 canonical (14 merged from >1 file)
+write batch 1/2/3: 8 + 8 + 2 = 18 pages (embedded ONCE each)
+reconcile graph: 23 pages, 73 links
+staging_in_db = 0          # the throwaway staging never hit the embedded store
 query -> people/sam-okafor (top hit)
 ```
 
-**0 sandbox timeouts** (extraction left the sandbox). **`14 merged from 19 entities`** is the proof the design is correct: 14 entities appeared across *multiple files* and were consolidated into one canonical page each — the cross-file dedup that one-big-prompt extraction did implicitly, now done explicitly in `merge_pass`. Re-running after an interrupt skips checkpointed files.
+**0 sandbox timeouts; embedding calls 65 → 18.** Two proofs the design is right: (1) **`14 merged from 19 entities`** — 14 entities spanned multiple files and were consolidated into one canonical page each (the cross-file dedup one-big-prompt did implicitly, now explicit in `merge_from_disk`); (2) **`staging_in_db = 0`** — the disposable per-file variants never touched GBrain, so each entity is embedded exactly once instead of once-per-file-mention. Re-running skips files already staged on disk.
 
 `★ Insight ─────────────────────────────────────`
-- **At scale the 30s sandbox was a red herring.** The real walls are the *extraction context limit* and *cross-file dedup*. Moving extraction to the driver dissolves the timeout as a side effect; the architecture is driven by context + dedup, not by the sandbox.
-- **`merge_pass` is the dedup-on-write pattern, deferred.** "Entity in file 7 already exists from file 2 → merge" is exactly `dedup_synthesis.decide_action` (W3.5.8/3.5.9). Doing it as a batch post-pass (vs on every write) trades freshness for far fewer LLM calls — only multi-file entities merge. Same lesson, different lifecycle position ([[Engineering Decision Patterns#Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)|Pattern 22]]).
-- **Checkpoint + idempotency = the only honest way to bulk-ingest.** Any large ingest will be interrupted (OOM, rate limit, a crash on file 4,000). Per-unit checkpoint + idempotent writes turn "start over" into "resume," which is the difference between a demo and an operable pipeline.
+- **At scale the 30s sandbox was a red herring.** The real walls are the *extraction context limit*, *cross-file dedup*, and *embedding throughput*. Moving extraction to the driver dissolves the timeout as a side effect; the architecture is driven by those three, not by the sandbox.
+- **Staging belongs in a cheap, disposable layer — not the embedded store.** v1 staged into GBrain and embedded every file-variant, then deleted them at merge: ~71% wasted embedding (65 calls for 18 final pages). Disk staging drops that to 18 — embed only the canonical. Don't make a throwaway intermediate pay the final state's cost; embedding is the one expensive op here, so optimize against *embedding count*, not DB writes.
+- **`merge_from_disk` is the dedup-on-write pattern, deferred.** "Entity in file 7 already exists from file 2 → merge" is exactly `dedup_synthesis.decide_action` (W3.5.8/3.5.9). Batched post-pass vs on-every-write trades freshness for far fewer LLM calls — only multi-file entities merge. Same lesson, different lifecycle position ([[Engineering Decision Patterns#Pattern 22 — Lifecycle Position Matters (early-binding vs late-binding for pipeline primitives)|Pattern 22]]).
+- **The teaching point survives the optimization.** The agent still writes the canonical pages and queries them over MCP — it uses GBrain as memory. Only the disposable staging moved to disk. Efficiency and the "agent-uses-GBrain" lesson aren't in tension; the *query* is what needs GBrain, and that never moved.
 `─────────────────────────────────────────────────`
 
 **Deliverable:** `src/resumable_ingest.py` + the measured run above (also in the lab's `RESULTS.md`).
@@ -1383,7 +1345,7 @@ _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 *Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
 **Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything).
 *Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free."
-*Fix:* per-file streaming + per-file checkpoint + staging-namespace writes + a final `merge_pass()` (the deferred dedup-on-write) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, scales with file count.
+*Fix:* per-file streaming + **disk** staging (no embedding) + a final `merge_from_disk()` (the deferred dedup-on-write) + agent writes only canonical pages (embedded once) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, embeds each entity once, scales with file count.
 
 _Projected (to confirm during Phases 3–6):_
 
