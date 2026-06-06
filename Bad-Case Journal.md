@@ -1399,4 +1399,44 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 
 ---
 
+## 2026-06-06 — Week 3.5.96 — CLI `gbrain put` titled pages from the slug, not the `# heading`; known-item exact probes scored 0.000
+
+**Symptom:** loaded 44 Berkshire-10-K sections via `gbrain put sections/brk_0002` with `# Berkshire … > Table of Contents`-headed content. The pages came out titled **"Brk 0002"** (slug-derived). The known-item eval's *exact* probes then queried "Brk 0002" — tokens absent from the body — so `keyword R@K exact = 0.000` and the whole 10-K eval run was contaminated.
+
+**Why it's a bad case:** the write *succeeded* — 44/44 pages stored, 429 chunks embedded, `gbrain stats` green — so it looked done. Only the per-kind eval column (`exact=0.000`, glaringly wrong for title queries) exposed it. "The write returned 0 / storage succeeded" is not "the data is right."
+
+**Root cause:** CLI `gbrain put` derives the page title from **YAML frontmatter** (falling back to the slug), NOT from the `# heading`. The MCP `put_page` path *does* parse the heading — which is why the entity pages (written over MCP) got real titles like "Alice Chen", but the CLI-loaded sections didn't. Two write paths, two titling rules; the loader used the one that ignores the heading.
+
+**Fix:** emit YAML frontmatter `title:` (authoritative), using the breadcrumb **tail** ("Chairman's Letter") not the full "Berkshire … Annual Report > X" — the shared prefix repeats across all 44 sections, so a full-breadcrumb title makes keyword drown in boilerplate. exact recall `0.000 → 0.786`.
+
+**5-second sanity test:** after any bulk load, read back ONE stored title (`gbrain get <slug>` or `SELECT title`) — don't trust the write's return code.
+
+**Generalizes to:** any ingestion where title/metadata is derived **differently across write paths** (CLI vs API/MCP vs file-import). Same content, different field-extraction rules → silent metadata drift. Always verify the stored artifact's fields, not just that the write returned success.
+
+**Tags:** #ingestion #metadata #title-extraction #write-path-divergence #storage-succeeded-data-wrong #lab-3.5.96
+
+**Captured in curriculum at:** [[Week 3.5.96 - Self-Wiring Memory (GBrain)#6. Bad-Case Journal]] (Entry 19)
+
+---
+
+## 2026-06-06 — Week 3.5.96 — Auto-tuned search policy selected the WORST arm because its eval queries were a proxy
+
+**Symptom:** the auto-eval loop picked `strategy=keyword` on the 10-K corpus (known-item recall@3 = 0.72) and wrote it to `search_policy.json`. But on 16 **real** labeled questions, keyword grounding@5 was **0.19** vs vector/hybrid **0.95** — the policy was routing real financial queries to the weakest arm.
+
+**Why it's a bad case:** the loop "worked" — it measured, decided, and wrote a policy; the pipeline was green. A self-tuning system can be **mechanically correct and still optimize the wrong objective**. The green loop hides a wrong policy; nothing errors.
+
+**Root cause:** the known-item proxy queries were page **titles** (keyword-friendly by construction); real questions are **paraphrases** with no shared surface tokens (vector-friendly). The proxy query distribution ≠ the real query distribution, so the measured winner didn't transfer to the real workload. The auto-tuner faithfully optimized for the wrong queries.
+
+**Fix:** drive the policy from a **real, version-controlled golden set** scored by grounding@K (`data/golden_eval.json`); demote the known-item proxy to a cold-start fallback + regression guardrail. Re-eval on every ingest so the policy tracks corpus drift — measured live: the policy moved `vector → hybrid` as the corpus grew from 10-K-only to a mixed 10-K+entity brain, and the move was data-justified.
+
+**5-second sanity test:** before trusting any auto-tuner, run a *handful of real queries* and confirm they pick the same winner the loop did. If they disagree, the loop's eval set is unrepresentative.
+
+**Generalizes to:** any auto-tuning / self-optimizing loop (hyperparameter search, prompt selection, retrieval-strategy selection, RLAIF reward models). The loop inherits the bias of its eval set; validate the eval's **representativeness of the real workload**, not just the loop's mechanics. A convenient auto-generated eval is the failure mode, not the win.
+
+**Tags:** #auto-tuning #eval-design #proxy-metric #distribution-shift #retrieval #policy #lab-3.5.96
+
+**Captured in curriculum at:** [[Week 3.5.96 - Self-Wiring Memory (GBrain)#6. Bad-Case Journal]] (Entry 20)
+
+---
+
 — end —

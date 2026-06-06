@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.96 — Self-Wiring Memory (GBrain — Garry Tan's Production Memory Layer for AI Agents)"
 created: 2026-05-28
-updated: 2026-06-05
+updated: 2026-06-06
 status: SPEC + executable lab
 tags:
   - agent
@@ -135,6 +135,15 @@ flowchart TD
   RRF --> SYN[Synthesis layer<br/>answer + citations<br/>+ what-we-don't-know]
   SYN --> A[Agent reads via MCP<br/>74 tools exposed]
 ```
+
+> **Markdown is the write-time substrate, not the run-time memory store.** Write
+> path: Markdown → deterministic parser → **Postgres** (`pages`/`entities`/`edges`
+> tables + a pgvector HNSW embedding column). The query path is **entirely
+> Postgres** — vector (HNSW) and keyword (tsvector FTS) fused by RRF; retrieval
+> never re-parses the `.md` files. So Markdown is the auditable, diff-friendly,
+> human-editable *source of truth*; once embedded, **PG serves all query-time
+> recall**. "Markdown-first" describes the write contract (deterministic,
+> zero-LLM extraction), not the retrieval engine — that's pgvector + tsvector.
 
 ---
 
@@ -841,6 +850,18 @@ Per-query: keyword **MISSED all four** purely-semantic queries (no lexical overl
 - **RRF can lose to its own input.** The reflexive "hybrid > vector > keyword" ranking is corpus-dependent. Here the keyword arm is net-negative for 40% of queries, so RRF's fusion *demotes* correct vector hits. Measure before claiming the lift; a hybrid that includes a weak arm can underperform that arm's strong sibling alone.
 `─────────────────────────────────────────────────`
 
+#### Why GBrain still defaults to RRF — and how to choose without guessing
+
+The lab result does **not** refute RRF; it refutes *transplanting the published 83→95 projection onto this corpus*. RRF is a **conditional** upgrade: it wins only when both arms are individually competitive and complementary. GBrain ships it as the default because its target domain — production CRM / founder-network data at 146K-page scale (§2.5), dense with proper nouns (people, companies, acronyms, dates) — is exactly the shape where the keyword arm earns its weight. The 19-page, semantic-heavy lab brain is the opposite shape, so vector-only wins there.
+
+**But corpus size is the wrong discriminator** (it's a confounded proxy). A *large* corpus that happens to be proper-noun-sparse — long-form prose, paraphrase-heavy chat logs — will still lose to RRF, because the keyword arm has nothing exact to catch. The causal variable is **per-query lexical signal × per-arm competitiveness**, not page count. Route on *that*, never on size. A practical three-layer auto-selection design (each layer label-cheaper than learning a full LTR router):
+
+1. **Runtime, per-query, label-free — score-gated weighted fusion.** RRF's specific defect is that it is **rank-only**: a confident vector hit @1 and a garbage keyword hit @1 both cast a `1/(rank+k)` vote of equal weight, so a dead arm *demotes* a strong one. Fix it at the root — make fusion **score-aware**. Per query, read each arm's top score (`ts_rank`/BM25 for keyword, cosine for vector), normalize, and weight each arm's contribution by its own confidence. When a purely-semantic query yields a near-zero keyword top-score, that arm's weight collapses to ~0 and hybrid **degenerates to vector-only automatically** — so it can no longer underperform the better arm. When an exact-term query makes the keyword arm confident, the lift returns. This is corpus-size-agnostic *and* proper-noun-density-agnostic because the decision is made per query from live signal.
+2. **Optional fast-path — query-feature pre-router.** Before retrieving, cheaply scan the query string for exact-term signal: quoted phrases, capitalized multi-word spans, all-caps acronyms (len ≥ 2), digits/dates, or tokens whose corpus document-frequency is low (rare = high-IDF). Signal present → run both arms (hybrid); absent → skip the keyword retrieval entirely and go vector-only. Coarser than score-gating but cheaper (it avoids the keyword round-trip when it's pointless); use it as a pre-filter, with score-gating as the accurate arbiter.
+3. **Offline backbone — rolling-qrel calibration + drift guard.** The honest version of "which default, and what threshold τ" is a *measured output*, not a hand-set guess. Keep a small labeled qrel set (seed by hand; grow it from weak labels — accepted answers, click-throughs), and run the engine-layer `runEval` harness (the Phase 6 script) on a schedule: it (a) picks the global default, (b) calibrates the per-arm gate threshold τ, and (c) **alarms when the winning strategy flips**, which is your signal that the corpus shape drifted (e.g. you ingested a large prose dump and the proper-noun ratio fell). The decision stays anchored to evidence as the corpus evolves.
+
+The meta-principle is the W3.5.9 thesis applied to retrieval: **don't reflexively default to hybrid, and don't pick by a size heuristic — gate per query on measured lexical signal, and let an eval harness, not intuition, set the thresholds.**
+
 **Deliverable:** `src/bench_strategies.ts` in the lab repo + the table above (also in the lab's `RESULTS.md`).
 
 ### Phase 7 — Ground-Truth Hierarchy: memory-as-authoritative A/B [executed, measured]
@@ -1494,6 +1515,257 @@ uv run --with pytest python -m pytest tests/ -v
 # → 17 passed   (test_resumable_ingest.py · test_ingest_agent.py · test_parsers.py)
 ```
 
+### Phase 9 — A corpus-adaptive search policy, tuned on a real golden eval set [executed, measured]
+
+**Goal:** make the agent's retrieval strategy **self-tune to the corpus**. After
+every ingest, score the three retrieval arms (keyword / vector / hybrid) against a
+**fixed golden set of real, labeled questions**, write the winning arm to a policy
+artifact, and route subsequent agent queries through it. Because the eval re-runs as
+the brain grows, the policy **adapts to drift** — search quality tracks the corpus
+without hand-tuning. This turns Phase 6's one-off finding ("the right arm is
+query/corpus-shape dependent") into a running, self-correcting control loop.
+
+> **The policy MUST come from real questions — the rejected first cut.** The first
+> version generated *known-item* queries automatically: sample a page, use its
+> **title** as the query, gold = that page. It's label-free and convenient — and
+> **wrong as a policy source.** On the 10-K it selected `keyword` (titles are
+> keyword-friendly); but real financial questions made keyword the *worst* arm by
+> ~5× (see the comparison below). A policy is only as trustworthy as the
+> representativeness of its eval queries. So known-item is demoted to a **cold-start
+> fallback** (better than nothing on a brand-new brain) + a regression guardrail,
+> and a **golden set of real, labeled questions is the policy source.** (Bad-Case
+> Entry 20.)
+
+> **Why an actuator at all?** Stock `gbrain query`/`search` are hybrid-only (Entry 8) —
+> there is no GBrain knob for "default strategy = keyword." So the apply step governs
+> only the path *we* own (the agent's retrieval call) via a small wrapper. It steers
+> the agent, not the stock CLI — a GBrain surface constraint, named honestly.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  GOLD[("golden_eval.json<br/>real labeled questions<br/>(fixed ruler)")] --> PE
+  ING[ingest + reconcile<br/>corpus changes] --> PE["policy_eval.ts<br/>grounding@K per arm<br/>over CURRENT corpus"]
+  PE --> DEC["decide winner<br/>grounding@K"]
+  DEC --> POL[("search_policy.json<br/>strategy + rrf_k")]
+  POL --> QP["query_policy.ts<br/>route to winning arm"]
+  QP --> ANS[agent retrieval<br/>honors the verdict]
+```
+
+#### Block A — `data/golden_eval.json`: the measuring stick
+
+The golden set is a **stable, version-controlled** artifact — kept *separate from
+the corpus* (which changes). 18 real, labeled questions, domain-tagged:
+- **`tenk` (12):** W2.7's labeled Berkshire-10-K questions (factoid / synthesis /
+  citation). The 4 out-of-document *refusal* questions are dropped — they test
+  generation refusal, not retrieval, and have no gold section to find.
+- **`entity` (6):** hand-written from the W3.5.96 `~/brain/sources` fixtures, keyed
+  on proper nouns that reliably appear (`Sam Okafor`, `Lin Zhao`, `Ridgeline`, …).
+
+Each question carries `expected_entities` — the substrings a correct answer-bearing
+section must contain. That's the gold: **no per-slug labels needed**, so the set is
+cheap to extend as the real query distribution shifts.
+
+```json
+{ "q": "Who is anchoring the acme-seed round?",
+  "expected_entities": ["Sam Okafor", "Northstar"], "domain": "entity" }
+```
+
+#### Block B — `policy_eval.ts`: score real questions, write the policy
+
+**Code (core — full source `src/policy_eval.ts`):**
+
+```typescript
+// for each arm: best top-K section's coverage of the question's expected_entities
+const report = await runEval(engine, qrels, { strategy, expand: false, limit: K }, K);
+for (let i = 0; i < golden.length; i++) {
+  const hits = report.queries[i].hits.slice(0, K);
+  let best = 0;
+  for (const slug of hits)
+    best = Math.max(best, coverage(await sectionText(slug), golden[i].expected_entities));
+  perQ[strategy].push(best);                           // grounding for this question
+}
+// winner = overall grounding@K (tie → answerable@K) → written to search_policy.json
+const winner = [...strategies].sort((a, b) =>
+  groundingFor(b) - groundingFor(a) || answerableFor(b) - answerableFor(a))[0];
+```
+
+**Walkthrough:**
+- **Grounding@K, not recall@K.** With no gold *slug*, "did retrieval surface a
+  section *containing the answer entities*" is the honest, label-cheap signal — and
+  it's what matters for the agent (can it ground an answer?).
+- **Per-domain breakdown is the diagnostic.** `g@K:tenk` vs `g@K:entity` shows
+  *which corpus the policy is serving*, and makes drift visible — an absent domain
+  scores ~0 until its data is ingested.
+- **Re-runs on every ingest.** `run_auto_eval()` prefers `policy_eval.ts` whenever
+  `data/golden_eval.json` exists, so the policy is re-selected against the *current*
+  corpus each time; the loop tracks drift automatically.
+
+**Result — the drift experiment (live, isolated `gbrain_brk` DB):**
+
+*Phase A — corpus = 10-K only (44 pages):*
+
+| arm | grounding@5 | g@5 tenk | g@5 entity |
+|---|---|---|---|
+| keyword | 0.167 | 0.250 | 0.000 |
+| **vector** | **0.667** | 0.958 | 0.083 |
+| hybrid | 0.667 | 0.958 | 0.083 |
+
+→ **policy v1 = `vector`.** Vector nails 10-K factoid retrieval (`tenk 0.958`); the
+entity questions score ~0 because that data isn't in the corpus yet (correctly
+uninformative — the per-domain split makes that legible).
+
+*Phase B — ingest the W3.5.96 entity corpus → mixed (59 pages); the eval auto-re-fires:*
+
+| arm | grounding@5 | g@5 tenk | g@5 entity |
+|---|---|---|---|
+| keyword | 0.222 | 0.250 | 0.167 |
+| vector | 0.944 | 0.958 | 0.917 |
+| **hybrid** | **0.972** | 0.958 | **1.000** |
+
+→ **policy v2 = `hybrid`.** The policy **changed on its own**, triggered by the
+ingest, with no code change. It's data-justified: entity questions are proper-noun
+lookups (`Sam Okafor`, `Lin Zhao`) that revive the keyword arm, while vector still
+owns 10-K semantics — both arms now competitive, so RRF earns its weight (entity
+`g@5`: hybrid **1.000** > vector 0.917). And `tenk` grounding held at 0.958 across
+both phases: the +15 distractor pages didn't degrade 10-K retrieval; the policy
+shifted to *capture new value*, not to recover lost ground.
+
+#### Block C — `query_policy.ts`: the actuator
+
+**Code (full — `src/query_policy.ts`):**
+
+```typescript
+let strategy: Strategy = "hybrid"; let rrfK = 60;           // fallback = GBrain's default
+if (existsSync(POLICY)) {
+  const p = JSON.parse(readFileSync(POLICY, "utf-8"));
+  if (["keyword","vector","hybrid"].includes(p.strategy)) strategy = p.strategy;
+  if (typeof p.rrf_k === "number") rrfK = p.rrf_k;
+}
+async function search(): Promise<{ slug: string }[]> {
+  if (strategy === "keyword") return engine.searchKeyword(query, { limit });
+  if (strategy === "vector")  return engine.searchVector(await embed(query), { limit });
+  return hybridSearch(engine, query, { limit, expansion: false, rrfK });   // hybrid
+}
+```
+
+**Walkthrough:**
+- **Reads the policy, routes accordingly** — after Phase B an agent query runs
+  through `hybrid`; the identical call ran `vector` after Phase A. The only thing
+  that changed between them is the policy file the loop rewrote.
+- **Fallback to hybrid** keeps a fresh brain (no policy yet) on GBrain's own default,
+  so the wrapper degrades to stock behavior rather than erroring. The vector arm
+  must `embed()` the query at run-time, which needs the same gateway bootstrap as the
+  eval (`hybrid.ts:975` silently no-ops without it).
+
+#### Comparison to W2.7 (same 10-K, different axis)
+
+W2.7 scored **answer quality** across **index types** (Vector / GraphRAG /
+tree-index); this lab scores **retrieval grounding** across **arms** (keyword /
+vector / hybrid). Not numerically comparable — compare which method wins which query
+*class*:
+
+| | measured | factoid winner | note |
+|---|---|---|---|
+| W2.7 three-way | answer quality (LLM-judge) | **Vector** 0.50 | aggregate Graph 0.48 / Tree 0.44 / Vector 0.25 |
+| this lab (golden, real Q) | retrieval grounding@5 | **vector/hybrid** 0.96 | keyword 0.19 |
+
+Shapes converge: dense vector is strongest at 10-K *factoid retrieval* in both. And
+grounding 0.96 ≫ W2.7's vector answer-judge 0.25 ⇒ in W2.7 the bottleneck was
+**generation, not retrieval** — GBrain surfaces the answer-bearing section ~96% of
+the time; turning that into a correct answer is the separate, harder step.
+
+`★ Insight ─────────────────────────────────────`
+- **A policy is only as good as its eval queries.** The convenient known-item proxy
+  (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid`
+  — opposite verdicts on the *same corpus*. The whole value of the loop rides on a
+  representative golden set, which is why it's the version-controlled centerpiece, not
+  an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
+- **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing*
+  corpus moved the policy `vector → hybrid` with zero code change, and the move was
+  justified (mixed query classes make both arms competitive → RRF wins). That's the
+  "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact
+  loop that improves the agent as its brain grows.
+- **Honest edges:** in Phase A vector and hybrid *tied* (0.667; entity data absent),
+  so v1 was a tie resolved by order — the decisive signal is Phase B. Grounding ≠
+  answer quality, the entity golden set is only 6 questions, and the policy steers the
+  agent's retrieval path, not stock `gbrain query`.
+`─────────────────────────────────────────────────`
+
+#### Reproduce — the drift experiment, end to end
+
+Prereqs: the Phase-1 stack up — Postgres+pgvector container (`gbrain-pg`) and the
+oMLX embedding server on `:8000`. All commands run from `~/code/agent-prep/lab-03-5-96-gbrain/`
+with the lab `.env` loaded (`set -a; . ./.env; set +a`) and `~/.bun/bin` on `PATH`.
+
+**Step 1 — an isolated DB, so the 10-K measures alone first.** A fresh database
+keeps the 10-K corpus uncontaminated by the entity brain for Phase A.
+
+```bash
+docker exec gbrain-pg psql -U postgres -c "CREATE DATABASE gbrain_brk;"
+docker exec gbrain-pg psql -U postgres -d gbrain_brk -c "CREATE EXTENSION IF NOT EXISTS vector;"
+gbrain init --url postgresql://postgres:postgres@localhost:5432/gbrain_brk \
+  --embedding-model ollama:nomicai-modernbert-embed-base-bf16
+export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain_brk
+```
+
+**Step 2 — ingest corpus #1: the 10-K.** `load_brk_corpus.py` reads W2.7's parsed
+sections (`lab-02-7-pageindex/data/brk_corpus.json` — the PDF already segmented into
+44 `{id,title,text}` sections), writes each as a GBrain page with YAML-frontmatter
+title (Entry 19), embeds, and triggers the golden auto-eval.
+
+```bash
+.venv/bin/python src/load_brk_corpus.py     # 44 pages, ~429 chunks embedded
+gbrain stats | head -3                       # Pages: 44
+```
+
+**Step 3 — Phase A: generate policy v1 on the 10-K-only corpus.**
+
+```bash
+bun src/policy_eval.ts        # scores the 18 golden Qs over the current 44 pages
+cat results/search_policy.json # → "strategy": "vector"  (tenk g@5 0.958; entity ~0, data absent)
+```
+
+**Step 4 — ingest corpus #2: the W3.5.96 entity data, INTO THE SAME DB.** This is
+the drift event. The raw fixtures live under `~/brain/sources/` (the emails, dinner/
+board-call/pitch transcripts, and tweets from Phase 2); the **thin-agent + fat-tools**
+pipeline (Phase 3) extracts entities and writes them via `put_page` over MCP, then
+reconciles links — now pointed at `gbrain_brk`, so the entity pages land *alongside*
+the 44 brk sections. Because `data/golden_eval.json` exists, `run_auto_eval()` fires
+`policy_eval.ts` automatically at the end of the ingest.
+
+```bash
+.venv/bin/python src/ingest_agent.py   # warms extraction cache → agent put_page's
+                                       # ~15 entity pages → reconcile_graph() →
+                                       # run_auto_eval() RE-FIRES policy_eval (golden)
+gbrain stats | head -3                 # Pages: 59  (44 brk + 15 entity)
+```
+
+**Step 5 — Phase B: observe the policy changed, and the actuator honors it.**
+
+```bash
+cat results/search_policy.json                 # "strategy": "vector" → "hybrid"
+bun src/policy_eval.ts                          # full per-domain table (idempotent re-check)
+bun src/query_policy.ts "Who is anchoring the acme-seed round?"   # routes via hybrid
+```
+
+**Verification:** `gbrain stats` shows pages 44 → 59 after Step 4; `search_policy.json`
+`strategy` flips `vector → hybrid`; `policy_eval` per-domain shows `entity g@5` rising
+from ~0 (Phase A) to 1.000 (Phase B, hybrid) while `tenk g@5` holds at 0.958. Teardown:
+`docker exec gbrain-pg psql -U postgres -c "DROP DATABASE gbrain_brk;"`.
+
+> **Cold-start note:** delete `data/golden_eval.json` and `run_auto_eval()` falls back
+> to the known-item `auto_eval.ts` (proxy) — useful on a brand-new brain with no real
+> questions yet, but it can mis-select the arm (Entry 20), so add a real golden set as
+> soon as you have representative questions.
+
+**Deliverable:** `data/golden_eval.json` (18 real Qs) + `src/policy_eval.ts` (policy
+source) + `src/query_policy.ts` (actuator) + `src/load_brk_corpus.py`. `run_auto_eval()`
+prefers the golden eval, falling back to the known-item `src/auto_eval.ts` only at
+cold start (when no golden set exists). Tests: `tests/auto_eval.test.ts` (15),
+`tests/test_load_brk_corpus.py` (7); regression gate **24 pytest + 15 bun** green.
+Policy artifact `results/search_policy.json`; full numbers in `RESULTS.md`.
+
 ## 6. Bad-Case Journal (real, observed)
 
 _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
@@ -1571,6 +1843,14 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 **Entry 18 — resume re-ran the (LLM) merge every time (OBSERVED, Phase 8).** Resume re-reads stage chunks to rebuild the canonical list, which re-fired `merge_from_disk`'s per-entity LLM merges — correct but wasteful (same "idempotent ≠ cheap" as the write phase, one layer up).
 *Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't.
 *Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
+
+**Entry 19 — CLI `gbrain put` titled pages from the slug, not the `# heading` (OBSERVED, Phase 9).** Loading the 44 brk 10-K sections via `gbrain put sections/brk_0002` with `# Berkshire … > Table of Contents`-headed content produced pages titled **"Brk 0002"**. The known-item eval's *exact* probes then queried "Brk 0002" — tokens absent from the body — so `keyword R@K exact = 0.000` and the whole brk run was contaminated.
+*Root cause:* CLI `put` derives the title from **YAML frontmatter** (falling back to the slug), NOT from the `# heading` — unlike MCP `put_page`, which parses the heading (which is why the entity pages got real titles). Two write paths, two titling rules; the loader used the wrong one.
+*Fix:* emit YAML frontmatter `title:` (authoritative), using the breadcrumb **tail** ("Chairman's Letter"), not the full "Berkshire … Annual Report > X" (the shared prefix repeats across all 44 → keyword drowns). exact recall `0.000 → 0.786`. **Measure the stored artifact (the title), not the write's return code** — the same "storage succeeded ≠ data is right" lesson as Entry 5.
+
+**Entry 20 — the auto-tuned policy selected the WORST arm for real queries (OBSERVED, Phase 9).** The known-item auto-eval picked `strategy=keyword` on the 10-K (recall@3 = 0.72) and wrote it to `search_policy.json`. But on 16 **real** W2.7 questions, keyword grounding@5 was **0.19** vs vector/hybrid **0.95** — the policy routes real financial questions to the weakest arm.
+*Root cause:* known-item probes use page **titles** as "exact" queries (keyword-friendly); real questions are **paraphrases** with no shared surface tokens (vector-friendly). The proxy query distribution ≠ the real one, so the measured winner doesn't transfer.
+*Fix:* drive the policy from a **representative/real** query set (Path A), and treat known-item auto-eval as a **regression guardrail**, not the policy oracle. An auto-tuning loop inherits the bias of its eval queries — measure the *decision input's* representativeness, not just the loop's mechanics.
 
 **Pre-run predictions vs. what actually happened** (these were guessed *before* Phases 3–6 ran; now resolved against the measured outcomes — **3 of 4 missed**, which is the honest record: predictions are cheap, the observed Entries above are the truth).
 
