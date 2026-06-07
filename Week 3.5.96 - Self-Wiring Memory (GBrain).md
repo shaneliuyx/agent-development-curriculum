@@ -2077,6 +2077,11 @@ flowchart TD
 
 The single structural failure flipped to pass, **zero regressions** on the other 15 — and GBrain now matches W2.7's *optimized* 16/16, but with the cheaper architecture (deterministic hybrid + static structural metadata, no per-query tree-walk). Honest edges: `build_tree.py` is a one-time LLM pass (the only document-specific LLM step); `tree.json`'s page ranges are slightly noisy (some single-page), but the `Item N` inheritance is the reliable signal and is what the rubric rewards; and this is the structural class only — factoid/semantic never needed it.
 
+> **Where the scripts live** (this pipeline spans two labs):
+> - `build_tree.py`, `_brk_corpus.py` — **W2.7's PageIndex lab**, `~/code/agent-prep/lab-02-7-pageindex/src/`. Artifacts they write: `tree.json`, `brk_corpus.json` in that lab's `data/`.
+> - `load_brk_corpus.py` (the tree→GBrain join), `eval_brk16.py` (the 16-question harness) — **this lab**, `~/code/agent-prep/lab-03-5-96-gbrain/src/`.
+> - `eval_ground_truth.json` (the 16 questions + `pass_criteria`) — `lab-02-7-pageindex/data/`.
+
 `★ Insight ─────────────────────────────────────`
 - **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
 - **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing* corpus moved the policy `vector → hybrid` with zero code change, and the move was justified (mixed query classes make both arms competitive → RRF wins). That's the "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact loop that improves the agent as its brain grows.
@@ -2129,6 +2134,25 @@ bun src/query_policy.ts "Who is anchoring the acme-seed round?"   # routes via h
 ```
 
 **Verification:** `gbrain stats` shows pages 44 → 59 after Step 4; `search_policy.json` `strategy` flips `vector → hybrid`; `policy_eval` per-domain shows `entity g@5` rising from ~0 (Phase A) to 1.000 (Phase B, hybrid) while `tenk g@5` holds at 0.958. Teardown: `docker exec gbrain-pg psql -U postgres -c "DROP DATABASE gbrain_brk;"`.
+
+**Step 6 — (combined PageIndex + GBrain) structural-question ingest.** To make location/citation questions answerable ("where are the Notes located?"), carry PageIndex's section structure into GBrain. Build the tree once in **W2.7's lab**, then re-ingest with the tree-join enrichment in **this lab** (see *Where the scripts live* under the comparison above):
+
+```bash
+# W2.7's PageIndex lab — build the structure (one-time LLM pass)
+cd ~/code/agent-prep/lab-02-7-pageindex
+python src/build_tree.py        # PDF → data/tree.json (per-section page ranges + hierarchy)
+python src/_brk_corpus.py       # PDF + tree.json → data/brk_corpus.json (section articles)
+
+# this lab — join tree.json into each GBrain page (frontmatter + **Location:** body line)
+cd ~/code/agent-prep/lab-03-5-96-gbrain
+uv run python src/load_brk_corpus.py    # re-ingests 44 sections, now structure-enriched
+
+# verify on all 16 W2.7 questions (GBrain hybrid retrieval + Opus reader/judge)
+OPENROUTER_BASE_URL=http://localhost:8317/v1 OPENROUTER_API_KEY=vibeproxy GEN=opus JUDGE=opus \
+  uv run python src/eval_brk16.py       # flat 15/16 → enriched 16/16; "Notes located?" flips PASS
+```
+
+**Verification:** `gbrain get sections/brk_0039` shows `**Location:** Item 8 … pages 99-147`; `eval_brk16.py` reports `gt_pass 16/16` with the Notes question PASS and no regression on the other 15.
 
 > **Cold-start note:** delete `data/golden_eval.json` and `run_auto_eval()` falls back
 > to the known-item `auto_eval.ts` (proxy) — useful on a brand-new brain with no real
