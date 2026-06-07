@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.96 — Self-Wiring Memory (GBrain — Garry Tan's Production Memory Layer for AI Agents)"
 created: 2026-05-28
-updated: 2026-06-06
+updated: 2026-06-07
 status: SPEC + executable lab
 tags:
   - agent
@@ -1789,6 +1789,18 @@ The oracle *equals* global hybrid — **hybrid weakly dominates every one of the
 > **Scope this honestly — the verdict is the *workload's*, not a law.** Routing beats global hybrid only when (a) different queries favor different arms AND (b) fusion sometimes demotes the winner. This golden set has neither: by query class it is **11 vector-only (semantic) · 6 both-find-it · 1 hybrid-only · 0 keyword-only**, and on **0 of 18** did RRF score below the best single arm. It's vector-skewed with no pure exact-match queries and no RRF-adversarial cases — so hybrid dominates by *construction*, and routing can't win. So I built that set and re-ran the oracle (`data/golden_balanced.json`, `GOLDEN_EVAL=… bun src/route_eval.ts`): **24 questions, the same answer targets phrased two ways** — keyword-style (exact distinctive tokens) vs vector-style (paraphrase with the answer terms removed). **Routing was still rejected: oracle 0.831 vs global hybrid 0.823 (Δ +0.008), heuristic −0.242.** And the reason turned out *deeper* than question balance: I couldn't even *build* keyword-favoring queries — GBrain's FTS arm returned grounding **0** on half the exact-token queries (`Itochu Marubeni…`, `Item 1C`, `Lin Zhao Quanta`, `Helix Bio protein`) while vector nailed every one. **Vector dominates this corpus regardless of phrasing**: `0/24` queries had keyword as the strict best, and only `1/24` had RRF demote the winner. So the no-headroom verdict is **not a sampling artifact** — it's one-arm (vector) dominance, *because the keyword arm contributes nothing on these queries.* Routing is rejected robustly **for the pipeline as built**.
 
 > **But the keyword arm isn't weak — it's mis-fed (deep-dive + fix, measured).** GBrain's keyword search is conjunctive: `websearch_to_tsquery('english', q)` ANDs every token over chunk-grain, so all terms must co-occur in one chunk. Bare exact tokens rank **~1.0** (`Itochu Marubeni Mitsubishi Mitsui Sumitomo` → the houses page at 0.993); adding context words (`… trading houses`, or any natural question) ANDs to **0** — every extra token is one more clause the answer chunk must also satisfy. The fix is one query-rewrite on *our* side, no GBrain change: drop stop/question words and **OR-join** the salient tokens (`a OR b OR c`), turning AND into best-match. Measured (`src/route_eval_kwpp.ts`, 24-Q balanced set): the keyword arm jumps **grnd@C 0.271 → 0.769** and **g@C:kw 0.500 → 1.000** — and with keyword finally competitive, per-query routing's oracle headroom *returns*: **+0.081** vs the fixed hybrid (`6/24` questions where a single arm strictly beats hybrid), up from +0.008. So "routing rejected / vector dominates" traced entirely to the **conjunctive-keyword × verbose-query mismatch** — fixable upstream. The *cleaner* move is to preprocess the keyword query **inside the arm** so global hybrid improves (no router needed); routing's gain is modest and its oracle is unattainable — a real classifier captures less (the heuristic still *lost*). Lesson: fix the query shape, not the arm — and the biggest architectural verdicts can rest on one `AND`-vs-`OR` default.
+
+**Result — keyword revival, all five arms (re-verified 2026-06-07, `GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts`, 24 Q · K=5 C=3):**
+
+| arm | grnd@C | g@C:kw | g@C:vec | g@C:mixed |
+|---|---|---|---|---|
+| `key` (raw, conjunctive) | 0.271 | 0.500 | 0.000 | 0.375 |
+| **`key_pp` (OR-preprocessed)** | **0.769** | **1.000** | 0.540 | 0.763 |
+| `vector` | 0.811 | 0.925 | 0.763 | 0.647 |
+| `hyb` (GBrain default hybrid) | 0.823 | 0.925 | 0.745 | 0.763 |
+| `hyb_pp` = RRF(`key_pp`, `vector`) | 0.796 | 0.950 | 0.689 | 0.680 |
+
+Routing with the revived keyword arm: global `hyb_pp` **0.796** · oracle **0.877** · **Δ +0.081** · **6/24** questions where one arm strictly beats fixed-hybrid. (The **0.877 is an aggregate, not a cell**: oracle = mean over the 24 questions of the *per-question best* of `key_pp` / `vector` / `hyb_pp`. Because it picks the winner each question it must exceed every single column — that's exactly the unattainable ceiling, since no real classifier knows the per-question best in advance.) Reading the columns: OR-preprocessing lifts `key` on *every* class (`g@C:kw` 0.500 → 1.000; `g@C:vec` 0.000 → 0.540 — even paraphrases share enough salient tokens to escape the AND-to-zero trap), but raw `vector` (0.811) and `hyb` (0.823) still match or beat `key_pp` (0.769) overall, so the revived keyword buys **routing headroom, not a new global winner**. The sharpest detail: `hyb_pp` (0.796) actually *trails* plain `hyb` (0.823) — naïvely OR-fusing the revived keyword into hybrid **hurts** the global policy. The +0.081 only exists under an oracle that peeks at labels; the shippable global default is left no better.
 
 **Answer-quality check — and a generation confound caught in the act.** Grounding takes the *max* coverage over the top-C, so it's blind to whether the *other* in-budget chunks are distractors. So we judged the answers too (`src/answer_route_ab.py`): generate from the global-hybrid context vs the routed context, LLM-judge against each question's `pass_criteria`. Run on **two generator tiers**:
 
