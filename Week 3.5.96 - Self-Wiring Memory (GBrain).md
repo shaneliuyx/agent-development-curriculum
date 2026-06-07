@@ -1790,7 +1790,7 @@ The policy picks ONE arm for the whole corpus. Natural next question: the best a
 
 **Build the ceiling before the classifier.** On the 67-page mixed brain:
 
-| router | grounding@3 | Δ vs global |
+| router | grnd@3↓ | Δ vs global |
 |---|---|---|
 | global (hybrid) | 0.910 | — |
 | heuristic | 0.736 | −0.174 |
@@ -2233,11 +2233,11 @@ The **loop is the point**: every ingest re-runs the SELECTOR, which re-measures 
 
 **Verified end-to-end** on the **`tenk` subset — the 12 10-K questions that carry `pass_criteria`** (`src/verify_arch.py`, judge = Claude Opus 4.5, 3 arms × 12 Q = **36 cells**). Grounding here is the **`g@3:tenk` column** of the metric table above — *not* a new measurement — so `hybrid` reads **0.927** (the 12-Q tenk slice), which is why it differs from the 18-Q full-set `0.910` (metric table) and the balanced-set `0.823` (routing tables): **same metric, three different question sets**. The point of this table is the second column (answer pass-rate), which only exists for questions with a rubric:
 
-| arm | grounding@3 (`tenk`, 12 Q) | answer pass-rate (`tenk`, 12 Q) |
-|---|---|---|
-| keyword | 0.250 | 0.167 |
-| vector | 0.858 | 0.917 |
-| **hybrid** | **0.927** | **1.000** |
+| arm        | grnd@3↓ (`tenk`, 12 Q) | answer pass-rate (`tenk`, 12 Q) |
+| ---------- | -------------------------- | ------------------------------- |
+| keyword    | 0.250                      | 0.167                           |
+| vector     | 0.858                      | 0.917                           |
+| **hybrid** | **0.927**                  | **1.000**                       |
 
 > **Provenance note (re-verified 2026-06-07, `results/verify_arch.out`).** Both columns are **current**: re-run uncapped on Opus 4.5 after the corpus picked up the combined **PageIndex+GBrain** ingest (the `**Location:**` breadcrumbs — see the combined-solution subsection). That ingest is what moved the numbers — keyword/vector grounding rose (`vector 0.816 → 0.858`) *and* their answers rose with them (`vector pass 0.750 → 0.917`, `hybrid 0.917 → 1.000`), which is why the calibrator went **up**, not down. The earlier worry that the drift might break the architecture was the right thing to check and it resolved favourably: grounding and answers moved *together*.
 
@@ -2806,7 +2806,7 @@ Notation: $q$ ranges over the $N$ golden questions; $\text{cov}_{q,i}\in[0,1]$ i
   - *reads:* the indicator $\mathbf{1}[\,\cdot=1\,]$ is $1$ only when some top-$C$ section covers EVERY expected entity (coverage exactly $1$), else $0$; the mean is the fraction of fully-answerable questions. A strict binary check — used only to break grounding ties.
 
 **Answer-quality metrics** (`verify_arch.py`, `reader_ab.py`)
-- **mean grounding@3** — per-arm average of the cheap discounted grounding@C=3 metric.
+- **mean grnd@3↓** — per-arm average of the cheap discounted grounding@C=3 metric (the `↓` marks it discounted; bare `grounding@N` without the `↓` denotes the *old rank-blind* metric — see `grounding@5` above — so the current metric always carries `↓`).
 - **answer pass-rate** — fraction of generated answers a strong LLM judge marks **PASS** against the question's `pass_criteria`. The real objective; grounding is its cheap surrogate (corr +0.820).
 
 **Reader strategies** (`reader_ab.py` — same retrieval, different prompt)
