@@ -254,10 +254,7 @@ gbrain --version                         # prints a version (e.g. 0.42.x)
 
 ##### The `.env` file (copy-paste)
 
-Create `~/code/agent-prep/gbrain/.env` with the block below, then fill the two
-`<…>` placeholders. **Required** = the lab won't run without it; **optional** =
-enables vector/hybrid search and query expansion (skip and you still get keyword
-search). `.env` holds secrets — it's already in GBrain's `.gitignore`; never commit it.
+Create `~/code/agent-prep/gbrain/.env` with the block below, then fill the two `<…>` placeholders. **Required** = the lab won't run without it; **optional** = enables vector/hybrid search and query expansion (skip and you still get keyword search). `.env` holds secrets — it's already in GBrain's `.gitignore`; never commit it.
 
 ```bash
 cat > ~/code/agent-prep/gbrain/.env <<'EOF'
@@ -395,28 +392,15 @@ Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]; angel i
 > **This is the ingestion engine for the whole lab.** It converts the Phase 2 raw
 > fixtures into structured pages; Phase 4 then verifies the graph it wired.
 
-**Goal:** the transferable skill behind this whole chapter — a **standalone agent
-you build** (here: smolagents, *not* Claude Code) uses GBrain as its memory layer
-over **MCP**: read raw → LLM-extract structured pages → `put_page` → `query`. Lab
-repo: `~/code/agent-prep/lab-03-5-96-gbrain/` (full source + `RESULTS.md`).
+**Goal:** the transferable skill behind this whole chapter — a **standalone agent you build** (here: smolagents, *not* Claude Code) uses GBrain as its memory layer over **MCP**: read raw → LLM-extract structured pages → `put_page` → `query`. Lab repo: `~/code/agent-prep/lab-03-5-96-gbrain/` (full source + `RESULTS.md`).
 
-**Framework choice (researched).** The agent's brain is local **oMLX, which has no
-native tool-calling**. smolagents' `CodeAgent` — the LLM writes Python that calls
-tools — is purpose-built for that; it doesn't need function-calling. (PydanticAI and
-the OpenAI Agents SDK are cleaner/typed but *require* a tool-calling model — you'd
-route the brain through VibeProxy→Haiku for those.) `use_structured_outputs_internally=True`
-sidesteps oMLX's `<code>` parsing (smolagents issue #1851).
+**Framework choice (researched).** The agent's brain is local **oMLX, which has no native tool-calling**. smolagents' `CodeAgent` — the LLM writes Python that calls tools — is purpose-built for that; it doesn't need function-calling. (PydanticAI and the OpenAI Agents SDK are cleaner/typed but *require* a tool-calling model — you'd route the brain through VibeProxy→Haiku for those.) `use_structured_outputs_internally=True` sidesteps oMLX's `<code>` parsing (smolagents issue #1851).
 
-**Design: thin agent, fat tools.** A 14B can't reliably read files **and** write a
-good extractor **and** compose markdown in one code loop — and the `CodeAgent` sandbox
-blocks `pathlib`/`json`. So the hard work lives in tools (`read_sources`,
-`extract_pages`); the agent's own code is ~4 lines of orchestration.
+**Design: thin agent, fat tools.** A 14B can't reliably read files **and** write a good extractor **and** compose markdown in one code loop — and the `CodeAgent` sandbox blocks `pathlib`/`json`. So the hard work lives in tools (`read_sources`, `extract_pages`); the agent's own code is ~4 lines of orchestration.
 
 #### Probe first — can plain Python drive GBrain's MCP?
 
-The smallest proof (`src/probe_mcp.py`, core): a Python MCP client spawns `gbrain
-serve` over stdio and lists its tools. **An MCP server is a separate process — it
-does NOT inherit your shell env**, so DB + oMLX vars are injected at spawn:
+The smallest proof (`src/probe_mcp.py`, core): a Python MCP client spawns `gbrain serve` over stdio and lists its tools. **An MCP server is a separate process — it does NOT inherit your shell env**, so DB + oMLX vars are injected at spawn:
 
 ```python
 from mcp import ClientSession, StdioServerParameters
@@ -1521,13 +1505,7 @@ uv run --with pytest python -m pytest tests/ -v
 
 ### Phase 9 — A corpus-adaptive search policy, tuned on a real golden eval set [executed, measured]
 
-**Goal:** make the agent's retrieval strategy **self-tune to the corpus**. After
-every ingest, score the three retrieval arms (keyword / vector / hybrid) against a
-**fixed golden set of real, labeled questions**, write the winning arm to a policy
-artifact, and route subsequent agent queries through it. Because the eval re-runs as
-the brain grows, the policy **adapts to drift** — search quality tracks the corpus
-without hand-tuning. This turns Phase 6's one-off finding ("the right arm is
-query/corpus-shape dependent") into a running, self-correcting control loop.
+**Goal:** make the agent's retrieval strategy **self-tune to the corpus**. After every ingest, score the three retrieval arms (keyword / vector / hybrid) against a **fixed golden set of real, labeled questions**, write the winning arm to a policy artifact, and route subsequent agent queries through it. Because the eval re-runs as the brain grows, the policy **adapts to drift** — search quality tracks the corpus without hand-tuning. This turns Phase 6's one-off finding ("the right arm is query/corpus-shape dependent") into a running, self-correcting control loop.
 
 > **The policy MUST come from real questions — the rejected first cut.** The first
 > version generated *known-item* queries automatically: sample a page, use its
@@ -1558,17 +1536,11 @@ flowchart TD
 
 #### Block A — `data/golden_eval.json`: the measuring stick
 
-The golden set is a **stable, version-controlled** artifact — kept *separate from
-the corpus* (which changes). 18 real, labeled questions, domain-tagged:
-- **`tenk` (12):** W2.7's labeled Berkshire-10-K questions (factoid / synthesis /
-  citation). The 4 out-of-document *refusal* questions are dropped — they test
-  generation refusal, not retrieval, and have no gold section to find.
-- **`entity` (6):** hand-written from the W3.5.96 `~/brain/sources` fixtures, keyed
-  on proper nouns that reliably appear (`Sam Okafor`, `Lin Zhao`, `Ridgeline`, …).
+The golden set is a **stable, version-controlled** artifact — kept *separate from the corpus* (which changes). 18 real, labeled questions, domain-tagged:
+- **`tenk` (12):** W2.7's labeled Berkshire-10-K questions (factoid / synthesis / citation). The 4 out-of-document *refusal* questions are dropped — they test generation refusal, not retrieval, and have no gold section to find.
+- **`entity` (6):** hand-written from the W3.5.96 `~/brain/sources` fixtures, keyed on proper nouns that reliably appear (`Sam Okafor`, `Lin Zhao`, `Ridgeline`, …).
 
-Each question carries `expected_entities` — the substrings a correct answer-bearing
-section must contain. That's the gold: **no per-slug labels needed**, so the set is
-cheap to extend as the real query distribution shifts.
+Each question carries `expected_entities` — the substrings a correct answer-bearing section must contain. That's the gold: **no per-slug labels needed**, so the set is cheap to extend as the real query distribution shifts.
 
 ```json
 { "q": "Who is anchoring the acme-seed round?",
@@ -1739,22 +1711,9 @@ process.exit(0);
 ```
 
 **Walkthrough:**
-- **Discounted grounding@C, not rank-blind grounding@K.** With no gold *slug*, "did
-  retrieval surface a section *containing the answer entities*" is the honest,
-  label-cheap signal. But the old `max`-over-top-K was **rank- and budget-blind** — it
-  scored 1.0 whether the answer sat at rank 0 or rank 4. RRF's failure mode is exactly
-  rank: fuse a keyword distractor above the dense answer and the answer reads later, or
-  falls past the `C` chunks the generator is actually handed. So we score the prompt the
-  model sees — `gDisc = max_i coverage_i · disc(i)` over the top-`C`, where
-  `disc(rank0)=1/log2(rank0+2)` rewards early placement and a section past `C` scores 0.
-  `C` is the **production injected-chunk count** (here 3, read off `ground_truth_ab.py`),
-  not a tunable — it is *measured off the agent*, never hand-picked.
-- **Per-domain breakdown is the diagnostic.** `g@C:tenk` vs `g@C:entity` shows
-  *which corpus the policy is serving*, and makes drift visible — an absent domain
-  scores ~0 until its data is ingested.
-- **Re-runs on every ingest.** `run_auto_eval()` prefers `policy_eval.ts` whenever
-  `data/golden_eval.json` exists, so the policy is re-selected against the *current*
-  corpus each time; the loop tracks drift automatically.
+- **Discounted grounding@C, not rank-blind grounding@K.** With no gold *slug*, "did retrieval surface a section *containing the answer entities*" is the honest, label-cheap signal. But the old `max`-over-top-K was **rank- and budget-blind** — it scored 1.0 whether the answer sat at rank 0 or rank 4. RRF's failure mode is exactly rank: fuse a keyword distractor above the dense answer and the answer reads later, or falls past the `C` chunks the generator is actually handed. So we score the prompt the model sees — `gDisc = max_i coverage_i · disc(i)` over the top-`C`, where `disc(rank0)=1/log2(rank0+2)` rewards early placement and a section past `C` scores 0. `C` is the **production injected-chunk count** (here 3, read off `ground_truth_ab.py`), not a tunable — it is *measured off the agent*, never hand-picked.
+- **Per-domain breakdown is the diagnostic.** `g@C:tenk` vs `g@C:entity` shows *which corpus the policy is serving*, and makes drift visible — an absent domain scores ~0 until its data is ingested.
+- **Re-runs on every ingest.** `run_auto_eval()` prefers `policy_eval.ts` whenever `data/golden_eval.json` exists, so the policy is re-selected against the *current* corpus each time; the loop tracks drift automatically.
 
 **Result — the drift experiment (live, isolated `gbrain_brk` DB):**
 
@@ -1771,9 +1730,7 @@ process.exit(0);
 | **vector** | **0.667** | 0.958 | 0.083 |
 | hybrid | 0.667 | 0.958 | 0.083 |
 
-→ **policy v1 = `vector`.** Vector nails 10-K factoid retrieval (`tenk 0.958`); the
-entity questions score ~0 because that data isn't in the corpus yet (correctly
-uninformative — the per-domain split makes that legible).
+→ **policy v1 = `vector`.** Vector nails 10-K factoid retrieval (`tenk 0.958`); the entity questions score ~0 because that data isn't in the corpus yet (correctly uninformative — the per-domain split makes that legible).
 
 *Phase B — ingest the W3.5.96 entity corpus → mixed (59 pages); the eval auto-re-fires:*
 
@@ -1783,22 +1740,11 @@ uninformative — the per-domain split makes that legible).
 | vector | 0.944 | 0.958 | 0.917 |
 | **hybrid** | **0.972** | 0.958 | **1.000** |
 
-→ **policy v2 = `hybrid`.** The policy **changed on its own**, triggered by the
-ingest, with no code change. It's data-justified: entity questions are proper-noun
-lookups (`Sam Okafor`, `Lin Zhao`) that revive the keyword arm, while vector still
-owns 10-K semantics — both arms now competitive, so RRF earns its weight (entity
-`g@5`: hybrid **1.000** > vector 0.917). And `tenk` grounding held at 0.958 across
-both phases: the +15 distractor pages didn't degrade 10-K retrieval; the policy
-shifted to *capture new value*, not to recover lost ground.
+→ **policy v2 = `hybrid`.** The policy **changed on its own**, triggered by the ingest, with no code change. It's data-justified: entity questions are proper-noun lookups (`Sam Okafor`, `Lin Zhao`) that revive the keyword arm, while vector still owns 10-K semantics — both arms now competitive, so RRF earns its weight (entity `g@5`: hybrid **1.000** > vector 0.917). And `tenk` grounding held at 0.958 across both phases: the +15 distractor pages didn't degrade 10-K retrieval; the policy shifted to *capture new value*, not to recover lost ground.
 
 ##### Metric upgrade — budget-aware discounted grounding@C (2026-06-06)
 
-Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-bearing
-section *anywhere* in the top-K, even when RRF has demoted it below the chunks the
-generator reads. Replaced with **discounted grounding@C** (`src/grounding.ts`,
-`budgetScore`): position-weighted best coverage over the context budget `C` (= the
-agent's real injected-chunk count, **3**, from `ground_truth_ab.py:110`). Re-measured on
-the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
+Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-bearing section *anywhere* in the top-K, even when RRF has demoted it below the chunks the generator reads. Replaced with **discounted grounding@C** (`src/grounding.ts`, `budgetScore`): position-weighted best coverage over the context budget `C` (= the agent's real injected-chunk count, **3**, from `ground_truth_ab.py:110`). Re-measured on the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
 
 | arm | grnd@3↓ | flat@3 (old) | demotion tax | g@3:tenk | g@3:entity |
 |---|---|---|---|---|---|
@@ -1806,11 +1752,7 @@ the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
 | vector | 0.809 | 0.870 | 0.061 | 0.816 | 0.794 |
 | **hybrid** | **0.910** | 0.972 | 0.062 | 0.927 | 0.877 |
 
-`flat@C` is the old rank-blind metric; the **demotion tax** (`flat − grnd↓`) is the
-answer mass RRF pushes below rank 0. Hybrid pays the most (0.062) yet still wins — its
-flat lead is wide enough to absorb the penalty (both arms competitive → fusion genuinely
-helps). The upgrade **validated** the `vector→hybrid` verdict on answer-quality grounds
-*and* priced RRF's reorder cost, instead of rubber-stamping it rank-blind.
+`flat@C` is the old rank-blind metric; the **demotion tax** (`flat − grnd↓`) is the answer mass RRF pushes below rank 0. Hybrid pays the most (0.062) yet still wins — its flat lead is wide enough to absorb the penalty (both arms competitive → fusion genuinely helps). The upgrade **validated** the `vector→hybrid` verdict on answer-quality grounds *and* priced RRF's reorder cost, instead of rubber-stamping it rank-blind.
 
 **C-sensitivity sweep** (same corpus) — the verdict is stable, no cliff:
 
@@ -1821,25 +1763,14 @@ helps). The upgrade **validated** the `vector→hybrid` verdict on answer-qualit
 | 3 | hybrid | 0.809 | 0.910 | 0.972 | 0.870 |
 | 5 | hybrid | 0.832 | 0.910 | 0.972 | **0.972** |
 
-The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 =
-0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.832`)
-— vector hides ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the
-generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the
-cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's
-context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`),
-then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips
-between adjacent C, pin the exact production number.
+The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 = 0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.832`) — vector hides ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`), then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips between adjacent C, pin the exact production number.
 
 ##### Per-query routing — tested and rejected (2026-06-06)
 
-The policy picks ONE arm for the whole corpus. Natural next question: the best arm is
-query-dependent (proper-noun lookups favour keyword/hybrid, semantic factoids favour
-vector), so should we route *each query* to its own best arm? Built `src/route_eval.ts`
-to measure it — three routers scored with the same discounted grounding@C:
+The policy picks ONE arm for the whole corpus. Natural next question: the best arm is query-dependent (proper-noun lookups favour keyword/hybrid, semantic factoids favour vector), so should we route *each query* to its own best arm? Built `src/route_eval.ts` to measure it — three routers scored with the same discounted grounding@C:
 - **global** — every query → the corpus winner (`hybrid`). The baseline.
 - **heuristic** — a zero-LLM classifier (proper-noun-heavy short query → keyword, else hybrid).
-- **oracle** — every query → its own best arm. The *ceiling*; unattainable in production
-  (it peeks at the labels) but it bounds how much routing can ever help.
+- **oracle** — every query → its own best arm. The *ceiling*; unattainable in production (it peeks at the labels) but it bounds how much routing can ever help.
 
 **Build the ceiling before the classifier.** On the 67-page mixed brain:
 
@@ -1849,32 +1780,16 @@ to measure it — three routers scored with the same discounted grounding@C:
 | heuristic | 0.736 | −0.174 |
 | **oracle (ceiling)** | **0.910** | **+0.000** |
 
-The oracle *equals* global hybrid — **hybrid weakly dominates every one of the 18
-questions**, so per-query routing has zero grounding headroom, and a real cheap classifier
-only loses (it mis-routes semantic questions to the weak keyword arm). One free number
-(the oracle) killed the whole feature before any classifier was tuned.
+The oracle *equals* global hybrid — **hybrid weakly dominates every one of the 18 questions**, so per-query routing has zero grounding headroom, and a real cheap classifier only loses (it mis-routes semantic questions to the weak keyword arm). One free number (the oracle) killed the whole feature before any classifier was tuned.
 
-**Answer-quality check — and a generation confound caught in the act.** Grounding takes
-the *max* coverage over the top-C, so it's blind to whether the *other* in-budget chunks
-are distractors. So we judged the answers too (`src/answer_route_ab.py`): generate from the
-global-hybrid context vs the routed context, LLM-judge against each question's
-`pass_criteria`. Run on **two generator tiers**:
+**Answer-quality check — and a generation confound caught in the act.** Grounding takes the *max* coverage over the top-C, so it's blind to whether the *other* in-budget chunks are distractors. So we judged the answers too (`src/answer_route_ab.py`): generate from the global-hybrid context vs the routed context, LLM-judge against each question's `pass_criteria`. Run on **two generator tiers**:
 
 | generator | global pass | routed pass | Δ | on differing-context Qs |
 |---|---|---|---|---|
 | local 14B (Qwen-Coder) | 1.000 | 0.750 | −0.250 | 1.000 → 0.500 |
 | **Claude Opus 4.5** | 0.917 | 0.917 | **+0.000** | 0.800 → 0.800 |
 
-The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the
-questions whose context differed. The regression was the **generator's** context-composition
-sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied)
-context; a capable one extracts the answer regardless. This is the *confounding* trap named
-in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in
-generation variance; pin the generator (here: a strong model) before attributing a delta to
-retrieval. **Verdict: keep the single global hybrid policy.** Routing adds a classifier, a
-per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a
-weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B:
-`uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.)
+The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the questions whose context differed. The regression was the **generator's** context-composition sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied) context; a capable one extracts the answer regardless. This is the *confounding* trap named in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in generation variance; pin the generator (here: a strong model) before attributing a delta to retrieval. **Verdict: keep the single global hybrid policy.** Routing adds a classifier, a per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B: `uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.)
 
 #### Block C — `query_policy.ts`: the actuator
 
@@ -1957,18 +1872,12 @@ process.exit(0);
 ```
 
 **Walkthrough:**
-- **Reads the policy, routes accordingly** — after Phase B an agent query runs
-  through `hybrid`; the identical call ran `vector` after Phase A. The only thing
-  that changed between them is the policy file the loop rewrote.
-- **Fallback to hybrid** keeps a fresh brain (no policy yet) on GBrain's own default,
-  so the wrapper degrades to stock behavior rather than erroring. The vector arm
-  must `embed()` the query at run-time, which needs the same gateway bootstrap as the
-  eval (`hybrid.ts:975` silently no-ops without it).
+- **Reads the policy, routes accordingly** — after Phase B an agent query runs through `hybrid`; the identical call ran `vector` after Phase A. The only thing that changed between them is the policy file the loop rewrote.
+- **Fallback to hybrid** keeps a fresh brain (no policy yet) on GBrain's own default, so the wrapper degrades to stock behavior rather than erroring. The vector arm must `embed()` the query at run-time, which needs the same gateway bootstrap as the eval (`hybrid.ts:975` silently no-ops without it).
 
 #### Block D — the recommended architecture (measured policy, three layers)
 
-Phase 9 converges on a reusable shape for any self-tuning retrieval policy — see
-`[[Engineering Decision Patterns#Pattern 37 — Measured Search-Policy Architecture (selector / gate / calibrator; score the prompt, not the retrieval)|Pattern 37]]`. Three layers, and little else:
+Phase 9 converges on a reusable shape for any self-tuning retrieval policy — see `[[Engineering Decision Patterns#Pattern 37 — Measured Search-Policy Architecture (selector / gate / calibrator; score the prompt, not the retrieval)|Pattern 37]]`. Three layers, and little else:
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -1988,17 +1897,9 @@ flowchart TD
 | vector | 0.816 | 0.750 |
 | **hybrid** | **0.927** | **0.917** |
 
-- **Calibrator** — `corr(discounted grounding@C, answer-pass) = +0.719`. The cheap,
-  deterministic metric strongly predicts the expensive answer-judge, so the SELECTOR earns
-  its place in the every-ingest hot loop *without* an LLM. This is the assumption the whole
-  architecture rests on, measured rather than asserted.
-- **Selector validity** — the max-grounding arm (`hybrid`) is also the answer-quality winner,
-  and the ordering `keyword < vector < hybrid` holds on **both** axes → CONFIRMED.
-- **The residual (r=0.719, not 1.0) is instructive** — e.g. *"Where are the Notes to
-  Consolidated Financial Statements"* grounds at **1.000 on all three arms yet every answer
-  FAILS**: the section was retrieved but the generator couldn't turn it into a correct
-  answer. That gap is exactly the Stage-2 (generation) bottleneck the W2.7 comparison names
-  below — grounding predicts answers well, but the answer step is separate and harder.
+- **Calibrator** — `corr(discounted grounding@C, answer-pass) = +0.719`. The cheap, deterministic metric strongly predicts the expensive answer-judge, so the SELECTOR earns its place in the every-ingest hot loop *without* an LLM. This is the assumption the whole architecture rests on, measured rather than asserted.
+- **Selector validity** — the max-grounding arm (`hybrid`) is also the answer-quality winner, and the ordering `keyword < vector < hybrid` holds on **both** axes → CONFIRMED.
+- **The residual (r=0.719, not 1.0) is instructive** — e.g. *"Where are the Notes to Consolidated Financial Statements"* grounds at **1.000 on all three arms yet every answer FAILS**: the section was retrieved but the generator couldn't turn it into a correct answer. That gap is exactly the Stage-2 (generation) bottleneck the W2.7 comparison names below — grounding predicts answers well, but the answer step is separate and harder.
 
 **The load-bearing primitive — complete source** (`src/grounding.ts`, pure + unit-tested):
 
@@ -2044,23 +1945,11 @@ export function budgetScore(coverages: number[], c: number): BudgetScore {
 }
 ```
 
-The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the
-policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer
-A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to
-build** (each measured into the ground this phase): an LLM judge in the every-ingest selector
-(confounds retrieval choice with generation variance, *and* meters the loop); per-query
-routing (oracle ceiling = global hybrid, Δ0); a rank-blind metric (can't see RRF demotion);
-a hand-picked `C` (scores a context the model never reads). Most of the win was **deletion** —
-the final system is simpler than the naïve one *and* better, because each cut piece failed a
-measurement.
+The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); per-query routing (oracle ceiling = global hybrid, Δ0); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
 
 #### Block E — the reader is the lever, measured (2026-06-07)
 
-Retrieval is solved here (hybrid grounding ~0.93); the open question is the *generation*
-step — W2.7's 0.96 grounding → 0.25 answer gap, and the "Notes" question that grounds 1.000
-yet answers 0/3. So we fixed retrieval (always the winning arm = hybrid, **full `gbrain get`
-bodies**) and A/B'd the READER STRATEGY against the golden `pass_criteria` (`src/reader_ab.py`;
-gen = the reader under test, judge = a fixed strong grader so the verdict isn't self-graded):
+Retrieval is solved here (hybrid grounding ~0.93); the open question is the *generation* step — W2.7's 0.96 grounding → 0.25 answer gap, and the "Notes" question that grounds 1.000 yet answers 0/3. So we fixed retrieval (always the winning arm = hybrid, **full `gbrain get` bodies**) and A/B'd the READER STRATEGY against the golden `pass_criteria` (`src/reader_ab.py`; gen = the reader under test, judge = a fixed strong grader so the verdict isn't self-graded):
 
 **Two generator tiers, judge = Opus 4.5, fixed hybrid context:**
 
@@ -2071,8 +1960,7 @@ gen = the reader under test, judge = a fixed strong grader so the verdict isn't 
 | extract-then-answer | 0.417 (−0.500) | 0.083 (−0.417) |
 | cite (source per claim) | 0.917 (+0.000) | 0.417 (−0.083) |
 
-The four readers differ ONLY in the prompt wrapped around the same `{ctx}` (full hybrid
-bodies) and `{q}` (the question) — verbatim from `src/reader_ab.py`:
+The four readers differ ONLY in the prompt wrapped around the same `{ctx}` (full hybrid bodies) and `{q}` (the question) — verbatim from `src/reader_ab.py`:
 
 ```text
 plain:
@@ -2125,76 +2013,39 @@ judge  (fixed, Opus 4.5 — grades every reader's answer identically):
    Verdict (PASS or FAIL):"
 ```
 
-**`plain` wins on both tiers; no prompt technique beats it, and `extract`-then-answer regresses
-hard on both.** Four reads:
+**`plain` wins on both tiers; no prompt technique beats it, and `extract`-then-answer regresses hard on both.** Four reads:
 - **No headroom on a capable model.** Haiku ceilings at 0.917, *identical to Opus* — the model
-  + good context already answer 11/12, so there is nothing for a prompt technique to add. The
-  quality came from *assembly + capability* (hybrid + full bodies + a capable model), not
-  wording — 0.917 vs W2.7's 0.25 on the same 10-K is that pipeline, not a clever prompt.
-- **Technique does NOT substitute for capability.** The weak 14B just scores lower (0.500), and
-  the "smart" framings (`authoritative`/`cite`) even slightly *hurt* (−0.083) while plain stays
-  best. You can't prompt a weak model up to a strong one's answers.
-- **`extract` is a lossy two-step** on both tiers (−0.500 Haiku, −0.417 14B): extracting "the
-  answer-bearing sentence" first lets the model drop/mangle the span, so the answer step gets
-  *worse* material than the full context. Added a step, added a failure point (Pattern 30).
-- **The "Notes" question fails on every reader and every model** — grounded 1.000, but its answer
-  ("Item 8") isn't stated in answerable form in the retrieved sections. **No reader technique
-  fixes a question whose answer isn't derivable from the injected context** — a retrieval/
-  decomposition problem, not a reader one.
+  + good context already answer 11/12, so there is nothing for a prompt technique to add. The quality came from *assembly + capability* (hybrid + full bodies + a capable model), not wording — 0.917 vs W2.7's 0.25 on the same 10-K is that pipeline, not a clever prompt.
+- **Technique does NOT substitute for capability.** The weak 14B just scores lower (0.500), and the "smart" framings (`authoritative`/`cite`) even slightly *hurt* (−0.083) while plain stays best. You can't prompt a weak model up to a strong one's answers.
+- **`extract` is a lossy two-step** on both tiers (−0.500 Haiku, −0.417 14B): extracting "the answer-bearing sentence" first lets the model drop/mangle the span, so the answer step gets *worse* material than the full context. Added a step, added a failure point (Pattern 30).
+- **The "Notes" question fails on every reader and every model** — grounded 1.000, but its answer ("Item 8") isn't stated in answerable form in the retrieved sections. **No reader technique fixes a question whose answer isn't derivable from the injected context** — a retrieval/ decomposition problem, not a reader one.
 
-**A capacity finding fell out of it.** The *first* 14B attempt (full bodies, no cap) **crashed
-the oMLX server after one question**: a single question's five generations over the ~70K-token
-full-body context exhausted it. Full-body reading of large sections demands a large-context
-model; bounding the context (`MAX_BODY_CHARS=8000 GEN=14b uv run python src/reader_ab.py`) let
-it run, at the cost of truncating sections (hence the lower 14B absolute rates). The
-snippet-regression guard (`build_context`) confirmed full bodies throughout
-(`body chars=[36252, 54411, 190984]`).
+**A capacity finding fell out of it.** The *first* 14B attempt (full bodies, no cap) **crashed the oMLX server after one question**: a single question's five generations over the ~70K-token full-body context exhausted it. Full-body reading of large sections demands a large-context model; bounding the context (`MAX_BODY_CHARS=8000 GEN=14b uv run python src/reader_ab.py`) let it run, at the cost of truncating sections (hence the lower 14B absolute rates). The snippet-regression guard (`build_context`) confirmed full bodies throughout (`body chars=[36252, 54411, 190984]`).
 
-**Verdict:** keep the `plain` reader; spend reader effort on **assembly** (full bodies, tight `C`,
-a capable large-context model), not prompt elaboration — the gains live upstream of the prompt.
+**Verdict:** keep the `plain` reader; spend reader effort on **assembly** (full bodies, tight `C`, a capable large-context model), not prompt elaboration — the gains live upstream of the prompt.
 
 #### Comparison to W2.7 (same 10-K, different axis)
 
-W2.7 scored **answer quality** across **index types** (Vector / GraphRAG /
-tree-index); this lab scores **retrieval grounding** across **arms** (keyword /
-vector / hybrid). Not numerically comparable — compare which method wins which query
-*class*:
+W2.7 scored **answer quality** across **index types** (Vector / GraphRAG / tree-index); this lab scores **retrieval grounding** across **arms** (keyword / vector / hybrid). Not numerically comparable — compare which method wins which query *class*:
 
 | | measured | factoid winner | note |
 |---|---|---|---|
 | W2.7 three-way | answer quality (LLM-judge) | **Vector** 0.50 | aggregate Graph 0.48 / Tree 0.44 / Vector 0.25 |
 | this lab (golden, real Q) | retrieval grounding@5 | **vector/hybrid** 0.96 | keyword 0.19 |
 
-Shapes converge: dense vector is strongest at 10-K *factoid retrieval* in both. And
-grounding 0.96 ≫ W2.7's vector answer-judge 0.25 ⇒ in W2.7 the bottleneck was
-**generation, not retrieval** — GBrain surfaces the answer-bearing section ~96% of
-the time; turning that into a correct answer is the separate, harder step.
+Shapes converge: dense vector is strongest at 10-K *factoid retrieval* in both. And grounding 0.96 ≫ W2.7's vector answer-judge 0.25 ⇒ in W2.7 the bottleneck was **generation, not retrieval** — GBrain surfaces the answer-bearing section ~96% of the time; turning that into a correct answer is the separate, harder step.
 
 `★ Insight ─────────────────────────────────────`
-- **A policy is only as good as its eval queries.** The convenient known-item proxy
-  (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid`
-  — opposite verdicts on the *same corpus*. The whole value of the loop rides on a
-  representative golden set, which is why it's the version-controlled centerpiece, not
-  an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
-- **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing*
-  corpus moved the policy `vector → hybrid` with zero code change, and the move was
-  justified (mixed query classes make both arms competitive → RRF wins). That's the
-  "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact
-  loop that improves the agent as its brain grows.
-- **Honest edges:** in Phase A vector and hybrid *tied* (0.667; entity data absent),
-  so v1 was a tie resolved by order — the decisive signal is Phase B. Grounding ≠
-  answer quality, the entity golden set is only 6 questions, and the policy steers the
-  agent's retrieval path, not stock `gbrain query`.
+- **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
+- **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing* corpus moved the policy `vector → hybrid` with zero code change, and the move was justified (mixed query classes make both arms competitive → RRF wins). That's the "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact loop that improves the agent as its brain grows.
+- **Honest edges:** in Phase A vector and hybrid *tied* (0.667; entity data absent), so v1 was a tie resolved by order — the decisive signal is Phase B. Grounding ≠ answer quality, the entity golden set is only 6 questions, and the policy steers the agent's retrieval path, not stock `gbrain query`.
 `─────────────────────────────────────────────────`
 
 #### Reproduce — the drift experiment, end to end
 
-Prereqs: the Phase-1 stack up — Postgres+pgvector container (`gbrain-pg`) and the
-oMLX embedding server on `:8000`. All commands run from `~/code/agent-prep/lab-03-5-96-gbrain/`
-with the lab `.env` loaded (`set -a; . ./.env; set +a`) and `~/.bun/bin` on `PATH`.
+Prereqs: the Phase-1 stack up — Postgres+pgvector container (`gbrain-pg`) and the oMLX embedding server on `:8000`. All commands run from `~/code/agent-prep/lab-03-5-96-gbrain/` with the lab `.env` loaded (`set -a; . ./.env; set +a`) and `~/.bun/bin` on `PATH`.
 
-**Step 1 — an isolated DB, so the 10-K measures alone first.** A fresh database
-keeps the 10-K corpus uncontaminated by the entity brain for Phase A.
+**Step 1 — an isolated DB, so the 10-K measures alone first.** A fresh database keeps the 10-K corpus uncontaminated by the entity brain for Phase A.
 
 ```bash
 docker exec gbrain-pg psql -U postgres -c "CREATE DATABASE gbrain_brk;"
@@ -2204,10 +2055,7 @@ gbrain init --url postgresql://postgres:postgres@localhost:5432/gbrain_brk \
 export GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain_brk
 ```
 
-**Step 2 — ingest corpus #1: the 10-K.** `load_brk_corpus.py` reads W2.7's parsed
-sections (`lab-02-7-pageindex/data/brk_corpus.json` — the PDF already segmented into
-44 `{id,title,text}` sections), writes each as a GBrain page with YAML-frontmatter
-title (Entry 19), embeds, and triggers the golden auto-eval.
+**Step 2 — ingest corpus #1: the 10-K.** `load_brk_corpus.py` reads W2.7's parsed sections (`lab-02-7-pageindex/data/brk_corpus.json` — the PDF already segmented into 44 `{id,title,text}` sections), writes each as a GBrain page with YAML-frontmatter title (Entry 19), embeds, and triggers the golden auto-eval.
 
 ```bash
 .venv/bin/python src/load_brk_corpus.py     # 44 pages, ~429 chunks embedded
@@ -2221,13 +2069,7 @@ bun src/policy_eval.ts        # scores the 18 golden Qs over the current 44 page
 cat results/search_policy.json # → "strategy": "vector"  (tenk g@5 0.958; entity ~0, data absent)
 ```
 
-**Step 4 — ingest corpus #2: the W3.5.96 entity data, INTO THE SAME DB.** This is
-the drift event. The raw fixtures live under `~/brain/sources/` (the emails, dinner/
-board-call/pitch transcripts, and tweets from Phase 2); the **thin-agent + fat-tools**
-pipeline (Phase 3) extracts entities and writes them via `put_page` over MCP, then
-reconciles links — now pointed at `gbrain_brk`, so the entity pages land *alongside*
-the 44 brk sections. Because `data/golden_eval.json` exists, `run_auto_eval()` fires
-`policy_eval.ts` automatically at the end of the ingest.
+**Step 4 — ingest corpus #2: the W3.5.96 entity data, INTO THE SAME DB.** This is the drift event. The raw fixtures live under `~/brain/sources/` (the emails, dinner/ board-call/pitch transcripts, and tweets from Phase 2); the **thin-agent + fat-tools** pipeline (Phase 3) extracts entities and writes them via `put_page` over MCP, then reconciles links — now pointed at `gbrain_brk`, so the entity pages land *alongside* the 44 brk sections. Because `data/golden_eval.json` exists, `run_auto_eval()` fires `policy_eval.ts` automatically at the end of the ingest.
 
 ```bash
 .venv/bin/python src/ingest_agent.py   # warms extraction cache → agent put_page's
@@ -2244,27 +2086,18 @@ bun src/policy_eval.ts                          # full per-domain table (idempot
 bun src/query_policy.ts "Who is anchoring the acme-seed round?"   # routes via hybrid
 ```
 
-**Verification:** `gbrain stats` shows pages 44 → 59 after Step 4; `search_policy.json`
-`strategy` flips `vector → hybrid`; `policy_eval` per-domain shows `entity g@5` rising
-from ~0 (Phase A) to 1.000 (Phase B, hybrid) while `tenk g@5` holds at 0.958. Teardown:
-`docker exec gbrain-pg psql -U postgres -c "DROP DATABASE gbrain_brk;"`.
+**Verification:** `gbrain stats` shows pages 44 → 59 after Step 4; `search_policy.json` `strategy` flips `vector → hybrid`; `policy_eval` per-domain shows `entity g@5` rising from ~0 (Phase A) to 1.000 (Phase B, hybrid) while `tenk g@5` holds at 0.958. Teardown: `docker exec gbrain-pg psql -U postgres -c "DROP DATABASE gbrain_brk;"`.
 
 > **Cold-start note:** delete `data/golden_eval.json` and `run_auto_eval()` falls back
 > to the known-item `auto_eval.ts` (proxy) — useful on a brand-new brain with no real
 > questions yet, but it can mis-select the arm (Entry 20), so add a real golden set as
 > soon as you have representative questions.
 
-**Deliverable:** `data/golden_eval.json` (18 real Qs) + `src/policy_eval.ts` (policy
-source) + `src/query_policy.ts` (actuator) + `src/load_brk_corpus.py`. `run_auto_eval()`
-prefers the golden eval, falling back to the known-item `src/auto_eval.ts` only at
-cold start (when no golden set exists). Tests: `tests/auto_eval.test.ts` (15),
-`tests/test_load_brk_corpus.py` (7); regression gate **24 pytest + 15 bun** green.
-Policy artifact `results/search_policy.json`; full numbers in `RESULTS.md`.
+**Deliverable:** `data/golden_eval.json` (18 real Qs) + `src/policy_eval.ts` (policy source) + `src/query_policy.ts` (actuator) + `src/load_brk_corpus.py`. `run_auto_eval()` prefers the golden eval, falling back to the known-item `src/auto_eval.ts` only at cold start (when no golden set exists). Tests: `tests/auto_eval.test.ts` (15), `tests/test_load_brk_corpus.py` (7); regression gate **24 pytest + 15 bun** green. Policy artifact `results/search_policy.json`; full numbers in `RESULTS.md`.
 
 #### Running reference — scripts, env, parameters
 
-Every Phase-9 script is parameterised by environment variables (and a couple by argv).
-This is the canonical "how do I run it" table — what each needs, and in what order.
+Every Phase-9 script is parameterised by environment variables (and a couple by argv). This is the canonical "how do I run it" table — what each needs, and in what order.
 
 **Services + shell (run all commands from `~/code/agent-prep/lab-03-5-96-gbrain/`):**
 - **`gbrain-pg`** — Postgres+pgvector container. `GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain`.
@@ -2283,15 +2116,9 @@ This is the canonical "how do I run it" table — what each needs, and in what o
 | `verify_arch.py` | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py` |
 | `reader_ab.py` | reader A/B (fixed retrieval) | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py` |
 
-**Data-dependency order (don't skip):** the four analysis scripts consume dumps, so
-retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json`
-→ which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts`
-and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms
-embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX
-embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`).
+**Data-dependency order (don't skip):** the four analysis scripts consume dumps, so retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json` → which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts` and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`).
 
-**`reader_ab.py` model presets (no code change to switch).** `GEN`/`JUDGE` each resolve a
-named model to endpoint+key+model id from the `_PROFILES` registry:
+**`reader_ab.py` model presets (no code change to switch).** `GEN`/`JUDGE` each resolve a named model to endpoint+key+model id from the `_PROFILES` registry:
 
 | preset | endpoint | model |
 |---|---|---|
@@ -2299,22 +2126,16 @@ named model to endpoint+key+model id from the `_PROFILES` registry:
 | `opus` | VibeProxy `:8317` | `claude-opus-4-5-20251101` |
 | `14b` / `qwen` | oMLX `:8000` | `Qwen2.5-Coder-14B-Instruct-MLX-4bit` |
 
-Add a model = one line in `_PROFILES`. Raw escape hatch: set `<ROLE>_MODEL` (+ optional
-`<ROLE>_BASE_URL` / `<ROLE>_API_KEY`) to bypass the registry, e.g.
-`GEN_MODEL=… GEN_BASE_URL=… uv run python src/reader_ab.py`. `MAX_BODY_CHARS` (default 0 =
-full bodies) caps each injected body for a small-context generator like the local 14B.
+Add a model = one line in `_PROFILES`. Raw escape hatch: set `<ROLE>_MODEL` (+ optional `<ROLE>_BASE_URL` / `<ROLE>_API_KEY`) to bypass the registry, e.g. `GEN_MODEL=… GEN_BASE_URL=… uv run python src/reader_ab.py`. `MAX_BODY_CHARS` (default 0 = full bodies) caps each injected body for a small-context generator like the local 14B.
 
 #### Metric & column glossary
 
 Every term that appears in a Phase-9 table, in one place.
 
 **Building blocks**
-- **coverage** — for one section, the fraction of a question's `expected_entities` that
-  appear as substrings in its text, ∈ [0,1]. The atom every grounding metric is built from.
-- **arm** — the retrieval strategy under test: **keyword** (FTS / BM25-style exact match),
-  **vector** (dense embedding similarity), **hybrid** (RRF fusion of keyword + vector).
-- **C (context budget)** — how many top-ranked chunks the generator actually reads (here **3**,
-  measured off the agent). **K (retrieval depth)** — how many hits retrieval pulls (here 5); C ≤ K.
+- **coverage** — for one section, the fraction of a question's `expected_entities` that appear as substrings in its text, ∈ [0,1]. The atom every grounding metric is built from.
+- **arm** — the retrieval strategy under test: **keyword** (FTS / BM25-style exact match), **vector** (dense embedding similarity), **hybrid** (RRF fusion of keyword + vector).
+- **C (context budget)** — how many top-ranked chunks the generator actually reads (here **3**, measured off the agent). **K (retrieval depth)** — how many hits retrieval pulls (here 5); C ≤ K.
 - **disc(rank)** — position discount `1/log2(rank+2)`: rank-0 = 1.00, rank-1 = 0.63, rank-2 = 0.50.
 
 **Domains** (the golden set is domain-tagged)
@@ -2322,81 +2143,47 @@ Every term that appears in a Phase-9 table, in one place.
 - **entity** — the 6 proper-noun questions from the W3.5.96 fixtures (Sam Okafor, Lin Zhao, …).
 
 **Retrieval-grounding metrics**
-- **grounding@5 / g@5 tenk / g@5 entity** *(original, rank-blind — superseded)* — mean over
-  questions of the **best** top-5 section's coverage; `g@5 <domain>` is the same averaged over
-  only that domain's questions. Asks "did retrieval surface an answer-bearing section *anywhere*
-  in top-5?" — blind to rank and to the context budget.
-- **discounted grounding@C / grnd@C↓ / g@C:tenk / g@C:entity** *(current)* — per question,
-  `max over the top-C of (coverage_i · disc(i))`. Rewards an answer-bearing section that is BOTH
-  high-ranked AND inside the C chunks the generator reads; a section RRF demoted, or pushed past
-  C, scores lower or 0. `g@C:<domain>` = the same averaged over one domain. The `↓` marks "discounted".
-- **flat@C (old)** — the rank-blind metric shown alongside for contrast: mean **raw** best-coverage
-  over the top-C, no position discount. Where `flat > grnd↓`, the answer sits below rank 0.
-- **demotion tax** — `flat@C − grnd@C↓`. The answer-mass an arm (usually hybrid RRF) pushes below
-  rank 0; the cost of fusion's reordering.
-- **answerable@C** — fraction of questions where some top-C section covers ALL expected entities
-  (the tie-breaker when grounding ties).
+- **grounding@5 / g@5 tenk / g@5 entity** *(original, rank-blind — superseded)* — mean over questions of the **best** top-5 section's coverage; `g@5 <domain>` is the same averaged over only that domain's questions. Asks "did retrieval surface an answer-bearing section *anywhere* in top-5?" — blind to rank and to the context budget.
+- **discounted grounding@C / grnd@C↓ / g@C:tenk / g@C:entity** *(current)* — per question, `max over the top-C of (coverage_i · disc(i))`. Rewards an answer-bearing section that is BOTH high-ranked AND inside the C chunks the generator reads; a section RRF demoted, or pushed past C, scores lower or 0. `g@C:<domain>` = the same averaged over one domain. The `↓` marks "discounted".
+- **flat@C (old)** — the rank-blind metric shown alongside for contrast: mean **raw** best-coverage over the top-C, no position discount. Where `flat > grnd↓`, the answer sits below rank 0.
+- **demotion tax** — `flat@C − grnd@C↓`. The answer-mass an arm (usually hybrid RRF) pushes below rank 0; the cost of fusion's reordering.
+- **answerable@C** — fraction of questions where some top-C section covers ALL expected entities (the tie-breaker when grounding ties).
 
 **Answer-quality metrics** (`verify_arch.py`, `reader_ab.py`)
 - **mean grounding@3** — per-arm average of the cheap discounted grounding@C=3 metric.
-- **answer pass-rate** — fraction of generated answers a strong LLM judge marks **PASS** against
-  the question's `pass_criteria`. The real objective; grounding is its cheap surrogate (corr +0.719).
+- **answer pass-rate** — fraction of generated answers a strong LLM judge marks **PASS** against the question's `pass_criteria`. The real objective; grounding is its cheap surrogate (corr +0.719).
 
 **Reader strategies** (`reader_ab.py` — same retrieval, different prompt)
 - **plain** — "Using only the notes, answer; if a fact isn't there, say you don't have it." Baseline.
-- **authoritative** — frames the notes as AUTHORITATIVE ground truth: trust them, don't re-derive,
-  don't re-fetch, don't hedge (the memory-os pattern).
-- **extract-then-answer** — two steps: first copy the answer-bearing sentence(s) verbatim, then
-  answer from that extraction. Decouples "find the fact" from "compose the answer".
+- **authoritative** — frames the notes as AUTHORITATIVE ground truth: trust them, don't re-derive, don't re-fetch, don't hedge (the memory-os pattern).
+- **extract-then-answer** — two steps: first copy the answer-bearing sentence(s) verbatim, then answer from that extraction. Decouples "find the fact" from "compose the answer".
 - **cite** — authoritative + require a `[bracketed]` source citation for each factual claim.
 
 ## 6. Bad-Case Journal (real, observed)
 
 _Observed during the real Phase-1 → Phase-6 runs (GBrain 0.42.25.0):_
 
-**Entry 1 — `llama-server` provider is a catch-22 for registry-known embed models (OBSERVED).** `--embedding-model llama-server:bge-m3` (and `:nomicai-modernbert-embed-base-bf16`) refuses *both* ways: **with** `--embedding-dimensions` → "does not support custom dimensions N (this model only emits its default vector size)"; **without** → "llama-server requires --embedding-dimensions <N> (user-driven recipes have no default dimension)." No value satisfies both → init impossible.
-*Fix:* use the **`ollama` provider** pointed at oMLX (`OLLAMA_BASE_URL=http://localhost:8000/v1`, `OLLAMA_API_KEY=<key>`, `--embedding-model ollama:<model>`, **no** `--embedding-dimensions`) — it *probes* the endpoint for the dim instead of demanding/rejecting it. (Worth a GBrain issue; strip keys before filing.)
+**Entry 1 — `llama-server` provider is a catch-22 for registry-known embed models (OBSERVED).** `--embedding-model llama-server:bge-m3` (and `:nomicai-modernbert-embed-base-bf16`) refuses *both* ways: **with** `--embedding-dimensions` → "does not support custom dimensions N (this model only emits its default vector size)"; **without** → "llama-server requires --embedding-dimensions <N> (user-driven recipes have no default dimension)." No value satisfies both → init impossible. *Fix:* use the **`ollama` provider** pointed at oMLX (`OLLAMA_BASE_URL=http://localhost:8000/v1`, `OLLAMA_API_KEY=<key>`, `--embedding-model ollama:<model>`, **no** `--embedding-dimensions`) — it *probes* the endpoint for the dim instead of demanding/rejecting it. (Worth a GBrain issue; strip keys before filing.)
 
-**Entry 2 — init is stateful + greedy; a botched first run poisons every retry (OBSERVED).** Three compounding traps: (a) `--supabase` runs the *interactive Supabase flow* and ignores `GBRAIN_DATABASE_URL` — use `--url`; (b) a present `OPENROUTER_API_KEY` makes init **auto-pick openrouter for embeddings** (probe failed 404 on a dummy key) even with `--embedding-model` set — keep it commented until post-init; (c) a wrong first init persists `~/.gbrain/config.json` + a baked vector-column width, so re-init fails citing the *stale* dimension.
-*Fix (0 pages → safe):* `DROP DATABASE gbrain; CREATE DATABASE gbrain;` + `rm ~/.gbrain/config.json`, then re-init. Lesson: **GBrain init is stateful and greedy — reset clean if anything looks off, and read the "Using …" line, not the green migration checkmarks.**
+**Entry 2 — init is stateful + greedy; a botched first run poisons every retry (OBSERVED).** Three compounding traps: (a) `--supabase` runs the *interactive Supabase flow* and ignores `GBRAIN_DATABASE_URL` — use `--url`; (b) a present `OPENROUTER_API_KEY` makes init **auto-pick openrouter for embeddings** (probe failed 404 on a dummy key) even with `--embedding-model` set — keep it commented until post-init; (c) a wrong first init persists `~/.gbrain/config.json` + a baked vector-column width, so re-init fails citing the *stale* dimension. *Fix (0 pages → safe):* `DROP DATABASE gbrain; CREATE DATABASE gbrain;` + `rm ~/.gbrain/config.json`, then re-init. Lesson: **GBrain init is stateful and greedy — reset clean if anything looks off, and read the "Using …" line, not the green migration checkmarks.**
 
-**Entry 3 — `gbrain` not found after `bun link` (OBSERVED).** `bun link` symlinks the CLI into `~/.bun/bin` but does not add it to PATH; the installer often doesn't persist the PATH line either.
-*Fix:* `echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc`. Tell-apart: `ls ~/.bun/bin/gbrain` exists ⇒ pure PATH issue, not a broken install.
+**Entry 3 — `gbrain` not found after `bun link` (OBSERVED).** `bun link` symlinks the CLI into `~/.bun/bin` but does not add it to PATH; the installer often doesn't persist the PATH line either. *Fix:* `echo 'export PATH="$HOME/.bun/bin:$PATH"' >> ~/.zshrc`. Tell-apart: `ls ~/.bun/bin/gbrain` exists ⇒ pure PATH issue, not a broken install.
 
-**Entry 4 — trying to hand-format every source type into brain pages (DESIGN anti-pattern).** Emails, tweets, and meeting transcripts each have a different shape; writing a per-format converter (or authoring the 50 pages by hand) does not scale and is *not* GBrain's model.
-*Root cause:* mistaking who owns the structured layer. GBrain splits **raw sources** (immutable, any format, in `sources/`) from **the brain** (two-layer pages the **agent** writes).
-*Fix:* never author structured pages manually — drop raw under `sources/` (or `gbrain capture`), then let the agent convert via **ingest skills** (`meeting-ingestion`, `article-enrichment`, `voice-note-ingest` → `put_page`/`add_link`) or, in production, the credentialed **integration recipes** (`email-to-brain`, `x-to-brain`, `meeting-sync`). The agent is the universal formatter; you curate. (Drove the Phase 2 rewrite.)
+**Entry 4 — trying to hand-format every source type into brain pages (DESIGN anti-pattern).** Emails, tweets, and meeting transcripts each have a different shape; writing a per-format converter (or authoring the 50 pages by hand) does not scale and is *not* GBrain's model. *Root cause:* mistaking who owns the structured layer. GBrain splits **raw sources** (immutable, any format, in `sources/`) from **the brain** (two-layer pages the **agent** writes). *Fix:* never author structured pages manually — drop raw under `sources/` (or `gbrain capture`), then let the agent convert via **ingest skills** (`meeting-ingestion`, `article-enrichment`, `voice-note-ingest` → `put_page`/`add_link`) or, in production, the credentialed **integration recipes** (`email-to-brain`, `x-to-brain`, `meeting-sync`). The agent is the universal formatter; you curate. (Drove the Phase 2 rewrite.)
 
-**Entry 5 — the agent stored pages fine but the graph had zero edges (OBSERVED, Phase 3).** A smolagents `CodeAgent` (oMLX) drove GBrain over MCP and wrote 5 well-formed pages via `put_page`, yet `gbrain extract links` reported `Links: 0`.
-*Root cause:* the LLM extraction wrote entity mentions as **plain prose** ("Alice Chen, founder of Acme AI") and used `<!-- timeline -->` instead of `---`, so there were no `[[wikilinks]]` to extract. The framework + MCP plumbing worked; the *contract* didn't.
-*Fix:* the extraction prompt must **hard-mandate** path-qualified `[[dir/slug]]` wikilinks with a worked example + "a page with zero wikilinks is invalid" → `Links: 0 → 11`. **Graph quality = extraction quality; measure edges, not pages.**
+**Entry 5 — the agent stored pages fine but the graph had zero edges (OBSERVED, Phase 3).** A smolagents `CodeAgent` (oMLX) drove GBrain over MCP and wrote 5 well-formed pages via `put_page`, yet `gbrain extract links` reported `Links: 0`. *Root cause:* the LLM extraction wrote entity mentions as **plain prose** ("Alice Chen, founder of Acme AI") and used `<!-- timeline -->` instead of `---`, so there were no `[[wikilinks]]` to extract. The framework + MCP plumbing worked; the *contract* didn't. *Fix:* the extraction prompt must **hard-mandate** path-qualified `[[dir/slug]]` wikilinks with a worked example + "a page with zero wikilinks is invalid" → `Links: 0 → 11`. **Graph quality = extraction quality; measure edges, not pages.**
 
-**Entry 6 — fully-autonomous `CodeAgent` failed on a 14B (OBSERVED, Phase 3).** Asking the agent to read files + write an extractor + compose markdown in one code loop produced a naive regex placeholder + `InterpreterError: import pathlib not allowed` (the CodeAgent sandbox blocks `pathlib`/`json`).
-*Fix:* **thin agent, fat tools** — move file I/O and extraction into `@tool`s (`read_sources`, `extract_pages`); the agent only orchestrates. Also: filter `ToolCollection.from_mcp` to the ~few tools needed (GBrain exposes ~70; a 14B drowns), depend on `smolagents[mcp]` (mcpadapt), pass DB/oMLX env via `StdioServerParameters(env=…)` (an MCP server is a separate process), and use `use_structured_outputs_internally=True` (oMLX has no native tool_calls). Lab: `~/code/agent-prep/lab-03-5-96-gbrain/`.
+**Entry 6 — fully-autonomous `CodeAgent` failed on a 14B (OBSERVED, Phase 3).** Asking the agent to read files + write an extractor + compose markdown in one code loop produced a naive regex placeholder + `InterpreterError: import pathlib not allowed` (the CodeAgent sandbox blocks `pathlib`/`json`). *Fix:* **thin agent, fat tools** — move file I/O and extraction into `@tool`s (`read_sources`, `extract_pages`); the agent only orchestrates. Also: filter `ToolCollection.from_mcp` to the ~few tools needed (GBrain exposes ~70; a 14B drowns), depend on `smolagents[mcp]` (mcpadapt), pass DB/oMLX env via `StdioServerParameters(env=…)` (an MCP server is a separate process), and use `use_structured_outputs_internally=True` (oMLX has no native tool_calls). Lab: `~/code/agent-prep/lab-03-5-96-gbrain/`.
 
-**Entry 7 — graph reads as "built" but has no new edges (OBSERVED, Phase 6).** After re-ingesting an expanded corpus, `gbrain stats` showed **19 pages but Links: 11** — unchanged from the 10-page run — even though the new pages' text held ~68 `[[wikilinks]]`.
-*Root cause:* self-wiring is a **batch extraction pass, not a `put_page` side-effect**. Pages written over MCP live only in Postgres; bare `gbrain extract links` walks a brain *directory* of `.md` files and errors `No brain directory configured`, so extraction never ran on them.
-*Fix:* `gbrain extract links --source db` re-parses the stored `compiled_truth`/`timeline` columns → `created 34 links from 19 pages` → 45 total. Do **not** gate on `pages.links_extracted_at` — that column tracks the file-source path only and stays null after DB-source extraction.
+**Entry 7 — graph reads as "built" but has no new edges (OBSERVED, Phase 6).** After re-ingesting an expanded corpus, `gbrain stats` showed **19 pages but Links: 11** — unchanged from the 10-page run — even though the new pages' text held ~68 `[[wikilinks]]`. *Root cause:* self-wiring is a **batch extraction pass, not a `put_page` side-effect**. Pages written over MCP live only in Postgres; bare `gbrain extract links` walks a brain *directory* of `.md` files and errors `No brain directory configured`, so extraction never ran on them. *Fix:* `gbrain extract links --source db` re-parses the stored `compiled_truth`/`timeline` columns → `created 34 links from 19 pages` → 45 total. Do **not** gate on `pages.links_extracted_at` — that column tracks the file-source path only and stays null after DB-source extraction.
 
-**Entry 8 — keyword-vs-hybrid benchmark shows zero difference (OBSERVED, Phase 6).** `gbrain search "<q>"` and `gbrain query "<q>"` returned byte-identical rankings *and* scores; an A/B "keyword vs hybrid" read as "no lift."
-*Root cause:* both subcommands fall through to the **same handler** (`src/cli.ts:771-772 — case 'search': case 'query':`). The CLI has no pure-keyword command; `keywordSearch` is an internal building block *inside* the hybrid pipeline, not a separate path.
-*Fix:* benchmark at the **engine layer** via `src/core/search/eval.ts:runEval()` with `strategy: 'keyword'|'vector'|'hybrid'`, bootstrapping engine + gateway exactly as the CLI does. **Never A/B retrievers through the CLI.**
+**Entry 8 — keyword-vs-hybrid benchmark shows zero difference (OBSERVED, Phase 6).** `gbrain search "<q>"` and `gbrain query "<q>"` returned byte-identical rankings *and* scores; an A/B "keyword vs hybrid" read as "no lift." *Root cause:* both subcommands fall through to the **same handler** (`src/cli.ts:771-772 — case 'search': case 'query':`). The CLI has no pure-keyword command; `keywordSearch` is an internal building block *inside* the hybrid pipeline, not a separate path. *Fix:* benchmark at the **engine layer** via `src/core/search/eval.ts:runEval()` with `strategy: 'keyword'|'vector'|'hybrid'`, bootstrapping engine + gateway exactly as the CLI does. **Never A/B retrievers through the CLI.**
 
-**Entry 9 — hybrid-RRF underperformed pure vector (OBSERVED, Phase 6).** On the 19-page brain, RRF scored recall@3 = 0.90 but MRR **0.78** — *worse* than pure vector (0.90 / **0.92**). The expected 83→95 RRF win was a slight regression instead.
-*Root cause:* the keyword arm missed all four purely-semantic queries (no lexical overlap); RRF fusion folded that dead arm back in, demoting correct vector hits a rank (`dinner at Tartine` vector @1 → hybrid @3). RRF helps only when *both* arms are individually competitive and complementary.
-*Fix:* on a small, semantic-heavy corpus, **prefer pure vector**; reserve RRF for corpora with enough exact-term / proper-noun traffic that keyword earns its weight. Always measure on your own corpus before quoting the published lift.
+**Entry 9 — hybrid-RRF underperformed pure vector (OBSERVED, Phase 6).** On the 19-page brain, RRF scored recall@3 = 0.90 but MRR **0.78** — *worse* than pure vector (0.90 / **0.92**). The expected 83→95 RRF win was a slight regression instead. *Root cause:* the keyword arm missed all four purely-semantic queries (no lexical overlap); RRF fusion folded that dead arm back in, demoting correct vector hits a rank (`dinner at Tartine` vector @1 → hybrid @3). RRF helps only when *both* arms are individually competitive and complementary. *Fix:* on a small, semantic-heavy corpus, **prefer pure vector**; reserve RRF for corpora with enough exact-term / proper-noun traffic that keyword earns its weight. Always measure on your own corpus before quoting the published lift.
 
-**Entry 10 — retrieved "context" is just a slug + one-line snippet; the LLM can't answer (OBSERVED, Phase 7).** The first Ground-Truth A/B fed `gbrain query --json` straight to the model, which replied "the context shows `[[people/lin-zhao]]` but doesn't include the actual content."
-*Root cause:* `gbrain query` returns ranked **snippets** (slug + compiled-truth first line) for *display*, not full page bodies for grounding.
-*Fix:* use `query` only to *rank* slugs, then pull each body with `gbrain get <slug>` before injecting. Retrieval (rank) and grounding (fetch) are two separate calls.
-**Entry 11 — the chat model refuses the task, insisting it's "Claude Code" (OBSERVED, Phase 7).** With the task instruction in the `system` role, VibeProxy→Claude answered every turn with "I'm Claude Code… I can't help with questions about people."
-*Root cause:* VibeProxy fronts the Claude-Code CLI identity and **overrides the caller's `system` prompt**, so a "you are a knowledge-base assistant" system message is discarded and the model falls back to refusing non-coding requests.
-*Fix:* put the instruction *and* the grounding notes in the **USER** message as a document-Q&A task ("using ONLY these notes, answer…"); don't depend on `system`. The same model then answers correctly.
+**Entry 10 — retrieved "context" is just a slug + one-line snippet; the LLM can't answer (OBSERVED, Phase 7).** The first Ground-Truth A/B fed `gbrain query --json` straight to the model, which replied "the context shows `[[people/lin-zhao]]` but doesn't include the actual content." *Root cause:* `gbrain query` returns ranked **snippets** (slug + compiled-truth first line) for *display*, not full page bodies for grounding. *Fix:* use `query` only to *rank* slugs, then pull each body with `gbrain get <slug>` before injecting. Retrieval (rank) and grounding (fetch) are two separate calls. **Entry 11 — the chat model refuses the task, insisting it's "Claude Code" (OBSERVED, Phase 7).** With the task instruction in the `system` role, VibeProxy→Claude answered every turn with "I'm Claude Code… I can't help with questions about people." *Root cause:* VibeProxy fronts the Claude-Code CLI identity and **overrides the caller's `system` prompt**, so a "you are a knowledge-base assistant" system message is discarded and the model falls back to refusing non-coding requests. *Fix:* put the instruction *and* the grounding notes in the **USER** message as a document-Q&A task ("using ONLY these notes, answer…"); don't depend on `system`. The same model then answers correctly.
 
-**Entry 12 — every agent step "Code execution exceeded the maximum execution time of 30 seconds"; ingest never finishes (OBSERVED, Phase 3/8).** Scaling to 8 sources, the agent burned all 6 steps timing out, re-extracting each time, ~6 min wasted.
-*Root cause:* `extract_pages` is a ~60s oMLX call, but smolagents' CodeAgent kills any single step's code at **30s** — and the agent re-runs its whole `read_sources(); extract_pages(...)` block every step. The heavy LLM call can never complete inside the sandbox.
-*Fix:* warm `extract_pages` **once outside the sandbox** (module-level cache in `main()`); the agent's call then returns instantly → ingest finishes in 1 step, 7.5s. At true scale, move extraction fully driver-side and stream per file (Phase 8 / `resumable_ingest.py`).
-*The 30s IS configurable — but a bump is the wrong fix.* The limit is `MAX_EXECUTION_TIME_SECONDS = 30` in smolagents' `local_python_executor.py`, overridable per agent:
+**Entry 12 — every agent step "Code execution exceeded the maximum execution time of 30 seconds"; ingest never finishes (OBSERVED, Phase 3/8).** Scaling to 8 sources, the agent burned all 6 steps timing out, re-extracting each time, ~6 min wasted. *Root cause:* `extract_pages` is a ~60s oMLX call, but smolagents' CodeAgent kills any single step's code at **30s** — and the agent re-runs its whole `read_sources(); extract_pages(...)` block every step. The heavy LLM call can never complete inside the sandbox. *Fix:* warm `extract_pages` **once outside the sandbox** (module-level cache in `main()`); the agent's call then returns instantly → ingest finishes in 1 step, 7.5s. At true scale, move extraction fully driver-side and stream per file (Phase 8 / `resumable_ingest.py`). *The 30s IS configurable — but a bump is the wrong fix.* The limit is `MAX_EXECUTION_TIME_SECONDS = 30` in smolagents' `local_python_executor.py`, overridable per agent:
 ```python
 from smolagents import CodeAgent
 agent = CodeAgent(tools=[...], model=model,
@@ -2404,37 +2191,21 @@ agent = CodeAgent(tools=[...], model=model,
 ```
 Two reasons we still move the slow work out of the sandbox instead of bumping: (1) it's a **thread timeout with no kill** — on timeout it raises `ExecutionTimeoutError` but the runaway thread keeps running in the background (Python can't force-kill a thread), so a bigger number just lets slow code *finish*, it adds no real preemption (and it's the *local* executor only; a remote E2B/Docker executor has its own). (2) A bigger timeout solves *nothing* of the actual scale walls — extraction context limit, cross-file dedup, embed-once, resume — and extraction time varies with corpus + model, so you'd keep chasing the number. Moving extraction driver-side makes the timeout value **irrelevant** and is required for the other walls anyway.
 
-**Entry 13 — ingest crashes on `.DS_Store` / picks up `.omc-state/` as "files" (OBSERVED, Phase 8).** `read_sources` threw `UnicodeDecodeError` on a binary `.DS_Store`; the resumable driver also checkpointed two `.omc-state-*` entries (0 pages each).
-*Root cause:* the walk skipped dotted *filenames* but rglob descended into dotted *directories* and grabbed the non-dotted files inside; binary files aren't UTF-8.
-*Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
+**Entry 13 — ingest crashes on `.DS_Store` / picks up `.omc-state/` as "files" (OBSERVED, Phase 8).** `read_sources` threw `UnicodeDecodeError` on a binary `.DS_Store`; the resumable driver also checkpointed two `.omc-state-*` entries (0 pages each). *Root cause:* the walk skipped dotted *filenames* but rglob descended into dotted *directories* and grabbed the non-dotted files inside; binary files aren't UTF-8. *Fix:* skip any **dotted path part** (`any(part.startswith(".") for part in rel.parts)`) AND catch `UnicodeDecodeError`. A real source dir always has `.DS_Store`, `.git/`, tool-state dirs — defend the read boundary.
 
-**Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything).
-*Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free."
-*Fix:* per-file streaming + **disk** staging (no embedding) + a final `merge_from_disk()` (the deferred dedup-on-write) + agent writes only canonical pages (embedded once) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, embeds each entity once, scales with file count.
+**Entry 14 — a large corpus can't be ingested in one shot (OBSERVED, Phase 8).** Phase 3's warm-once extraction concatenates *all* files into one prompt → context-window wall + un-resumable (lose the run = lose everything). *Root cause:* the binding scale limits are extraction *context* and cross-file entity *dedup*, not the 30s sandbox. One prompt can't hold thousands of files, and one prompt is the only thing that dedups entities "for free." *Fix:* per-file streaming + **disk** staging (no embedding) + a final `merge_from_disk()` (the deferred dedup-on-write) + agent writes only canonical pages (embedded once) + reconcile — `resumable_ingest.py` (Phase 8). Resumable, bounded, embeds each entity once, scales with file count.
 
-**Entry 15 — a resumed bulk-ingest silently re-embeds everything (OBSERVED, Phase 8).** The first resumable cut checkpointed only EXTRACTION (per file); the write phase relied on `put_page` idempotency. A crash mid-write → resume re-writes ALL canonical → every page embedded a *second* time, quietly negating "embed once."
-*Root cause:* **idempotent ≠ resumable.** Re-running is *correct* but not *cheap* — the expensive op (embedding) had no resume marker, only the outer extraction loop did.
-*Fix:* a write checkpoint `~/brain/.ingest_written.json` (written canonical slugs), marked after each batch; the write loop skips done slugs. Proven: a resumed run does **0 write batches, 0 re-embeds**. Checkpoint every *expensive* op, not just the outer loop — "the writes are idempotent" hides a full re-embed behind a true-but-irrelevant claim.
+**Entry 15 — a resumed bulk-ingest silently re-embeds everything (OBSERVED, Phase 8).** The first resumable cut checkpointed only EXTRACTION (per file); the write phase relied on `put_page` idempotency. A crash mid-write → resume re-writes ALL canonical → every page embedded a *second* time, quietly negating "embed once." *Root cause:* **idempotent ≠ resumable.** Re-running is *correct* but not *cheap* — the expensive op (embedding) had no resume marker, only the outer extraction loop did. *Fix:* a write checkpoint `~/brain/.ingest_written.json` (written canonical slugs), marked after each batch; the write loop skips done slugs. Proven: a resumed run does **0 write batches, 0 re-embeds**. Checkpoint every *expensive* op, not just the outer loop — "the writes are idempotent" hides a full re-embed behind a true-but-irrelevant claim.
 
-**Entry 16 — a single file too big for the extract context (OBSERVED, Phase 8).** Per-file staging assumed one file fits one extract prompt; a huge file (log, book, long transcript) breaks that and is un-resumable mid-file.
-*Root cause:* the resume unit was the whole *file*; the binding limit (extract context) is hit *within* a file.
-*Fix:* `_chunk_text` splits a file > `CHUNK_CHARS` into deterministic, line-aligned chunks `<file>#0/#1/…`, each its own staging unit. **Chose deterministic chunk-index over a `{file: last_line}` offset** — chunk-file existence is an atomic checkpoint (can't be half-written), reuses the per-file resume mechanism unchanged, and collapses "many files" + "one huge file" into one concept (a chunk; a small file = 1 chunk). Cross-chunk entities are reunited by `merge_from_disk` (same path as cross-file). Proven: 13.9 KB → 3 chunks; delete #1 → only #1 re-extracts.
+**Entry 16 — a single file too big for the extract context (OBSERVED, Phase 8).** Per-file staging assumed one file fits one extract prompt; a huge file (log, book, long transcript) breaks that and is un-resumable mid-file. *Root cause:* the resume unit was the whole *file*; the binding limit (extract context) is hit *within* a file. *Fix:* `_chunk_text` splits a file > `CHUNK_CHARS` into deterministic, line-aligned chunks `<file>#0/#1/…`, each its own staging unit. **Chose deterministic chunk-index over a `{file: last_line}` offset** — chunk-file existence is an atomic checkpoint (can't be half-written), reuses the per-file resume mechanism unchanged, and collapses "many files" + "one huge file" into one concept (a chunk; a small file = 1 chunk). Cross-chunk entities are reunited by `merge_from_disk` (same path as cross-file). Proven: 13.9 KB → 3 chunks; delete #1 → only #1 re-extracts.
 
-**Entry 17 — the write checkpoint marked a page that never landed (OBSERVED-class, Phase 8).** Marking a whole batch right after `agent.run` returned trusts the agent loop; if a `put_page` failed silently (agent swallows the error, still returns a final answer), the slug gets checkpointed → resume skips it → the page is lost, with no error anywhere.
-*Root cause:* the checkpoint recorded "the agent's batch code finished," not "the page is in the store." Those differ exactly in the silent-failure case.
-*Fix:* **verify-then-mark** — `_verify_written` queries `pages` (existence == successful embed+upsert) and the loop checkpoints only the verified subset; un-landed slugs stay un-checkpointed and retry. Invariant: a slug is in the write checkpoint IFF its page is really in GBrain. Gate tested: `_verify_written([real, fake]) → [real]`. Lesson: a checkpoint must record *confirmed durable state*, not "the code that should have written it returned."
+**Entry 17 — the write checkpoint marked a page that never landed (OBSERVED-class, Phase 8).** Marking a whole batch right after `agent.run` returned trusts the agent loop; if a `put_page` failed silently (agent swallows the error, still returns a final answer), the slug gets checkpointed → resume skips it → the page is lost, with no error anywhere. *Root cause:* the checkpoint recorded "the agent's batch code finished," not "the page is in the store." Those differ exactly in the silent-failure case. *Fix:* **verify-then-mark** — `_verify_written` queries `pages` (existence == successful embed+upsert) and the loop checkpoints only the verified subset; un-landed slugs stay un-checkpointed and retry. Invariant: a slug is in the write checkpoint IFF its page is really in GBrain. Gate tested: `_verify_written([real, fake]) → [real]`. Lesson: a checkpoint must record *confirmed durable state*, not "the code that should have written it returned."
 
-**Entry 18 — resume re-ran the (LLM) merge every time (OBSERVED, Phase 8).** Resume re-reads stage chunks to rebuild the canonical list, which re-fired `merge_from_disk`'s per-entity LLM merges — correct but wasteful (same "idempotent ≠ cheap" as the write phase, one layer up).
-*Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't.
-*Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
+**Entry 18 — resume re-ran the (LLM) merge every time (OBSERVED, Phase 8).** Resume re-reads stage chunks to rebuild the canonical list, which re-fired `merge_from_disk`'s per-entity LLM merges — correct but wasteful (same "idempotent ≠ cheap" as the write phase, one layer up). *Root cause:* the merge is a derived layer with no cache; the extraction and write layers were checkpointed but the layer between them wasn't. *Fix:* cache the merge result to `.ingest_merged.json`, keyed by a **stage fingerprint** (each chunk's name+mtime+size). Unchanged staging → cache HIT (skip re-merge); a re-extracted chunk changes the fingerprint → MISS → re-merge + re-cache. Completes the picture: **every derived layer (stage, merge, write) has its own checkpoint**, so resume rebuilds nothing already built. The fingerprint *is* the invalidation — the cache is valid exactly while its inputs are unchanged.
 
-**Entry 19 — CLI `gbrain put` titled pages from the slug, not the `# heading` (OBSERVED, Phase 9).** Loading the 44 brk 10-K sections via `gbrain put sections/brk_0002` with `# Berkshire … > Table of Contents`-headed content produced pages titled **"Brk 0002"**. The known-item eval's *exact* probes then queried "Brk 0002" — tokens absent from the body — so `keyword R@K exact = 0.000` and the whole brk run was contaminated.
-*Root cause:* CLI `put` derives the title from **YAML frontmatter** (falling back to the slug), NOT from the `# heading` — unlike MCP `put_page`, which parses the heading (which is why the entity pages got real titles). Two write paths, two titling rules; the loader used the wrong one.
-*Fix:* emit YAML frontmatter `title:` (authoritative), using the breadcrumb **tail** ("Chairman's Letter"), not the full "Berkshire … Annual Report > X" (the shared prefix repeats across all 44 → keyword drowns). exact recall `0.000 → 0.786`. **Measure the stored artifact (the title), not the write's return code** — the same "storage succeeded ≠ data is right" lesson as Entry 5.
+**Entry 19 — CLI `gbrain put` titled pages from the slug, not the `# heading` (OBSERVED, Phase 9).** Loading the 44 brk 10-K sections via `gbrain put sections/brk_0002` with `# Berkshire … > Table of Contents`-headed content produced pages titled **"Brk 0002"**. The known-item eval's *exact* probes then queried "Brk 0002" — tokens absent from the body — so `keyword R@K exact = 0.000` and the whole brk run was contaminated. *Root cause:* CLI `put` derives the title from **YAML frontmatter** (falling back to the slug), NOT from the `# heading` — unlike MCP `put_page`, which parses the heading (which is why the entity pages got real titles). Two write paths, two titling rules; the loader used the wrong one. *Fix:* emit YAML frontmatter `title:` (authoritative), using the breadcrumb **tail** ("Chairman's Letter"), not the full "Berkshire … Annual Report > X" (the shared prefix repeats across all 44 → keyword drowns). exact recall `0.000 → 0.786`. **Measure the stored artifact (the title), not the write's return code** — the same "storage succeeded ≠ data is right" lesson as Entry 5.
 
-**Entry 20 — the auto-tuned policy selected the WORST arm for real queries (OBSERVED, Phase 9).** The known-item auto-eval picked `strategy=keyword` on the 10-K (recall@3 = 0.72) and wrote it to `search_policy.json`. But on 16 **real** W2.7 questions, keyword grounding@5 was **0.19** vs vector/hybrid **0.95** — the policy routes real financial questions to the weakest arm.
-*Root cause:* known-item probes use page **titles** as "exact" queries (keyword-friendly); real questions are **paraphrases** with no shared surface tokens (vector-friendly). The proxy query distribution ≠ the real one, so the measured winner doesn't transfer.
-*Fix:* drive the policy from a **representative/real** query set (Path A), and treat known-item auto-eval as a **regression guardrail**, not the policy oracle. An auto-tuning loop inherits the bias of its eval queries — measure the *decision input's* representativeness, not just the loop's mechanics.
+**Entry 20 — the auto-tuned policy selected the WORST arm for real queries (OBSERVED, Phase 9).** The known-item auto-eval picked `strategy=keyword` on the 10-K (recall@3 = 0.72) and wrote it to `search_policy.json`. But on 16 **real** W2.7 questions, keyword grounding@5 was **0.19** vs vector/hybrid **0.95** — the policy routes real financial questions to the weakest arm. *Root cause:* known-item probes use page **titles** as "exact" queries (keyword-friendly); real questions are **paraphrases** with no shared surface tokens (vector-friendly). The proxy query distribution ≠ the real one, so the measured winner doesn't transfer. *Fix:* drive the policy from a **representative/real** query set (Path A), and treat known-item auto-eval as a **regression guardrail**, not the policy oracle. An auto-tuning loop inherits the bias of its eval queries — measure the *decision input's* representativeness, not just the loop's mechanics.
 
 **Pre-run predictions vs. what actually happened** (these were guessed *before* Phases 3–6 ran; now resolved against the measured outcomes — **3 of 4 missed**, which is the honest record: predictions are cheap, the observed Entries above are the truth).
 
