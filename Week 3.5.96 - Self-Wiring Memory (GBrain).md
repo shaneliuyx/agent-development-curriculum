@@ -1769,7 +1769,7 @@ Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-b
 
 The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 = 0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.832`) — vector hides ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`), then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips between adjacent C, pin the exact production number.
 
-##### Per-query routing — tested and rejected (2026-06-06)
+##### Per-query routing — rejected on the natural corpus, accepted on a mixed-type one (2026-06-06 → 06-07)
 
 The policy picks ONE arm for the whole corpus. Natural next question: the best arm is query-dependent (proper-noun lookups favour keyword/hybrid, semantic factoids favour vector), so should we route *each query* to its own best arm? Built `src/route_eval.ts` to measure it — three routers scored with the same discounted grounding@C:
 - **global** — every query → the corpus winner (`hybrid`). The baseline.
@@ -1809,7 +1809,33 @@ Routing with the revived keyword arm: global `hyb_pp` **0.796** · oracle **0.87
 | local 14B (Qwen-Coder) | 1.000 | 0.750 | −0.250 | 1.000 → 0.500 |
 | **Claude Opus 4.5** | 0.917 | 0.917 | **+0.000** | 0.800 → 0.800 |
 
-The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the questions whose context differed. The regression was the **generator's** context-composition sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied) context; a capable one extracts the answer regardless. This is the *confounding* trap named in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in generation variance; pin the generator (here: a strong model) before attributing a delta to retrieval. **Verdict: keep the single global hybrid policy.** Routing adds a classifier, a per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B: `uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.)
+The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the questions whose context differed. The regression was the **generator's** context-composition sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied) context; a capable one extracts the answer regardless. This is the *confounding* trap named in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in generation variance; pin the generator (here: a strong model) before attributing a delta to retrieval. **Verdict (this natural, vector-skewed corpus): keep the single global hybrid policy.** *Here* routing adds a classifier, a per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B: `uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.) **But that verdict is the *corpus's*, not the *principle's*** — the next subsection re-tests the honest version (route to the *fixed* keyword arm, on a workload that actually spans query types) and the result **reverses**: routing wins on both grounding and answer quality, even on a strong generator.
+
+##### Re-tested with the keyword fix — routing accepted on a mixed-type workload (2026-06-07)
+
+The rejection above rests on two things the *natural* corpus baked in: it is vector-skewed (one dominant query type), and `route_eval.ts` routed `kw` queries to the **raw** keyword arm — the one GBrain's conjunctive FTS had crippled (it scored `g@C:kw` 0.500, *worse* than hybrid's 0.925, so "route to keyword" could only lose). Fix both and the original design principle gets a fair trial: classify each query by type and send it to the arm that fits — `kw → key_pp` (the OR-preprocessed keyword arm), `vec → vector`, `mixed → hyb`. Three policies, balanced 24-Q set, deterministic classifier (24/24 vs the gold type label), `src/route_principle_ab.ts`:
+
+**Grounding A/B (discounted grounding@C):**
+
+| policy | grnd@C | g@C:kw | g@C:vec | g@C:mixed | Δ vs baseline |
+|---|---|---|---|---|---|
+| baseline (global `hyb`) | 0.823 | 0.925 | 0.745 | 0.763 | — |
+| **router** (`kw`→`key_pp` · `vec`→`vector` · `mixed`→`hyb`) | **0.862** | **1.000** | 0.763 | 0.763 | **+0.039** |
+| strengthened-global (`hyb` on OR-preprocessed query) | 0.810 | 1.000 | 0.682 | 0.658 | −0.013 |
+
+The router strictly beats baseline on **+2 / 0 worse / 22 tie** — the +2 are exactly the `kw`-class queries global hybrid demoted (`g@C:kw` 0.925 → 1.000), with zero regression on `vec` / `mixed`. The *strengthened-global* alternative (no router — just OR-preprocess the whole query before hybrid) **loses** (−0.013): OR-joining the query degrades the dense leg's embedding, and the revived keyword won't fuse cleanly into RRF. So the principle **must** be honored by a router, not by strengthening the single global arm.
+
+**Answer-quality A/B (entity coverage, pinned Opus 4.5 — `src/answer_principle_ab.py`):**
+
+| policy | pass | p:kw | p:vec | p:mixed | Δ vs baseline |
+|---|---|---|---|---|---|
+| baseline (global `hyb`) | 0.792 | 0.800 | 0.800 | 0.750 | — |
+| **router** | **0.875** | 0.900 | 0.900 | 0.750 | **+0.083** |
+| strengthened-global | 0.833 | 0.900 | 0.800 | 0.750 | +0.042 |
+
+The edge **survives a strong generator** (+0.083 on Opus, *larger* than the grounding gap): the router fixes answers global hybrid gets wrong — `Itochu…` F→**P**, `Item 8 Notes` F→**P**, the Item-1C-via-semantic question F→**P** — because Opus still cannot extract an answer from a wrong-context chunk set. This is the opposite of the natural-set `Δ 0`: there routing changed nothing real on a one-type corpus; here, on a workload that spans types, routing recovers the compromised queries at *answer* time, not just at grounding time.
+
+**Refined verdict — routing is worth building, conditionally.** Per-query routing pays iff **three gates all hold**: (a) the traffic genuinely **spans query types** (keyword-focused *and* semantic), (b) the keyword arm is **OR-preprocessed** (else its target is the crippled raw arm and routing can only lose), and (c) a **cheap type-classifier** can actually detect the type. All three held here → +0.039 grounding, +0.083 answer quality. On the production brain as-is (vector-skewed, single dominant type) gate (a) fails, so the earlier "keep global hybrid" still stands *for that corpus*. The honest scope: the classifier is 24/24 only because this set is built type-separable (`kw` = token-lists, `vec` = prose); real queries blur that, so +0.083 is the **strong-classifier ceiling** — production gain is ≤ that and shrinks with classifier error. Net: don't reject the principle — gate it on the workload. (Grounding A/B: `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`; answer A/B: `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`.)
 
 #### Block C — `query_policy.ts`: the actuator
 
@@ -1965,7 +1991,7 @@ export function budgetScore(coverages: number[], c: number): BudgetScore {
 }
 ```
 
-The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); per-query routing (oracle ceiling = global hybrid, Δ0); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
+The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); per-query routing *on a single-type corpus* (oracle ceiling = global hybrid, Δ0 — though it **reverses** to +0.083 once the workload spans types and the keyword arm is OR-preprocessed; gate it on the workload, don't reject the principle); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
 
 #### Block E — the reader is the lever, measured (2026-06-07)
 
@@ -2549,8 +2575,8 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 **(d) "Retrieval works — why are the answers still wrong?"**
 > Generation is the bottleneck, not retrieval. On the same 10-K my hybrid grounded the answer-bearing section ~96% of the time, yet the *weak setup* answered correctly only ~25% (W2.7's vector baseline): **vector-only retrieval**, **thin snippet context** (`query --json` truncations, not full pages), and **a small local model** reading. Three assembly changes closed it to 15/16 — hybrid retrieval (keyword + vector RRF), injecting **full page bodies** via `gbrain get` instead of snippets, and **a capable reader** (Opus). The one remaining miss — a structural "where are the Notes located?" question — I fixed at **ingest** (joining PageIndex's page-ranges into the page body → 16/16), not by prompt-tuning. Reader gains are assembly, not wording.
 
-**(e) "Tell me about a feature you decided NOT to build."**
-> Per-query routing — and I killed it *before* writing the classifier. I computed the oracle first: route every question to its own best arm, peeking at the labels. That unattainable ceiling equaled global hybrid exactly (0.910) — hybrid already won every one of the 18 questions, so routing had zero headroom, and a real heuristic router only lost. The one apparent answer-quality win was a weak-14B artifact that vanished on Opus (Δ0 — generation variance, not retrieval). The rule: build the ceiling before the classifier; if perfect play doesn't beat the baseline, no engineering will.
+**(e) "Tell me about a technical verdict you reversed."**
+> Per-query routing — I killed it, then reversed myself, and the reversal is the better engineer. First pass: I built the oracle (route each query to its labeled-best arm) *before* writing any classifier; it tied global hybrid exactly (0.910), so even perfect play had zero headroom — reject. Then I caught that my own test was rigged: the corpus was vector-skewed (one query type), and the router fed GBrain's *raw* keyword arm, which its conjunctive FTS had crippled to 0.5 — so "route to keyword" could only lose. I OR-preprocessed the keyword query and built a type-balanced set, and the verdict flipped: router +0.039 grounding and +0.083 answer-quality on a *pinned Opus* generator, beating global even on a strong model. Lesson: build the ceiling before the classifier — but make sure the ceiling test isn't rigged by a broken arm or a one-type corpus. I shipped routing gated on the workload, not as a blanket default.
 
 ---
 
