@@ -2095,10 +2095,7 @@ figures, segment names, subsidiaries, "Scorecard", "operating earnings" — exac
 where the KEYWORD arm earns its weight and hybrid-RRF should win. Loading it lets
 `auto_eval.ts` test that hypothesis directly.
 
-The W2.7 sections (`brk_corpus.json`) are ALREADY page-shaped — `{id, title, text}`
-— so this is a DETERMINISTIC load (slug = sections/<id>), no LLM extraction and no
-graph reconcile (we're testing retrieval, not wiring). After loading we embed, then
-the existing `run_auto_eval()` measures keyword vs vector vs hybrid over them.
+The W2.7 sections (`brk_corpus.json`) are ALREADY page-shaped — `{id, title, text}` — so this is a DETERMINISTIC load (slug = sections/<id>), no LLM extraction and no graph reconcile (we're testing retrieval, not wiring). After loading we embed, then the existing `run_auto_eval()` measures keyword vs vector vs hybrid over them.
 
 Run: python src/load_brk_corpus.py     (needs GBRAIN_DATABASE_URL + OLLAMA_* up)
 Env: BRK_CORPUS=<path>  SLUG_PREFIX=sections  AUTO_EVAL=1
@@ -2136,9 +2133,7 @@ def _clean_title(raw: str, fallback: str) -> str:
 
 def flatten_tree(node: dict, parent_title: str = "", inherited_item: str = "",
                  out: dict | None = None) -> dict:
-    """node_id → {title, start_page, end_page, parent, item}. `item` is inherited from the
-    nearest ancestor whose title matches `Item N` (so a sub-section of Item 8 still knows it's
-    in Item 8). Used to enrich each GBrain page with its document location."""
+    """node_id → {title, start_page, end_page, parent, item}. `item` is inherited from the nearest ancestor whose title matches `Item N` (so a sub-section of Item 8 still knows it's in Item 8). Used to enrich each GBrain page with its document location."""
     if out is None:
         out = {}
     title = str(node.get("title", ""))
@@ -2155,18 +2150,9 @@ def flatten_tree(node: dict, parent_title: str = "", inherited_item: str = "",
 
 def build_pages(corpus: list[dict], prefix: str = _SLUG_PREFIX,
                 tree_meta: dict | None = None, source: str = "") -> list[tuple[str, str]]:
-    """Pure transform: W2.7 sections → (slug, GBrain-page-content) pairs.
+    """Pure transform: W2.7 sections → (slug, GBrain-page-content) pairs. Each section becomes a markdown page with YAML frontmatter under `<prefix>/<id>`. The frontmatter `title:` is AUTHORITATIVE — `gbrain put` titles from frontmatter, NOT from the `# heading` (that seam is why a slug-only write gets titled "Brk 0002").
 
-    Each section becomes a markdown page with YAML frontmatter under `<prefix>/<id>`.
-    The frontmatter `title:` is AUTHORITATIVE — `gbrain put` titles from frontmatter,
-    NOT from the `# heading` (that seam is why a slug-only write gets titled "Brk 0002").
-
-    PageIndex-enriched (when `tree_meta` is supplied): frontmatter gains `source` / `item` /
-    `pages` / `parent`, AND a `**Location:**` breadcrumb is prepended to the BODY. The body
-    line is the load-bearing bit — GBrain indexes title+body+timeline, so a location *in the
-    body* is retrievable (keyword + vector) and injected into the reader's context, whereas
-    unknown frontmatter keys are not. That is what makes "where are the Notes located?"
-    answerable. Sections with no id or empty text are skipped.
+    PageIndex-enriched (when `tree_meta` is supplied): frontmatter gains `source` / `item` / `pages` / `parent`, AND a `**Location:**` breadcrumb is prepended to the BODY. The body line is the load-bearing bit — GBrain indexes title+body+timeline, so a location *in the body* is retrievable (keyword + vector) and injected into the reader's context, whereas unknown frontmatter keys are not. That is what makes "where are the Notes located?" answerable. Sections with no id or empty text are skipped.
     """
     pages: list[tuple[str, str]] = []
     tree_meta = tree_meta or {}
@@ -2259,17 +2245,13 @@ if __name__ == "__main__":
 ```python
 """eval_brk16.py — run GBrain on ALL 16 W2.7 questions; answer pass-rate vs `pass_criteria`.
 
-The full W2.7 eval (12 in-document + 4 out-of-document refusals), retrieved through GBrain's
-hybrid arm (C=3, full bodies), answered + judged against the same rubric W2.7 used. Run it
-BEFORE and AFTER the PageIndex-structure ingest enrichment to see whether the structural
-"where-is-X" questions (esp. the Notes question) start passing — without regressing the rest.
+The full W2.7 eval (12 in-document + 4 out-of-document refusals), retrieved through GBrain's hybrid arm (C=3, full bodies), answered + judged against the same rubric W2.7 used. Run it BEFORE and AFTER the PageIndex-structure ingest enrichment to see whether the structural "where-is-X" questions (esp. the Notes question) start passing — without regressing the rest.
 
-Reuses shared/ (per AGENTS.md): llm (resolve/chat/judge/load_pass_criteria) + gbrain_cli
-(gbrain_query_slugs/build_context). Generator + judge default to Opus so a failure is a
-retrieval-representation gap, not a weak-generator artifact.
+Reuses shared/ (per AGENTS.md): llm (resolve/chat/judge/load_pass_criteria) + gbrain_cli (gbrain_query_slugs/build_context). Generator + judge default to Opus so a failure is a retrieval-representation gap, not a weak-generator artifact.
 
-Run (services: gbrain-pg, oMLX :8000 for query embed, VibeProxy :8317 for gen/judge):
-  GEN=opus JUDGE=opus OPENROUTER_BASE_URL=http://localhost:8317/v1 OPENROUTER_API_KEY=vibeproxy \
+Run (services: gbrain-pg, oMLX :8000 for query embed, VibeProxy :8317 for gen/judge): 
+  GEN=opus JUDGE=opus OPENROUTER_BASE_URL=http://localhost:8317/v1 \
+  OPENROUTER_API_KEY=vibeproxy \
   uv run python src/eval_brk16.py
 """
 from __future__ import annotations
@@ -2412,16 +2394,16 @@ Every Phase-9 script is parameterised by environment variables (and a couple by 
 - **VibeProxy `:8317`** — OpenAI-compatible proxy to **cloud Claude** (`OPENROUTER_BASE_URL`/`OPENROUTER_API_KEY=vibeproxy`); used as the answer generator / judge.
 - Load the lab `.env` (`set -a; . ./.env; set +a`) and put `~/.bun/bin` on `PATH`. `.env` holds `GBRAIN_DATABASE_URL`, `OLLAMA_*`, `LLM_*` (oMLX key + local chat model), `OPENROUTER_*`.
 
-| script | role | params / env (default) | services | run |
-|---|---|---|---|---|
-| `grounding.test.ts` | unit tests for the metric | — | none | `bun test src/grounding.test.ts` |
-| `policy_eval.ts` | **SELECTOR** — write the policy | `POLICY_K` (5), `POLICY_C` (3) | pg + oMLX embed | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts` |
-| `query_policy.ts` | actuator — route one query | argv `"<query>" [limit=5]` | pg + oMLX embed | `bun src/query_policy.ts "Who is anchoring acme-seed?" 3` |
-| `route_eval.ts` | routing headroom + **dumps** | `POLICY_K` (5), `POLICY_C` (3) | pg + oMLX embed | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
-| `load_brk_corpus.py` | ingest the 10-K corpus | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`) | pg + oMLX embed | `uv run python src/load_brk_corpus.py` |
-| `answer_route_ab.py` | answer A/B (routing) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py` |
-| `verify_arch.py` | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py` |
-| `reader_ab.py` | reader A/B (fixed retrieval) | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py` |
+| script               | role                                  | params / env (default)                                                                                  | services                 | run                                                                                    |
+| -------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------- |
+| `grounding.test.ts`  | unit tests for the metric             | —                                                                                                       | none                     | `bun test src/grounding.test.ts`                                                       |
+| `policy_eval.ts`     | **SELECTOR** — write the policy       | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts`                  |
+| `query_policy.ts`    | actuator — route one query            | argv `"<query>" [limit=5]`                                                                              | pg + oMLX embed          | `bun src/query_policy.ts "Who is anchoring acme-seed?" 3`                              |
+| `route_eval.ts`      | routing headroom + **dumps**          | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
+| `load_brk_corpus.py` | ingest the 10-K corpus                | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`)                                                         | pg + oMLX embed          | `uv run python src/load_brk_corpus.py`                                                 |
+| `answer_route_ab.py` | answer A/B (routing)                  | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json`          | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py`             |
+| `verify_arch.py`     | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json`                                 | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py`                 |
+| `reader_ab.py`       | reader A/B (fixed retrieval)          | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py`                                    |
 
 **Data-dependency order (don't skip):** the four analysis scripts consume dumps, so retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json` → which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts` and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`).
 
@@ -2529,7 +2511,7 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 | **Phase 3** — agent over-relies on GBrain for general knowledge | ✗ didn't occur | Real Phase-3 failures were more basic: zero graph edges (Entry 5) + `CodeAgent` crash on a 14B (Entry 6). The Ground-Truth A/B (Phase 7) showed correct answering-*from*-brain. |
 | **Phase 4** — `@handle` markdown-convention mismatch | ✗ didn't occur | Agent emits `[[dir/slug]]` wikilinks → GBrain parses them directly (45 edges). Real issue: MCP `put_page` skips inline auto-link → needs an `extract links --source db` reconcile (Entry 7). |
 | **Phase 5** — synthesis emits a wrong "we don't know" | ✗ didn't occur | Gap-honesty worked: absent date → "no information"; present fact → 0.93 (Phase 5 §Verification). |
-| **Phase 6** — RRF lift smaller than 12pts | ✓ confirmed, *stronger* | Not just a smaller lift — pure vector **beat** RRF on the small corpus (Entry 9). Projected cause (short corpus / converging queries) was right. |
+| **Phase 6** — RRF lift smaller than 12pts | ✓ confirmed, *stronger* — but later refined | Not just a smaller lift — pure vector **beat** RRF on the small entity corpus (Entry 9). The projected cause ("short corpus") was a *proxy*: **Phase 9's drift experiment** sharpened it to **RRF wins iff both arms are individually competitive** — the policy auto-flipped `vector → hybrid` once the brain grew to a mixed 10-K+entity corpus (proper-noun queries revived the keyword arm). So "vector beats RRF" is scoped to single-query-class corpora, not a law. |
 
 ---
 
@@ -2539,10 +2521,13 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 > Because my data was already structured, so I let the structure do the work. The agent writes Markdown pages with `[[dir/slug]]` wikilinks; GBrain turns those into typed edges by regex — zero LLM calls — so re-running extraction yields identical edges every time. On my corpus that was 45 reproducible edges from the agent's wikilinks. LLM extraction is the right tool for *unstructured* text — raw conversations, scraped web — not for notes that already carry their own links. It's a workload decision, not philosophy; production stacks run both tiers.
 
 **(b) "Does hybrid-RRF always beat plain vector search?"**
-> No — and I measured it rather than assume. On my 19-page brain, pure vector hit recall@3 = 0.90, MRR 0.92; RRF *matched* the recall but dropped MRR to 0.78, because the keyword arm missed every purely-semantic query and fusing it demoted strong vector hits a rank. RRF only wins when both arms are individually competitive — on a small, semantic-heavy corpus it's net-negative. I don't trust the published 83→95 lift without re-running on my own corpus.
+> No — and I measured it rather than assume. On my 19-page brain, pure vector hit recall@3 = 0.90, MRR 0.92; RRF *matched* recall but dropped MRR to 0.78 — the keyword arm missed every semantic query and fusing it demoted strong vector hits a rank. So I built a **self-tuning policy**: a cheap, deterministic metric scores keyword/vector/hybrid on a real golden set after *every* ingest and routes the agent to the winner. It auto-flipped `vector → hybrid` the moment the brain grew to a mixed 10-K corpus — no code change. RRF only wins when both arms are competitive; I never assume the published 83→95 lift.
 
 **(c) "How do you make a bulk ingest into a memory store crash-resumable?"**
 > Checkpoint every *expensive* layer, not just the outer loop. Mine has three on disk: per-file-chunk extraction (skip staged chunks), a fingerprint-keyed merge cache, and a verify-then-mark write checkpoint — a page's slug is recorded only after I confirm it's actually in the store. Killed mid-run, the resume re-embedded nothing already done — zero write batches on the second pass. The trap I hit: "the writes are idempotent" hides a full re-embed. Idempotent isn't cheap; checkpoint against confirmed durable state.
+
+**(d) "Retrieval works — why are the answers still wrong?"**
+> Generation is the bottleneck, not retrieval. On the same 10-K, my hybrid grounded the answer-bearing section ~96% of the time, but answers were right only ~25% in a weak setup; full page bodies + a capable reader got me 15/16 on the real eval. The one miss — a structural "where are the Notes located?" question — I fixed at **ingest**, joining PageIndex's per-section page-ranges into each GBrain page so the location sits in the body (16/16), not by prompt-tuning. The lesson: reader gains are assembly, not wording.
 
 ---
 
