@@ -2533,6 +2533,9 @@ Two reasons we still move the slow work out of the sandbox instead of bumping: (
 **(d) "Retrieval works — why are the answers still wrong?"**
 > Generation is the bottleneck, not retrieval. On the same 10-K, my hybrid grounded the answer-bearing section ~96% of the time, but answers were right only ~25% in a weak setup; full page bodies + a capable reader got me 15/16 on the real eval. The one miss — a structural "where are the Notes located?" question — I fixed at **ingest**, joining PageIndex's per-section page-ranges into each GBrain page so the location sits in the body (16/16), not by prompt-tuning. The lesson: reader gains are assembly, not wording.
 
+**(e) "Tell me about a feature you decided NOT to build."**
+> Per-query routing — and I killed it *before* writing the classifier. I computed the oracle first: route every question to its own best arm, peeking at the labels. That unattainable ceiling equaled global hybrid exactly (0.910) — hybrid already won every one of the 18 questions, so routing had zero headroom, and a real heuristic router only lost. The one apparent answer-quality win was a weak-14B artifact that vanished on Opus (Δ0 — generation variance, not retrieval). The rule: build the ceiling before the classifier; if perfect play doesn't beat the baseline, no engineering will.
+
 ---
 
 ## 8. References
