@@ -1856,14 +1856,26 @@ The edge **survives a strong generator** (+0.083 on Opus, *larger* than the grou
  * The agent calls this for its retrieval; the per-corpus verdict steers it.
  *
  * Fallback: if no policy file exists yet, default to hybrid (GBrain's own default).
- * Usage: bun src/query_policy.ts "<query text>" [limit]
+ *
+ * Per-query ROUTER switch (opt-in): set `QUERY_ROUTER=on` to route each query to the arm its
+ * TYPE favours (kw→OR-preprocessed keyword · vec→vector · mixed→hybrid) instead of the single
+ * global policy. DEFAULT OFF — routing is a *conditional* win (route_principle_ab.ts: +0.039
+ * grounding / +0.083 answer-quality ONLY when the workload spans query types AND a cheap
+ * classifier detects them; on a single-type corpus a perfect router merely ties global and a
+ * real classifier nets negative). So it ships off; turn it on when the traffic is mixed-type
+ * and the extra accuracy is worth the per-query classify step.
+ *
+ * Usage: bun src/query_policy.ts "<query text>" [limit]      (global policy — default)
+ *        QUERY_ROUTER=on bun src/query_policy.ts "<query>" [limit]   (per-query router)
  */
 import { existsSync, readFileSync } from "node:fs";
+
+import { type Strategy, classifyType, preprocessOR, TYPE_TO_STRATEGY } from "./query_routing.ts";
 
 const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
 const POLICY = `${import.meta.dir}/../results/search_policy.json`;
 
-type Strategy = "keyword" | "vector" | "hybrid";
+const ROUTER_ON = ["1", "on", "true", "yes"].includes((process.env.QUERY_ROUTER ?? "").toLowerCase());
 
 const query = process.argv[2];
 if (!query) {
@@ -1900,16 +1912,33 @@ const engine = await createEngine(toEngineConfig(config));
 await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
 await reconfigureGatewayWithEngine(engine);
 
-// ── route to the policy-selected strategy ───────────────────────────────────
+// ── pick the strategy: per-query router (opt-in) or the global policy (default) ──
+// Router ON: classify the query's type and route to the arm it favours; the keyword arm is
+// fed the OR-preprocessed query (the validated path). Router OFF: the single global strategy.
+let routeNote = "";
+function pickStrategy(): { strategy: Strategy; kwQuery: string } {
+  if (!ROUTER_ON) {
+    // global policy = whatever auto_eval wrote (keyword | vector | hybrid) — NOT always hybrid;
+    // hybrid is only the fallback when no policy file exists. Surface the actual arm.
+    const knob = strategy === "hybrid" ? ` rrf_k=${rrfK}` : "";
+    routeNote = `router OFF · global policy = ${strategy}${knob}  ←  ${source}`;
+    return { strategy, kwQuery: query };
+  }
+  const type = classifyType(query);
+  const routed = TYPE_TO_STRATEGY[type];
+  routeNote = `router ON · type=${type} → ${routed}`;
+  return { strategy: routed, kwQuery: routed === "keyword" ? preprocessOR(query) : query };
+}
+
 async function search(): Promise<{ slug: string }[]> {
-  if (strategy === "keyword") return engine.searchKeyword(query, { limit });
-  if (strategy === "vector") return engine.searchVector(await embed(query), { limit });
+  const { strategy: strat, kwQuery } = pickStrategy();
+  if (strat === "keyword") return engine.searchKeyword(kwQuery, { limit });
+  if (strat === "vector") return engine.searchVector(await embed(query), { limit });
   return hybridSearch(engine, query, { limit, expansion: false, rrfK });
 }
 
 const results = await search();
-const knob = strategy === "hybrid" ? ` rrf_k=${rrfK}` : "";
-console.log(`policy: strategy=${strategy}${knob}  ←  ${source}`);
+console.log(`policy: ${routeNote}`);
 console.log(`query: ${JSON.stringify(query)}  (limit=${limit})`);
 for (const [i, r] of results.entries()) console.log(`  ${i + 1}. ${r.slug}`);
 
@@ -1918,8 +1947,98 @@ process.exit(0);
 ```
 
 **Walkthrough:**
-- **Reads the policy, routes accordingly** — after Phase B an agent query runs through `hybrid`; the identical call ran `vector` after Phase A. The only thing that changed between them is the policy file the loop rewrote.
-- **Fallback to hybrid** keeps a fresh brain (no policy yet) on GBrain's own default, so the wrapper degrades to stock behavior rather than erroring. The vector arm must `embed()` the query at run-time, which needs the same gateway bootstrap as the eval (`hybrid.ts:975` silently no-ops without it).
+- **Router OFF (default) = the global policy, *not* hardcoded hybrid.** `strategy` is whatever `auto_eval` wrote to `search_policy.json` — `keyword`, `vector`, **or** `hybrid`. On this 67-page mixed corpus that's `hybrid` (the Phase-6 `vector → hybrid` flip), but on a keyword-heavy or tiny corpus the same OFF path would route `keyword` or `vector`. The log prints the resolved arm (`global policy = hybrid rrf_k=60`) so the choice is never assumed. `hybrid` is only the **fallback** when no policy file exists yet.
+- **Router ON (opt-in, `QUERY_ROUTER=on`) ignores the single global arm and routes per query type** via `pickStrategy()` → `classifyType` + `TYPE_TO_STRATEGY` from `query_routing.ts`. The `kw` branch feeds the keyword arm the **OR-preprocessed** query (`kwQuery`), the validated path; `vec`/`mixed` embed/hybrid the raw query. Default off because routing is a *conditional* win — see the re-test above (gates: mixed-type traffic + OR-preprocessed keyword + a cheap classifier).
+- **One classifier, two callers.** `query_routing.ts` is imported by both this actuator and the A/B (`route_principle_ab.ts`), so production routes by the *exact* classifier the +0.039 / +0.083 numbers were measured on — no drift between "tested" and "shipped". The vector arm must `embed()` at run-time, which needs the same gateway bootstrap as the eval (`hybrid.ts:975` silently no-ops without it).
+
+**Code (full source `src/query_routing.ts` — the shared router brain):**
+
+```typescript
+/**
+ * query_routing.ts — shared per-query TYPE classifier + keyword preprocessing.
+ *
+ * ONE canonical definition, imported by BOTH the production actuator (query_policy.ts, behind
+ * the QUERY_ROUTER switch) and the A/B that validated it (route_principle_ab.ts). If the two
+ * diverged, the measured win would not transfer — production would route by an unvalidated
+ * classifier. Co-locating them guarantees production == tested.
+ *
+ * The principle this implements: a single global policy compromises queries whose best arm
+ * isn't the global winner. Route by query TYPE instead —
+ *   exact-token probe  → keyword, OR-preprocessed (so GBrain's conjunctive FTS doesn't AND a
+ *                         verbose query to zero; route_eval_kwpp.ts: g@C:kw 0.500 → 1.000)
+ *   semantic paraphrase → vector
+ *   natural question    → hybrid
+ * Measured on the balanced 24-Q set (route_principle_ab.ts): classifier 24/24, router +0.039
+ * grounding and +0.083 answer-quality (pinned Opus) over global hybrid.
+ */
+export type QueryType = "kw" | "vec" | "mixed";
+export type Strategy = "keyword" | "vector" | "hybrid";
+
+// Noise words dropped before OR-joining the keyword query (domain + question + function words).
+export const STOP = new Set([
+  "a", "an", "the", "of", "in", "on", "for", "to", "and", "or", "is", "are", "was", "were",
+  "what", "which", "who", "where", "when", "how", "why", "did", "does", "do", "write", "wrote",
+  "describe", "describes", "described", "about", "berkshire", "company", "firm", "report",
+  "annual", "five", "percent", "common", "shares", "its", "his", "her", "their", "that", "this",
+  "with", "from", "by", "as", "at", "be", "it", "they", "long", "term", "holds", "hold", "leave",
+  "leaves", "comfortable", "according", "year", "lists", "could", "go", "wrong", "business",
+  "filing", "section", "part", "where-is", "located", "live", "lives", "puts", "putting", "up",
+  "money", "anchor", "early", "funding", "round", "guards", "guard", "against", "oversees",
+  "owns", "own", "large", "minority", "stake", "runs", "run", "optimizing", "before", "designing",
+  "structure", "detailed", "following", "primary", "statements", "operating", "earnings",
+  "associated", "venture", "angel", "investor", "network",
+]);
+
+// Function words used to detect a prose paraphrase (high ratio → semantic, not exact-token).
+export const FUNCTION = new Set([
+  "the", "a", "an", "of", "in", "on", "for", "to", "and", "or", "is", "are", "was", "were",
+  "that", "this", "with", "from", "by", "as", "at", "be", "it", "they", "its", "his", "her",
+  "their", "how", "who", "which", "where", "what", "when", "could", "following",
+]);
+
+/**
+ * Drop stop/question words, then OR-join the salient tokens. OR switches GBrain's
+ * `websearch_to_tsquery` from AND (every token must co-occur in one chunk → verbose queries
+ * score 0) to best-match (a missing token lowers rank instead of zeroing the match).
+ */
+export function preprocessOR(q: string): string {
+  const toks = (q.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(t => t.length > 1 && !STOP.has(t));
+  const uniq = [...new Set(toks)];
+  return uniq.length ? uniq.join(" OR ") : q;   // fall back to raw if we stripped everything
+}
+
+/**
+ * Deterministic, zero-LLM query-type classifier. A natural question (ends '?') is mixed;
+ * a high function-word ratio / leading lowercase connective marks a semantic paraphrase;
+ * otherwise distinctive exact tokens (Item N, ALL-CAPS, capitalised entity runs, digit+%) or a
+ * capitalised lead marks an exact-token keyword probe.
+ */
+export function classifyType(q: string): QueryType {
+  const raw = q.trim();
+  if (/\?\s*$/.test(raw)) return "mixed";
+  const words = raw.split(/\s+/);
+  const distinctive = raw.match(
+    /\bItem\s+\d+[A-Z]?\b|\b[A-Z]{2,}\b|\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b|\b\d+\s*(?:percent|%)\b/g,
+  ) ?? [];
+  const fnRatio = words.filter(w => FUNCTION.has(w.toLowerCase())).length / words.length;
+  const leadsLowerFn = FUNCTION.has(words[0].toLowerCase()) && /^[a-z]/.test(words[0]);
+  if (leadsLowerFn || fnRatio >= 0.4) return "vec";
+  if (distinctive.length >= 1 || /^[A-Z]/.test(words[0])) return "kw";
+  return "vec";
+}
+
+// Arm each query type routes to. `kw` → keyword arm, fed the OR-preprocessed query.
+export const TYPE_TO_STRATEGY: Record<QueryType, Strategy> = {
+  kw: "keyword",
+  vec: "vector",
+  mixed: "hybrid",
+};
+```
+
+**Walkthrough:**
+- **`classifyType` is a deterministic ladder, no LLM.** `?`-terminated → `mixed` (natural question); else a high function-word ratio or a leading lowercase connective → `vec` (prose paraphrase); else distinctive exact tokens (`Item N`, ALL-CAPS, capitalised runs, `27 percent`) or a capitalised lead → `kw`. It's cheap enough to run per query, which is the whole point — a per-query branch can't afford an LLM classifier.
+- **`preprocessOR` is the load-bearing line.** Dropping stop-words then OR-joining flips GBrain's conjunctive FTS from "every token must co-occur" (verbose queries → 0) to best-match. Without it, routing `kw → keyword` routes to a crippled arm and *loses* — the OR-preprocess is what makes the `kw` route a win (`g@C:kw` 0.500 → 1.000).
+- **The honest caveat the classifier carries:** 24/24 on the balanced set is partly because that set is built type-separable (`kw` = token-lists, `vec` = prose). Real traffic blurs the boundary, so production accuracy < 24/24 and the realized gain shrinks toward the classifier's error rate. It's a *starting* classifier, not a finished one.
 
 #### Block D — the recommended architecture (measured policy, three layers)
 
@@ -2399,7 +2518,8 @@ gbrain stats | head -3                 # Pages: 59  (44 brk + 15 entity)
 ```bash
 cat results/search_policy.json                 # "strategy": "vector" → "hybrid"
 bun src/policy_eval.ts                          # full per-domain table (idempotent re-check)
-bun src/query_policy.ts "Who is anchoring the acme-seed round?"   # routes via hybrid
+bun src/query_policy.ts "Who is anchoring the acme-seed round?"              # global policy (= hybrid on THIS corpus; auto_eval's pick)
+QUERY_ROUTER=on bun src/query_policy.ts "Item 1C Cybersecurity governance"   # per-query router → keyword (OR-preprocessed)
 ```
 
 **Verification:** `gbrain stats` shows pages 44 → 59 after Step 4; `search_policy.json` `strategy` flips `vector → hybrid`; `policy_eval` per-domain shows `entity g@5` rising from ~0 (Phase A) to 1.000 (Phase B, hybrid) while `tenk g@5` holds at 0.958. Teardown: `docker exec gbrain-pg psql -U postgres -c "DROP DATABASE gbrain_brk;"`.
@@ -2444,14 +2564,18 @@ Every Phase-9 script is parameterised by environment variables (and a couple by 
 | -------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------- |
 | `grounding.test.ts`  | unit tests for the metric             | —                                                                                                       | none                     | `bun test src/grounding.test.ts`                                                       |
 | `policy_eval.ts`     | **SELECTOR** — write the policy       | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts`                  |
-| `query_policy.ts`    | actuator — route one query            | argv `"<query>" [limit=5]`                                                                              | pg + oMLX embed          | `bun src/query_policy.ts "Who is anchoring acme-seed?" 3`                              |
+| `query_policy.ts`    | actuator — global policy **or** per-query router | argv `"<query>" [limit=5]`; **`QUERY_ROUTER`** (off→global policy · on→type-route)        | pg + oMLX embed          | global: `bun src/query_policy.ts "Who is anchoring acme-seed?" 3` · router: `QUERY_ROUTER=on bun src/query_policy.ts "Item 1C Cybersecurity" 3` |
+| `query_routing.ts`   | **ROUTER brain** — type classifier + kw OR-preprocess (shared, no main) | — (imported)                                                       | none                     | imported by `query_policy.ts` + `route_principle_ab.ts` (one canonical classifier → production == tested) |
 | `route_eval.ts`      | routing headroom + **dumps**          | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
+| `route_eval_kwpp.ts` | keyword-revival probe (raw vs OR-preprocessed) | `GOLDEN_EVAL`, `POLICY_K` (5), `POLICY_C` (3)                                                  | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts`                     |
+| `route_principle_ab.ts` | **3-way routing A/B** (grounding) — router vs global vs strengthened-global | `GOLDEN_EVAL`, `POLICY_K`/`_C`; writes `results/principle_slugs.json`        | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`                  |
 | `load_brk_corpus.py` | ingest the 10-K corpus                | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`)                                                         | pg + oMLX embed          | `uv run python src/load_brk_corpus.py`                                                 |
 | `answer_route_ab.py` | answer A/B (routing)                  | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json`          | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py`             |
+| `answer_principle_ab.py` | answer-quality A/B (3 policies, entity coverage) | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `principle_slugs.json`                            | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`         |
 | `verify_arch.py`     | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json`                                 | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py`                 |
 | `reader_ab.py`       | reader A/B (fixed retrieval)          | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py`                                    |
 
-**Data-dependency order (don't skip):** the four analysis scripts consume dumps, so retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json` → which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts` and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`).
+**Data-dependency order (don't skip):** the four analysis scripts consume dumps, so retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json` → which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts` and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`). The **routing re-test** is its own chain: `route_principle_ab.ts` → writes `results/principle_slugs.json` → read by `answer_principle_ab.py` (pin a strong generator with `CHAT_MODEL`). The per-query **router itself ships in `query_policy.ts` behind `QUERY_ROUTER` (default off)** and shares one classifier with the A/B via `query_routing.ts`, so what production routes is exactly what the A/B scored.
 
 **`reader_ab.py` model presets (no code change to switch).** `GEN`/`JUDGE` each resolve a named model to endpoint+key+model id from the `_PROFILES` registry:
 
