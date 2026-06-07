@@ -2204,12 +2204,20 @@ Phase 9 converges on a reusable shape for any self-tuning retrieval policy — s
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  ING["ingest"] -->|every ingest| SEL["SELECTOR<br/>policy_eval.ts<br/>disc. grounding@C<br/>global arm · 0-LLM<br/>C measured off agent"]
-  SEL -->|writes| POL[("search_policy.json")]
-  POL -->|steady state| ACT["actuator<br/>query_policy.ts<br/>applies policy<br/>+ opt. router"]
-  POL -.->|on policy flip| GATE["GATE<br/>answer-judge<br/>pinned strong model<br/>old arm vs new arm<br/>adopt iff no regress"]
-  SEL -.->|on domain shift| CAL["CALIBRATOR<br/>verify_arch.py<br/>corr grnd vs answer<br/>+0.719 measured"]
+  NEW["new data"] --> ING["ingest +<br/>reconcile<br/>graph self-wires"]
+  ING -->|"every ingest"| SEL["SELECTOR<br/>policy_eval.ts<br/>disc. grounding@C<br/>global arm · 0-LLM"]
+  SEL -->|"writes"| POL[("search_policy.json")]
+  POL -->|"steady state"| ACT{"actuator<br/>query_policy.ts"}
+  ACT -->|"default"| GLOB["apply global<br/>policy arm"]
+  ACT -->|"QUERY_ROUTER on"| RTR["classify query type<br/>→ per-arm route<br/>kw · vec · mixed"]
+  GLOB --> ANS["agent answer"]
+  RTR --> ANS
+  ANS -.->|"next ingest re-tunes"| NEW
+  POL -.->|"on policy flip"| GATE["GATE<br/>answer-judge<br/>old vs new arm<br/>adopt iff no regress"]
+  SEL -.->|"on domain shift"| CAL["CALIBRATOR<br/>verify_arch.py<br/>corr grnd vs answer<br/>+0.719 measured"]
 ```
+
+The **loop is the point**: every ingest re-runs the SELECTOR, which re-measures the arms and rewrites `search_policy.json` — the system re-tunes itself as the corpus grows, with no human in the loop (this is what flipped `vector → hybrid` in Phase 6 when the 10-K landed on the entity brain). The **actuator** then serves each query *either* by the single global policy arm (default) *or*, with `QUERY_ROUTER=on`, by classifying the query's type and routing per-arm (`kw → key_pp`, `vec → vector`, `mixed → hybrid`). GATE and CALIBRATOR are **event-triggered, not per-query** — the GATE answer-judge fires only when the selector *flips* the policy (adopt the new arm iff it doesn't regress), and the CALIBRATOR re-checks `corr(grounding, answer)` only on a domain shift. Both stay out of the hot path; only the 0-LLM selector and the deterministic actuator run continuously.
 
 **Verified end-to-end** on the **`tenk` subset — the 12 10-K questions that carry `pass_criteria`** (`src/verify_arch.py`, judge = Claude Opus 4.5, 3 arms × 12 Q = **36 cells**). Grounding here is the **`g@3:tenk` column** of the metric table above — *not* a new measurement — so `hybrid` reads **0.927** (the 12-Q tenk slice), which is why it differs from the 18-Q full-set `0.910` (metric table) and the balanced-set `0.823` (routing tables): **same metric, three different question sets**. The point of this table is the second column (answer pass-rate), which only exists for questions with a rubric:
 
