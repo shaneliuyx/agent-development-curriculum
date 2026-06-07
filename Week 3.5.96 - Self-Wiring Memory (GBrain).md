@@ -2206,14 +2206,14 @@ Phase 9 converges on a reusable shape for any self-tuning retrieval policy — s
 flowchart TD
   ING["ingest"] -->|every ingest| SEL["SELECTOR<br/>policy_eval.ts<br/>disc. grounding@C<br/>global arm · 0-LLM<br/>C measured off agent"]
   SEL -->|writes| POL[("search_policy.json")]
-  POL -->|steady state| ACT["actuator<br/>query_policy.ts<br/>routes agent query"]
+  POL -->|steady state| ACT["actuator<br/>query_policy.ts<br/>applies policy<br/>+ opt. router"]
   POL -.->|on policy flip| GATE["GATE<br/>answer-judge<br/>pinned strong model<br/>old arm vs new arm<br/>adopt iff no regress"]
   SEL -.->|on domain shift| CAL["CALIBRATOR<br/>verify_arch.py<br/>corr grnd vs answer<br/>+0.719 measured"]
 ```
 
-**Verified end-to-end** (`src/verify_arch.py`, judge = Claude Opus 4.5, 36 arm×question cells):
+**Verified end-to-end** on the **`tenk` subset — the 12 10-K questions that carry `pass_criteria`** (`src/verify_arch.py`, judge = Claude Opus 4.5, 3 arms × 12 Q = **36 cells**). Grounding here is the **`g@3:tenk` column** of the metric table above — *not* a new measurement — so `hybrid` reads **0.927** (the 12-Q tenk slice), which is why it differs from the 18-Q full-set `0.910` (metric table) and the balanced-set `0.823` (routing tables): **same metric, three different question sets**. The point of this table is the second column (answer pass-rate), which only exists for questions with a rubric:
 
-| arm | mean grounding@3 | answer pass-rate |
+| arm | grounding@3 (`tenk`, 12 Q) | answer pass-rate (`tenk`, 12 Q) |
 |---|---|---|
 | keyword | 0.222 | 0.167 |
 | vector | 0.816 | 0.750 |
@@ -2267,7 +2267,7 @@ export function budgetScore(coverages: number[], c: number): BudgetScore {
 }
 ```
 
-The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads); **entity-aware graph expansion in the live path** (fixes only 1/24 — judge-noise magnitude — and only *missing-neighbor* 2-hop, not distractor failures; runtime token cost is unbounded in neighbor page size; kept as a tested module, shelved — see "Decision — measured, NOT shipped"). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
+The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `route_eval_kwpp.ts` + `route_principle_ab.ts` (the keyword-revival and per-query-routing A/Bs), `answer_route_ab.py` / `answer_principle_ab.py` (answer A/Bs), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads); **entity-aware graph expansion in the live path** (fixes only 1/24 — judge-noise magnitude — and only *missing-neighbor* 2-hop, not distractor failures; runtime token cost is unbounded in neighbor page size; kept as a tested module, shelved — see "Decision — measured, NOT shipped"). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
 
 **What we DID build (gated): the per-query router.** Unlike the shelved items above, per-query routing earned its place — it is shipped in `query_policy.ts` behind `QUERY_ROUTER`, **default-off**. On a single-type corpus the oracle ceiling equals global hybrid (Δ0), so you leave it off; once the workload spans query types and the keyword arm is OR-preprocessed it **reverses to +0.039 grounding / +0.042 answer** and you switch it on. So the router is not a "don't build" — it's a "build it, gate it on the workload."
 
