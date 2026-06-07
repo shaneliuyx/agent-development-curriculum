@@ -1523,16 +1523,20 @@ uv run --with pytest python -m pytest tests/ -v
 > only the path *we* own (the agent's retrieval call) via a small wrapper. It steers
 > the agent, not the stock CLI — a GBrain surface constraint, named honestly.
 
+The loop — **measure → decide → apply**, re-fired on every ingest, so the policy tracks the corpus on its own:
+
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  GOLD[("golden_eval.json<br/>real labeled questions<br/>(fixed ruler)")] --> PE
-  ING[ingest + reconcile<br/>corpus changes] --> PE["policy_eval.ts<br/>grounding@K per arm<br/>over CURRENT corpus"]
-  PE --> DEC["decide winner<br/>grounding@K"]
-  DEC --> POL[("search_policy.json<br/>strategy + rrf_k")]
-  POL --> QP["query_policy.ts<br/>route to winning arm"]
-  QP --> ANS[agent retrieval<br/>honors the verdict]
+  GOLD[("golden_eval.json<br/>fixed real-Q ruler")] -.->|measuring stick| PE
+  ING["ingest + reconcile<br/>corpus grows/drifts"] --> PE["MEASURE<br/>policy_eval.ts<br/>score 3 arms<br/>disc. grounding@C"]
+  PE -->|"winner can flip<br/>vector→hybrid"| POL[("DECIDE<br/>search_policy.json<br/>winning arm + rrf_k")]
+  POL --> QP["APPLY<br/>query_policy.ts<br/>route agent queries"]
+  QP --> ANS["agent retrieval<br/>honors the verdict"]
+  ANS -.->|every new ingest re-fires| ING
 ```
+
+The dashed loop is the "self-tuning": new pages → re-MEASURE over the current corpus → the DECIDE step can pick a different arm than last time (Phase A→B flipped `vector → hybrid`), and APPLY routes the agent through it — no human, no code change. The golden set is the one fixed thing (the ruler); everything else moves with the corpus.
 
 #### Block A — `data/golden_eval.json`: the measuring stick
 
