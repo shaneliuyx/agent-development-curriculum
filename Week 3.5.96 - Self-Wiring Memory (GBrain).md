@@ -751,7 +751,7 @@ flowchart TD
  *
  * Run: bun src/bench_strategies.ts   (needs GBRAIN_DATABASE_URL + OLLAMA_* env)
  */
-const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
 
 const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
 const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
@@ -1592,7 +1592,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { budgetScore, coverage } from "./grounding.ts";
 
-const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
 const GOLDEN = `${import.meta.dir}/../data/golden_eval.json`;
 const POLICY = `${import.meta.dir}/../results/search_policy.json`;
 const K = Number(process.env.POLICY_K ?? "5");   // retrieval depth (hits pulled)
@@ -1872,7 +1872,7 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { type Strategy, classifyType, preprocessOR, TYPE_TO_STRATEGY } from "./query_routing.ts";
 
-const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
 const POLICY = `${import.meta.dir}/../results/search_policy.json`;
 
 const ROUTER_ON = ["1", "on", "true", "yes"].includes((process.env.QUERY_ROUTER ?? "").toLowerCase());
