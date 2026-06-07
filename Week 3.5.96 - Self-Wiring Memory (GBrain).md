@@ -1577,28 +1577,179 @@ cheap to extend as the real query distribution shifts.
 
 #### Block B — `policy_eval.ts`: score real questions, write the policy
 
-**Code (core — full source `src/policy_eval.ts`):**
+**Code (full source `src/policy_eval.ts`):**
 
 ```typescript
-// for each arm: best top-K section's coverage of the question's expected_entities
-const report = await runEval(engine, qrels, { strategy, expand: false, limit: K }, K);
-for (let i = 0; i < golden.length; i++) {
-  const hits = report.queries[i].hits.slice(0, K);
-  let best = 0;
-  for (const slug of hits)
-    best = Math.max(best, coverage(await sectionText(slug), golden[i].expected_entities));
-  perQ[strategy].push(best);                           // grounding for this question
+/**
+ * policy_eval.ts — REAL-question policy generator (the trustworthy policy source).
+ *
+ * Replaces auto_eval.ts's known-item PROXY as the thing that writes the policy.
+ * The proxy used page titles as queries and mis-selected `keyword`; real questions
+ * refuted that ~5×. So the policy must come from a real, labeled golden set.
+ *
+ * Reads data/golden_eval.json (real questions + expected_entities, domain-tagged),
+ * runs keyword/vector/hybrid over the CURRENT corpus, scores DISCOUNTED grounding
+ * over the context budget, picks the overall winner, and WRITES
+ * results/search_policy.json. Re-run after every ingest → the policy ADAPTS as the
+ * corpus drifts (new pages = distractors that can shift which arm retrieves best).
+ *
+ * Why discounted-over-budget, not the old rank-blind max-over-top-K:
+ *   The real objective is ANSWER quality, not raw retrieval. Hybrid RRF can fuse a
+ *   keyword distractor above the dense answer chunk — the answer is still "in top-K"
+ *   (rank-blind grounding unchanged) but it now reads later, or falls past the chunks
+ *   the generator is actually given. Rank-blind grounding cannot see that; it's the
+ *   exact RRF failure we care about. So we score the prompt the generator really sees:
+ *
+ *   grounding@C  = mean over questions of  max_i coverage_i · disc(i)   over top-C
+ *                  (position-weighted best coverage; primacy via disc, budget via C).
+ *                  Answer demoted by RRF → lower; answer pushed past C → 0.
+ *   answerable@C = fraction of questions where some top-C section covers ALL entities.
+ *
+ * K = retrieval depth (how many hits we pull); C = context budget (how many chunks
+ * the generator reads, C ≤ K). Set C to the production injected-chunk count so the
+ * metric measures "did the answer survive into the prompt?". The golden set is a
+ * stable measuring stick (version-controlled); keep it representative of the workload.
+ *
+ * Run: bun src/policy_eval.ts        (needs the corpus loaded + OLLAMA_* up)
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { budgetScore, coverage } from "./grounding.ts";
+
+const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+const GOLDEN = `${import.meta.dir}/../data/golden_eval.json`;
+const POLICY = `${import.meta.dir}/../results/search_policy.json`;
+const K = Number(process.env.POLICY_K ?? "5");   // retrieval depth (hits pulled)
+const C = Number(process.env.POLICY_C ?? "3");   // context budget (chunks the generator reads; C ≤ K)
+
+interface GoldenQ { q: string; expected_entities: string[]; domain: string }
+type Strategy = "keyword" | "vector" | "hybrid";
+
+if (!existsSync(GOLDEN)) {
+  console.error(`no golden set at ${GOLDEN} — run auto_eval.ts (known-item fallback) instead.`);
+  process.exit(1);
 }
-// winner = overall grounding@K (tie → answerable@K) → written to search_policy.json
+const golden: GoldenQ[] = JSON.parse(readFileSync(GOLDEN, "utf-8")).questions;
+
+// ── engine bootstrap (identical sequence to auto_eval.ts / the CLI) ─────────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { runEval } = await import(`${GB}/core/search/eval.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+const nPages = (await engine.listPages()).length;
+
+// section text cache (slug → lowercased title+body+timeline)
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+const domains = [...new Set(golden.map(g => g.domain))];
+const strategies: readonly Strategy[] = ["keyword", "vector", "hybrid"];
+
+// Per strategy, per question: discounted grounding@C (drives policy) + raw best
+// coverage in budget (feeds answerable@C). Retrieval pulls K hits; we score only the
+// C the generator actually reads, so an RRF reorder that demotes the answer — or
+// pushes it past C — is penalised. See grounding.ts for the scoring contract.
+const perQ = {} as Record<Strategy, number[]>;       // discounted grounding@C
+const perQFull = {} as Record<Strategy, number[]>;   // raw best coverage within budget
+for (const strategy of strategies) {
+  const report = await runEval(
+    engine,
+    golden.map(g => ({ query: g.q, relevant: [] as string[] })),
+    { strategy, expand: false, limit: K },
+    K,
+  );
+  const gDisc: number[] = [];
+  const gFull: number[] = [];
+  for (let i = 0; i < golden.length; i++) {
+    const topC: string[] = report.queries[i].hits.slice(0, C); // limit fetches to the budget window
+    const ents = golden[i].expected_entities;
+    const coverages = await Promise.all(topC.map(async slug => coverage(await sectionText(slug), ents)));
+    const { gDisc: d, gFull: full } = budgetScore(coverages, C);
+    gDisc.push(d);
+    gFull.push(full);
+  }
+  perQ[strategy] = gDisc;
+  perQFull[strategy] = gFull;
+}
+
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const groundingFor = (s: Strategy, domain?: string) =>
+  mean(perQ[s].filter((_, i) => !domain || golden[i].domain === domain));
+// flatFor = the OLD rank-blind metric (mean raw best-coverage in budget). Shown next
+// to the discounted score: where flat > discounted, the answer sits below rank 0 —
+// i.e. an arm (often hybrid RRF) demoted it. The gap is the penalty we added.
+const flatFor = (s: Strategy, domain?: string) =>
+  mean(perQFull[s].filter((_, i) => !domain || golden[i].domain === domain));
+const answerableFor = (s: Strategy) =>
+  mean(perQFull[s].map(v => (v === 1 ? 1 : 0)));
+
+// ── report: overall + per-domain grounding@C ────────────────────────────────
+const pad = (s: string, n: number) => s.padEnd(n);
+const f = (x: number) => x.toFixed(3);
+console.log(`policy_eval: golden set = ${golden.length} real questions ` +
+  `(${domains.map(d => `${d}:${golden.filter(g => g.domain === d).length}`).join(", ")}) ` +
+  `· corpus = ${nPages} pages · retrieval K=${K} · context budget C=${C}\n`);
+console.log(pad("strategy", 10) + pad(`grnd@${C}↓`, 12) + pad(`flat@${C}`, 11) + pad(`answ@${C}`, 11) +
+  domains.map(d => pad(`g@${C}:${d}`, 13)).join(""));
+console.log("-".repeat(44 + domains.length * 13));
+for (const s of strategies) {
+  console.log(pad(s, 10) + pad(f(groundingFor(s)), 12) + pad(f(flatFor(s)), 11) + pad(f(answerableFor(s)), 11) +
+    domains.map(d => pad(f(groundingFor(s, d)), 13)).join(""));
+}
+
+// ── decide + write policy (winner = overall discounted grounding, tie → answerable) ──
 const winner = [...strategies].sort((a, b) =>
   groundingFor(b) - groundingFor(a) || answerableFor(b) - answerableFor(a))[0];
+
+const policy = {
+  strategy: winner,
+  rrf_k: 60,
+  k: K,
+  c: C,
+  metric: "discounted_grounding@C (position-weighted best coverage over the context budget)",
+  source: "golden_eval",
+  n_questions: golden.length,
+  n_pages: nPages,
+  grounding: groundingFor(winner),
+  per_domain: Object.fromEntries(domains.map(d => [d, groundingFor(winner, d)])),
+  note: "auto-selected from data/golden_eval.json (REAL questions, discounted grounding@C: "
+    + "rank- and budget-aware, so an RRF reorder that demotes the answer is penalized). "
+    + "Read by query_policy.ts; does NOT change stock `gbrain query` (hybrid-only).",
+};
+mkdirSync(dirname(POLICY), { recursive: true });
+writeFileSync(POLICY, JSON.stringify(policy, null, 2) + "\n");
+console.log(`\napplied policy → strategy=${winner} (grnd@${C}↓=${f(groundingFor(winner))})  ` +
+  `← results/search_policy.json [source: golden_eval]`);
+
+await engine.disconnect?.();
+process.exit(0);
 ```
 
 **Walkthrough:**
-- **Grounding@K, not recall@K.** With no gold *slug*, "did retrieval surface a
-  section *containing the answer entities*" is the honest, label-cheap signal — and
-  it's what matters for the agent (can it ground an answer?).
-- **Per-domain breakdown is the diagnostic.** `g@K:tenk` vs `g@K:entity` shows
+- **Discounted grounding@C, not rank-blind grounding@K.** With no gold *slug*, "did
+  retrieval surface a section *containing the answer entities*" is the honest,
+  label-cheap signal. But the old `max`-over-top-K was **rank- and budget-blind** — it
+  scored 1.0 whether the answer sat at rank 0 or rank 4. RRF's failure mode is exactly
+  rank: fuse a keyword distractor above the dense answer and the answer reads later, or
+  falls past the `C` chunks the generator is actually handed. So we score the prompt the
+  model sees — `gDisc = max_i coverage_i · disc(i)` over the top-`C`, where
+  `disc(rank0)=1/log2(rank0+2)` rewards early placement and a section past `C` scores 0.
+  `C` is the **production injected-chunk count** (here 3, read off `ground_truth_ab.py`),
+  not a tunable — it is *measured off the agent*, never hand-picked.
+- **Per-domain breakdown is the diagnostic.** `g@C:tenk` vs `g@C:entity` shows
   *which corpus the policy is serving*, and makes drift visible — an absent domain
   scores ~0 until its data is ingested.
 - **Re-runs on every ingest.** `run_auto_eval()` prefers `policy_eval.ts` whenever
@@ -1606,6 +1757,11 @@ const winner = [...strategies].sort((a, b) =>
   corpus each time; the loop tracks drift automatically.
 
 **Result — the drift experiment (live, isolated `gbrain_brk` DB):**
+
+> The two tables below are the **original rank-blind `grounding@5`** runs (the
+> superseded metric — kept because the *drift narrative* is what they illustrate).
+> The metric was later upgraded to **budget-aware discounted grounding@C**; the
+> re-measured numbers and the C-sweep are in *Metric upgrade* below.
 
 *Phase A — corpus = 10-K only (44 pages):*
 
@@ -1635,22 +1791,169 @@ owns 10-K semantics — both arms now competitive, so RRF earns its weight (enti
 both phases: the +15 distractor pages didn't degrade 10-K retrieval; the policy
 shifted to *capture new value*, not to recover lost ground.
 
+##### Metric upgrade — budget-aware discounted grounding@C (2026-06-06)
+
+Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-bearing
+section *anywhere* in the top-K, even when RRF has demoted it below the chunks the
+generator reads. Replaced with **discounted grounding@C** (`src/grounding.ts`,
+`budgetScore`): position-weighted best coverage over the context budget `C` (= the
+agent's real injected-chunk count, **3**, from `ground_truth_ab.py:110`). Re-measured on
+the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
+
+| arm | grnd@3↓ | flat@3 (old) | demotion tax | g@3:tenk | g@3:entity |
+|---|---|---|---|---|---|
+| keyword | 0.287 | 0.306 | 0.019 | 0.222 | 0.417 |
+| vector | 0.809 | 0.870 | 0.061 | 0.816 | 0.794 |
+| **hybrid** | **0.910** | 0.972 | 0.062 | 0.927 | 0.877 |
+
+`flat@C` is the old rank-blind metric; the **demotion tax** (`flat − grnd↓`) is the
+answer mass RRF pushes below rank 0. Hybrid pays the most (0.062) yet still wins — its
+flat lead is wide enough to absorb the penalty (both arms competitive → fusion genuinely
+helps). The upgrade **validated** the `vector→hybrid` verdict on answer-quality grounds
+*and* priced RRF's reorder cost, instead of rubber-stamping it rank-blind.
+
+**C-sensitivity sweep** (same corpus) — the verdict is stable, no cliff:
+
+| C | winner | vector↓ | hybrid↓ | hybrid flat | vector flat |
+|---|---|---|---|---|---|
+| 1 | hybrid | 0.759 | 0.861 | 0.861 | 0.759 |
+| 2 | hybrid | 0.802 | 0.903 | 0.944 | 0.843 |
+| 3 | hybrid | 0.809 | 0.910 | 0.972 | 0.870 |
+| 5 | hybrid | 0.832 | 0.910 | 0.972 | **0.972** |
+
+The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 =
+0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.832`)
+— vector hides ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the
+generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the
+cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's
+context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`),
+then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips
+between adjacent C, pin the exact production number.
+
+##### Per-query routing — tested and rejected (2026-06-06)
+
+The policy picks ONE arm for the whole corpus. Natural next question: the best arm is
+query-dependent (proper-noun lookups favour keyword/hybrid, semantic factoids favour
+vector), so should we route *each query* to its own best arm? Built `src/route_eval.ts`
+to measure it — three routers scored with the same discounted grounding@C:
+- **global** — every query → the corpus winner (`hybrid`). The baseline.
+- **heuristic** — a zero-LLM classifier (proper-noun-heavy short query → keyword, else hybrid).
+- **oracle** — every query → its own best arm. The *ceiling*; unattainable in production
+  (it peeks at the labels) but it bounds how much routing can ever help.
+
+**Build the ceiling before the classifier.** On the 67-page mixed brain:
+
+| router | grounding@3 | Δ vs global |
+|---|---|---|
+| global (hybrid) | 0.910 | — |
+| heuristic | 0.736 | −0.174 |
+| **oracle (ceiling)** | **0.910** | **+0.000** |
+
+The oracle *equals* global hybrid — **hybrid weakly dominates every one of the 18
+questions**, so per-query routing has zero grounding headroom, and a real cheap classifier
+only loses (it mis-routes semantic questions to the weak keyword arm). One free number
+(the oracle) killed the whole feature before any classifier was tuned.
+
+**Answer-quality check — and a generation confound caught in the act.** Grounding takes
+the *max* coverage over the top-C, so it's blind to whether the *other* in-budget chunks
+are distractors. So we judged the answers too (`src/answer_route_ab.py`): generate from the
+global-hybrid context vs the routed context, LLM-judge against each question's
+`pass_criteria`. Run on **two generator tiers**:
+
+| generator | global pass | routed pass | Δ | on differing-context Qs |
+|---|---|---|---|---|
+| local 14B (Qwen-Coder) | 1.000 | 0.750 | −0.250 | 1.000 → 0.500 |
+| **Claude Opus 4.5** | 0.917 | 0.917 | **+0.000** | 0.800 → 0.800 |
+
+The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the
+questions whose context differed. The regression was the **generator's** context-composition
+sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied)
+context; a capable one extracts the answer regardless. This is the *confounding* trap named
+in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in
+generation variance; pin the generator (here: a strong model) before attributing a delta to
+retrieval. **Verdict: keep the single global hybrid policy.** Routing adds a classifier, a
+per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a
+weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B:
+`uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.)
+
 #### Block C — `query_policy.ts`: the actuator
 
-**Code (full — `src/query_policy.ts`):**
+**Code (full source `src/query_policy.ts`):**
 
 ```typescript
-let strategy: Strategy = "hybrid"; let rrfK = 60;           // fallback = GBrain's default
+/**
+ * query_policy.ts — the APPLY/actuator half of the auto-eval loop.
+ *
+ * Stock `gbrain query` is hybrid-only (Phase 6 trap), so it cannot honor a
+ * corpus-selected strategy. This helper does: it reads the policy artifact
+ * `results/search_policy.json` (written by auto_eval.ts after it measures the
+ * current corpus) and routes the query to the WINNING engine path —
+ * keyword / vector / hybrid — instead of bare hybrid. That closes the loop:
+ *
+ *   ingest → reconcile → auto_eval (measure+decide+write policy) → THIS (apply)
+ *
+ * The agent calls this for its retrieval; the per-corpus verdict steers it.
+ *
+ * Fallback: if no policy file exists yet, default to hybrid (GBrain's own default).
+ * Usage: bun src/query_policy.ts "<query text>" [limit]
+ */
+import { existsSync, readFileSync } from "node:fs";
+
+const GB = "/Users/yuxinliu/code/agent-prep/gbrain/src";
+const POLICY = `${import.meta.dir}/../results/search_policy.json`;
+
+type Strategy = "keyword" | "vector" | "hybrid";
+
+const query = process.argv[2];
+if (!query) {
+  console.error('usage: bun src/query_policy.ts "<query text>" [limit]');
+  process.exit(1);
+}
+const limit = Number(process.argv[3] ?? "5");
+
+// ── load the corpus-selected policy (fallback: hybrid) ──────────────────────
+let strategy: Strategy = "hybrid";
+let rrfK = 60;
+let source = "default (no policy file yet)";
 if (existsSync(POLICY)) {
   const p = JSON.parse(readFileSync(POLICY, "utf-8"));
-  if (["keyword","vector","hybrid"].includes(p.strategy)) strategy = p.strategy;
+  if (p.strategy === "keyword" || p.strategy === "vector" || p.strategy === "hybrid") {
+    strategy = p.strategy;
+  }
   if (typeof p.rrf_k === "number") rrfK = p.rrf_k;
+  source = `results/search_policy.json (n_pages=${p.n_pages}, recall=${p.recall})`;
 }
+
+// ── bootstrap engine (identical sequence to auto_eval.ts / the CLI) ──────────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { embed } = await import(`${GB}/core/embedding.ts`);
+const { hybridSearch } = await import(`${GB}/core/search/hybrid.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+// ── route to the policy-selected strategy ───────────────────────────────────
 async function search(): Promise<{ slug: string }[]> {
   if (strategy === "keyword") return engine.searchKeyword(query, { limit });
-  if (strategy === "vector")  return engine.searchVector(await embed(query), { limit });
-  return hybridSearch(engine, query, { limit, expansion: false, rrfK });   // hybrid
+  if (strategy === "vector") return engine.searchVector(await embed(query), { limit });
+  return hybridSearch(engine, query, { limit, expansion: false, rrfK });
 }
+
+const results = await search();
+const knob = strategy === "hybrid" ? ` rrf_k=${rrfK}` : "";
+console.log(`policy: strategy=${strategy}${knob}  ←  ${source}`);
+console.log(`query: ${JSON.stringify(query)}  (limit=${limit})`);
+for (const [i, r] of results.entries()) console.log(`  ${i + 1}. ${r.slug}`);
+
+await engine.disconnect?.();
+process.exit(0);
 ```
 
 **Walkthrough:**
@@ -1661,6 +1964,197 @@ async function search(): Promise<{ slug: string }[]> {
   so the wrapper degrades to stock behavior rather than erroring. The vector arm
   must `embed()` the query at run-time, which needs the same gateway bootstrap as the
   eval (`hybrid.ts:975` silently no-ops without it).
+
+#### Block D — the recommended architecture (measured policy, three layers)
+
+Phase 9 converges on a reusable shape for any self-tuning retrieval policy — see
+`[[Engineering Decision Patterns#Pattern 37 — Measured Search-Policy Architecture (selector / gate / calibrator; score the prompt, not the retrieval)|Pattern 37]]`. Three layers, and little else:
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  ING["ingest"] -->|every ingest| SEL["SELECTOR<br/>policy_eval.ts<br/>disc. grounding@C<br/>global arm · 0-LLM<br/>C measured off agent"]
+  SEL -->|writes| POL[("search_policy.json")]
+  POL -->|steady state| ACT["actuator<br/>query_policy.ts<br/>routes agent query"]
+  POL -.->|on policy flip| GATE["GATE<br/>answer-judge<br/>pinned strong model<br/>old arm vs new arm<br/>adopt iff no regress"]
+  SEL -.->|on domain shift| CAL["CALIBRATOR<br/>verify_arch.py<br/>corr grnd vs answer<br/>+0.719 measured"]
+```
+
+**Verified end-to-end** (`src/verify_arch.py`, judge = Claude Opus 4.5, 36 arm×question cells):
+
+| arm | mean grounding@3 | answer pass-rate |
+|---|---|---|
+| keyword | 0.222 | 0.167 |
+| vector | 0.816 | 0.750 |
+| **hybrid** | **0.927** | **0.917** |
+
+- **Calibrator** — `corr(discounted grounding@C, answer-pass) = +0.719`. The cheap,
+  deterministic metric strongly predicts the expensive answer-judge, so the SELECTOR earns
+  its place in the every-ingest hot loop *without* an LLM. This is the assumption the whole
+  architecture rests on, measured rather than asserted.
+- **Selector validity** — the max-grounding arm (`hybrid`) is also the answer-quality winner,
+  and the ordering `keyword < vector < hybrid` holds on **both** axes → CONFIRMED.
+- **The residual (r=0.719, not 1.0) is instructive** — e.g. *"Where are the Notes to
+  Consolidated Financial Statements"* grounds at **1.000 on all three arms yet every answer
+  FAILS**: the section was retrieved but the generator couldn't turn it into a correct
+  answer. That gap is exactly the Stage-2 (generation) bottleneck the W2.7 comparison names
+  below — grounding predicts answers well, but the answer step is separate and harder.
+
+**The load-bearing primitive — complete source** (`src/grounding.ts`, pure + unit-tested):
+
+```typescript
+/**
+ * grounding.ts — pure scoring primitives for the policy eval (no I/O, unit-testable).
+ *
+ * The policy's objective is ANSWER quality, not raw retrieval. The generator reads
+ * only the top-C chunks, in order — so the metric scores the prompt it actually sees:
+ * position-weighted best coverage over the context budget. An RRF reorder that demotes
+ * the answer chunk, or pushes it past C, lowers the score; the old rank-blind
+ * max-over-top-K could not see either.
+ */
+
+/** Substring coverage of a section's (lowercased) text against expected entities, ∈ [0,1]. */
+export const coverage = (lowercasedText: string, ents: string[]): number =>
+  ents.length ? ents.filter(e => lowercasedText.includes(e.toLowerCase())).length / ents.length : 0;
+
+/** Position discount: rank-0 = 1.0, decaying with depth. disc(0)=1, disc(1)=0.63, disc(2)=0.5. */
+export const disc = (rank0: number): number => 1 / Math.log2(rank0 + 2);
+
+export interface BudgetScore {
+  /** max_i coverage_i · disc(i) over the top-C window — drives the policy. */
+  gDisc: number;
+  /** max_i coverage_i over the top-C window — raw best coverage (feeds answerable@C). */
+  gFull: number;
+}
+
+/**
+ * Score one question from the per-rank coverage of its retrieved hits.
+ * `coverages` is coverage at each retrieved rank (length ≤ K); only the first `c`
+ * (the context budget) are read — anything past C contributes nothing, modelling
+ * "the answer fell out of the prompt".
+ */
+export function budgetScore(coverages: number[], c: number): BudgetScore {
+  let gDisc = 0;
+  let gFull = 0;
+  for (let r = 0; r < Math.min(coverages.length, c); r++) {
+    gDisc = Math.max(gDisc, coverages[r] * disc(r));
+    gFull = Math.max(gFull, coverages[r]);
+  }
+  return { gDisc, gFull };
+}
+```
+
+The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the
+policy), `route_eval.ts` (routing headroom + per-arm dump), `answer_route_ab.py` (answer
+A/B across generator tiers), `verify_arch.py` (calibrator + selector audit). **What NOT to
+build** (each measured into the ground this phase): an LLM judge in the every-ingest selector
+(confounds retrieval choice with generation variance, *and* meters the loop); per-query
+routing (oracle ceiling = global hybrid, Δ0); a rank-blind metric (can't see RRF demotion);
+a hand-picked `C` (scores a context the model never reads). Most of the win was **deletion** —
+the final system is simpler than the naïve one *and* better, because each cut piece failed a
+measurement.
+
+#### Block E — the reader is the lever, measured (2026-06-07)
+
+Retrieval is solved here (hybrid grounding ~0.93); the open question is the *generation*
+step — W2.7's 0.96 grounding → 0.25 answer gap, and the "Notes" question that grounds 1.000
+yet answers 0/3. So we fixed retrieval (always the winning arm = hybrid, **full `gbrain get`
+bodies**) and A/B'd the READER STRATEGY against the golden `pass_criteria` (`src/reader_ab.py`;
+gen = the reader under test, judge = a fixed strong grader so the verdict isn't self-graded):
+
+**Two generator tiers, judge = Opus 4.5, fixed hybrid context:**
+
+| reader strategy | Haiku 4.5 (full ctx) | local 14B (ctx-capped) |
+|---|---|---|
+| **plain** ("answer from the notes") | **0.917** | **0.500** |
+| authoritative (notes are ground truth) | 0.917 (+0.000) | 0.417 (−0.083) |
+| extract-then-answer | 0.417 (−0.500) | 0.083 (−0.417) |
+| cite (source per claim) | 0.917 (+0.000) | 0.417 (−0.083) |
+
+The four readers differ ONLY in the prompt wrapped around the same `{ctx}` (full hybrid
+bodies) and `{q}` (the question) — verbatim from `src/reader_ab.py`:
+
+```text
+plain:
+  "Using ONLY the notes below, answer the question. If a fact is not in the notes, say you don't have it.
+
+   NOTES:
+   {ctx}
+
+   QUESTION: {q}"
+
+authoritative:
+  "The NOTES below are AUTHORITATIVE ground truth — trust them, never contradict them,
+   do not re-derive or re-fetch. Answer concisely from the notes. If the answer is not
+   in the notes, say 'insufficient context'.
+
+   NOTES (authoritative):
+   {ctx}
+
+   QUESTION: {q}"
+
+cite:
+  <the authoritative prompt above>
+  + "\n\nCite the source section in [brackets] for each factual claim."
+
+extract-then-answer  (TWO LLM calls):
+  step 1 — extract:
+    "From the notes below, copy VERBATIM the sentence(s) that contain the answer to the
+     question. If none do, reply exactly NONE.
+
+     NOTES:
+     {ctx}
+
+     QUESTION: {q}"
+  step 2 — answer from the extracted spans:
+    "These extracted facts are AUTHORITATIVE. Answer the question concisely from them;
+     if they are insufficient, say 'insufficient context'.
+
+     FACTS:
+     {spans}      ← step-1 output
+
+     QUESTION: {q}"
+
+judge  (fixed, Opus 4.5 — grades every reader's answer identically):
+  "You are grading a candidate answer against a rubric. Reply with EXACTLY one word:
+   PASS or FAIL.
+
+   RUBRIC (what makes the answer correct):
+   {criteria}    ← the question's pass_criteria from eval_ground_truth.json
+
+   CANDIDATE ANSWER:
+   {answer}
+
+   Verdict (PASS or FAIL):"
+```
+
+**`plain` wins on both tiers; no prompt technique beats it, and `extract`-then-answer regresses
+hard on both.** Four reads:
+- **No headroom on a capable model.** Haiku ceilings at 0.917, *identical to Opus* — the model
+  + good context already answer 11/12, so there is nothing for a prompt technique to add. The
+  quality came from *assembly + capability* (hybrid + full bodies + a capable model), not
+  wording — 0.917 vs W2.7's 0.25 on the same 10-K is that pipeline, not a clever prompt.
+- **Technique does NOT substitute for capability.** The weak 14B just scores lower (0.500), and
+  the "smart" framings (`authoritative`/`cite`) even slightly *hurt* (−0.083) while plain stays
+  best. You can't prompt a weak model up to a strong one's answers.
+- **`extract` is a lossy two-step** on both tiers (−0.500 Haiku, −0.417 14B): extracting "the
+  answer-bearing sentence" first lets the model drop/mangle the span, so the answer step gets
+  *worse* material than the full context. Added a step, added a failure point (Pattern 30).
+- **The "Notes" question fails on every reader and every model** — grounded 1.000, but its answer
+  ("Item 8") isn't stated in answerable form in the retrieved sections. **No reader technique
+  fixes a question whose answer isn't derivable from the injected context** — a retrieval/
+  decomposition problem, not a reader one.
+
+**A capacity finding fell out of it.** The *first* 14B attempt (full bodies, no cap) **crashed
+the oMLX server after one question**: a single question's five generations over the ~70K-token
+full-body context exhausted it. Full-body reading of large sections demands a large-context
+model; bounding the context (`MAX_BODY_CHARS=8000 GEN=14b uv run python src/reader_ab.py`) let
+it run, at the cost of truncating sections (hence the lower 14B absolute rates). The
+snippet-regression guard (`build_context`) confirmed full bodies throughout
+(`body chars=[36252, 54411, 190984]`).
+
+**Verdict:** keep the `plain` reader; spend reader effort on **assembly** (full bodies, tight `C`,
+a capable large-context model), not prompt elaboration — the gains live upstream of the prompt.
 
 #### Comparison to W2.7 (same 10-K, different axis)
 
@@ -1769,6 +2263,95 @@ prefers the golden eval, falling back to the known-item `src/auto_eval.ts` only 
 cold start (when no golden set exists). Tests: `tests/auto_eval.test.ts` (15),
 `tests/test_load_brk_corpus.py` (7); regression gate **24 pytest + 15 bun** green.
 Policy artifact `results/search_policy.json`; full numbers in `RESULTS.md`.
+
+#### Running reference — scripts, env, parameters
+
+Every Phase-9 script is parameterised by environment variables (and a couple by argv).
+This is the canonical "how do I run it" table — what each needs, and in what order.
+
+**Services + shell (run all commands from `~/code/agent-prep/lab-03-5-96-gbrain/`):**
+- **`gbrain-pg`** — Postgres+pgvector container. `GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain`.
+- **oMLX `:8000`** — local MLX server. Serves **embeddings** (`OLLAMA_BASE_URL`/`OLLAMA_API_KEY`) for the vector/hybrid arms, AND the local **14B chat** model.
+- **VibeProxy `:8317`** — OpenAI-compatible proxy to **cloud Claude** (`OPENROUTER_BASE_URL`/`OPENROUTER_API_KEY=vibeproxy`); used as the answer generator / judge.
+- Load the lab `.env` (`set -a; . ./.env; set +a`) and put `~/.bun/bin` on `PATH`. `.env` holds `GBRAIN_DATABASE_URL`, `OLLAMA_*`, `LLM_*` (oMLX key + local chat model), `OPENROUTER_*`.
+
+| script | role | params / env (default) | services | run |
+|---|---|---|---|---|
+| `grounding.test.ts` | unit tests for the metric | — | none | `bun test src/grounding.test.ts` |
+| `policy_eval.ts` | **SELECTOR** — write the policy | `POLICY_K` (5), `POLICY_C` (3) | pg + oMLX embed | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts` |
+| `query_policy.ts` | actuator — route one query | argv `"<query>" [limit=5]` | pg + oMLX embed | `bun src/query_policy.ts "Who is anchoring acme-seed?" 3` |
+| `route_eval.ts` | routing headroom + **dumps** | `POLICY_K` (5), `POLICY_C` (3) | pg + oMLX embed | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
+| `load_brk_corpus.py` | ingest the 10-K corpus | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`) | pg + oMLX embed | `uv run python src/load_brk_corpus.py` |
+| `answer_route_ab.py` | answer A/B (routing) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py` |
+| `verify_arch.py` | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py` |
+| `reader_ab.py` | reader A/B (fixed retrieval) | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py` |
+
+**Data-dependency order (don't skip):** the four analysis scripts consume dumps, so
+retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json`
+→ which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts`
+and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms
+embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX
+embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`).
+
+**`reader_ab.py` model presets (no code change to switch).** `GEN`/`JUDGE` each resolve a
+named model to endpoint+key+model id from the `_PROFILES` registry:
+
+| preset | endpoint | model |
+|---|---|---|
+| `haiku` | VibeProxy `:8317` | `claude-haiku-4-5-20251001` |
+| `opus` | VibeProxy `:8317` | `claude-opus-4-5-20251101` |
+| `14b` / `qwen` | oMLX `:8000` | `Qwen2.5-Coder-14B-Instruct-MLX-4bit` |
+
+Add a model = one line in `_PROFILES`. Raw escape hatch: set `<ROLE>_MODEL` (+ optional
+`<ROLE>_BASE_URL` / `<ROLE>_API_KEY`) to bypass the registry, e.g.
+`GEN_MODEL=… GEN_BASE_URL=… uv run python src/reader_ab.py`. `MAX_BODY_CHARS` (default 0 =
+full bodies) caps each injected body for a small-context generator like the local 14B.
+
+#### Metric & column glossary
+
+Every term that appears in a Phase-9 table, in one place.
+
+**Building blocks**
+- **coverage** — for one section, the fraction of a question's `expected_entities` that
+  appear as substrings in its text, ∈ [0,1]. The atom every grounding metric is built from.
+- **arm** — the retrieval strategy under test: **keyword** (FTS / BM25-style exact match),
+  **vector** (dense embedding similarity), **hybrid** (RRF fusion of keyword + vector).
+- **C (context budget)** — how many top-ranked chunks the generator actually reads (here **3**,
+  measured off the agent). **K (retrieval depth)** — how many hits retrieval pulls (here 5); C ≤ K.
+- **disc(rank)** — position discount `1/log2(rank+2)`: rank-0 = 1.00, rank-1 = 0.63, rank-2 = 0.50.
+
+**Domains** (the golden set is domain-tagged)
+- **tenk** — the 12 Berkshire 10-K questions (factoid / synthesis / citation).
+- **entity** — the 6 proper-noun questions from the W3.5.96 fixtures (Sam Okafor, Lin Zhao, …).
+
+**Retrieval-grounding metrics**
+- **grounding@5 / g@5 tenk / g@5 entity** *(original, rank-blind — superseded)* — mean over
+  questions of the **best** top-5 section's coverage; `g@5 <domain>` is the same averaged over
+  only that domain's questions. Asks "did retrieval surface an answer-bearing section *anywhere*
+  in top-5?" — blind to rank and to the context budget.
+- **discounted grounding@C / grnd@C↓ / g@C:tenk / g@C:entity** *(current)* — per question,
+  `max over the top-C of (coverage_i · disc(i))`. Rewards an answer-bearing section that is BOTH
+  high-ranked AND inside the C chunks the generator reads; a section RRF demoted, or pushed past
+  C, scores lower or 0. `g@C:<domain>` = the same averaged over one domain. The `↓` marks "discounted".
+- **flat@C (old)** — the rank-blind metric shown alongside for contrast: mean **raw** best-coverage
+  over the top-C, no position discount. Where `flat > grnd↓`, the answer sits below rank 0.
+- **demotion tax** — `flat@C − grnd@C↓`. The answer-mass an arm (usually hybrid RRF) pushes below
+  rank 0; the cost of fusion's reordering.
+- **answerable@C** — fraction of questions where some top-C section covers ALL expected entities
+  (the tie-breaker when grounding ties).
+
+**Answer-quality metrics** (`verify_arch.py`, `reader_ab.py`)
+- **mean grounding@3** — per-arm average of the cheap discounted grounding@C=3 metric.
+- **answer pass-rate** — fraction of generated answers a strong LLM judge marks **PASS** against
+  the question's `pass_criteria`. The real objective; grounding is its cheap surrogate (corr +0.719).
+
+**Reader strategies** (`reader_ab.py` — same retrieval, different prompt)
+- **plain** — "Using only the notes, answer; if a fact isn't there, say you don't have it." Baseline.
+- **authoritative** — frames the notes as AUTHORITATIVE ground truth: trust them, don't re-derive,
+  don't re-fetch, don't hedge (the memory-os pattern).
+- **extract-then-answer** — two steps: first copy the answer-bearing sentence(s) verbatim, then
+  answer from that extraction. Decouples "find the fact" from "compose the answer".
+- **cite** — authoritative + require a `[bracketed]` source citation for each factual claim.
 
 ## 6. Bad-Case Journal (real, observed)
 

@@ -1,7 +1,7 @@
 ---
 tags: [agent-curriculum, meta-skills, decision-making, working-with-ai, multi-agent, delegation]
 created: 2026-04-28
-updated: 2026-06-03
+updated: 2026-06-06
 ---
 
 # Agent Development Patterns — Memory · Retrieval · Multi-Agent · Eval · LLM-Ops
@@ -278,6 +278,29 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 - Pattern 28 — Memory-Tier Graduation Triggers + Null-Result Discipline (graduation/eviction are the two ends of the same bounded-store lifecycle)
 - [[Week 3.5.95 - Self-Observability Memory#Phase 7 — Bounding the store: heat-scored eviction|W3.5.95 Phase 7]] — the heat/eviction mechanism + the `recall(track=)` wiring (BAI-LAB/MemoryOS leverage)
 
+### Pattern 37 — Measured Search-Policy Architecture (selector / gate / calibrator; score the prompt, not the retrieval)
+
+**Rule.** A self-tuning retrieval policy needs exactly **three layers**, and almost nothing else: a **cheap deterministic SELECTOR** that runs every ingest, a **rare expensive GATE** that runs only on a policy change, and an **offline CALIBRATOR** that proves the selector's cheap metric still tracks the real objective. Build the simplest version that the evidence supports; every richer thing must *measure* its way in. **W3.5.96 (mixed 67-page brain, golden eval):** SELECTOR = discounted grounding@C over keyword/vector/hybrid → one global arm per *corpus*, re-fired on ingest; GATE = answer-judge (pinned strong model) on a flip; CALIBRATOR = corr(metric, answer-pass) on a snapshot.
+
+**Sub-rule A — Score the prompt, not the retrieval.** The selector metric must use the cutoff `C` = the chunks the generator actually reads, and discount by rank — not an arbitrary top-K. **W3.5.96: rank-blind grounding@5 *tied* vector and hybrid (0.972=0.972, decided by sort order); budget-aware discounted grounding@3 separated them (0.910 > 0.832) because vector hid ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the generator never sees.** `C` is *measured off the agent's context-assembly* (here `limit=3`), never hand-tuned; sweep `C∈{1,2,3,5}` to confirm the verdict isn't on a cliff.
+
+**Sub-rule B — Cheap in the hot loop, expensive at the edges.** The deterministic metric runs every ingest (zero-LLM, free); the answer-judge GATE fires only when the policy flips. **Cost: an answer-judge *selector* = `6G` LLM calls every ingest forever; the *gate* = `4G·P(flip)` → ~15× cheaper early, →0 as the policy converges.** Same metric, opposite placement, completely different cost curve — and the gate's cost falls exactly as the system matures and risk drops.
+
+**Sub-rule C — Build the ceiling before the classifier.** Before engineering any router/reranker/sub-agent, compute its *unattainable* upper bound against the baseline. **W3.5.96: the per-query routing oracle (peeks at labels) equalled global hybrid in one free number (0.910 = 0.910) — killing per-query routing before any classifier was tuned.** If the perfect-play ceiling doesn't clear the baseline, no engineering will. (See Pattern 27 — both router and ensemble can lose to the best single backend.)
+
+**Sub-rule D — Pin the generator before attributing a delta to retrieval.** Scoring a retrieval choice by answer quality mixes in generation variance. **W3.5.96: per-query routing showed −0.250 answer-pass on a local 14B, but Δ0 on Claude Opus 4.5 — identical even on the differing-context questions. The "regression" was the weak generator's context-composition sensitivity, not retrieval.** Run a **two-tier judge (weak + strong)**; the *gap between them* localizes whether an effect is retrieval or generation. (This is Pattern 29 — the instrument shapes the result — applied to the generator.)
+
+**Anti-pattern.** Putting an LLM answer-judge in the every-ingest hot loop (confounds retrieval choice with generation variance *and* meters the loop); per-query routing built without a ceiling check (complexity for Δ0); a rank-blind grounding metric (structurally can't see RRF demotion); a hand-picked `C` (scores a context the model never reads); trusting a single weak generator (manufactures phantom retrieval effects). Most of the win here was **deletion** — the final system is simpler than the naive one *and* better, because each cut piece failed a measurement.
+
+**Conditionality.** The architecture is corpus-agnostic; the *verdict* ("global hybrid wins, routing rejected") is not. Re-fire the selector on drift (built-in), re-run the calibrator on domain shift, and re-check the routing oracle if a future corpus is genuinely bimodal (e.g. a code corpus + a prose corpus where one arm is useless on half the queries). The loop signals when its own assumptions break.
+
+**See also:**
+- Pattern 27 — Router Selects, Ensemble Unions; both can LOSE to the best single backend (the ceiling-first check operationalizes this)
+- Pattern 29 — Eval Integrity (the instrument shapes the result) — Sub-rule D is this applied to the generator
+- Pattern 30 — New Complexity Must A/B-Earn Its Keep — routing failed exactly this test
+- Pattern 33 — Route the READ assembly by question type; select, don't union — W3.5.96 *tested* per-query routing and rejected it on this corpus (Pattern 33's conditionality made concrete)
+- [[Week 3.5.96 - Self-Wiring Memory (GBrain)#Phase 9 — A corpus-adaptive search policy, tuned on a real golden eval set|W3.5.96 Phase 9]] — selector (`policy_eval.ts`), routing test (`route_eval.ts`), answer A/B (`answer_route_ab.py`), verifier (`verify_arch.py`)
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
@@ -298,6 +321,7 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 | 33 — Route the READ Assembly by Question Type | Building a multi-shape memory reader | One universal reader prompt; routing storage but not the read assembly |
 | 34 — Evidence-Before-Belief Extraction | Choosing what to keep/drop at write | Discarding turns/roles at write — unrecoverable, breaks the axis whose answer lived there |
 | 35 — Abstention Is Topic-Presence, Not Groundedness | Making a reader refuse unanswerable questions | Catastrophic over-refusal from a grounding gate; tuning strictness instead of reframing |
+| 37 — Measured Search-Policy Architecture | Building a self-tuning retrieval policy / eval loop | LLM-judge in the hot loop; routing without a ceiling check; rank-blind metric; hand-picked C; phantom retrieval deltas from a weak generator |
 
 These patterns compound. The teams (or solo engineers) who use them feel "calm and deliberate" to work with; the ones who don't feel "frantic and surprising." The difference isn't IQ or experience — it's the discipline of slowing down at the right 5-10% of moments.
 
