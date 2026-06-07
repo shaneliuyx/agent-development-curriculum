@@ -1748,7 +1748,19 @@ process.exit(0);
 
 ##### Metric upgrade — budget-aware discounted grounding@C (2026-06-06)
 
-Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-bearing section *anywhere* in the top-K, even when RRF has demoted it below the chunks the generator reads. Replaced with **discounted grounding@C** (`src/grounding.ts`, `budgetScore`): position-weighted best coverage over the context budget `C` (= the agent's real injected-chunk count, **3**, from `ground_truth_ab.py:110`). Re-measured on the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
+**The setup.** Retrieval returns `K` candidates, ranked by score. The generator reads only the top-`C` (= **3**, the agent's real injected-chunk count, from `ground_truth_ab.py:110`) that you actually paste into the prompt — and it weights earlier chunks more heavily. So the metric we tune the policy on must score *the prompt the generator sees*, in order, not the raw retrieval list.
+
+**Rank-blind grounding (`flat@C`, the old metric)** asks only "is the answer *anywhere* in the top-`C`?" — `max` coverage over the window, **ignoring position**. An answer chunk at rank 0 and one at rank 2 both score 1.0. The problem: RRF fusion (hybrid) can **reorder** — it can take an answer chunk that one arm ranked at position 0 and *demote* it to position 2, or push it past `C` entirely. Rank-blind can't see that; it still says "answer in budget, score 1.0" even though the generator now sees it buried (or never sees it).
+
+**Discounted grounding@C (`grnd@C↓`, the new metric)** is position-weighted: `coverage(rank r) × disc(r)`, where `disc(0)=1.0`, `disc(1)=0.63`, `disc(2)=0.5` (the `1/log₂(r+2)` curve in `grounding.ts`). The *same* answer scores **1.0 at rank 0** but only **0.5 at rank 2** — the metric now *feels* where the answer sits in the budget.
+
+**The demotion tax = `flat − grnd↓`** is exactly how much answer mass got pushed below rank 0 within the budget — *the lie the rank-blind metric was telling*. Answer always at rank 0 → tax 0 (the two metrics agree, the upgrade would be pointless). Answer demoted to rank 2 → `flat` 1.0 but discounted 0.5 → tax 0.5. The tax makes RRF's reorder cost a *visible number* instead of a hidden one.
+
+**Why this matters for the design.** The metric's whole job is to **predict answer quality cheaply** so the SELECTOR can run on every ingest *without* an LLM (see Block D). A demotion-blind metric mis-predicts: it credits "hybrid grounds 1.0" when hybrid's RRF demoted the answer to rank 2 and the generator then fumbled it. The discounted metric catches that demotion → tracks answer quality better → correlates with the answer-judge more strongly (`r = +0.820`, Block D) → the 0-LLM selector is *justified*. A rank-blind metric, by contrast, would have a *lower* correlation, because it over-credits demoted answers the generator never uses.
+
+**Why vector's tax *growing* reinforces the choice — not threatens it.** The discounted-over-rank-blind decision is only worth making if the demotion tax is **non-zero in the data**; if every answer sat at rank 0 the two metrics would agree and the upgrade would be ceremony. In the measured table below, **vector** carries the biggest tax (**0.090**) — its best chunk often lands at rank 1–2, not 0 — so a rank-blind metric would miss that entire 0.090 and over-credit vector. The sharpest case is the **C-sweep at C=5**: vector's `flat` *ties* hybrid (`0.972 = 0.972`), so rank-blind would call them **equal and the selector could pick wrong** — but discounted separates them (`hybrid 0.910 > vector 0.836`) because vector hides ~14% of its answer mass at ranks 4–5 the generator never reads. Bigger tax = the rank-blind metric lies more = *stronger* case for the discounted one. (The mid-session corpus drift that nudged vector's tax up from 0.061 to 0.090 therefore didn't threaten the decision — it produced *more* evidence rank-blind is inadequate.)
+
+Re-measured on the live **mixed brain (67 pages, 10-K re-ingested over the entity corpus)**:
 
 | arm | grnd@3↓ | flat@3 (old) | demotion tax | g@3:tenk | g@3:entity |
 |---|---|---|---|---|---|
