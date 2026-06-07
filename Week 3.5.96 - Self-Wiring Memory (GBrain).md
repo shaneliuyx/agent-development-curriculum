@@ -2082,6 +2082,247 @@ The single structural failure flipped to pass, **zero regressions** on the other
 > - `load_brk_corpus.py` (the tree→GBrain join), `eval_brk16.py` (the 16-question harness) — **this lab**, `~/code/agent-prep/lab-03-5-96-gbrain/src/`.
 > - `eval_ground_truth.json` (the 16 questions + `pass_criteria`) — `lab-02-7-pageindex/data/`.
 
+**Code — the tree→GBrain join (full source `src/load_brk_corpus.py`):** the `flatten_tree` +
+title-join + `**Location:**` breadcrumb is the combined-solution core.
+
+```python
+"""W3.5.96 Path B — load the W2.7 Berkshire 10-K corpus into GBrain as a richer,
+EXACT-TERM-HEAVY test corpus for the auto-eval harness.
+
+WHY this corpus: the 19-page entity brain is semantic-heavy, so pure vector wins
+and RRF adds nothing (Phase 6). A 10-K is the opposite shape — dense with dollar
+figures, segment names, subsidiaries, "Scorecard", "operating earnings" — exactly
+where the KEYWORD arm earns its weight and hybrid-RRF should win. Loading it lets
+`auto_eval.ts` test that hypothesis directly.
+
+The W2.7 sections (`brk_corpus.json`) are ALREADY page-shaped — `{id, title, text}`
+— so this is a DETERMINISTIC load (slug = sections/<id>), no LLM extraction and no
+graph reconcile (we're testing retrieval, not wiring). After loading we embed, then
+the existing `run_auto_eval()` measures keyword vs vector vs hybrid over them.
+
+Run: python src/load_brk_corpus.py     (needs GBRAIN_DATABASE_URL + OLLAMA_* up)
+Env: BRK_CORPUS=<path>  SLUG_PREFIX=sections  AUTO_EVAL=1
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+
+from ingest_agent import _GBRAIN, _server_env, run_auto_eval
+
+_DEFAULT_CORPUS = pathlib.Path(os.path.expanduser(
+    "~/code/agent-prep/lab-02-7-pageindex/data/brk_corpus.json"))
+# PageIndex tree (built by lab-02-7 build_tree.py) carries the STRUCTURE the flat
+# brk_corpus.json drops: per-section page ranges + hierarchy. Joining it in is the
+# "PageIndex + GBrain" combined ingest — it makes structural/"where-is-X" questions
+# answerable from the page itself, with no per-query tree navigation.
+_DEFAULT_TREE = pathlib.Path(os.path.expanduser(
+    "~/code/agent-prep/lab-02-7-pageindex/data/tree.json"))
+_SLUG_PREFIX = os.getenv("SLUG_PREFIX", "sections")
+_ITEM_RE = re.compile(r"\bItem\s+\d+[A-Z]?\b")
+
+
+def _clean_title(raw: str, fallback: str) -> str:
+    """The W2.7 titles are breadcrumbs ("Berkshire ... Annual Report > Chairman's
+    Letter"). The shared prefix repeats across all 44 sections, so using the whole
+    breadcrumb makes keyword drown in boilerplate. Keep only the distinctive TAIL
+    after the last '>' ("Chairman's Letter") as the page title / exact probe."""
+    tail = raw.split(">")[-1].strip() if raw else ""
+    return tail or fallback
+
+
+def flatten_tree(node: dict, parent_title: str = "", inherited_item: str = "",
+                 out: dict | None = None) -> dict:
+    """node_id → {title, start_page, end_page, parent, item}. `item` is inherited from the
+    nearest ancestor whose title matches `Item N` (so a sub-section of Item 8 still knows it's
+    in Item 8). Used to enrich each GBrain page with its document location."""
+    if out is None:
+        out = {}
+    title = str(node.get("title", ""))
+    m = _ITEM_RE.search(title)
+    item = m.group(0) if m else inherited_item
+    nid = str(node.get("node_id", "")).strip()
+    if nid:
+        out[nid] = {"title": title, "start_page": node.get("start_page"),
+                    "end_page": node.get("end_page"), "parent": parent_title, "item": item}
+    for child in node.get("nodes", []):
+        flatten_tree(child, title, item, out)
+    return out
+
+
+def build_pages(corpus: list[dict], prefix: str = _SLUG_PREFIX,
+                tree_meta: dict | None = None, source: str = "") -> list[tuple[str, str]]:
+    """Pure transform: W2.7 sections → (slug, GBrain-page-content) pairs.
+
+    Each section becomes a markdown page with YAML frontmatter under `<prefix>/<id>`.
+    The frontmatter `title:` is AUTHORITATIVE — `gbrain put` titles from frontmatter,
+    NOT from the `# heading` (that seam is why a slug-only write gets titled "Brk 0002").
+
+    PageIndex-enriched (when `tree_meta` is supplied): frontmatter gains `source` / `item` /
+    `pages` / `parent`, AND a `**Location:**` breadcrumb is prepended to the BODY. The body
+    line is the load-bearing bit — GBrain indexes title+body+timeline, so a location *in the
+    body* is retrievable (keyword + vector) and injected into the reader's context, whereas
+    unknown frontmatter keys are not. That is what makes "where are the Notes located?"
+    answerable. Sections with no id or empty text are skipped.
+    """
+    pages: list[tuple[str, str]] = []
+    tree_meta = tree_meta or {}
+    for sec in corpus:
+        sid = str(sec.get("id", "")).strip()
+        text = str(sec.get("text", "")).strip()
+        if not sid or not text:
+            continue
+        title = _clean_title(str(sec.get("title", "")), sid)
+        esc = title.replace('"', '\\"')
+        slug = f"{prefix}/{sid}"
+        # Join by TITLE, not node_id: the on-disk brk_corpus.json and tree.json can carry
+        # drifted node_ids (regenerated independently), but section titles are stable.
+        meta = tree_meta.get(title, {})
+
+        fm = [f'title: "{esc}"']
+        loc = ""
+        if source:
+            fm.append(f'source: "{source}"')
+        if meta.get("item"):
+            fm.append(f'item: "{meta["item"]}"')
+        if meta.get("parent"):
+            fm.append(f'parent: "{_clean_title(meta["parent"], "").replace(chr(34), "")}"')
+        if meta.get("start_page") and meta.get("end_page"):
+            pages_str = f'{meta["start_page"]}-{meta["end_page"]}'
+            fm.append(f'pages: "{pages_str}"')
+            where = meta.get("item") or title
+            loc = (f"**Location:** {where} — {title} · pages {pages_str}"
+                   + (f" · source: {source}" if source else "") + "\n\n")
+
+        content = f'---\n' + "\n".join(fm) + f'\n---\n\n# {title}\n\n{loc}{text}\n'
+        pages.append((slug, content))
+    return pages
+
+
+def _put_page(slug: str, content: str) -> bool:
+    """Write one page via the local `gbrain put` CLI (stdin = content)."""
+    out = subprocess.run([_GBRAIN, "put", slug], input=content,
+                         capture_output=True, text=True, env=_server_env())
+    if out.returncode != 0:
+        print(f">>> WARNING: put failed for {slug}: {(out.stderr or out.stdout).strip()[:200]}")
+    return out.returncode == 0
+
+
+def _embed_stale() -> str:
+    """Embed newly-written chunks so the vector arm has vectors to search."""
+    out = subprocess.run([_GBRAIN, "embed", "--stale"],
+                         capture_output=True, text=True, env=_server_env())
+    lines = [ln for ln in (out.stdout or out.stderr).splitlines() if ln.strip()]
+    return lines[-1] if lines else "(no output)"
+
+
+def main() -> None:
+    corpus_path = pathlib.Path(os.getenv("BRK_CORPUS", str(_DEFAULT_CORPUS)))
+    if not corpus_path.exists():
+        raise SystemExit(f"corpus not found: {corpus_path} (set BRK_CORPUS=<path>)")
+
+    corpus = json.loads(corpus_path.read_text())
+
+    # PageIndex join: pull per-section page ranges + hierarchy from tree.json (if present).
+    tree_path = pathlib.Path(os.getenv("BRK_TREE", str(_DEFAULT_TREE)))
+    tree_meta, source = {}, ""
+    if tree_path.exists():
+        tree = json.loads(tree_path.read_text())
+        # key by title (see build_pages: id join is unreliable across regenerated files)
+        tree_meta = {m["title"].strip(): m for m in flatten_tree(tree).values() if m.get("title")}
+        source = str(tree.get("title", "")).strip()
+        print(f">>> PageIndex enrich: {tree_path.name} → {len(tree_meta)} nodes "
+              f"(source '{source}')")
+    else:
+        print(f">>> no tree.json at {tree_path} — ingesting WITHOUT structural metadata")
+
+    pages = build_pages(corpus, tree_meta=tree_meta, source=source)
+    print(f">>> {corpus_path.name}: {len(corpus)} sections → {len(pages)} pages "
+          f"(prefix '{_SLUG_PREFIX}')")
+
+    written = sum(_put_page(slug, content) for slug, content in pages)
+    print(f">>> wrote {written}/{len(pages)} pages")
+
+    print(">>> embed --stale: " + _embed_stale())
+    print(">>> auto-eval: " + run_auto_eval())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Code — the 16-question verifier (full source `src/eval_brk16.py`, reuses `shared/`):**
+
+```python
+"""eval_brk16.py — run GBrain on ALL 16 W2.7 questions; answer pass-rate vs `pass_criteria`.
+
+The full W2.7 eval (12 in-document + 4 out-of-document refusals), retrieved through GBrain's
+hybrid arm (C=3, full bodies), answered + judged against the same rubric W2.7 used. Run it
+BEFORE and AFTER the PageIndex-structure ingest enrichment to see whether the structural
+"where-is-X" questions (esp. the Notes question) start passing — without regressing the rest.
+
+Reuses shared/ (per AGENTS.md): llm (resolve/chat/judge/load_pass_criteria) + gbrain_cli
+(gbrain_query_slugs/build_context). Generator + judge default to Opus so a failure is a
+retrieval-representation gap, not a weak-generator artifact.
+
+Run (services: gbrain-pg, oMLX :8000 for query embed, VibeProxy :8317 for gen/judge):
+  GEN=opus JUDGE=opus OPENROUTER_BASE_URL=http://localhost:8317/v1 OPENROUTER_API_KEY=vibeproxy \
+  uv run python src/eval_brk16.py
+"""
+from __future__ import annotations
+
+import sys
+
+sys.path.insert(0, "/Users/yuxinliu/code/agent-prep/shared")
+from gbrain_cli import build_context  # noqa: E402
+from llm import LLMUnavailable, chat, judge, load_pass_criteria, resilient, resolve  # noqa: E402
+
+_GT = "/Users/yuxinliu/code/agent-prep/lab-02-7-pageindex/data/eval_ground_truth.json"
+_PROMPT = ("Using ONLY the notes below, answer the question. If a fact is not in the notes, "
+           "say 'insufficient context'.\n\nNOTES:\n{ctx}\n\nQUESTION: {q}")
+_C = 3
+
+
+def _slugs(q: str, limit: int) -> list[str]:
+    # local import so a missing gbrain CLI surfaces clearly
+    from gbrain_cli import gbrain_query_slugs
+    return gbrain_query_slugs(q, limit)
+
+
+def main() -> None:
+    criteria_by_q = load_pass_criteria(_GT)
+    gen_c, gen_m, gen_n = resolve("GEN", "opus")
+    judge_c, judge_m, judge_n = resolve("JUDGE", "opus")
+    print(f"eval_brk16: {len(criteria_by_q)} questions · gen={gen_n} · judge={judge_n} · C={_C}\n")
+
+    rows: list[tuple[str, bool]] = []
+    for q, criteria in criteria_by_q.items():
+        slugs = _slugs(q, _C)
+        try:
+            ctx = build_context(slugs) if slugs else ""
+            answer = resilient(chat, gen_c, _PROMPT.format(ctx=ctx, q=q), gen_m)
+            ok = judge(judge_c, answer, criteria, judge_m)
+        except LLMUnavailable as exc:
+            print(f"  [skip] {q[:56]} ({exc})")
+            continue
+        rows.append((q, ok))
+        print(f"  {'P' if ok else 'F'}  {q[:66]}")
+
+    n = len(rows)
+    passed = sum(1 for _, ok in rows if ok)
+    print(f"\ngt_pass: {passed}/{n} = {passed / n:.3f}" if n else "\nno rows")
+    notes = [ok for q, ok in rows if "Notes to Consolidated" in q]
+    if notes:
+        print(f"structural 'Notes located?' question: {'PASS' if notes[0] else 'FAIL'}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
 `★ Insight ─────────────────────────────────────`
 - **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
 - **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing* corpus moved the policy `vector → hybrid` with zero code change, and the move was justified (mixed query classes make both arms competitive → RRF wins). That's the "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact loop that improves the agent as its brain grows.
