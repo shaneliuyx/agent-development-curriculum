@@ -1752,11 +1752,11 @@ Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-b
 
 | arm | grnd@3↓ | flat@3 (old) | demotion tax | g@3:tenk | g@3:entity |
 |---|---|---|---|---|---|
-| keyword | 0.287 | 0.306 | 0.019 | 0.222 | 0.417 |
-| vector | 0.809 | 0.870 | 0.061 | 0.816 | 0.794 |
+| keyword | 0.306 | 0.306 | 0.000 | 0.250 | 0.417 |
+| vector | 0.836 | 0.926 | 0.090 | 0.858 | 0.794 |
 | **hybrid** | **0.910** | 0.972 | 0.062 | 0.927 | 0.877 |
 
-`flat@C` is the old rank-blind metric; the **demotion tax** (`flat − grnd↓`) is the answer mass RRF pushes below rank 0. Hybrid pays the most (0.062) yet still wins — its flat lead is wide enough to absorb the penalty (both arms competitive → fusion genuinely helps). The upgrade **validated** the `vector→hybrid` verdict on answer-quality grounds *and* priced RRF's reorder cost, instead of rubber-stamping it rank-blind.
+`flat@C` is the old rank-blind metric; the **demotion tax** (`flat − grnd↓`) is the answer mass sitting below rank 0 within the budget. **Vector** pays the most (0.090) — its best chunk often lands at rank 1–2, not 0 — and **hybrid** pays 0.062, but hybrid still wins outright on *both* the flat (0.972) *and* the discounted score (**0.910 > vector's 0.836**), so RRF's reorder cost is real yet more than covered. The upgrade **validated** the `vector→hybrid` verdict on answer-quality grounds *and* priced the reorder cost, instead of rubber-stamping it rank-blind.
 
 **C-sensitivity sweep** (same corpus) — the verdict is stable, no cliff:
 
@@ -1764,10 +1764,10 @@ Rank-blind `grounding@K` cannot see RRF's actual failure: it credits an answer-b
 |---|---|---|---|---|---|
 | 1 | hybrid | 0.759 | 0.861 | 0.861 | 0.759 |
 | 2 | hybrid | 0.802 | 0.903 | 0.944 | 0.843 |
-| 3 | hybrid | 0.809 | 0.910 | 0.972 | 0.870 |
-| 5 | hybrid | 0.832 | 0.910 | 0.972 | **0.972** |
+| 3 | hybrid | 0.836 | 0.910 | 0.972 | 0.926 |
+| 5 | hybrid | 0.836 | 0.910 | 0.972 | **0.972** |
 
-The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 = 0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.832`) — vector hides ~10% of its answer mass at ranks 4–5, outside a 3-chunk prompt the generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`), then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips between adjacent C, pin the exact production number.
+The payoff shows at **C=5**: the old metric *ties* vector and hybrid (`flat 0.972 = 0.972`, decided by sort order), but discounted grounding separates them (`0.910 > 0.836`) — vector hides ~14% of its answer mass at ranks 4–5 (its `flat` climbs 0.926 → 0.972 from C=3 to C=5 while its discounted score stays 0.836), outside a 3-chunk prompt the generator never reads; hybrid keeps answers in the top-3. Same arms, same corpus — the cutoff `C` is the entire difference. **How to choose `C`:** measure it off the agent's context-assembly (injected-chunk count, or `floor(token_budget / avg_page_tokens)`), then sweep `C∈{1,2,3,5}` to confirm the verdict isn't sitting on a cliff; if it flips between adjacent C, pin the exact production number.
 
 ##### Per-query routing — rejected on the natural corpus, accepted on a mixed-type one (2026-06-06 → 06-07)
 
