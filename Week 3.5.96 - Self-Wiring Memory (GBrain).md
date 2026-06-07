@@ -2035,6 +2035,20 @@ W2.7 scored **answer quality** across **index types** (Vector / GraphRAG / tree-
 
 Shapes converge: dense vector is strongest at 10-K *factoid retrieval* in both. And grounding 0.96 ≫ W2.7's vector answer-judge 0.25 ⇒ in W2.7 the bottleneck was **generation, not retrieval** — GBrain surfaces the answer-bearing section ~96% of the time; turning that into a correct answer is the separate, harder step.
 
+##### Results comparison — answer quality on the same 10-K (and why it's a wash, but GBrain's architecture still fits better)
+
+Now that `reader_ab.py` scores ANSWER pass-rate against the same `pass_criteria` W2.7 used, the two are finally on one axis:
+
+| system | retrieval architecture | per-document build | answer pass-rate (same 10-K `pass_criteria`) |
+|---|---|---|---|
+| W2.7 three-way (baseline) | Vector / GraphRAG / tree-index — **3 specialized backends** | Graph 71.9 min (Neo4j extract); Tree LLM multipass | Vector 0.25 · Graph 0.48 · Tree 0.44 (LLM-judge) |
+| W2.7 optimized (`ab_v2`, reader prompt-dev) | same backends, tuned reader | + reader optimization | **gt_pass 1.000** (16/16; judge 0.818) |
+| W3.5.96 GBrain | **hybrid** (BM25 + dense, RRF) — **one arm** | deterministic chunk + embed; **no LLM build, no per-query nav** | **gt_pass 0.917** (11/12 in-doc; Opus judge) |
+
+**Read it honestly — the score is a wash, not a GBrain win.** W2.7's *optimized* config edges GBrain on raw pass-rate (1.000 vs 0.917), though on an easier mix (its 16 include 4 out-of-document refusals that tree/graph nail; GBrain's 12 are all in-document, including the "Notes" question that fails for *every* system), and under a different judge model — not a controlled head-to-head. And the headline gap people quote — GBrain 0.92 vs W2.7 *baseline* 0.25–0.48 — is mostly the **reader** (full bodies + a capable model), not the retrieval architecture: W2.7 closed that same gap to 1.0 once *it* tuned its reader. Both labs confirm the chapter's thesis — *generation is the lever* — from opposite directions.
+
+**Where GBrain's architecture IS the better fit: economy and generality, not the number.** W2.7 needed **three specialized backends**, each winning exactly one query class (Vector→factoid, Graph→citation, Tree→synthesis) and therefore a **router** to pick among them — plus expensive per-document construction (Graph's ~72-minute Neo4j extract; Tree's LLM multipass build). GBrain reaches comparable answer quality with **one deterministic pipeline**: chunk + embed + hybrid-RRF — keyword catches `Item 1C` / dollar figures, vector catches semantics, **both query classes in a single arm, no router** — zero per-document LLM construction, and it **self-tunes** as the corpus drifts and generalizes to a mixed corpus. So GBrain is the more suitable architecture for document retrieval **not because it scores higher** (it doesn't, cleanly) **but because it reaches the same place with cheaper, general, deterministic machinery** instead of three LLM-heavy specialized backends behind a router.
+
 `★ Insight ─────────────────────────────────────`
 - **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
 - **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing* corpus moved the policy `vector → hybrid` with zero code change, and the move was justified (mixed query classes make both arms competitive → RRF wins). That's the "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact loop that improves the agent as its brain grows.
