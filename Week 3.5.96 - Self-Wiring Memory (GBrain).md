@@ -1830,7 +1830,14 @@ The rejection above rests on two things the *natural* corpus baked in: it is vec
 | **router** (`kw`→`key_pp` · `vec`→`vector` · `mixed`→`hyb`) | **0.862** | **1.000** | 0.763 | 0.763 | **+0.039** |
 | strengthened-global (`hyb` on OR-preprocessed query) | 0.837 | 1.000 | 0.745 | 0.658 | +0.014 |
 
-The router strictly beats baseline on **+2 / 0 worse / 22 tie** — the +2 are exactly the `kw`-class queries global hybrid demoted (`g@C:kw` 0.925 → 1.000), with zero regression on `vec` / `mixed`. The *strengthened-global* alternative (no router — just OR-preprocess the whole query before hybrid) edges baseline by only **+0.014** and still trails the router (0.862) by a wide margin: OR-joining the whole query slightly helps the keyword leg but does nothing for the dense leg, so it can't recover the `kw`-class queries the way a router pointed at `key_pp` does. So the principle **must** be honored by a router, not by strengthening the single global arm.
+The router strictly beats baseline on **+2 / 0 worse / 22 tie** — only **2 of the 24** questions move; the other 22 route to the arm baseline already used, so they're identical. Here are the **2 movers** (the rows where `router ≠ baseline`, from `bun src/route_principle_ab.ts`):
+
+| question | routed type → arm | baseline `hyb` | router | gain |
+|---|---|---|---|---|
+| `Itochu Marubeni Mitsubishi Mitsui Sumitomo…` | `kw` → `key_pp` | 0.252 | **1.000** | +0.748 |
+| `how the company guards against digital intrusions…` | `vec` → `vector` | 0.315 | **0.500** | +0.185 |
+
+Both are answer pages that global hybrid's RRF **demoted** below the 3-chunk reader budget (so `hyb` scores them low — 0.252, 0.315); routing each to the arm its type favours recovers the page — one via the OR-preprocessed keyword arm, one via dense vector. Note the +2 are **not** both keyword queries: one `kw`, one `vec` — routing helps wherever the global arm buried the answer, not just on exact-token lookups. The whole +0.039 is just these two: `(0.748 + 0.185) / 24 = +0.039`; the other 22 contribute 0. (This is also why the `kw`-class *mean* moved `g@C:kw` 0.925 → 1.000 — nine of ten `kw` questions already scored 1.0 under hybrid; only `Itochu` was demoted, and `key_pp` fixes it.) The *strengthened-global* alternative (no router — just OR-preprocess the whole query before hybrid) edges baseline by only **+0.014** and still trails the router (0.862) by a wide margin: OR-joining the whole query slightly helps the keyword leg but does nothing for the dense leg, so it can't recover the `kw`-class queries the way a router pointed at `key_pp` does. So the principle **must** be honored by a router, not by strengthening the single global arm.
 
 **Answer-quality A/B (entity coverage, pinned Opus 4.5 — `src/answer_principle_ab.py`):**
 
