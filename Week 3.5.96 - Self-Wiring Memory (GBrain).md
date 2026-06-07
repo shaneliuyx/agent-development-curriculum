@@ -2051,6 +2051,32 @@ Now that `reader_ab.py` scores ANSWER pass-rate against the same `pass_criteria`
 
 **Where GBrain's architecture IS the better fit: economy and generality, not universal accuracy.** W2.7 needed **three specialized backends**, each winning one query class (Vector→factoid, Graph→citation, Tree→synthesis) and therefore a **router** to pick among them — plus expensive per-document construction (Graph's ~72-minute Neo4j extract; Tree's LLM multipass build). GBrain reaches comparable answer quality with **one deterministic pipeline** — chunk + embed + hybrid-RRF (keyword catches `Item 1C` / dollar figures, vector catches semantics), zero per-document LLM construction, self-tuning on drift, generalizing to a mixed corpus. The trade is explicit: GBrain gives up the structural-question edge that W2.7's heavier, structure-aware backends buy. So GBrain is the more suitable architecture for *most* document retrieval **not because it scores higher** (it doesn't) **but because it reaches comparable quality with cheaper, general, deterministic machinery** — and you reach for a structure-aware index only when location/citation questions dominate.
 
+##### The fix — PageIndex + GBrain combined ingest (closes the structural gap, measured)
+
+The structural-class loss isn't a law — it's a **dropped column at ingest**. PageIndex's `build_tree.py` already extracts per-section page ranges + hierarchy into `tree.json`; the flat loader just discarded them. So the combined design keeps both halves: **PageIndex's structure (built once) + GBrain's hybrid retrieval (cheap, every query), with no per-query tree navigation.**
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  PDF["brk-2023-ar.pdf<br/>152 pages"] -->|build_tree.py| TREE[("tree.json<br/>title · pages<br/>hierarchy")]
+  PDF -->|_brk_corpus.py| RAW["brk_corpus.json<br/>id · title · text"]
+  TREE -.->|join by title| ENR
+  RAW --> ENR["load_brk_corpus.py<br/>+ Location header<br/>+ frontmatter<br/>item · pages · src"]
+  ENR -->|gbrain put + embed| BRAIN["GBrain pages<br/>body has location<br/>hybrid-indexed"]
+  BRAIN -->|hybrid retrieve| ANS["reader sees<br/>Item 8 · pp 99-147<br/>answers location"]
+```
+
+`load_brk_corpus.py` joins `tree.json` **by title** (the on-disk ids had drifted off-by-one — joining by `node_id` wrote *wrong* locations; titles are stable) and prepends a `**Location:**` breadcrumb to each section's **body** — the load-bearing choice, since GBrain indexes title+body+timeline, so a location *in the body* is retrievable and injected, whereas an unknown frontmatter key is not. The Notes section now carries: `**Location:** Item 8 — Notes to Consolidated Financial Statements · pages 99-147 · source: …`.
+
+**Measured on all 16 W2.7 questions (GBrain hybrid retrieval, Opus reader + judge, `src/eval_brk16.py`):**
+
+| ingest | gt_pass | the "Notes located?" question |
+|---|---|---|
+| flat (`{id,title,text}`) | 15/16 = 0.938 | **FAIL** (grounds 1.000, but body has no locational statement) |
+| **PageIndex-enriched** | **16/16 = 1.000** | **PASS** (reads `Item 8 · pages 99-147` from the Location line) |
+
+The single structural failure flipped to pass, **zero regressions** on the other 15 — and GBrain now matches W2.7's *optimized* 16/16, but with the cheaper architecture (deterministic hybrid + static structural metadata, no per-query tree-walk). Honest edges: `build_tree.py` is a one-time LLM pass (the only document-specific LLM step); `tree.json`'s page ranges are slightly noisy (some single-page), but the `Item N` inheritance is the reliable signal and is what the rubric rewards; and this is the structural class only — factoid/semantic never needed it.
+
 `★ Insight ─────────────────────────────────────`
 - **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
 - **Drift adaptation, measured.** A *fixed* golden set re-scored against a *changing* corpus moved the policy `vector → hybrid` with zero code change, and the move was justified (mixed query classes make both arms competitive → RRF wins). That's the "search quality tracks the corpus" claim, demonstrated end-to-end — and the exact loop that improves the agent as its brain grows.
