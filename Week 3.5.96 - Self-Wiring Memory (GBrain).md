@@ -2143,11 +2143,19 @@ Every term that appears in a Phase-9 table, in one place.
 - **entity** — the 6 proper-noun questions from the W3.5.96 fixtures (Sam Okafor, Lin Zhao, …).
 
 **Retrieval-grounding metrics**
-- **grounding@5 / g@5 tenk / g@5 entity** *(original, rank-blind — superseded)* — mean over questions of the **best** top-5 section's coverage; `g@5 <domain>` is the same averaged over only that domain's questions. Asks "did retrieval surface an answer-bearing section *anywhere* in top-5?" — blind to rank and to the context budget.
-- **discounted grounding@C / grnd@C↓ / g@C:tenk / g@C:entity** *(current)* — per question, `max over the top-C of (coverage_i · disc(i))`. Rewards an answer-bearing section that is BOTH high-ranked AND inside the C chunks the generator reads; a section RRF demoted, or pushed past C, scores lower or 0. `g@C:<domain>` = the same averaged over one domain. The `↓` marks "discounted".
-- **flat@C (old)** — the rank-blind metric shown alongside for contrast: mean **raw** best-coverage over the top-C, no position discount. Where `flat > grnd↓`, the answer sits below rank 0.
-- **demotion tax** — `flat@C − grnd@C↓`. The answer-mass an arm (usually hybrid RRF) pushes below rank 0; the cost of fusion's reordering.
-- **answerable@C** — fraction of questions where some top-C section covers ALL expected entities (the tie-breaker when grounding ties).
+
+Notation: $q$ ranges over the $N$ golden questions; $\text{cov}_{q,i}\in[0,1]$ is the coverage of the rank-$i$ retrieved section for $q$ (top hit = rank $i{=}0$); $\text{disc}(i)=\tfrac{1}{\log_2(i+2)}$. A per-domain variant ($g@5{:}\text{tenk}$, $g@C{:}\text{entity}$, …) restricts the mean to the $q$ in that domain.
+
+- **grounding@5 / g@5 tenk / g@5 entity** *(original, rank-blind — superseded)* — best raw coverage over the top-5, averaged over questions; blind to rank and to the context budget. $\;\text{grounding@5}=\dfrac{1}{N}\sum_{q}\max_{0\le i<5}\text{cov}_{q,i}$
+  - *reads:* $\max_{0\le i<5}$ keeps the single best of the top-5 sections (one good hit is enough); $\tfrac{1}{N}\sum_q$ averages that best over all $N$ questions. No $\text{disc}$ factor, so where in the top-5 the answer sits is ignored.
+- **discounted grounding@C / grnd@C↓ / g@C:tenk / g@C:entity** *(current)* — position-weighted best coverage over the top-$C$; rewards a section that is BOTH high-ranked AND inside the $C$ chunks the generator reads (a section RRF demoted, or pushed past $C$, scores lower or 0). The `↓` marks "discounted". $\;\text{grnd@C}\!\downarrow=\dfrac{1}{N}\sum_{q}\max_{0\le i<C}\big(\text{cov}_{q,i}\cdot\text{disc}(i)\big)$
+  - *reads:* each section is scored $\text{cov}_{q,i}\cdot\text{disc}(i)$ — coverage times its rank weight ($1,\,0.63,\,0.5,\dots$); $\max_{0\le i<C}$ keeps the best within the budget $C$; average over $q$. A full answer at rank 0 scores $1.0$, at rank 2 scores $0.5$, past rank $C$ it is outside the window so it contributes $0$.
+- **flat@C (old)** — the rank-blind contrast: discounted grounding@C with $\text{disc}(i)\equiv1$ (no position discount, so an answer at rank 0 and at rank 4 score identically). In `grounding.ts` this is `budgetScore.gFull` (the discounted score is `gDisc`). Where $\text{flat}>\text{grnd}\!\downarrow$, the answer sits below rank 0. $\;\text{flat@C}=\dfrac{1}{N}\sum_{q}\max_{0\le i<C}\text{cov}_{q,i}$
+  - *reads:* identical to $\text{grnd@C}\!\downarrow$ but with every $\text{disc}(i)=1$ — best raw coverage in the top-$C$, position thrown away. The *only* difference from the discounted score is that flat does not care WHERE the best section ranks.
+- **demotion tax** — the answer-mass an arm (usually hybrid RRF) pushes below rank 0; the cost of fusion's reordering, always $\ge 0$ since $\text{disc}(i)\le 1$. $\;\text{demotion tax}=\text{flat@C}-\text{grnd@C}\!\downarrow$
+  - *reads:* the two metrics differ only by the $\text{disc}$ weight, so their difference is exactly what the position discount subtracted. A large tax means the best-covering section is being demoted below rank 0 (fusion reordered it down).
+- **answerable@C** — fraction of questions where some top-$C$ section fully covers the expected entities (the tie-breaker when grounding ties). $\;\text{answerable@C}=\dfrac{1}{N}\sum_{q}\mathbf{1}\!\left[\max_{0\le i<C}\text{cov}_{q,i}=1\right]$
+  - *reads:* the indicator $\mathbf{1}[\,\cdot=1\,]$ is $1$ only when some top-$C$ section covers EVERY expected entity (coverage exactly $1$), else $0$; the mean is the fraction of fully-answerable questions. A strict binary check — used only to break grounding ties.
 
 **Answer-quality metrics** (`verify_arch.py`, `reader_ab.py`)
 - **mean grounding@3** — per-arm average of the cheap discounted grounding@C=3 metric.
