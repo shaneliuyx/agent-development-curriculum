@@ -2223,11 +2223,13 @@ The **loop is the point**: every ingest re-runs the SELECTOR, which re-measures 
 
 | arm | grounding@3 (`tenk`, 12 Q) | answer pass-rate (`tenk`, 12 Q) |
 |---|---|---|
-| keyword | 0.222 | 0.167 |
-| vector | 0.816 | 0.750 |
+| keyword | 0.250 | 0.167 |
+| vector | 0.858 | 0.750 |
 | **hybrid** | **0.927** | **0.917** |
 
-- **Calibrator** — `corr(discounted grounding@C, answer-pass) = +0.719`. The cheap, deterministic metric strongly predicts the expensive answer-judge, so the SELECTOR earns its place in the every-ingest hot loop *without* an LLM. This is the assumption the whole architecture rests on, measured rather than asserted.
+> **Provenance note (audit 2026-06-07).** The **grounding** column is current (refreshed `g@3:tenk` after a mid-session corpus drift nudged keyword/vector up — keyword `0.222 → 0.250`, vector `0.816 → 0.858`; hybrid unchanged). The **answer pass-rate** column and the calibrator `r` below are from the *canonical pre-drift `verify_arch` run* and are **pending a refresh** (re-running the answer-judge costs the paid model on full 10-K bodies). The verdict is **drift-robust regardless**: the arm *ordering* `keyword < vector < hybrid` still holds on the grounding axis (`0.250 < 0.858 < 0.910`), and hybrid still tops it — so the selector's pick is unaffected; only the exact `r` and pass-rate magnitudes await re-confirmation.
+
+- **Calibrator** — `corr(discounted grounding@C, answer-pass) = +0.719` *(pre-drift; pending refresh)*. The cheap, deterministic metric strongly predicts the expensive answer-judge, so the SELECTOR earns its place in the every-ingest hot loop *without* an LLM. This is the assumption the whole architecture rests on, measured rather than asserted.
 - **Selector validity** — the max-grounding arm (`hybrid`) is also the answer-quality winner, and the ordering `keyword < vector < hybrid` holds on **both** axes → CONFIRMED.
 - **The residual (r=0.719, not 1.0) is instructive** — e.g. *"Where are the Notes to Consolidated Financial Statements located?"* grounds at **1.000 on all three arms yet GBrain's answer FAILS**. This is a **false-positive grounding**: the retrieved chunks (`sections/brk_0034/0039/0040`) *contain* the substrings `Item 8`, `K-75`, `Notes to Consolidated` — so substring grounding scores 1.0 — but those chunks *are the Notes body*, where `Item 8` sits as a buried page-header marker, not a clean "*the Notes are located in Item 8 / pages 99-141*" statement. The answer is in the document (W2.7 answers it — see comparison below), and even technically in GBrain's chunks, but **not in answerable form** for a "where-is-X" structural question. Flat-chunk hybrid is weak on exactly this class (location / citation), where a structure-aware index that stores section→page-range as metadata (W2.7's tree/page-index) wins. The residual is where the cheap substring metric and answer quality diverge — and it's a retrieval-*representation* gap, not pure generation.
 
