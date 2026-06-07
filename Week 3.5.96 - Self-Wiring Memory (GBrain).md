@@ -1853,6 +1853,132 @@ The edge **survives a strong generator** (+0.042 on Opus, on par with the ground
 
 **Refined verdict — routing is worth building, conditionally.** Per-query routing pays iff **three gates all hold**: (a) the traffic genuinely **spans query types** (keyword-focused *and* semantic), (b) the keyword arm is **OR-preprocessed** (else its target is the crippled raw arm and routing can only lose), and (c) a **cheap type-classifier** can actually detect the type. All three held here → +0.039 grounding, +0.042 answer quality. On the production brain as-is (vector-skewed, single dominant type) gate (a) fails, so the earlier "keep global hybrid" still stands *for that corpus* — and precisely so: a router doesn't *lose by design* there (it can always default to hybrid). The realizable gain decomposes as **(oracle − global) − classifier_error_cost**. On a single-type corpus the first term is **0** (oracle = global, the 0.910 = 0.910 tie), so a *perfect* router merely **ties** and a *real* classifier nets **negative** — its mis-routes have no headroom to offset them. All-risk-no-reward, so don't route. The headroom is the *budget* a router has to spend on its own classifier errors: 0 on single-type (can't afford any), +0.065 oracle on the mixed set (enough to cover a good classifier and still net +0.039 / +0.042). The honest scope: the classifier is 24/24 only because this set is built type-separable (`kw` = token-lists, `vec` = prose); real queries blur that, so +0.042 is the **strong-classifier ceiling** — production gain is ≤ that and shrinks with classifier error. Net: don't reject the principle — gate it on the workload. (Grounding A/B: `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`; answer A/B: `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`.)
 
+#### Entity-aware assembly — one-hop graph expansion (2026-06-07)
+
+Routing fixes *which arm* retrieves; it can't fix a **2-hop question** where the answer needs **two** entity pages in the same `C`-chunk budget and retrieval ranks the second one at `C+1`. We saw this in the answer A/B: `which venture firm is the angel investor associated with` retrieved both `ridgeline-capital` (rank 3, in budget) and `people/dev-patel` (rank 4, **out**) — the generator saw the firm but not the investor. GBrain is a knowledge graph, so there's a cheap fix the chapter's whole premise points at: `dev-patel` is a **1-hop neighbor** of the in-budget `ridgeline-capital` (`invested_in` / `founded` edges). Pull the neighbor's page into the context — one edge traversal, no NER. Assembly becomes *entity-aware*: it guarantees the graph-completion of an in-budget entity rather than blindly taking the top-`C` by score.
+
+The rule is deliberately high-precision: pull a demoted page **only** when it is *both* graph-connected to an in-budget page *and* itself retrieved-but-demoted (in the top-`K` pool, ranked past `C`). That keeps single-hop queries at exactly `C` and spends extra budget only along a real edge to an already-relevant page.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q["query"] --> ARM["routed arm"]
+  ARM --> RANK["top-K ranked"]
+  RANK --> TOPC["top-C<br/>reader budget"]
+  RANK --> TAIL["demoted tail<br/>ranks C+1..K"]
+  TOPC --> NBR["1-hop neighbors<br/>getLinks +<br/>getBacklinks"]
+  NBR --> M{"demoted page<br/>is a neighbor?"}
+  TAIL --> M
+  M -->|"yes · up to maxPull"| PULL["pull page<br/>into context"]
+  M -->|"no"| SKIP["keep top-C"]
+  TOPC --> CTX["assembled<br/>context"]
+  PULL --> CTX
+  CTX --> GEN["generator"]
+```
+
+**Code (full source `src/assembly.ts`):**
+
+```typescript
+/**
+ * assembly.ts — entity-aware context assembly via 1-hop GRAPH EXPANSION.
+ *
+ * The gap it closes (measured): a 2-hop question needs TWO entity pages in the same C-chunk
+ * reader budget. Rank-only assembly (`ranked.slice(0, C)`) can drop the second one when retrieval
+ * ranks it at C+1 — e.g. "which venture firm is the angel investor associated with" retrieved both
+ * `ridgeline-capital` (#3, in budget) and `people/dev-patel` (#4, OUT), so the generator saw the
+ * firm but not the investor and failed (route_principle_ab / answer_principle_ab).
+ *
+ * GBrain is a knowledge graph, so the fix is one edge traversal: `dev-patel` is a 1-hop neighbor
+ * of the in-budget `ridgeline-capital` (`invested_in` / `founded` edges, both directions). Pull it
+ * into the context. We pull a neighbor only when it is (a) graph-connected to an in-budget page AND
+ * (b) itself retrieved-but-demoted (in the top-K pool, ranked past C) — high precision: the page was
+ * relevant enough to retrieve, and the graph says it completes an in-budget entity. `maxPull` caps
+ * the spend so single-hop queries stay at C.
+ */
+
+interface GraphEngine {
+  getLinks(slug: string, opts?: { sourceId?: string }): Promise<{ to_slug: string }[]>;
+  getBacklinks(slug: string, opts?: { sourceId?: string }): Promise<{ from_slug: string }[]>;
+}
+
+/** 1-hop neighbors of `slug`: union of outgoing (`getLinks.to`) and incoming (`getBacklinks.from`). */
+export async function neighborSlugs(engine: GraphEngine, slug: string): Promise<string[]> {
+  const [out, back] = await Promise.all([engine.getLinks(slug), engine.getBacklinks(slug)]);
+  const s = new Set<string>();
+  for (const l of out) s.add(l.to_slug);
+  for (const l of back) s.add(l.from_slug);
+  s.delete(slug);
+  return [...s];
+}
+
+export interface ExpandOpts {
+  C: number;                 // reader budget (injected-chunk count)
+  maxPull?: number;          // max neighbors to pull beyond C (default 2)
+  poolOnly?: boolean;        // pull only retrieved-but-demoted neighbors (default true, high precision)
+}
+
+export interface ExpandResult {
+  slugs: string[];           // assembled context: top-C + pulled neighbors (length C..C+maxPull)
+  pulled: string[];          // the graph-pulled neighbor slugs (empty = no expansion happened)
+}
+
+/**
+ * Graph-expanded assembly. Takes the full ranked candidate list (top-K from one search arm),
+ * keeps the top-C, then appends up to `maxPull` 1-hop neighbors of the in-budget pages.
+ *
+ * poolOnly=true  → only neighbors that were themselves retrieved (in `ranked`) but demoted past C.
+ * poolOnly=false → any 1-hop neighbor of an in-budget page (pure graph reach; lower precision).
+ */
+export async function graphExpand(
+  engine: GraphEngine,
+  ranked: string[],
+  { C, maxPull = 2, poolOnly = true }: ExpandOpts,
+): Promise<ExpandResult> {
+  const topC = ranked.slice(0, C);
+  const inBudget = new Set(topC);
+
+  // 1-hop neighbor set of the in-budget pages
+  const nbr = new Set<string>();
+  for (const ns of await Promise.all(topC.map(p => neighborSlugs(engine, p)))) {
+    for (const n of ns) nbr.add(n);
+  }
+
+  // candidates to pull, in priority order
+  const candidates = poolOnly
+    ? ranked.slice(C).filter(s => nbr.has(s))         // retrieved-but-demoted AND graph-connected
+    : [...nbr].filter(s => !inBudget.has(s));         // any graph neighbor (incl. never-retrieved)
+
+  const pulled: string[] = [];
+  for (const s of candidates) {
+    if (pulled.length >= maxPull) break;
+    if (!inBudget.has(s) && !pulled.includes(s)) pulled.push(s);
+  }
+  return { slugs: [...topC, ...pulled], pulled };
+}
+```
+
+**Walkthrough:**
+- **`neighborSlugs` is the one-hop traversal** — union of `getLinks` (outgoing edges, `to_slug`) and `getBacklinks` (incoming, `from_slug`). GBrain's edges are typed and bidirectional (`ridgeline-capital —invested_in→ dev-patel`, `dev-patel —founded→ ridgeline-capital`), so the investor↔firm link is already in the graph — no entity extraction, no second model.
+- **The pull condition is `pool ∩ neighbors`, not just neighbors.** `poolOnly` keeps only demoted pages that were *retrieved* (so already judged relevant by the arm) **and** graph-connected to something in budget. Pulling arbitrary neighbors (`poolOnly=false`) would drag in every linked page — high recall, low precision. The intersection is the entity-aware sweet spot.
+- **`maxPull` bounds the budget blow-up.** Single-hop queries have no demoted neighbor, so `pulled` is empty and the context stays exactly `C`. Only genuine multi-hop questions pay the +1–2 pages — the cost lands where the benefit is.
+
+**Result (balanced 24-Q, on top of the router; `src/assembly_graph_ab.ts` + `src/assembly_answer_ab.py`):**
+
+| metric | plain top-C | graph-expanded | note |
+|---|---|---|---|
+| lexical entity coverage | 0.986 | 0.986 | **saturated** — related pages cross-name each other, so coverage is blind to this |
+| answer pass (Opus 4.5), all 24 | 0.792 | **0.833** | **Δ +0.042** — 1 fixed, 0 broke |
+| answer pass, the **7** where it fired | 0.714 | **0.857** | **Δ +0.143** |
+| avg context size | 3.00 | 3.46 | grows only on the 7 fired questions |
+
+The single fix is `What does Quanta Labs work on?` (F→P): the deal page `deals/quanta-seed` was retrieved-but-demoted and one edge from the in-budget Quanta page; pulling it gave the generator the answer. The motivating `which venture firm` question **stays F** — that one is *distractor-dominated* (two `northstar` pages outrank `ridgeline`), and additive expansion adds the right page without removing the wrong ones. Graph expansion fixes *missing-neighbor* 2-hop failures, not *distractor* failures.
+
+`★ Insight ─────────────────────────────────────`
+- **Coverage said useless, the answer judge said +1.** Lexical coverage was already 0.986 because `ridgeline`'s page text *names* "Dev Patel" — the string is in budget even when the page isn't. Only judging the answer exposed that the generator needs the *page*, not the mention. Same lesson as the routing A/B: grounding metrics under-measure; pin a strong generator and judge.
+- **Two failure modes, one fix each.** Missing-neighbor (Quanta's deal page demoted) → graph expansion. Distractor-dominated (Northstar outranks Ridgeline) → rerank / dedup, which *removes* a page rather than adding one. Recognizing which mode a failure is in tells you which lever to pull.
+- **The graph was free.** GBrain already wired the edges at ingest (`invested_in`, `founded`); assembly just walks one hop. That's the "self-wiring memory" thesis paying off downstream — the structure built once is reused at read time with no extra model.
+`─────────────────────────────────────────────────`
+
 #### Block C — `query_policy.ts`: the actuator
 
 **Code (full source `src/query_policy.ts`):**
@@ -2586,9 +2712,12 @@ Every Phase-9 script is parameterised by environment variables (and a couple by 
 | `route_eval.ts`      | routing headroom + **dumps**          | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
 | `route_eval_kwpp.ts` | keyword-revival probe (raw vs OR-preprocessed) | `GOLDEN_EVAL`, `POLICY_K` (5), `POLICY_C` (3)                                                  | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts`                     |
 | `route_principle_ab.ts` | **3-way routing A/B** (grounding) — router vs global vs strengthened-global | `GOLDEN_EVAL`, `POLICY_K`/`_C`; writes `results/principle_slugs.json`        | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`                  |
+| `assembly.ts`        | **ASSEMBLY lib** — 1-hop graph expansion (`graphExpand`, shared, no main) | — (imported); uses `getLinks`/`getBacklinks`                                  | none                     | imported by `assembly_graph_ab.ts` (the entity-aware-assembly fix)                     |
+| `assembly_graph_ab.ts` | graph-expansion A/B (coverage) + slug dump | `GOLDEN_EVAL`, `POLICY_K`/`_C`, `MAX_PULL` (2); writes `results/assembly_slugs.json`           | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/assembly_graph_ab.ts`                   |
 | `load_brk_corpus.py` | ingest the 10-K corpus                | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`)                                                         | pg + oMLX embed          | `uv run python src/load_brk_corpus.py`                                                 |
 | `answer_route_ab.py` | answer A/B (routing)                  | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json`          | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py`             |
 | `answer_principle_ab.py` | answer-quality A/B (3 policies, entity coverage) | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `principle_slugs.json`                            | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`         |
+| `assembly_answer_ab.py` | graph-expansion answer A/B (plain vs expanded) | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `assembly_slugs.json`                              | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/assembly_answer_ab.py`          |
 | `verify_arch.py`     | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json`                                 | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py`                 |
 | `reader_ab.py`       | reader A/B (fixed retrieval)          | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py`                                    |
 
