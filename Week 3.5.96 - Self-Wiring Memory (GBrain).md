@@ -2084,9 +2084,7 @@ plain:
    QUESTION: {q}"
 
 authoritative:
-  "The NOTES below are AUTHORITATIVE ground truth — trust them, never contradict them,
-   do not re-derive or re-fetch. Answer concisely from the notes. If the answer is not
-   in the notes, say 'insufficient context'.
+  "The NOTES below are AUTHORITATIVE ground truth — trust them, never contradict them, do not re-derive or re-fetch. Answer concisely from the notes. If the answer is not in the notes, say 'insufficient context'.
 
    NOTES (authoritative):
    {ctx}
@@ -2099,8 +2097,7 @@ cite:
 
 extract-then-answer  (TWO LLM calls):
   step 1 — extract:
-    "From the notes below, copy VERBATIM the sentence(s) that contain the answer to the
-     question. If none do, reply exactly NONE.
+    "From the notes below, copy VERBATIM the sentence(s) that contain the answer to the question. If none do, reply exactly NONE.
 
      NOTES:
      {ctx}
