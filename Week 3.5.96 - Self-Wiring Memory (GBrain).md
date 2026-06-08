@@ -1,7 +1,7 @@
 ---
 title: "Week 3.5.96 — Self-Wiring Memory (GBrain — Garry Tan's Production Memory Layer for AI Agents)"
 created: 2026-05-28
-updated: 2026-06-07
+updated: 2026-06-08
 status: SPEC + executable lab
 tags:
   - agent
@@ -148,6 +148,70 @@ flowchart TD
 > human-editable *source of truth*; once embedded, **PG serves all query-time
 > recall**. "Markdown-first" describes the write contract (deterministic,
 > zero-LLM extraction), not the retrieval engine — that's pgvector + tsvector.
+
+### 3.1 The end-to-end pipeline — corpus ingest to query
+
+§3 is the *engine's* write/read shape. This subsection is the **operational lifecycle you actually run in production**: how a raw corpus becomes a queryable, self-tuning brain, and how every Lab Phase below slots into one pipeline. Read this once and the rest of the chapter is "here is each box in detail." There are four stages and one feedback loop; the same two entrypoints (`ingest_agent.py` for small corpora, `resumable_ingest.py` at scale) run all of stages 1-3 in `main()`, and `query_policy.ts` is stage 4.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SRC[Corpus<br/>~/brain/sources/*<br/>ground truth]
+  subgraph ING["1 - Resumable Ingest"]
+    EX[Per-file/chunk extract<br/>driver-side LLM]
+    ST[Disk stage<br/>.ingest_stage]
+    MG[merge_from_disk<br/>dedup across files]
+    WR[put_page over MCP<br/>embed ONCE]
+    EX --> ST --> MG --> WR
+  end
+  RC[2 - reconcile_graph<br/>extract links --source db<br/>0-LLM · wikilinks to edges]
+  DEC{golden_eval.json<br/>exists?}
+  PE[policy_eval.ts<br/>score 3 arms · real Qs<br/>discounted grounding@C]
+  AE[auto_eval.ts<br/>cold-start known-item proxy]
+  POL[(search_policy.json<br/>winning arm + rrf_k)]
+  subgraph QRY["4 - Query Apply"]
+    QP[query_policy.ts<br/>read policy]
+    SW{QUERY_ROUTER?}
+    GA[global arm<br/>keyword / vector / hybrid]
+    RT[per-query route<br/>+ entity-aware<br/>one-hop assembly]
+    QP --> SW
+    SW -->|off · default| GA
+    SW -->|on · accuracy switch| RT
+  end
+  ANS[Answer + citations<br/>+ what-we-don't-know]
+  SRC --> EX
+  WR --> RC
+  RC -->|"3 - run_auto_eval()<br/>every ingest"| DEC
+  DEC -->|yes · current| PE
+  DEC -->|no · cold start| AE
+  PE --> POL
+  AE --> POL
+  POL --> QP
+  GA --> ANS
+  RT --> ANS
+```
+*The production lifecycle. Stages 1-3 run inside one `main()` (small: `ingest_agent.py`; large: `resumable_ingest.py`); stage 4 is `query_policy.ts`. The loop: every ingest re-runs `run_auto_eval()`, which re-selects the search arm against the current corpus and rewrites `search_policy.json` - so retrieval self-tunes as the corpus drifts, with no human in the loop.*
+
+**Stage 1 - Resumable ingest (large-volume capability).** Raw files stream through a **per-file, per-chunk** extractor that runs *driver-side* (outside the agent's 30 s sandbox), stages results on **disk** (never embedded), merges duplicate entities across files once, then writes only the **canonical** pages to GBrain over MCP - so each entity is **embedded exactly once**. Three on-disk checkpoints (stage / merge / write, the last *verify-then-mark*) make a crash mid-corpus resume rather than restart. Measured at scale: embedding calls dropped **65 → 18** with `staging_in_db = 0`, and a killed run re-embedded **nothing** on resume. Small corpora use the one-shot `ingest_agent.py`; the same lifecycle, just without the streaming machinery. **(Phase 3 small-corpus, Phase 8 scale.)**
+
+**Stage 2 - Reconcile (`reconcile_graph()`).** A deterministic, **zero-LLM** `gbrain extract links --source db` pass materializes the `[[wikilinks]]` the extractor wrote into typed graph edges. It must run *after* all writes and *before* any query, because `put_page` over MCP is a remote caller (GBrain skips inline auto-link) and forward references only resolve once the whole corpus exists. **(Phase 4.)**
+
+**Stage 3 - Auto-eval + policy selection (`run_auto_eval()`, the self-tuning hook).** Immediately after reconcile, `main()` calls `run_auto_eval()` - the keystone that makes retrieval adaptive instead of a hard-coded `hybrid`. It branches on whether a **real** golden set exists:
+
+- **`data/golden_eval.json` exists → `policy_eval.ts`** (the trustworthy source): scores all three arms - keyword, vector, hybrid-RRF - on the *real* question set using **discounted grounding@C** (substring coverage × a rank/budget discount over the production injected-chunk count `C`), a **0-LLM** deterministic metric. It writes the winning arm + `rrf_k` to `results/search_policy.json`.
+- **No golden set yet → `auto_eval.ts`** (cold-start fallback): a known-item proxy that auto-generates qrels so a brand-new brain still gets a defensible policy on day one. It is a regression guardrail, not the oracle (Bad-Case Entry 20).
+
+`run_auto_eval()` is **best-effort**: any failure returns a string instead of raising, so a broken eval never breaks an ingest (disable entirely with `AUTO_EVAL=0`). Because it re-runs on **every ingest**, the policy is re-selected against the *current* corpus each time - this is what flipped the measured policy **vector → hybrid** when a 10-K landed on the entity brain. **(Phase 6 benchmark, Phase 9 policy loop.)**
+
+**Stage 4 - Query apply + the accuracy switch (`query_policy.ts`).** At read time the agent calls `query_with_policy()` → `query_policy.ts`, which reads `search_policy.json` and routes accordingly - **not** a hard-coded hybrid. Two modes:
+
+- **`QUERY_ROUTER` off (default):** every query uses the single **global arm** the selector chose (`keyword` | `vector` | `hybrid`).
+- **`QUERY_ROUTER=on` (the accuracy switch):** classify each query's shape and route *per-query* (`kw → keyword`, `vec → vector`, `mixed → hybrid`), plus **entity-aware one-hop graph expansion** that pulls in directly-linked pages. This is the extra switch you flip to buy accuracy on a mixed corpus where one global arm leaves recall on the table. **(Phase 9 Blocks C/E.)**
+
+**Why the loop is cheap (the cost model that makes self-tuning affordable).** The selector in stage 3 runs on *every* ingest - the hot loop - and it is **0-LLM** (deterministic grounding, no model call). The tempting alternative, an LLM answer-judge per arm per question per ingest, is wrong three ways: cost (a single uncapped answer-eval measured ~1.5 M tokens), latency (ingest blocks on dozens of generate-then-judge round-trips), and confounding (judging *retrieval* by *answer* quality lets the policy flip on generation noise). The expensive LLM judge is reserved for **event-triggered** checks only - a GATE when the policy *flips*, a CALIBRATOR on a domain shift. What licenses the cheap proxy is the measured correlation **`r = +0.820`** between discounted grounding and the answer-judge: cheap-and-continuous in the hot path, expensive-and-rare on the edges. **(Phase 9 Block D.)**
+
+> [!tip] One-paragraph mental model
+> **Ingest streams and stages so it scales and resumes; reconcile wires the graph for free; auto-eval measures the corpus on real questions for free and writes the winning search arm; query reads that policy and (optionally) routes per-query for extra accuracy.** Large volume comes from stage 1's disk-staging + embed-once + checkpoints; low-cost self-tuning comes from stage 3's 0-LLM selector run every ingest; accuracy-on-demand comes from stage 4's `QUERY_ROUTER` switch. Everything below is one of these four boxes in full.
 
 ---
 
@@ -402,6 +466,18 @@ Founder of [[companies/acme-ai]]; previously at [[companies/anthropic]]; angel i
 
 The smallest proof (`src/probe_mcp.py`, core): a Python MCP client spawns `gbrain serve` over stdio and lists its tools. **An MCP server is a separate process — it does NOT inherit your shell env**, so DB + oMLX vars are injected at spawn:
 
+**When to use:** Reach for `probe_mcp.py` when you want to confirm the GBrain MCP server is reachable from plain Python before building any agent - it isolates the spawn + handshake + tool-enumeration concern so a later failure in `ingest_agent.py` has exactly one cause (the prompt/agent logic) rather than two (plumbing + logic).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  PY[Python MCP client] -->|"StdioServerParameters<br/>env = _server_env()"| SP[spawn gbrain serve<br/>separate process]
+  SP --> INIT[session.initialize]
+  INIT --> LT[list_tools]
+  LT --> T[~70 tools<br/>put_page · query · search · ...]
+```
+*`probe_mcp.py` flow. A plain Python client spawns the GBrain MCP server over stdio and enumerates its tools - the smallest possible proof the MCP path works from non-Claude-Code Python before any agent is built. The env dict is injected at spawn because the server is a child process that does not inherit the shell.*
+
 ```python
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -420,9 +496,40 @@ async with stdio_client(params) as (read, write):
         tools = (await session.list_tools()).tools           # ~70 tools
 ```
 
+**Walkthrough:**
+- **The env dict is the whole point.** A stdio MCP server is a *child process*; it does not inherit your interactive shell's exports. `_server_env()` rebuilds what GBrain needs - `~/.bun/bin` on `PATH` (so `gbrain` resolves) plus `GBRAIN_DATABASE_URL` / `OLLAMA_BASE_URL` / `OLLAMA_API_KEY` - and passes it via `StdioServerParameters(env=...)`. Skip this and the server starts but can't reach Postgres or the embedder, and every tool call fails opaquely.
+- **Probe-first is de-risking, not ceremony.** Before wiring smolagents, this ~15-line client proves the spawn + handshake + tool list work from plain Python. If the probe lists `put_page`/`query`, the agent's only remaining variable is the *prompt* - you've separated "is the MCP plumbing alive?" from "can the model drive it?", so a later failure has one cause, not two. The same `_server_env()` is then reused verbatim by `ingest_agent.py`.
+
 **Result:** ~70 tools exposed; `put_page, add_link, add_timeline_entry, query, search` all present. The MCP path works from non-Claude-Code Python.
 
 #### The agent
+
+**When to use:** Reach for `ingest_agent.py` when your corpus fits in a single LLM context window (tens of files, up to a few hundred pages) and you want the full WRITE - RECONCILE - AUTO-EVAL - READ lifecycle in one blocking script. Use `resumable_ingest.py` instead when the source set is large enough that a single extraction call would exceed the model's context or timeout, or when you need per-file retry and progress checkpointing.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  M[main]
+  M -->|0 warm cache| EP0[extract_pages<br/>oMLX · driver-side<br/>outside sandbox]
+  M -->|1 WRITE| AG[CodeAgent loop<br/>thin · orchestrates]
+  subgraph TOOLS["fat tools"]
+    RS[read_sources<br/>local file I/O]
+    EP[extract_pages<br/>raw to pages · cached]
+    PP[put_page<br/>MCP write]
+  end
+  AG --> RS
+  AG --> EP
+  AG -->|per page| PP
+  PP --> GB[(GBrain<br/>Postgres + pgvector)]
+  M -->|2 RECONCILE| RG[reconcile_graph<br/>extract links · 0-LLM]
+  M -->|2.5 AUTO-EVAL| RA[run_auto_eval<br/>policy_eval / auto_eval]
+  M -->|3 READ| QW[query_with_policy<br/>query_policy.ts]
+  RG --> GB
+  RA --> POL[(search_policy.json)]
+  POL --> QW
+  QW --> GB
+```
+*`ingest_agent.py` call graph. The thin `CodeAgent` only orchestrates (read → extract → loop put_page); the capability lives in the two `@tool`s and the three driver-side infra calls (`reconcile_graph` → `run_auto_eval` → `query_with_policy`) `main()` runs in order around the agent. The cache is warmed once outside the 30 s sandbox so the in-agent `extract_pages` returns instantly.*
 
 **Code:** `src/ingest_agent.py` (full)
 
@@ -451,6 +558,13 @@ typed edges. This is infra, NOT an agent tool: put_page over MCP skips inline
 auto-link (remote caller) and inline auto-link can't wire forward references
 anyway, so the graph must be reconciled once the full corpus exists.
 
+Then main() calls run_auto_eval() — a best-effort, post-ingest retrieval-health +
+search-policy step (golden_eval.json present → policy_eval.ts on REAL questions,
+else auto_eval.ts cold-start proxy). It re-selects keyword/vector/hybrid against
+the current corpus and writes results/search_policy.json, so retrieval self-tunes
+on every ingest. It never raises (AUTO_EVAL=0 disables it). Queries then read that
+policy via query_with_policy() → query_policy.ts (Phase 9), not a hard-coded hybrid.
+
 Brain = oMLX (no native tool-calls) → CodeAgent + use_structured_outputs_internally.
 """
 from __future__ import annotations
@@ -458,6 +572,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 
 from dotenv import load_dotenv
@@ -582,6 +697,50 @@ def reconcile_graph() -> str:
     return lines[-1] if lines else "(no output)"
 
 
+def run_auto_eval() -> str:
+    """Post-ingest retrieval-health + search-policy step. BEST-EFFORT: a failed or
+    absent eval must NEVER break an ingest, so every error path returns a string
+    instead of raising. Disable with AUTO_EVAL=0.
+
+    Branch: prefer the REAL-question policy source when a golden set exists; fall
+    back to the known-item proxy only as cold-start (no golden set yet). The proxy
+    is a regression guardrail, not the policy oracle (Bad-Case Entry 20)."""
+    if os.getenv("AUTO_EVAL", "1") != "1":
+        return "(skipped: AUTO_EVAL=0)"
+    bun = shutil.which("bun", path=_server_env().get("PATH"))
+    if not bun:
+        return "(skipped: bun not found on PATH)"
+    golden = pathlib.Path(__file__).resolve().parent.parent / "data" / "golden_eval.json"
+    script = pathlib.Path(__file__).resolve().parent / (
+        "policy_eval.ts" if golden.exists() else "auto_eval.ts")   # ← the decision
+    try:
+        out = subprocess.run([bun, str(script)], capture_output=True, text=True,
+                             env=_server_env(), timeout=600)
+    except Exception as e:  # noqa: BLE001 — eval is advisory; never fail the ingest
+        return f"(auto-eval error: {e})"
+    if out.stdout:
+        print(out.stdout, end="")
+    lines = [ln for ln in (out.stdout or out.stderr).splitlines() if ln.strip()]
+    return lines[-1] if lines else "(no output)"
+
+
+def query_with_policy(query: str, limit: int = 5) -> str:
+    """APPLY half of the loop: run a query through query_policy.ts, which reads the
+    corpus-selected strategy from results/search_policy.json (written by the last
+    run_auto_eval) and routes to keyword/vector/hybrid accordingly — instead of a
+    hard-coded hybrid. This is how the agent's retrieval honors the per-corpus
+    verdict. With QUERY_ROUTER=on it routes per-query + adds entity-aware one-hop
+    assembly (Phase 9). Returns the actuator's stdout (policy line + ranked slugs)."""
+    env = _server_env()
+    bun = shutil.which("bun", path=env.get("PATH"))
+    if not bun:
+        return "(query_policy skipped: bun not found)"
+    script = pathlib.Path(__file__).resolve().parent / "query_policy.ts"
+    out = subprocess.run([bun, str(script), query, str(limit)],
+                         capture_output=True, text=True, env=env, timeout=120)
+    return (out.stdout or out.stderr).strip()
+
+
 # Two phases on purpose: WRITE, then (infra reconcile), then READ. The query must
 # run AFTER reconcile_graph() or it reads a graph whose edges aren't materialized.
 INGEST_TASK = """Build the brain using ONLY the provided tools:
@@ -626,7 +785,13 @@ def main() -> None:
         # BEFORE the read, so the query sees the wired graph. See reconcile_graph().
         print(">>> reconcile graph: " + reconcile_graph())
 
-        # 3. READ — query now runs over the reconciled graph.
+        # 2.5 AUTO-EVAL — retrieval-health + search-policy after every ingest.
+        # golden_eval.json present → policy_eval.ts (real Qs); else auto_eval.ts
+        # (cold start). Writes results/search_policy.json. Best-effort: never
+        # breaks the ingest (AUTO_EVAL=0 disables). See Phase 9 for the loop.
+        print(">>> auto-eval: " + run_auto_eval())
+
+        # 3. READ — query now runs over the reconciled graph AND the chosen policy.
         answer = agent.run(QUERY_TASK)
         print("\n>>> agent final answer:\n" + str(answer))
 
@@ -639,6 +804,7 @@ if __name__ == "__main__":
 - **`ToolCollection.from_mcp` + filter.** smolagents loads GBrain's MCP tools straight in (needs `smolagents[mcp]`). We pass only the ~2 the agent calls — GBrain exposes ~70, and handing all to a 14B blows its context and confuses tool selection.
 - **The two `@tool`s are where the intelligence lives.** `read_sources` does file I/O (the agent can't — sandbox blocks `pathlib`); `extract_pages` makes the one focused oMLX call that turns raw text into structured pages with wikilinks. The agent itself just loops `put_page` and calls `query`.
 - **The extraction prompt is the load-bearing part.** It *hard-mandates* `[[wikilinks]]` with a worked example — because without that the model writes prose and the graph never wires (see Result).
+- **`main()` runs the whole lifecycle in order: WRITE → RECONCILE → AUTO-EVAL → READ** (§3.1). After the agent writes pages, `reconcile_graph()` wires the edges, then `run_auto_eval()` re-selects the search policy against the now-current corpus (`policy_eval.ts` if `data/golden_eval.json` exists, else the `auto_eval.ts` cold-start proxy) and writes `results/search_policy.json`. It is **best-effort** — wrapped so a failed eval returns a string instead of raising, because an advisory retrieval check must never break an ingest (`AUTO_EVAL=0` skips it). The READ step then honors that policy via `query_with_policy()` → `query_policy.ts` (Phase 9), not a hard-coded hybrid. This is the seam that makes retrieval self-tune on every ingest.
 
 **Result:** `uv run python src/ingest_agent.py` — the agent wrote **10 pages** via `put_page`, then `gbrain extract links --source db` produced **11 typed edges**. `query "who is anchoring acme-seed?"` → top hit `deals/acme-seed` (**score 0.93**): *"Seed round for `[[companies/acme-ai]]`… `[[people/sam-okafor]]` is anchoring the remainder."* `graph-query deals/acme-seed` traverses `--invested_in->` / `--works_at->` / `--mentions->` across people + companies (depth 1–5).
 
@@ -722,6 +888,8 @@ gbrain extract links --source db  # → "created 34 links from 19 pages" → 45 
 **Step C — the second trap: the CLI cannot A/B keyword vs hybrid.** The obvious benchmark is `gbrain search` (keyword) vs `gbrain query` (hybrid). It is **invalid**: both subcommands fall through to the *same* handler (`src/cli.ts:771-772 — case 'search': case 'query':`), so they return byte-identical rankings, scores included. The real keyword/vector/hybrid split lives one layer down — `engine.searchKeyword` / `engine.searchVector` / `hybridSearch` — exposed only through GBrain's own eval harness, `src/core/search/eval.ts:runEval()`. The benchmark must call that directly.
 
 Below: the harness bootstraps the engine + AI gateway exactly as the CLI does, then runs `runEval()` once per strategy on one qrel set.
+
+**When to use:** reach for `bench_strategies.ts` when you need a rigorous, engine-layer A/B of keyword vs vector vs hybrid-RRF - specifically because `gbrain search` and `gbrain query` alias to the same CLI handler and cannot be differentiated from the shell; use its Python sibling `bench_rrf.py` only for a quick sanity check on a loaded brain where CLI-layer hit@3 is sufficient.
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -852,11 +1020,140 @@ The meta-principle is the W3.5.9 thesis applied to retrieval: **don't reflexivel
 
 **Deliverable:** `src/bench_strategies.ts` in the lab repo + the table above (also in the lab's `RESULTS.md`).
 
+> **Sibling benchmark - `src/bench_rrf.py` (the CLI-layer counterpart).** The same exact-vs-semantic question set also has a Python runner that shells out to `gbrain search` (keyword) and `gbrain query` (hybrid), parses the `[score] slug -- text` lines, and reports **hit@3 + MRR** per method. Keep it for a quick sanity check on a loaded brain, but the **engine-layer `bench_strategies.ts` above is the one to trust for an arm A/B**: `gbrain search` and `gbrain query` fall through to the *same* handler (Bad-Case Entry 8), so a CLI-level comparison can read as "no difference" between keyword and hybrid even when the engine arms genuinely diverge. `bench_rrf.py` is the artifact that surfaced that trap - which is exactly why the shown benchmark moved to the engine layer.
+
+`src/bench_rrf.py` shells out to the GBrain CLI and measures **hit@3 + MRR** across 10 labeled queries (5 exact-name, 5 semantic-paraphrase), running both `gbrain search` (keyword/FTS) and `gbrain query` (hybrid-RRF) so you can see where the two CLI arms agree and where they diverge on this specific brain.
+
+**When to use:** Reach for `bench_rrf.py` when you want a fast, dependency-light sanity check on a live brain - it requires only `gbrain` on PATH and a running Postgres instance. Use `bench_strategies.ts` instead whenever you need a trustworthy arm A/B, because the CLI routes both commands through the same handler (Bad-Case Entry 8) and can mask real engine-level differences.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  A["QUERIES list<br/>10 labeled tuples<br/>(query, gold_slug, kind)"] --> B["_ranked_slugs()<br/>subprocess: gbrain<br/>search OR query"]
+  B --> C["stdout lines<br/>parse _LINE regex<br/>extract slug list"]
+  C --> D["_rank_of()<br/>find gold in<br/>ranked slugs"]
+  D --> E["hit@3 + RR<br/>accumulate per method"]
+  E --> F{"all queries done?"}
+  F -->|"no"| B
+  F -->|"yes"| G["print per-query table<br/>+ summary hit@3 / MRR"]
+  subgraph Env["_env() injection"]
+    H["PATH += ~/.bun/bin"]
+    I["GBRAIN_DATABASE_URL<br/>OLLAMA_BASE_URL"]
+  end
+  B -.->|"uses env"| Env
+```
+*`bench_rrf.py` data flow - query list drives two subprocess calls per row; ranked slugs are parsed from stdout and scored against the gold label.*
+
+**Code: `src/bench_rrf.py`**
+
+```python
+"""Phase 6 benchmark — keyword FTS (`gbrain search`) vs hybrid-RRF (`gbrain query`).
+
+Runs a labeled query set against the live brain, parses GBrain's ranked output
+(`[score] slug -- text` lines), and reports hit@3 + MRR per method. The query
+set deliberately mixes EXACT-NAME queries (proper nouns — favor keyword/FTS) with
+SEMANTIC-PARAPHRASE queries (no shared surface token — favor vector). The whole
+point is to show WHERE the two retrievers diverge, not just an aggregate.
+
+Honest-measurement note: this brain is ~19 pages. On a corpus this small both
+retrievers nearly saturate, so the RRF lift here is a floor, not the 240-page
+number. We report what we measured.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+
+_BUN = os.path.expanduser("~/.bun/bin")
+_GBRAIN = os.path.join(_BUN, "gbrain")
+
+# (query, gold_slug, kind) — gold is the single page that best answers.
+QUERIES: list[tuple[str, str, str]] = [
+    ("Lin Zhao",                          "people/lin-zhao",             "exact"),
+    ("Ridgeline Capital",                 "companies/ridgeline-capital", "exact"),
+    ("Northstar Ventures",                "companies/northstar-ventures","exact"),
+    ("Marcus Webb",                       "people/marcus-webb",          "exact"),
+    ("dinner at Tartine",                 "meetings/tartine-dinner",     "exact"),
+    ("who runs serving infrastructure",   "people/lin-zhao",             "semantic"),
+    ("protein design foundation models",  "companies/helix-bio",         "semantic"),
+    ("inference optimization startup",    "companies/quanta-labs",       "semantic"),
+    ("early-stage bio funding round",     "deals/helix-series-a",        "semantic"),
+    ("payments company angel investment", "companies/stripe",            "semantic"),
+]
+
+K = 3  # hit@K
+_LINE = re.compile(r"^\[[-\d.]+\]\s+(\S+)\s+--")
+
+
+def _env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = _BUN + os.pathsep + env.get("PATH", "")
+    env.setdefault("GBRAIN_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/gbrain")
+    env.setdefault("OLLAMA_BASE_URL", "http://localhost:8000/v1")
+    return env
+
+
+def _ranked_slugs(cmd: str, query: str) -> list[str]:
+    """Run `gbrain <cmd> <query> --json --limit 10`, return ordered slugs."""
+    out = subprocess.run(
+        [_GBRAIN, cmd, query, "--json", "--limit", "10"],
+        capture_output=True, text=True, env=_env(),
+    ).stdout
+    slugs: list[str] = []
+    for line in out.splitlines():
+        m = _LINE.match(line.strip())
+        if m:
+            slugs.append(m.group(1))
+    return slugs
+
+
+def _rank_of(gold: str, slugs: list[str]) -> int | None:
+    for i, s in enumerate(slugs, 1):
+        if s == gold:
+            return i
+    return None
+
+
+def main() -> None:
+    methods = {"search (keyword)": "search", "query (hybrid-RRF)": "query"}
+    agg: dict[str, dict] = {m: {"hits": 0, "rr": 0.0} for m in methods}
+    print(f"{'query':<38}{'kind':<10}{'keyword':<12}{'hybrid-RRF':<12}")
+    print("-" * 72)
+    for q, gold, kind in QUERIES:
+        row = f"{q:<38}{kind:<10}"
+        for label, cmd in methods.items():
+            rank = _rank_of(gold, _ranked_slugs(cmd, q))
+            hit = rank is not None and rank <= K
+            agg[label]["hits"] += int(hit)
+            agg[label]["rr"] += (1.0 / rank) if rank else 0.0
+            row += f"{('@' + str(rank)) if rank else 'MISS':<12}"
+        print(row)
+    n = len(QUERIES)
+    print("-" * 72)
+    print(f"\n{'method':<22}{'hit@'+str(K):<10}{'MRR':<8}")
+    for m in methods:
+        print(f"{m:<22}{agg[m]['hits']}/{n} ({agg[m]['hits']/n:.0%})  {agg[m]['rr']/n:.3f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+
+- **Block 1 - QUERIES constant.** The list is typed as `list[tuple[str, str, str]]` and every entry carries a `kind` tag (`"exact"` vs `"semantic"`). The split is deliberate: exact-name queries favor FTS/keyword (token overlap is 1.0), semantic-paraphrase queries favor vector (no shared surface token). Without this split you cannot tell which retriever failed on which query class - an aggregate hit@3 hides cancellation between the two groups.
+- **Block 2 - _env() injection.** Rather than assuming `gbrain` is on the user's login PATH, `_env()` prepends `~/.bun/bin` at call time and sets the two DB/embedding URLs with `setdefault` (so an existing env var is never clobbered). This keeps the script portable across machines without editing PATH in the shell profile.
+- **Block 3 - _ranked_slugs().** The only output contract GBrain's CLI guarantees is the `[score] slug -- text` line format, so the function runs the subprocess and regex-parses stdout instead of relying on structured JSON. `--json --limit 10` is passed but the fallback parse handles cases where JSON framing is inconsistent across GBrain versions. Returning a plain `list[str]` (ordered slugs) keeps `_rank_of` decoupled from the retrieval path.
+- **Block 4 - main() accumulator.** `agg` accumulates integer hit counts and float reciprocal-rank sums in one pass; MRR is computed at the end as `rr_sum / n` rather than averaging per-query, which avoids a div-by-zero edge case when `rank` is `None` (a miss contributes 0.0). The aligned `f-string` print format means the output table is copy-pasteable directly into `RESULTS.md` without reformatting.
+
 ### Phase 7 — Ground-Truth Hierarchy: memory-as-authoritative A/B [executed, measured]
 
 **Goal:** leverage a principle from **ClaudioDrews/memory-os** — the *Ground-Truth Hierarchy*: injected memory is **authoritative**; an agent must not re-derive or re-fetch facts it already holds. memory-os names the anti-pattern **"memory-zero"** (re-establishing context from scratch every turn). GBrain is the authoritative store, so this is a natural fit: we A/B a 5-turn conversation that chains on overlapping entities (`Lin Zhao → Acme AI → its seed → investors`), comparing a memory-zero agent (re-query every turn) against a ground-truth agent (retrieve the subgraph once, inject it as authoritative, reuse).
 
 > **Provenance (kept honest):** the *Ground-Truth Hierarchy* principle is **ClaudioDrews/memory-os**'s. The sibling heat/eviction mechanism (W3.5.95) comes from a *different* repo, **BAI-LAB/MemoryOS** — don't conflate them.
+
+**When to use:** reach for `ground_truth_ab.py` when you need to measure the concrete cost of memory-zero vs ground-truth-authoritative memory on a real multi-turn conversation - specifically any time you have a chain of turns that share overlapping entities and you want numbers (retrieval calls, context tokens, coreference correctness) rather than intuition. Use it as a baseline template when introducing a new GBrain brain or a new entity-dense topic; its siblings (`eval_memory_policies.py`, `bench_strategies.ts`) benchmark retrieval arm strategy and eval scoring instead.
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -1137,6 +1434,62 @@ flowchart LR
   class L1,L2,L3 cont
 ```
 
+`resumable_ingest.py` is the large-corpus entry point. It replaces the single-prompt ingest with a four-phase pipeline - extract per file chunk to disk, merge across files, write only canonical pages to GBrain, reconcile - so each entity is embedded exactly once and the run is resumable at every expensive boundary.
+
+**When to use:** reach for `resumable_ingest.py` (instead of `ingest_agent.py`) when the source corpus is too large for a single extract call, spans many files that mention the same entities, or must survive crashes without re-doing expensive work; use `ingest_agent.py` for small, fresh, single-session corpora where simplicity matters more than throughput.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SRC[("~/brain/sources/*")]
+  FILES["_files()<br/>glob + decode"]
+  CHUNK["_chunk_text()<br/>line-aligned split<br/>at CHUNK_CHARS"]
+  EXTRACT["extract_file()<br/>driver-side LLM<br/>JSON pages"]
+  STAGE[(".ingest_stage/<br/>{stem}#{idx}.json")]
+  SKIP1{"chunk staged?<br/>skip"}
+  STAGEKEY["_stage_key()<br/>name+mtime+size<br/>fingerprint"]
+  MERGECACHE{"cache HIT?<br/>.ingest_merged.json"}
+  MERGE["merge_from_disk()<br/>group by slug<br/>across files"]
+  MERGEOP["_merge()<br/>one LLM call<br/>per multi-file entity"]
+  CANONICAL[["canonical pages"]]
+  WRITTEN[(".ingest_written.json")]
+  PENDING{"slug written?<br/>skip"}
+  BIG{"content ><br/>BIG_PAGE_CHARS?"]
+  DRIVER["_gbrain_put()<br/>subprocess driver-side"]
+  AGENT["CodeAgent.run()<br/>WRITE_TASK<br/>batches of BATCH"]
+  VERIFY["_verify_written()<br/>psql pages table<br/>existence check"]
+  MARK["_mark_written()<br/>verify-then-mark"]
+  RECONCILE["reconcile_graph()<br/>wire wikilinks"]
+  EVAL["run_auto_eval()<br/>golden eval + policy"]
+  QUERY["agent.run()<br/>QUERY_TASK"]
+
+  SRC --> FILES
+  FILES --> CHUNK
+  CHUNK --> SKIP1
+  SKIP1 -->|"not staged"| EXTRACT
+  EXTRACT --> STAGE
+  SKIP1 -->|"already staged"| STAGE
+  STAGE --> STAGEKEY
+  STAGEKEY --> MERGECACHE
+  MERGECACHE -->|"HIT: load cache"| CANONICAL
+  MERGECACHE -->|"MISS: re-merge"| MERGE
+  MERGE --> MERGEOP
+  MERGEOP --> CANONICAL
+  CANONICAL --> PENDING
+  PENDING -->|"not written"| BIG
+  PENDING -->|"already written"| WRITTEN
+  BIG -->|"oversized"| DRIVER
+  BIG -->|"normal"| AGENT
+  DRIVER --> VERIFY
+  AGENT --> VERIFY
+  VERIFY --> MARK
+  MARK --> WRITTEN
+  WRITTEN --> RECONCILE
+  RECONCILE --> EVAL
+  EVAL --> QUERY
+```
+*`resumable_ingest.py` internal call flow: four phases (extract-to-disk, merge, agent write with verify-then-mark, reconcile+eval+query); pink decision nodes are the resume gates - each one skips work already done.*
+
 **Code:** `src/resumable_ingest.py`:
 
 ```python
@@ -1157,7 +1510,7 @@ This version stages on disk (cheap, no embedding) and only writes finals to GBra
   merge_from_disk(): group by entity across files, merge multi-file entities (one
     LLM call each) -> a list of CANONICAL pages
   agent: put_page each canonical page over MCP, in bounded batches  # embedded ONCE
-  reconcile_graph(); query
+  reconcile_graph(); run_auto_eval(); query   # same WRITE→RECONCILE→AUTO-EVAL→READ as ingest_agent
 
 The "agent uses GBrain as memory" lesson is intact: the agent still WRITES the
 canonical pages and QUERIES them over MCP. Only the throwaway intermediate left
@@ -1197,7 +1550,8 @@ from openai import OpenAI
 from smolagents import CodeAgent, OpenAIServerModel, ToolCollection, tool
 
 from ingest_agent import (
-    NEEDED_TOOLS, QUERY_TASK, _EXTRACT_PROMPT, _GBRAIN, _server_env, reconcile_graph,
+    NEEDED_TOOLS, QUERY_TASK, _EXTRACT_PROMPT, _GBRAIN, _server_env,
+    reconcile_graph, run_auto_eval,
 )
 
 SOURCES = pathlib.Path(os.path.expanduser("~/brain/sources"))
@@ -1439,6 +1793,13 @@ def main() -> None:
 
         # 4. RECONCILE links, then the agent queries its memory.
         print(">>> reconcile graph: " + reconcile_graph())
+
+        # 4.5 AUTO-EVAL — retrieval-health + search-policy after every ingest
+        # (best-effort; never breaks the ingest). golden_eval.json → policy_eval.ts,
+        # else auto_eval.ts. Writes results/search_policy.json. Same hook as the
+        # small-corpus path (ingest_agent.py), so the scale path self-tunes too.
+        print(">>> auto-eval: " + run_auto_eval())
+
         answer = agent.run(QUERY_TASK)
         print("\n>>> agent final answer:\n" + str(answer))
 
@@ -1553,13 +1914,33 @@ Each question carries `expected_entities` — the substrings a correct answer-be
 
 #### Block B — `policy_eval.ts`: score real questions, write the policy
 
+**When to use:** reach for `policy_eval.ts` whenever `data/golden_eval.json` is present and you want a trustworthy, corpus-adaptive policy - it uses real, labeled questions and position-aware discounted grounding@C to select the best retrieval arm. Use `auto_eval.ts` instead only as a fallback when no golden set exists yet.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  G[(golden_eval.json<br/>real labeled Qs<br/>+ expected_entities)] --> CK{golden<br/>exists?}
+  CK -->|no| FB[exit 1<br/>caller falls back<br/>to auto_eval.ts]
+  CK -->|yes| BOOT[bootstrap GBrain engine<br/>same seq as the CLI]
+  BOOT --> ARM[for each arm:<br/>keyword · vector · hybrid]
+  ARM --> SR[search top-K<br/>per golden question]
+  SR --> SC[grounding.ts · 0-LLM<br/>grnd@C↓ = max coverage x disc i<br/>answ@C = all entities in some top-C]
+  SC --> AGG[per arm: mean grnd@C↓<br/>+ mean answ@C<br/>+ per-domain g@C tenk · entity]
+  AGG --> WIN[winner = argmax grnd@C↓]
+  WIN --> TIE{grnd@C↓ tie?}
+  TIE -->|no| POL[(search_policy.json<br/>winner + rrf_k<br/>source: golden_eval)]
+  TIE -->|"yes · 平手"| TB[tie-break<br/>argmax answ@C]
+  TB --> POL
+```
+*`policy_eval.ts` data flow. The golden set is the fixed ruler; for every arm it searches the live corpus and scores each question on two 0-LLM metrics in `grounding.ts` - `grnd@C↓` (position-weighted best coverage over the generator's budget `C`) and `answ@C` (answerable@C: fraction of questions where some top-C section covers ALL expected entities). The winner is `argmax(grnd@C↓)`; on a tie it falls back to `argmax(answ@C)` (`groundingFor(b)-groundingFor(a) || answerableFor(b)-answerableFor(a)`), then writes the winning arm to `search_policy.json`. Absent golden set → exit 1, and `run_auto_eval()` runs `auto_eval.ts` instead.*
+
 **Code (full source `src/policy_eval.ts`):**
 
 ```typescript
 /**
  * policy_eval.ts — REAL-question policy generator (the trustworthy policy source).
  *
- * Replaces auto_eval.ts's known-item PROXY as the thing that writes the policy.
+ * Replaces eval.ts's known-item PROXY as the thing that writes the policy.
  * The proxy used page titles as queries and mis-selected `keyword`; real questions
  * refuted that ~5×. So the policy must come from a real, labeled golden set.
  *
@@ -1717,7 +2098,308 @@ process.exit(0);
 **Walkthrough:**
 - **Discounted grounding@C, not rank-blind grounding@K.** With no gold *slug*, "did retrieval surface a section *containing the answer entities*" is the honest, label-cheap signal. But the old `max`-over-top-K was **rank- and budget-blind** — it scored 1.0 whether the answer sat at rank 0 or rank 4. RRF's failure mode is exactly rank: fuse a keyword distractor above the dense answer and the answer reads later, or falls past the `C` chunks the generator is actually handed. So we score the prompt the model sees — `gDisc = max_i coverage_i · disc(i)` over the top-`C`, where `disc(rank0)=1/log2(rank0+2)` rewards early placement and a section past `C` scores 0. `C` is the **production injected-chunk count** (here 3, read off `ground_truth_ab.py`), not a tunable — it is *measured off the agent*, never hand-picked.
 - **Per-domain breakdown is the diagnostic.** `g@C:tenk` vs `g@C:entity` shows *which corpus the policy is serving*, and makes drift visible — an absent domain scores ~0 until its data is ingested.
+- **Winner = `argmax(grnd@C↓)`, ties broken by `argmax(answ@C)`.** The selection is one sort: `strategies.sort((a,b) => groundingFor(b)-groundingFor(a) || answerableFor(b)-answerableFor(a))[0]`. Primary key is discounted grounding (does the answer land high *and* inside the budget); the `||` only fires when two arms tie on grounding, then the more *answerable* arm (more questions whose top-C covers ALL expected entities) wins. This is why both `grnd@C↓` and `answ@C` columns are computed per arm even though only grounding usually decides - `answ@C` is the documented deterministic tiebreaker, not decoration.
 - **Re-runs on every ingest.** `run_auto_eval()` prefers `policy_eval.ts` whenever `data/golden_eval.json` exists, so the policy is re-selected against the *current* corpus each time; the loop tracks drift automatically.
+
+#### Block C — `auto_eval.ts`: cold-start SELECTOR + regression guardrail
+
+`auto_eval.ts` is the fallback SELECTOR that fires when no `golden_eval.json` exists yet. Instead of real labeled questions it synthesizes its own qrels from the live corpus: each sampled page contributes an **exact** query (the page title - exercises keyword FTS) and a **semantic** query (body words with the title tokens stripped - the gold page name is never a literal substring, so keyword cannot trivially win). Sample size scales with corpus size (`Q = clamp(ceil(ratio·N), Q_MIN, Q_MAX)`) and a seeded shuffle keeps runs reproducible. It scores all three arms via `runEval()`, writes the winner to `results/search_policy.json`, and appends the run record to `results/auto_eval.jsonl` so the next run can detect a regression.
+
+**When to use:** reach for `auto_eval.ts` (via `run_auto_eval()`) when the brain is brand-new and no hand-labeled golden set exists yet - it gives a retrieval-health signal and a policy artifact immediately, at zero labeling cost. Prefer `policy_eval.ts` once real questions are available; `auto_eval.ts` is demoted to a cold-start fallback and a run-to-run regression guardrail (Δrecall@K across ingests), not a trusted policy source.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  PAGES["engine.listPages()<br/>all N pages"] --> SORT["sort by slug<br/>(order-independent)"] 
+  SORT --> SHUF["seededShuffle<br/>mulberry32 PRNG<br/>seed=42"]
+  SHUF --> SAMPLE["sample Q pages<br/>Q=clamp(ceil(ratio·N),<br/>Q_MIN,Q_MAX)"]
+  SAMPLE --> EXACT["exact query<br/>= page.title<br/>gold = page.slug"]
+  SAMPLE --> SEM["semanticQuery()<br/>body-minus-title tokens<br/>≥3 words kept"]
+  EXACT --> QRELS["AutoQrel set<br/>exact + semantic"]
+  SEM --> QRELS
+  QRELS --> RE["runEval() × 3<br/>keyword · vector · hybrid"]
+  RE --> WIN["winner = argmax recall@K<br/>tie-break: argmax MRR"]
+  WIN --> POL[("search_policy.json<br/>strategy + recall")]
+  WIN --> LOG[("auto_eval.jsonl<br/>run history")]
+  LOG --> REG{"previous run<br/>exists?"}  
+  REG -->|"yes"| DIFF["Δrecall@K per arm<br/>⚠ if < -ε"]
+  REG -->|"no"| BASE["baseline run"]
+```
+*`auto_eval.ts` data flow. The corpus itself generates the qrels (known-item proxy) - no human labeling required. `mulberry32` is a tiny seeded PRNG so the sampled page-set is reproducible for a given (corpus, seed) pair. The regression check compares the new run against the last `auto_eval.jsonl` line and emits a warning when any arm drops more than `REGRESS_EPS` (default 0.05).*
+
+**Code: `src/auto_eval.ts`**
+
+```typescript
+/**
+ * auto_eval.ts — post-ingest retrieval-health regression check.
+ *
+ * WIRED INTO THE INGEST FLOW: ingest_agent.py / resumable_ingest.py call this
+ * via `bun src/auto_eval.ts` right after reconcile_graph(), so every corpus
+ * write is followed by a keyword-vs-vector-vs-hybrid measurement on the LIVE
+ * brain. It runs at the ENGINE layer (engine.searchKeyword / searchVector /
+ * hybridSearch via gbrain's runEval) — the CLI cannot A/B these (Phase 6 trap:
+ * `gbrain search` and `gbrain query` share one handler).
+ *
+ * AUTO-LABELING (no hand-built qrels): this is a KNOWN-ITEM eval. We sample Q
+ * pages and synthesize one query per page whose gold answer IS that page's own
+ * slug:
+ *   - exact    query = the page TITLE          → exercises the keyword arm
+ *   - semantic query = body words MINUS the title tokens → exercises the vector
+ *                      arm (the gold page's name is NOT a literal substring, so
+ *                      keyword cannot trivially win it)
+ * Q scales with corpus size: Q = clamp(ceil(ratio·N), Q_MIN, Q_MAX), sampled
+ * with a SEEDED shuffle so a given page-set is reproducible run-to-run.
+ *
+ * HONEST LIMITATION (do not oversell): known-item queries are drawn from each
+ * doc's OWN vocabulary, so they are a PROXY for real user queries, not a
+ * substitute for a hand-labeled gold set that reflects the real query
+ * distribution. This harness answers "did retrieval regress / which arm wins on
+ * THIS corpus shape?" — it is a guardrail + trend signal, not a quality verdict.
+ *
+ * Config (env): AUTO_EVAL_RATIO=0.30  AUTO_EVAL_QMIN=5  AUTO_EVAL_QMAX=50
+ *   AUTO_EVAL_K=3  AUTO_EVAL_SEED=42  AUTO_EVAL_REGRESS_EPS=0.05  AUTO_EVAL_STRICT=0
+ * Run: bun src/auto_eval.ts   (needs GBRAIN_DATABASE_URL + OLLAMA_* env)
+ */
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const RESULTS = `${import.meta.dir}/../results/auto_eval.jsonl`;
+// The APPLY target: the decision artifact the policy-aware query path reads to
+// honor the corpus-selected strategy (closes the measure→decide→apply loop).
+const POLICY = `${import.meta.dir}/../results/search_policy.json`;
+
+const RATIO = Number(process.env.AUTO_EVAL_RATIO ?? "0.30");
+const Q_MIN = Number(process.env.AUTO_EVAL_QMIN ?? "5");
+const Q_MAX = Number(process.env.AUTO_EVAL_QMAX ?? "50");
+const K = Number(process.env.AUTO_EVAL_K ?? "3");
+const SEED = Number(process.env.AUTO_EVAL_SEED ?? "42") || 42;
+const REGRESS_EPS = Number(process.env.AUTO_EVAL_REGRESS_EPS ?? "0.05");
+const STRICT = process.env.AUTO_EVAL_STRICT === "1";
+
+export interface PageLite { slug: string; title: string; compiled_truth: string }
+export type Kind = "exact" | "semantic";
+export interface AutoQrel { query: string; relevant: string[]; kind: Kind }
+type Strategy = "keyword" | "vector" | "hybrid";
+
+// Q scales with corpus size: clamp(ceil(ratio·N), Q_MIN, Q_MAX), never above N.
+export function computeQ(n: number, ratio: number, qMin: number, qMax: number): number {
+  return Math.min(n, qMax, Math.max(qMin, Math.ceil(ratio * n)));
+}
+
+// ── deterministic sampling ────────────────────────────────────────────────
+// mulberry32: tiny seeded PRNG so the sampled page-set is reproducible for a
+// given (corpus, seed). Adding pages reshuffles — the eval is a per-run trend,
+// not a frozen gold set.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function seededShuffle<T>(arr: readonly T[], seed: number): T[] {
+  const rand = mulberry32(seed);
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+// ── known-item query synthesis ────────────────────────────────────────────
+const WIKILINK = /\[\[([^\]]+)\]\]/g;
+
+// Replace [[dir/slug]] with its readable tail ("companies/acme-ai" → "acme ai")
+// so the body becomes plain words, not link markup.
+function deLink(text: string): string {
+  return text.replace(WIKILINK, (_m, inner: string) => {
+    const tail = inner.split("/").pop() ?? "";
+    return tail.replace(/-/g, " ");
+  });
+}
+
+function tokenize(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+}
+
+// Semantic probe: first body sentence, de-linked, with the page's TITLE tokens
+// removed — so the gold page's name is never a literal substring of the query
+// (keyword cannot trivially match it; the vector arm has to earn the hit).
+// Returns null when too few content words survive to be a meaningful query.
+export function semanticQuery(page: PageLite): string | null {
+  const body = (page.compiled_truth ?? "").replace(/^#.*$/m, "").trim();
+  const plain = deLink(body).replace(/\s+/g, " ").trim();
+  const firstSentence = (plain.split(/(?<=[.!?])\s+/)[0] ?? "").trim();
+  if (!firstSentence) return null;
+  const titleTokens = new Set(tokenize(page.title));
+  const kept = tokenize(firstSentence).filter(t => t.length > 2 && !titleTokens.has(t));
+  return kept.length >= 3 ? kept.join(" ") : null;
+}
+
+export function buildQrels(sample: readonly PageLite[]): AutoQrel[] {
+  const qrels: AutoQrel[] = [];
+  for (const page of sample) {
+    const exact = page.title?.trim();
+    if (exact) qrels.push({ query: exact, relevant: [page.slug], kind: "exact" });
+    const semantic = semanticQuery(page);
+    if (semantic) qrels.push({ query: semantic, relevant: [page.slug], kind: "semantic" });
+  }
+  return qrels;
+}
+
+// ── live run (engine layer) — only when executed directly, not on import ────
+async function main(): Promise<void> {
+// engine bootstrap (identical sequence to bench_strategies.ts / the CLI)
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { runEval } = await import(`${GB}/core/search/eval.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+// ── sample + label ─────────────────────────────────────────────────────────
+const allPages: PageLite[] = await engine.listPages();
+const N = allPages.length;
+if (N === 0) {
+  console.log("auto-eval: empty brain (0 pages) — nothing to evaluate.");
+  await engine.disconnect?.();
+  process.exit(0);
+}
+
+const Q = computeQ(N, RATIO, Q_MIN, Q_MAX);
+// Sort by slug first so the seeded shuffle is order-independent of listPages().
+const bySlug = [...allPages].sort((a, b) => (a.slug < b.slug ? -1 : 1));
+const sample = seededShuffle(bySlug, SEED).slice(0, Q);
+const qrels = buildQrels(sample);
+
+const nExact = qrels.filter(q => q.kind === "exact").length;
+const nSemantic = qrels.filter(q => q.kind === "semantic").length;
+console.log(
+  `auto-eval: N=${N} pages · ratio=${RATIO} · Q=${Q} sampled (seed=${SEED}) · ` +
+  `${qrels.length} known-item queries (${nExact} exact / ${nSemantic} semantic) · K=${K}`,
+);
+
+// ── run the three strategies ────────────────────────────────────────────────
+const strategies: readonly Strategy[] = ["keyword", "vector", "hybrid"];
+const plain = qrels.map(({ query, relevant }) => ({ query, relevant }));
+const reports: Record<Strategy, any> = {} as Record<Strategy, any>;
+for (const strategy of strategies) {
+  reports[strategy] = await runEval(engine, plain, { strategy, expand: false }, K);
+}
+
+// per-kind recall: where does each arm actually win?
+function recallByKind(strategy: Strategy, kind: Kind): number {
+  const vals = qrels
+    .map((q, i) => (q.kind === kind ? reports[strategy].queries[i].recall_at_k : null))
+    .filter((v): v is number => v !== null);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : NaN;
+}
+
+const f = (x: number) => (Number.isNaN(x) ? "  n/a" : x.toFixed(3));
+const pad = (s: string, n: number) => s.padEnd(n);
+
+console.log("\n" + pad("strategy", 10) + pad(`recall@${K}`, 11) + pad("MRR", 9) +
+  pad(`nDCG@${K}`, 10) + pad("R@K exact", 11) + pad("R@K seman", 11));
+console.log("-".repeat(62));
+for (const s of strategies) {
+  const r = reports[s];
+  console.log(
+    pad(s, 10) + pad(f(r.mean_recall), 11) + pad(f(r.mean_mrr), 9) +
+    pad(f(r.mean_ndcg), 10) + pad(f(recallByKind(s, "exact")), 11) +
+    pad(f(recallByKind(s, "semantic")), 11),
+  );
+}
+
+// winner by recall@K, tie-broken by MRR
+const winner = [...strategies].sort((a, b) =>
+  reports[b].mean_recall - reports[a].mean_recall ||
+  reports[b].mean_mrr - reports[a].mean_mrr)[0];
+console.log(`\nwinner on this corpus: ${winner} ` +
+  `(recall@${K}=${f(reports[winner].mean_recall)}, MRR=${f(reports[winner].mean_mrr)})`);
+
+// ── persist + regression check vs the previous run ──────────────────────────
+const record = {
+  ts: new Date().toISOString(),
+  n_pages: N, q: Q, ratio: RATIO, seed: SEED, k: K, n_queries: qrels.length,
+  winner,
+  strategies: Object.fromEntries(strategies.map(s => [s, {
+    recall: reports[s].mean_recall, mrr: reports[s].mean_mrr, ndcg: reports[s].mean_ndcg,
+    recall_exact: recallByKind(s, "exact"), recall_semantic: recallByKind(s, "semantic"),
+  }])),
+};
+
+let previous: typeof record | null = null;
+if (existsSync(RESULTS)) {
+  const lines = readFileSync(RESULTS, "utf-8").trim().split("\n").filter(Boolean);
+  if (lines.length) {
+    try { previous = JSON.parse(lines[lines.length - 1]); } catch { previous = null; }
+  }
+}
+
+mkdirSync(dirname(RESULTS), { recursive: true });
+appendFileSync(RESULTS, JSON.stringify(record) + "\n");
+
+// ── APPLY: write the corpus-selected policy the query path will honor ────────
+// Winner = recall@K winner (tie-broken by MRR). This is the actuator half: the
+// next agent query reads search_policy.json and routes to this strategy instead
+// of bare hybrid. Stock `gbrain query` is hybrid-only and is NOT affected.
+const policy = {
+  strategy: winner,
+  rrf_k: 60,                       // GBrain RRF default; only used when strategy==="hybrid"
+  k: K,
+  n_pages: N,
+  recall: reports[winner].mean_recall,
+  per_kind: { exact: recallByKind(winner, "exact"), semantic: recallByKind(winner, "semantic") },
+  ts: record.ts,
+  note: "auto-selected by auto_eval.ts (known-item eval). Read by query_policy.ts; "
+    + "does NOT change stock `gbrain query` (hybrid-only).",
+};
+writeFileSync(POLICY, JSON.stringify(policy, null, 2) + "\n");
+console.log(`applied search policy → strategy=${winner}  (results/search_policy.json)`);
+
+let regressed = false;
+if (previous) {
+  console.log(`\nvs previous run (${previous.ts}, N=${previous.n_pages}):`);
+  for (const s of strategies) {
+    const d = reports[s].mean_recall - previous.strategies[s].recall;
+    const tag = d < -REGRESS_EPS ? "  ⚠ REGRESSION" : "";
+    if (d < -REGRESS_EPS) regressed = true;
+    console.log(`  ${pad(s, 10)} Δrecall@${K} = ${d >= 0 ? "+" : ""}${d.toFixed(3)}${tag}`);
+  }
+  if (!regressed) console.log("  no strategy regressed beyond ε=" + REGRESS_EPS);
+} else {
+  console.log("\n(no previous run — this is the baseline)");
+}
+
+console.log("\nnote: known-item proxy eval (queries drawn from each page's own text). " +
+  "Measures retrieval health + per-arm fit, NOT real-query quality.");
+
+await engine.disconnect?.();
+process.exit(regressed && STRICT ? 2 : 0);
+}
+
+if (import.meta.main) {
+  await main();
+}
+```
+
+**Walkthrough:**
+- **Known-item auto-labeling avoids cold-start paralysis.** Without any hand-built qrels a brand-new brain still gets a policy. The trick: each page's own title makes a valid exact-keyword query (gold = that slug), and the first body sentence with title tokens removed makes a semantic probe the keyword arm cannot trivially win. The split between `exact` and `semantic` kinds is load-bearing - it exposes *per-arm* recall so you see whether keyword or vector is doing the work (the `R@K exact` / `R@K seman` columns in the output table).
+- **`mulberry32` + sort-before-shuffle makes runs reproducible.** A standard PRNG seeded differently each run would make the sampled page-set non-deterministic; the same seed but random `listPages()` order would do the same. Sorting by slug first eliminates the second source of variance, so a given (corpus state, SEED) always samples the same pages - adding new pages changes the sorted order and reshuffles, but the eval is a per-run trend signal, not a frozen gold set, so that is correct behavior.
+- **`semanticQuery` strips title tokens precisely to prevent trivial keyword wins.** If the title `Lin Zhao` appeared verbatim in the semantic query, keyword FTS would match it by exact token overlap and inflate keyword recall - the semantic arm would not be tested at all. Removing title tokens forces the vector arm to earn hits on paraphrase, giving an honest arm comparison on small corpora where keyword precision can otherwise mask poor vector coverage.
+- **Regression check compares against the last `auto_eval.jsonl` line, not a fixed baseline.** This means every ingest automatically detects drift: if corpus changes degrade any arm by more than `REGRESS_EPS` (default 0.05), a `⚠ REGRESSION` line appears. `STRICT=1` exits with code 2 so a CI hook can catch it. The JSONL append is the audit trail - historical recall@K is always recoverable even when `search_policy.json` has been overwritten many times.
+- **APPLY step closes the measure-decide-apply loop.** `search_policy.json` is not just a log - it is the artifact `query_policy.ts` reads on every agent retrieval call. Writing it here (with `source: auto_eval`) is the actuator step; the next query the agent issues will honor the corpus-selected arm without any code change.
 
 **Result — the drift experiment (live, isolated `gbrain_brk` DB):**
 
@@ -1821,6 +2503,176 @@ Routing with the revived keyword arm — **three of these four numbers are compu
 
 **Why oracle isn't a cell:** the table shows *average-then-display* (each cell = the mean over 24 Q for one arm). Oracle is *max-per-question-then-average* — it picks the winner **inside each question first**. Because `max-then-average ≠ average-of-columns`, 0.887 can't be recovered from the column means, and it must sit above every column (0.887 > the best column, 0.823). That gap is exactly the unattainable ceiling — no real classifier knows the per-question best in advance. Reading the columns (these all *are* table cells): OR-preprocessing lifts `key` on *every* class (`g@C:kw` 0.500 → 1.000; `g@C:vec` 0.000 → 0.588 — even paraphrases share enough salient tokens to escape the AND-to-zero trap), but raw `vector` (0.811) and `hyb` (0.823) still match or beat `key_pp` (0.799) overall, so the revived keyword buys **routing headroom, not a new global winner**. And note `hyb_pp` (0.823) now exactly *equals* plain `hyb` (0.823) — OR-fusing the revived keyword into hybrid is **neutral** for the global policy (an earlier, corpus-overfit stop-list made it *trail*; with a generic stop-list that artifact is gone). The +0.065 only exists under an oracle that peeks at labels; the shippable global default is left no better.
 
+---
+
+**`src/route_eval_kwpp.ts` — keyword-revival probe**
+
+This script measures whether OR-preprocessing the keyword query revives the conjunctive-FTS arm and, if so, whether that creates per-query routing headroom. It scores five arms (`key`, `key_pp`, `vector`, `hyb`, `hyb_pp`) on the 24-Q balanced golden set and then computes oracle vs global-`hyb_pp` to quantify the routing ceiling.
+
+**When to use:** reach for `route_eval_kwpp.ts` when you suspect the keyword arm is broken by verbose or conjunctive queries and want to measure whether an OR-rewrite fixes it - and whether that fix reopens routing headroom. Use `route_eval.ts` instead when the keyword arm health is already known and you just want the standard three-arm routing ceiling.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  ENV["ENV: GOLDEN_EVAL<br/>POLICY_K · POLICY_C"] --> LOAD[Load golden JSON<br/>GoldenQ list]
+  LOAD --> BOOT[Bootstrap GBrain engine<br/>loadConfig · createEngine<br/>connectWithRetry]
+  BOOT --> LOOP[for each golden question]
+  LOOP --> KR[searchKeyword<br/>raw q]
+  LOOP --> PP[preprocessOR q<br/>drop stopwords<br/>OR-join tokens]
+  PP --> KPP[searchKeyword<br/>preprocessed q]
+  LOOP --> VEC[searchVector<br/>embed q]
+  LOOP --> HYB[hybridSearch<br/>raw q]
+  KPP --> HYBPP["RRF(key_pp, vector)<br/>hyb_pp"]  
+  KR --> GK[ground key]
+  KPP --> GKPP[ground key_pp]
+  VEC --> GV[ground vector]
+  HYB --> GH[ground hyb]
+  HYBPP --> GHP[ground hyb_pp]
+  GK & GKPP & GV & GH & GHP --> SCORES[score arrays<br/>per arm · 24 Q]
+  SCORES --> TABLE[Print arm table<br/>grnd@C · per-domain]
+  SCORES --> ORACLE["oracle = mean(max per Q<br/>over key_pp / vector / hyb_pp)"]
+  ORACLE --> HEADROOM[Print routing headroom<br/>global hyb_pp · oracle · Δ<br/>wins / total]
+```
+*`route_eval_kwpp.ts` data flow. Five arms are scored in parallel per question; the arm table reveals the AND-vs-OR gap; the oracle block reveals how much routing headroom the revived keyword arm reopens.*
+
+**Code (`src/route_eval_kwpp.ts`):**
+
+```typescript
+/**
+ * route_eval_kwpp.ts — does KEYWORD-QUERY PREPROCESSING revive the keyword arm,
+ * and does that re-open per-query routing headroom?
+ *
+ * Diagnosis (deep-dive): GBrain's keyword arm uses conjunctive `websearch_to_tsquery`
+ * over chunk-grain — every query token must co-occur in one chunk, so verbose queries
+ * (natural questions, padded exact queries) AND to ZERO. Bare exact tokens rank ~1.0.
+ *
+ * Fix tested here, entirely on OUR side (no GBrain change): preprocess the keyword query —
+ * drop stop/question words, then **OR-join** the salient tokens. OR (`a OR b OR c`) switches
+ * websearch from AND to best-match, so a missing token lowers rank instead of zeroing the match.
+ *
+ * Arms scored with the same discounted grounding@C as the policy:
+ *   key      — engine.searchKeyword(raw q)            (conjunctive, current behavior)
+ *   key_pp   — engine.searchKeyword(preprocessOR(q))  (the fix)
+ *   vector   — engine.searchVector(embed(q))
+ *   hyb      — hybridSearch(raw q)                     (GBrain's current hybrid)
+ *   hyb_pp   — RRF(key_pp, vector)                     (fixed hybrid using the revived keyword)
+ * Then: per-class grounding + oracle{key_pp, vector, hyb_pp} vs global(hyb_pp) → routing headroom?
+ *
+ * Run: GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts
+ */
+import { readFileSync } from "node:fs";
+
+import { budgetScore, coverage } from "./grounding.ts";
+import { preprocessOR } from "./query_routing.ts";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const GOLDEN = process.env.GOLDEN_EVAL ?? `${import.meta.dir}/../data/golden_eval.json`;
+const K = Number(process.env.POLICY_K ?? "5");
+const C = Number(process.env.POLICY_C ?? "3");
+
+interface GoldenQ { q: string; expected_entities: string[]; domain: string }
+const golden: GoldenQ[] = JSON.parse(readFileSync(GOLDEN, "utf-8")).questions;
+
+// `preprocessOR` (drop generic stop-words, OR-join salient tokens) is the shared, corpus-AGNOSTIC
+// version from ./query_routing.ts — the same one the production router uses. An earlier local copy
+// baked in corpus/question-specific words (`berkshire`, `anchor`, `funding`…); that overfit the
+// eval and is gone.
+
+// ── simple RRF over two ranked slug lists ────────────────────────────────────
+function rrf(a: string[], b: string[], k = 60): string[] {
+  const score = new Map<string, number>();
+  for (const list of [a, b]) {
+    list.forEach((slug, i) => score.set(slug, (score.get(slug) ?? 0) + 1 / (k + i + 1)));
+  }
+  return [...score.entries()].sort((x, y) => y[1] - x[1]).map(([s]) => s);
+}
+
+// ── engine bootstrap ──────────────────────────────────────────────────────────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { embed } = await import(`${GB}/core/embedding.ts`);
+const { hybridSearch } = await import(`${GB}/core/search/hybrid.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+async function ground(slugs: string[], ents: string[]): Promise<number> {
+  const covs = await Promise.all(slugs.slice(0, C).map(async s => coverage(await sectionText(s), ents)));
+  return budgetScore(covs, C).gDisc;
+}
+const slugsOf = (rs: { slug: string }[]) => rs.map(r => r.slug);
+
+// ── per-question scoring across the five arms ────────────────────────────────
+type Arm = "key" | "key_pp" | "vector" | "hyb" | "hyb_pp";
+const arms: Arm[] = ["key", "key_pp", "vector", "hyb", "hyb_pp"];
+const score = Object.fromEntries(arms.map(a => [a, [] as number[]])) as Record<Arm, number[]>;
+
+for (const g of golden) {
+  const ents = g.expected_entities;
+  const keyRaw = slugsOf(await engine.searchKeyword(g.q, { limit: K }));
+  const keyPP = slugsOf(await engine.searchKeyword(preprocessOR(g.q), { limit: K }));
+  const vec = slugsOf(await engine.searchVector(await embed(g.q), { limit: K }));
+  const hyb = slugsOf(await hybridSearch(engine, g.q, { limit: K, expansion: false, rrfK: 60 }));
+  const hybPP = rrf(keyPP, vec).slice(0, K);
+  score.key.push(await ground(keyRaw, ents));
+  score.key_pp.push(await ground(keyPP, ents));
+  score.vector.push(await ground(vec, ents));
+  score.hyb.push(await ground(hyb, ents));
+  score.hyb_pp.push(await ground(hybPP, ents));
+}
+
+// ── report ───────────────────────────────────────────────────────────────────
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const pad = (s: string, n: number) => s.padEnd(n);
+const f = (x: number) => x.toFixed(3);
+const domains = [...new Set(golden.map(g => g.domain))];
+const meanFor = (a: Arm, d?: string) => mean(score[a].filter((_, i) => !d || golden[i].domain === d));
+
+console.log(`route_eval_kwpp: ${golden.length} questions · K=${K} C=${C}\n`);
+console.log(pad("arm", 10) + pad("grnd@C", 9) + domains.map(d => pad(`g@C:${d}`, 9)).join(""));
+console.log("-".repeat(10 + 9 + domains.length * 9));
+for (const a of arms) {
+  console.log(pad(a, 10) + pad(f(meanFor(a)), 9) + domains.map(d => pad(f(meanFor(a, d)), 9)).join(""));
+}
+
+// routing headroom with the REVIVED keyword arm: oracle over {key_pp, vector, hyb_pp} vs global hyb_pp
+const routeArms: Arm[] = ["key_pp", "vector", "hyb_pp"];
+const global = mean(score.hyb_pp);
+const oracle = mean(golden.map((_, i) => Math.max(...routeArms.map(a => score[a][i]))));
+const wins = golden.filter((_, i) => {
+  const best = Math.max(...routeArms.map(a => score[a][i]));
+  return best > score.hyb_pp[i] + 1e-9;   // a non-hybrid arm strictly beats fixed-hybrid
+}).length;
+console.log(`\nrouting (with revived keyword): global hyb_pp ${f(global)} · oracle ${f(oracle)} · Δ ${f(oracle - global)}`);
+console.log(`${wins}/${golden.length} questions where some arm strictly beats hyb_pp (real routing headroom)`);
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+- **Five arms, one loop - the design is comparative, not productive.** The script's purpose is measurement, not retrieval. All five arms (`key`, `key_pp`, `vector`, `hyb`, `hyb_pp`) run on the same 24 questions using the same `grounding.ts` primitive (`budgetScore(...).gDisc`) so any score difference is purely the query-rewrite or fusion choice, not a metric artifact.
+- **`preprocessOR` is imported from `query_routing.ts`, not redefined.** An earlier iteration had a local stop-list that included corpus-specific tokens (`berkshire`, `anchor`...) - that overfit the eval and made `hyb_pp` trail `hyb`. Importing the production-shared, corpus-agnostic version removes that artifact: `hyb_pp` now ties `hyb` globally (0.823 = 0.823), confirming the preprocessing is neutral as a global policy change.
+- **`rrf` is inlined (not imported) because this is a measurement instrument.** The script needs its own local `rrf` to construct `hyb_pp = RRF(key_pp, vector)` without depending on GBrain's hybrid path - it is deliberately building a hypothetical arm to measure, not calling the production hybrid. Inlining keeps the probe self-contained and auditable.
+- **`sectionText` with `textCache` avoids re-fetching pages.** The same slug can appear in multiple arms' top-K across different questions; caching the compiled text means each page is fetched from Postgres at most once per run, not once per (question x arm x rank) hit.
+- **The oracle block is the load-bearing output.** The per-arm table answers "is `key_pp` competitive?"; the oracle block answers "does that competitiveness reopen routing headroom?" - `oracle = mean(max per Q over key_pp / vector / hyb_pp)` is the ceiling no real classifier can reach, and `Δ = oracle - global` is the available prize. On 24 Q with OR-preprocessing: Δ +0.065 with 4/24 movers vs Δ +0.008 with raw keyword - the entire routing-headroom story depends on which keyword arm you hand the classifier.
+
+---
+
 **Answer-quality check — and a generation confound caught in the act.** Grounding takes the *max* coverage over the top-C, so it's blind to whether the *other* in-budget chunks are distractors. So we judged the answers too (`src/answer_route_ab.py`): generate from the global-hybrid context vs the routed context, LLM-judge against each question's `pass_criteria`. Run on **two generator tiers**:
 
 | generator | global pass | routed pass | Δ | on differing-context Qs |
@@ -1830,17 +2682,208 @@ Routing with the revived keyword arm — **three of these four numbers are compu
 
 The weak 14B *regressed* under routing — but Opus shows **Δ 0**, identical even on the questions whose context differed. The regression was the **generator's** context-composition sensitivity, **not** a retrieval effect: a weak model is rattled by a different (grounding-tied) context; a capable one extracts the answer regardless. This is the *confounding* trap named in `Engineering Decision Patterns` — scoring a retrieval choice by answer quality mixes in generation variance; pin the generator (here: a strong model) before attributing a delta to retrieval. **Verdict (this natural, vector-skewed corpus): keep the single global hybrid policy.** *Here* routing adds a classifier, a per-query branch, and a calibration surface for *zero* gain — and its one apparent win was a weak-model artifact. (Deterministic ceiling: `bun src/route_eval.ts`; answer A/B: `uv run python src/answer_route_ab.py` with `CHAT_MODEL` set.) **But that verdict is the *corpus's*, not the *principle's*** — the next subsection re-tests the honest version (route to the *fixed* keyword arm, on a workload that actually spans query types) and the result **reverses**: routing wins on both grounding and answer quality, even on a strong generator.
 
+**When to use:** Reach for `answer_route_ab.py` when you want to test whether per-query routing changes *answer quality* (not just grounding coverage) on the natural, vector-skewed corpus - specifically to separate a retrieval effect from a generator-sensitivity effect before accepting or rejecting the routing design.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SLUGS[(route_slugs.json<br/>from route_eval.ts)] --> LOAD[load per-question<br/>global_slugs +<br/>routed_slugs]
+  GT[(W2.7 ground truth<br/>pass_criteria<br/>tenk Qs only)] --> CRIT[_pass_criteria_by_q]
+  CRIT --> LOOP
+  LOAD --> LOOP[for each tenk Q]
+  LOOP --> DIFFERS{routed ≠ global?}
+  DIFFERS -->|"yes (DIFF)"| GBOTH[build both contexts<br/>via build_context]
+  DIFFERS -->|"no (same)"| GBOTH
+  GBOTH --> GA[_answer<br/>global_slugs + Q]
+  GBOTH --> RA[_answer<br/>routed_slugs + Q]
+  GA --> GJ[_judge vs criteria<br/>PASS / FAIL]
+  RA --> RJ[_judge vs criteria<br/>PASS / FAIL]
+  GJ --> ROWS[accumulate rows]
+  RJ --> ROWS
+  ROWS --> REPORT[pass rates<br/>global vs routed<br/>+ DIFF-context split]
+```
+*`answer_route_ab.py` flow. Pre-computed slugs arrive from `route_eval.ts`; the script only runs generation + judgment. DIFF-context questions (routed_slugs ≠ global_slugs) are reported separately so a corpus-level tie doesn't hide per-question movement.*
+
+**Code (`src/answer_route_ab.py`):**
+
+```python
+"""answer_route_ab.py — does per-query ROUTING beat global hybrid at ANSWER time?
+
+route_eval.ts already showed routing has ZERO *grounding* headroom on this corpus
+(hybrid weakly dominates per-query). This script tests the one effect grounding can't
+see: discounted grounding takes the *max* coverage over the top-C, so it ignores
+whether the OTHER chunks in the budget are distractors. Two contexts with the same
+best chunk score identically — but the generator reads all C, and hybrid's fused set
+may carry distractors a clean single-arm set avoids. So we judge the ANSWERS.
+
+For each tenk golden question (those carry `pass_criteria` in eval_ground_truth.json):
+  - build the GLOBAL-hybrid context (top-C pages) and the ROUTED best-arm context,
+  - generate an answer from each (temp 0, VibeProxy → Claude),
+  - LLM-judge each PASS/FAIL against the question's pass_criteria,
+  - compare pass rates. Questions where routed_slugs == global_slugs are identical by
+    construction (reported separately — they can't show a difference).
+
+Inputs: results/route_slugs.json (from `bun src/route_eval.ts`) + the W2.7 ground truth.
+Run: uv run python src/answer_route_ab.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import time
+
+from openai import APIConnectionError, APIError
+
+from ground_truth_ab import _MEMZERO_TMPL, _ask, _client, gbrain_get
+
+
+class LLMUnavailable(RuntimeError):
+    """The chat endpoint refused after retries — skip this question, don't crash the run."""
+
+
+def _resilient(fn, *args, retries: int = 4, backoff: float = 2.0):
+    """Retry an LLM call through transient connection drops (the local 14B MLX chat
+    server falls over under memory pressure). Raise LLMUnavailable if it never recovers."""
+    for attempt in range(retries):
+        try:
+            return fn(*args)
+        except (APIConnectionError, APIError) as exc:
+            if attempt == retries - 1:
+                raise LLMUnavailable(str(exc)) from exc
+            time.sleep(backoff * (attempt + 1))
+    raise LLMUnavailable("unreachable")
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_SLUGS = _ROOT / "results" / "route_slugs.json"
+_GROUND_TRUTH = pathlib.Path(
+    "~/code/agent-prep/lab-02-7-pageindex/data/eval_ground_truth.json").expanduser()
+
+_JUDGE_TMPL = (
+    "You are grading a candidate answer against a rubric. Reply with EXACTLY one word: "
+    "PASS or FAIL.\n\nRUBRIC (what makes the answer correct):\n{criteria}\n\n"
+    "CANDIDATE ANSWER:\n{answer}\n\nVerdict (PASS or FAIL):"
+)
+
+
+def _pass_criteria_by_q() -> dict[str, str]:
+    """Map question text → pass_criteria from the W2.7 ground-truth (tenk questions)."""
+    raw = json.loads(_GROUND_TRUTH.read_text())
+    out: dict[str, str] = {}
+    for key, entry in raw.items():
+        if key.startswith("_") or not isinstance(entry, dict):
+            continue
+        if entry.get("q") and entry.get("pass_criteria"):
+            out[entry["q"].strip()] = entry["pass_criteria"]
+    return out
+
+
+class SnippetRegression(RuntimeError):
+    """A reader injected a truncated `query --json` snippet instead of a full
+    `gbrain get` body — the failure mode the lab fixed once and must not regress to."""
+
+
+_MIN_BODY_CHARS = 80   # a `gbrain get` page body; a `query --json` snippet is a short fragment
+# Optional per-body char cap. Default 0 = full bodies (unchanged). Set MAX_BODY_CHARS to
+# fit a small-context generator (e.g. the local 14B chokes on ~70K-token 10-K sections).
+_MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "0"))
+_body_check_logged = False
+
+
+def build_context(slugs: list[str]) -> str:
+    """Assemble reader context from FULL `gbrain get` page bodies — never the truncated
+    `query --json` snippet (which lacks the grounding the generator needs; ground_truth_ab
+    gotcha #1). Guards the seam: logs body sizes once so a regression is visible, and raises
+    SnippetRegression (fail loud) if any injected body is suspiciously short. MAX_BODY_CHARS
+    (opt-in) caps each body for small-context generators."""
+    global _body_check_logged
+    bodies = [gbrain_get(s) for s in slugs]
+    if _MAX_BODY_CHARS:
+        bodies = [b[:_MAX_BODY_CHARS] for b in bodies]
+    sizes = [len(b.strip()) for b in bodies]
+    if not _body_check_logged:
+        print(f"  [reader] full-body check: {len(slugs)} slugs, body chars={sizes} "
+              f"(via `gbrain get`, not `query --json` snippets)")
+        _body_check_logged = True
+    short = [(s, n) for s, n in zip(slugs, sizes) if n < _MIN_BODY_CHARS]
+    if short:
+        raise SnippetRegression(
+            f"injected body too short {short} — reader must pull full `gbrain get` bodies, "
+            f"not `query --json` snippets")
+    return "\n\n".join(bodies)
+
+
+def _answer(client, slugs: list[str], q: str) -> str:
+    ctx = build_context(slugs)
+    msg = [{"role": "user", "content": _MEMZERO_TMPL.format(ctx=ctx, q=q)}]
+    ans, _ = _resilient(_ask, client, msg)
+    return ans
+
+
+def _judge(client, answer: str, criteria: str) -> bool:
+    msg = [{"role": "user", "content": _JUDGE_TMPL.format(criteria=criteria, answer=answer)}]
+    verdict, _ = _resilient(_ask, client, msg)
+    return verdict.strip().upper().startswith("PASS")
+
+
+def main() -> None:
+    dump = json.loads(_SLUGS.read_text())
+    criteria_by_q = _pass_criteria_by_q()
+    client = _client()
+
+    rows: list[tuple[str, bool, bool, bool]] = []  # (q, differs, global_pass, routed_pass)
+    for item in dump:
+        q = item["q"].strip()
+        criteria = criteria_by_q.get(q)
+        if criteria is None:
+            continue  # entity questions have no pass_criteria — skip (judge needs a rubric)
+        differs = item["routed_slugs"] != item["global_slugs"]
+        try:
+            g_pass = _judge(client, _answer(client, item["global_slugs"], q), criteria)
+            r_pass = _judge(client, _answer(client, item["routed_slugs"], q), criteria)
+        except LLMUnavailable as exc:
+            print(f"  [skip] chat endpoint down — {q[:52]} ({exc})")
+            continue
+        rows.append((q, differs, g_pass, r_pass))
+        tag = "DIFF" if differs else "same"
+        print(f"  [{tag}] global={'P' if g_pass else 'F'} routed={'P' if r_pass else 'F'}  {q[:52]}")
+
+    n = len(rows)
+    g_rate = sum(g for _, _, g, _ in rows) / n if n else 0.0
+    r_rate = sum(r for _, _, _, r in rows) / n if n else 0.0
+    diff = [row for row in rows if row[1]]
+    print(f"\njudged {n} tenk questions ({len(diff)} have a routed≠global context)")
+    print(f"  global (hybrid) pass rate : {g_rate:.3f}")
+    print(f"  routed (per-query) pass   : {r_rate:.3f}   Δ {r_rate - g_rate:+.3f}")
+    if diff:
+        dg = sum(g for _, _, g, _ in diff) / len(diff)
+        dr = sum(r for _, _, _, r in diff) / len(diff)
+        print(f"  on the {len(diff)} DIFF-context questions: global {dg:.3f} → routed {dr:.3f}  Δ {dr - dg:+.3f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **Design principle - separate the retrieval question from the generation question.** Grounding@C is blind to distractor chunks: two slug sets that share the top-1 answer page score identically even if one includes three off-topic pages the generator must read past. This script provides the complementary signal - does changing the context (same question, different slug set) change the *answer*? Running two generators side-by-side (local 14B, Opus) isolates whether a delta is a retrieval effect or a generator-sensitivity effect.
+- **Pre-computed slugs decouple retrieval cost from generation cost.** `route_slugs.json` (written by `bun src/route_eval.ts`) already contains both `global_slugs` and `routed_slugs` for every question. This script never touches the vector DB - it only calls `gbrain_get` for page bodies. That separation means you can re-run the answer A/B with a different `CHAT_MODEL` (swap generator tier) without re-running retrieval, and it keeps the LLM call count manageable (2 generates + 2 judges per question, not `num_arms × num_questions` as in `verify_arch.py`).
+- **`build_context` guards the snippet-vs-body seam.** The critical invariant is that the generator receives *full page bodies* (`gbrain get`), not the short snippets `query --json` returns. `_MIN_BODY_CHARS = 80` catches the regression at runtime - a short body raises `SnippetRegression` immediately rather than silently feeding a context-starved generator. `MAX_BODY_CHARS` (env, default 0 = off) is the escape valve for small-context local models that choke on 70K-token 10-K sections.
+- **`_resilient` wraps every LLM call because local inference is fragile under memory pressure.** The 14B MLX server can drop connections mid-run. Rather than crashing the whole experiment, `_resilient` retries with linear backoff (4 attempts, 2/4/6/8 s gaps). If it never recovers, `LLMUnavailable` is raised; `main` catches it per-question with a `[skip]` log so the run continues and the final pass rate is computed over the questions that did complete.
+- **DIFF-context split is the load-bearing diagnostic.** Questions where `routed_slugs == global_slugs` are identical by construction and cannot show a delta - including them in the headline rate would dilute any real signal. The script reports both the full-set rate and the subset where contexts actually differ, so a corpus-level tie (Δ 0) that hides a large per-question swing is visible rather than masked.
+- **`_judge` is a one-word gate.** The prompt ends with `Verdict (PASS or FAIL):` and the parser calls `.startswith("PASS")` after stripping. This is deliberately narrow - a partial-credit rubric would require a scoring prompt and a float parser, adding both prompt complexity and judge variance. Binary PASS/FAIL on a `pass_criteria` rubric is the cheapest judge that still tests the real objective (does the answer satisfy the information need?).
+
 ##### Re-tested with the keyword fix — routing accepted on a mixed-type workload (2026-06-07)
 
 The rejection above rests on two things the *natural* corpus baked in: it is vector-skewed (one dominant query type), and `route_eval.ts` routed `kw` queries to the **raw** keyword arm — the one GBrain's conjunctive FTS had crippled (it scored `g@C:kw` 0.500, *worse* than hybrid's 0.925, so "route to keyword" could only lose). Fix both and the original design principle gets a fair trial: classify each query by type and send it to the arm that fits — `kw → key_pp` (the OR-preprocessed keyword arm), `vec → vector`, `mixed → hyb`. Three policies, balanced 24-Q set, deterministic classifier (24/24 vs the gold type label), `src/route_principle_ab.ts`:
 
 **Grounding A/B (discounted grounding@C):**
 
-| policy | grnd@C | g@C:kw | g@C:vec | g@C:mixed | Δ vs baseline |
-|---|---|---|---|---|---|
-| baseline (global `hyb`) | 0.823 | 0.925 | 0.745 | 0.763 | — |
-| **router** (`kw`→`key_pp` · `vec`→`vector` · `mixed`→`hyb`) | **0.862** | **1.000** | 0.763 | 0.763 | **+0.039** |
-| strengthened-global (`hyb` on OR-preprocessed query) | 0.837 | 1.000 | 0.745 | 0.658 | +0.014 |
+| policy                                                      | grnd@C    | g@C:kw    | g@C:vec | g@C:mixed | Δ vs baseline |
+| ----------------------------------------------------------- | --------- | --------- | ------- | --------- | ------------- |
+| baseline (global `hyb`)                                     | 0.823     | 0.925     | 0.745   | 0.763     | —             |
+| **router** (`kw`→`key_pp` · `vec`→`vector` · `mixed`→`hyb`) | **0.862** | **1.000** | 0.763   | 0.763     | **+0.039**    |
+| strengthened-global (`hyb` on OR-preprocessed query)        | 0.837     | 1.000     | 0.745   | 0.658     | +0.014        |
 
 The router strictly beats baseline on **+2 / 0 worse / 22 tie** — only **2 of the 24** questions move; the other 22 route to the arm baseline already used, so they're identical. Here are the **2 movers** (the rows where `router ≠ baseline`, from `bun src/route_principle_ab.ts`):
 
@@ -1852,6 +2895,173 @@ The router strictly beats baseline on **+2 / 0 worse / 22 tie** — only **2 of 
 Both are answer pages that global hybrid's RRF **demoted** below the 3-chunk reader budget (so `hyb` scores them low — 0.252, 0.315); routing each to the arm its type favours recovers the page — one via the OR-preprocessed keyword arm, one via dense vector. Note the +2 are **not** both keyword queries: one `kw`, one `vec` — routing helps wherever the global arm buried the answer, not just on exact-token lookups. The whole +0.039 is just these two: `(0.748 + 0.185) / 24 = +0.039`; the other 22 contribute 0. (This is also why the `kw`-class *mean* moved `g@C:kw` 0.925 → 1.000 — nine of ten `kw` questions already scored 1.0 under hybrid; only `Itochu` was demoted, and `key_pp` fixes it.) The *strengthened-global* alternative (no router — just OR-preprocess the whole query before hybrid) edges baseline by only **+0.014** and still trails the router (0.862) by a wide margin: OR-joining the whole query slightly helps the keyword leg but does nothing for the dense leg, so it can't recover the `kw`-class queries the way a router pointed at `key_pp` does. So the principle **must** be honored by a router, not by strengthening the single global arm.
 
 **Answer-quality A/B (entity coverage, pinned Opus 4.5 — `src/answer_principle_ab.py`):**
+
+`answer_principle_ab.py` closes the loop that `route_principle_ab.ts` opened: grounding measures whether the right chunks were retrieved, but this script asks whether a *strong generator* can turn those chunks into correct answers. It reads the slug-sets already dumped by `route_principle_ab.ts`, fetches full `gbrain get` page bodies for each arm, generates an answer with a pinned Opus model, and judges pass/fail by entity coverage - so the verdict reflects retrieval quality, not small-model fragility.
+
+**When to use:** reach for this script (rather than `answer_route_ab.py`) when you want to confirm that the *3-way routing principle* (baseline vs router vs strengthened-global) holds at answer time on the balanced, multi-type question set - i.e. when you need entity-coverage judgement rather than `pass_criteria` judgement, and the slug source is `principle_slugs.json` rather than `route_slugs.json`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SLUGS["results/principle_slugs.json<br/>(baseline · router · strong_g<br/>slug lists + expected_entities)"] --> LOOP["for each question"]
+  LOOP --> ARM["for each arm<br/>(baseline · router · strong_g)"]
+  ARM --> BUILD["build_context()<br/>gbrain_get per slug<br/>→ full page bodies"]
+  BUILD --> GUARD{"body length<br/>≥ MIN_BODY_CHARS?"]
+  GUARD -->|"no"| ERR["raise SnippetRegression<br/>(snippet, not full body)"]
+  GUARD -->|"yes"| ANS["_answer()<br/>MEMZERO_TMPL + Opus<br/>via _resilient()"]
+  ANS --> JUDGE["_judge()<br/>JUDGE_TMPL → PASS/FAIL<br/>entity coverage"]
+  JUDGE --> ACC["accumulate passes[]<br/>+ types[]"]
+  ACC --> PRINT["per-arm pass-rate table<br/>broken out by kw/vec/mixed"]
+```
+
+*`answer_principle_ab.py` data flow: slug lists in, full bodies fetched, Opus generates answer, judge scores entity coverage, per-arm pass-rates printed.*
+
+**Code (`src/answer_principle_ab.py`):**
+
+```python
+"""answer_principle_ab.py — does the per-query ROUTER produce better ANSWERS than global
+hybrid (and than a strengthened global), on a PINNED strong generator?
+
+route_principle_ab.ts settled the *grounding* A/B on the balanced set: router 0.862 beats
+baseline hybrid 0.823 (+0.039), strengthened-global loses. Grounding takes the max coverage
+over the top-C, so it can't see whether the OTHER in-budget chunks are distractors. This
+script closes that gap at answer time: for each balanced question, generate an answer from
+each policy's context and judge whether it actually identifies the question's expected
+entities. Pin a STRONG generator (Opus via VibeProxy) so the verdict reflects retrieval, not
+the small-model context-sensitivity confound caught earlier (answer_route_ab.py).
+
+The balanced set carries `expected_entities`, not W2.7 `pass_criteria`, so the judge rubric is
+"the answer correctly identifies <entities>" — answer-level coverage, aligned with grounding.
+
+Inputs: results/principle_slugs.json (from `bun src/route_principle_ab.ts`).
+Run:    CHAT_MODEL=claude-opus-4-5 JUDGE_MODEL=claude-opus-4-5 uv run python src/answer_principle_ab.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import time
+
+from openai import APIConnectionError, APIError
+
+from ground_truth_ab import _MEMZERO_TMPL, _ask, _client, gbrain_get
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_SLUGS = _ROOT / "results" / "principle_slugs.json"
+_ARMS = ("baseline", "router", "strong_g")
+_MIN_BODY_CHARS = 80
+_MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "0"))
+
+_JUDGE_TMPL = (
+    "You are grading whether a candidate answer correctly identifies the required facts. "
+    "Reply with EXACTLY one word: PASS or FAIL.\n\n"
+    "The answer PASSES only if it correctly names/identifies ALL of these (synonyms and the "
+    "full entity for an abbreviation are fine):\n{entities}\n\n"
+    "CANDIDATE ANSWER:\n{answer}\n\nVerdict (PASS or FAIL):"
+)
+
+
+class LLMUnavailable(RuntimeError):
+    """Chat endpoint refused after retries — skip the question, don't crash the run."""
+
+
+class SnippetRegression(RuntimeError):
+    """A body came back as a truncated `query --json` snippet, not a full `gbrain get` page."""
+
+
+def _resilient(fn, *args, retries: int = 4, backoff: float = 2.0):
+    for attempt in range(retries):
+        try:
+            return fn(*args)
+        except (APIConnectionError, APIError) as exc:
+            if attempt == retries - 1:
+                raise LLMUnavailable(str(exc)) from exc
+            time.sleep(backoff * (attempt + 1))
+    raise LLMUnavailable("unreachable")
+
+
+def build_context(slugs: list[str]) -> str:
+    """Assemble reader context from FULL `gbrain get` page bodies (never `query --json`
+    snippets — the grounding-loss gotcha). Fail loud if a body is suspiciously short."""
+    bodies = [gbrain_get(s) for s in slugs]
+    if _MAX_BODY_CHARS:
+        bodies = [b[:_MAX_BODY_CHARS] for b in bodies]
+    short = [(s, len(b.strip())) for s, b in zip(slugs, bodies) if len(b.strip()) < _MIN_BODY_CHARS]
+    if short:
+        raise SnippetRegression(f"injected body too short {short} — pull full `gbrain get` bodies")
+    return "\n\n".join(bodies)
+
+
+def _answer(client, slugs: list[str], q: str) -> str:
+    msg = [{"role": "user", "content": _MEMZERO_TMPL.format(ctx=build_context(slugs), q=q)}]
+    ans, _ = _resilient(_ask, client, msg)
+    return ans
+
+
+def _judge(client, answer: str, entities: list[str]) -> bool:
+    rubric = "; ".join(entities)
+    msg = [{"role": "user", "content": _JUDGE_TMPL.format(entities=rubric, answer=answer)}]
+    verdict, _ = _resilient(_ask, client, msg)
+    return verdict.strip().upper().startswith("PASS")
+
+
+def main() -> None:
+    dump = json.loads(_SLUGS.read_text())
+    client = _client()
+    print(f"generator/judge: {os.getenv('CHAT_MODEL', '(default)')} · {len(dump)} questions\n")
+
+    # per-arm pass flags, and per-class accumulators
+    passes: dict[str, list[bool]] = {a: [] for a in _ARMS}
+    types: list[str] = []
+    for item in dump:
+        q = item["q"].strip()
+        ents = item["expected_entities"]
+        row = {}
+        try:
+            for arm in _ARMS:
+                ans = _answer(client, item[f"{arm}_slugs"], q)
+                row[arm] = _judge(client, ans, ents)
+        except LLMUnavailable as exc:
+            print(f"  [skip] chat endpoint down — {q[:48]} ({exc})")
+            continue
+        for arm in _ARMS:
+            passes[arm].append(row[arm])
+        types.append(item["type"])
+        differs = item["router_slugs"] != item["baseline_slugs"]
+        tag = "DIFF" if differs else "same"
+        flags = " ".join(f"{a[:4]}={'P' if row[a] else 'F'}" for a in _ARMS)
+        print(f"  [{tag}] {flags}  ({item['type']}) {q[:46]}")
+
+    n = len(types)
+    if not n:
+        print("\nno questions judged (endpoint down?)")
+        return
+    rate = lambda a, cls=None: (  # noqa: E731
+        sum(p for p, t in zip(passes[a], types) if cls is None or t == cls)
+        / max(1, sum(1 for t in types if cls is None or t == cls)))
+    base = rate("baseline")
+    print(f"\njudged {n} questions on a pinned generator")
+    classes = ["kw", "vec", "mixed"]
+    hdr = f"  {'policy':12}{'pass':8}" + "".join(f"{'p:'+c:9}" for c in classes) + "Δ vs base"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for a in _ARMS:
+        cols = "".join(f"{rate(a, c):<9.3f}" for c in classes)
+        print(f"  {a:12}{rate(a):<8.3f}{cols}{rate(a) - base:+.3f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+
+- **Design principle - pin a strong generator to isolate retrieval.** The whole point is to measure retrieval quality, not generator sensitivity. By pinning Opus (`CHAT_MODEL=claude-opus-4-5`) as both generator and judge, any remaining pass/fail difference between arms is attributable to context quality, not model fragility. This directly addresses the confound exposed by `answer_route_ab.py`, where small-model variance overwhelmed retrieval signal.
+- **`build_context()` - full bodies only, never snippets.** Slugs are fetched via `gbrain_get()` (the full `gbrain get` page body), not the `query --json` snippet path. The `_MIN_BODY_CHARS = 80` guard + `SnippetRegression` exception exist because a previous version of the pipeline accidentally injected truncated query snippets instead of full pages, silently tanking context quality without any visible error. The guard makes that regression loud and immediate.
+- **Entity-coverage judge, not `pass_criteria` judge.** The balanced set (`golden_balanced.json`) carries `expected_entities` fields (e.g. `["ridgeline-capital", "dev-patel"]`), not the W2.7 `pass_criteria` free-text rubrics. The `_JUDGE_TMPL` is calibrated to this: it asks Opus to confirm ALL required entities are named (synonyms and abbreviations accepted), which aligns with what `discounted grounding@C` measures at the chunk level - both are entity-coverage metrics.
+- **`_resilient()` wraps every LLM call, `LLMUnavailable` skips rather than crashes.** The outer loop catches `LLMUnavailable` and prints a `[skip]` line rather than aborting the run. This matters for long eval runs against VibeProxy (which can throttle mid-run) - partial results are still useful for trend analysis even if a few questions are dropped.
+- **Per-class breakdown (`kw`/`vec`/`mixed`) is load-bearing.** The aggregate pass-rate can hide type-skewed gains. Printing per-class rates is what revealed that the router's +0.042 came entirely from `kw` queries (`0.800 → 0.900`), while `vec` and `mixed` held flat - confirming the routing gain is type-specific, not a broad improvement.
 
 | policy | pass | p:kw | p:vec | p:mixed | Δ vs baseline |
 |---|---|---|---|---|---|
@@ -1865,11 +3075,246 @@ The edge **survives a strong generator** (+0.042 on Opus, on par with the ground
 
 **Refined verdict — routing is worth building, conditionally.** Per-query routing pays iff **three gates all hold**: (a) the traffic genuinely **spans query types** (keyword-focused *and* semantic), (b) the keyword arm is **OR-preprocessed** (else its target is the crippled raw arm and routing can only lose), and (c) a **cheap type-classifier** can actually detect the type. All three held here → +0.039 grounding, +0.042 answer quality. On the production brain as-is (vector-skewed, single dominant type) gate (a) fails, so the earlier "keep global hybrid" still stands *for that corpus* — and precisely so: a router doesn't *lose by design* there (it can always default to hybrid). The realizable gain decomposes as **(oracle − global) − classifier_error_cost**. On a single-type corpus the first term is **0** (oracle = global, the 0.910 = 0.910 tie), so a *perfect* router merely **ties** and a *real* classifier nets **negative** — its mis-routes have no headroom to offset them. All-risk-no-reward, so don't route. The headroom is the *budget* a router has to spend on its own classifier errors: 0 on single-type (can't afford any), +0.065 oracle on the mixed set (enough to cover a good classifier and still net +0.039 / +0.042). The honest scope: the classifier is 24/24 only because this set is built type-separable (`kw` = token-lists, `vec` = prose); real queries blur that, so +0.042 is the **strong-classifier ceiling** — production gain is ≤ that and shrinks with classifier error. Net: don't reject the principle — gate it on the workload. (Grounding A/B: `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`; answer A/B: `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`.)
 
+`src/route_principle_ab.ts` is the **grounding-layer A/B harness** that gives the three-way verdict above a number. It runs every arm for every question, picks the best strengthened-global variant post-loop, routes each question by its detected type, then scores and reports all three policies in one pass. The per-arm slug dump (`results/principle_slugs.json`) feeds the downstream answer-quality A/B (`answer_principle_ab.py`) so the retrieval and answer evaluations share the same context sets.
+
+**When to use:** reach for `route_principle_ab.ts` (instead of `route_eval.ts`) when you want a **three-way comparison** - router vs. global-hybrid baseline vs. a strengthened-global fallback - on a **balanced, multi-type golden set** where OR-preprocessed keyword retrieval is already validated; use `route_eval.ts` for the earlier single-arm routing headroom probe or when you only need the slug dump for `answer_route_ab.py`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  ENV["GOLDEN_EVAL +<br/>POLICY_K / POLICY_C"] --> LOAD["load golden_balanced.json"]
+  LOAD --> LOOP["for each question"]
+  LOOP --> PP["preprocessOR(q)"]
+  LOOP --> EMB["embed(q)"]
+  PP --> KPP["engine.searchKeyword<br/>key_pp arm"]
+  EMB --> VEC["engine.searchVector<br/>vector arm"]
+  LOOP --> HYB["hybridSearch<br/>hyb arm"]
+  KPP --> G1["rrf(key_pp, vec)<br/>g1 variant"]
+  LOOP --> G2["hybridSearch<br/>(preprocessOR(q))<br/>g2 variant"]
+  KPP --> SCORE["ground each arm<br/>budgetScore"]
+  VEC --> SCORE
+  HYB --> SCORE
+  G1 --> SCORE
+  G2 --> SCORE
+  SCORE --> PICK["gWhich = better of<br/>g1 vs g2 by mean"]
+  PICK --> ROUTE["classifyType per Q<br/>kw→key_pp<br/>vec→vector<br/>mixed→hyb"]
+  ROUTE --> POLICIES["baseline / router /<br/>strong_g per question"]
+  POLICIES --> REPORT["console: Δ vs baseline<br/>per-class breakdown<br/>win/loss/tie rows"]
+  POLICIES --> DUMP["writeFileSync<br/>results/principle_slugs.json"]
+```
+*`route_principle_ab.ts` - 3-way routing A/B: for every golden question all five arms are scored in one loop; the best strengthened-global variant is elected after the loop; policy slugs are dumped for the answer-quality A/B downstream.*
+
+**Code (full source `src/route_principle_ab.ts`):**
+
+```typescript
+/**
+ * route_principle_ab.ts — honor the per-query principle in the LIVE path, three ways, A/B'd.
+ *
+ * The design intent of per-query routing: pick the arm that fits the QUERY TYPE, because a
+ * single global policy compromises queries whose best arm isn't the global winner. The earlier
+ * rejection (route_eval.ts) was unfair — its router targeted the RAW keyword arm, which GBrain's
+ * conjunctive FTS had crippled (route_eval_kwpp.ts: raw key g@C:kw 0.500 vs preprocessed 1.000).
+ * Route to the *preprocessed* keyword arm and the routing decision should finally pay on kw-class.
+ *
+ * Three contestants, measured with the same discounted grounding@C, on the balanced 24-Q set:
+ *   baseline  — every query → global hybrid `hyb`         (the current shipped default)
+ *   router    — classify query type, route kw→key_pp · vec→vector · mixed→hyb   (the principle)
+ *   strong_g  — every query → strengthened global, no router:
+ *                 g1 = RRF(key_pp, vector)        (hybrid w/ preprocessed keyword leg)
+ *                 g2 = hybridSearch(preprocessOR(q))  (whole query preprocessed)
+ *               we report whichever global variant scores higher.
+ *
+ * Decision: does either honor-the-principle arm beat baseline by a margin a real classifier can
+ * keep? Router needs its classifier to actually detect type; strong_g needs no classifier at all.
+ * Dumps per-arm top-C slugs → results/principle_slugs.json for the answer-quality A/B.
+ *
+ * Run: GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts
+ */
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+import { budgetScore, coverage } from "./grounding.ts";
+import { classifyType, preprocessOR, type QueryType } from "./query_routing.ts";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const GOLDEN = process.env.GOLDEN_EVAL ?? `${import.meta.dir}/../data/golden_balanced.json`;
+const SLUG_DUMP = `${import.meta.dir}/../results/principle_slugs.json`;
+const K = Number(process.env.POLICY_K ?? "5");
+const C = Number(process.env.POLICY_C ?? "3");
+
+interface GoldenQ { q: string; expected_entities: string[]; domain: string }
+const golden: GoldenQ[] = JSON.parse(readFileSync(GOLDEN, "utf-8")).questions;
+
+// `preprocessOR` + `classifyType` (the shippable router's brain) live in ./query_routing.ts —
+// the SAME module the production actuator (query_policy.ts) imports, so this A/B validates the
+// exact classifier production ships. type alias for readability:
+type Type = QueryType;
+
+// ── RRF over two ranked slug lists ───────────────────────────────────────────
+function rrf(a: string[], b: string[], k = 60): string[] {
+  const score = new Map<string, number>();
+  for (const list of [a, b]) {
+    list.forEach((slug, i) => score.set(slug, (score.get(slug) ?? 0) + 1 / (k + i + 1)));
+  }
+  return [...score.entries()].sort((x, y) => y[1] - x[1]).map(([s]) => s);
+}
+
+// ── engine bootstrap (identical sequence to the other probes / the CLI) ──────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { embed } = await import(`${GB}/core/embedding.ts`);
+const { hybridSearch } = await import(`${GB}/core/search/hybrid.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+async function ground(slugs: string[], ents: string[]): Promise<number> {
+  const covs = await Promise.all(slugs.slice(0, C).map(async s => coverage(await sectionText(s), ents)));
+  return budgetScore(covs, C).gDisc;
+}
+const slugsOf = (rs: { slug: string }[]) => rs.map(r => r.slug);
+
+// ── per-question: compute every arm's top-C slugs, then the three policies ───
+type Arm = "key_pp" | "vector" | "hyb" | "g1" | "g2";
+interface Row {
+  q: string; domain: string; type: Type;
+  baseline: string[]; router: string[]; strong_g: string[];
+  arm: Record<Arm, number>;       // grounding of each candidate arm (for transparency)
+}
+const rows: Row[] = [];
+let gWhich: "g1" | "g2" = "g1";    // decided after the loop by mean grounding
+
+const perArm = { key_pp: [] as number[], vector: [] as number[], hyb: [] as number[],
+                 g1: [] as number[], g2: [] as number[] };
+const raw: { q: string; domain: string; type: Type; slugs: Record<Arm, string[]>; ents: string[] }[] = [];
+
+for (const g of golden) {
+  const ents = g.expected_entities;
+  const keyPP = slugsOf(await engine.searchKeyword(preprocessOR(g.q), { limit: K }));
+  const vec = slugsOf(await engine.searchVector(await embed(g.q), { limit: K }));
+  const hyb = slugsOf(await hybridSearch(engine, g.q, { limit: K, expansion: false, rrfK: 60 }));
+  const g1 = rrf(keyPP, vec).slice(0, K);
+  const g2 = slugsOf(await hybridSearch(engine, preprocessOR(g.q), { limit: K, expansion: false, rrfK: 60 }));
+  const slugs: Record<Arm, string[]> = { key_pp: keyPP, vector: vec, hyb, g1, g2 };
+  perArm.key_pp.push(await ground(keyPP, ents));
+  perArm.vector.push(await ground(vec, ents));
+  perArm.hyb.push(await ground(hyb, ents));
+  perArm.g1.push(await ground(g1, ents));
+  perArm.g2.push(await ground(g2, ents));
+  raw.push({ q: g.q, domain: g.domain, type: classifyType(g.q), slugs, ents });
+}
+
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+gWhich = mean(perArm.g1) >= mean(perArm.g2) ? "g1" : "g2";  // strengthened-global = better variant
+
+// route each question by its detected type → the arm the principle assigns
+const armForType: Record<Type, Arm> = { kw: "key_pp", vec: "vector", mixed: "hyb" };
+for (let i = 0; i < raw.length; i++) {
+  const r = raw[i];
+  const routerArm = armForType[r.type];
+  rows.push({
+    q: r.q, domain: r.domain, type: r.type,
+    baseline: r.slugs.hyb, router: r.slugs[routerArm], strong_g: r.slugs[gWhich],
+    arm: { key_pp: perArm.key_pp[i], vector: perArm.vector[i], hyb: perArm.hyb[i],
+           g1: perArm.g1[i], g2: perArm.g2[i] },
+  });
+}
+
+// ── scoring helpers ──────────────────────────────────────────────────────────
+const score = {
+  baseline: rows.map((_, i) => perArm.hyb[i]),
+  router:   rows.map((r, i) => perArm[armForType[r.type]][i]),
+  strong_g: rows.map((_, i) => perArm[gWhich][i]),
+};
+const classes: Type[] = ["kw", "vec", "mixed"];
+const meanFor = (xs: number[], cls?: Type) => mean(xs.filter((_, i) => !cls || rows[i].type === cls));
+
+// ── report ───────────────────────────────────────────────────────────────────
+const pad = (s: string, n: number) => s.padEnd(n);
+const f = (x: number) => x.toFixed(3);
+console.log(`route_principle_ab: ${rows.length} questions · K=${K} C=${C} · strengthened-global = ${gWhich}\n`);
+
+// classifier confusion vs gold domain
+const correct = rows.filter(r => r.type === r.domain).length;
+console.log(`classifier vs gold domain: ${correct}/${rows.length} correct`);
+console.log("  per-q:  " + rows.map(r => (r.type === r.domain ? r.type : `${r.domain}->${r.type}`)).join(" "));
+console.log();
+
+console.log(pad("policy", 12) + pad("grnd@C", 9) + classes.map(c => pad(`g@C:${c}`, 9)).join(""));
+console.log("-".repeat(12 + 9 + classes.length * 9));
+for (const [name, xs] of Object.entries(score)) {
+  console.log(pad(name, 12) + pad(f(meanFor(xs)), 9) + classes.map(c => pad(f(meanFor(xs, c)), 9)).join(""));
+}
+const base = mean(score.baseline);
+console.log(`\nΔ vs baseline(hyb ${f(base)}):  router ${f(mean(score.router) - base)}  ·  strong_g(${gWhich}) ${f(mean(score.strong_g) - base)}`);
+
+// how often each honor-the-principle arm strictly beats baseline (where the principle pays)
+const rWins = rows.filter((_, i) => score.router[i] > score.baseline[i] + 1e-9).length;
+const rLoses = rows.filter((_, i) => score.router[i] < score.baseline[i] - 1e-9).length;
+console.log(`router vs baseline per-question:  +${rWins} better  ·  -${rLoses} worse  ·  ${rows.length - rWins - rLoses} tie`);
+
+// show the questions where router differs from baseline — the evidence behind the +N/-N count
+console.log("\nwhere router ≠ baseline (the only rows that move the average):");
+rows.forEach((r, i) => {
+  const d = score.router[i] - score.baseline[i];
+  if (Math.abs(d) <= 1e-9) return;
+  const arm = armForType[r.type];
+  console.log(`  ${d > 0 ? "WIN " : "LOSS"}  ${r.type}  baseline(hyb) ${f(score.baseline[i])} → router(${arm}) ${f(score.router[i])}   "${r.q.slice(0, 50)}"`);
+});
+
+// ── dump slugs for the answer-quality A/B ────────────────────────────────────
+const dump = rows.map(r => ({
+  q: r.q, domain: r.domain, type: r.type,
+  expected_entities: golden.find(g => g.q === r.q)!.expected_entities,
+  baseline_slugs: r.baseline, router_slugs: r.router, strong_g_slugs: r.strong_g,
+  strong_g_variant: gWhich,
+}));
+mkdirSync(dirname(SLUG_DUMP), { recursive: true });
+writeFileSync(SLUG_DUMP, JSON.stringify(dump, null, 2) + "\n");
+console.log(`\nwrote per-arm slugs → ${SLUG_DUMP}`);
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+- **The three-contestant design is the whole point.** Routing can be rejected two ways - either via a head-to-head where the router loses to the baseline, or via a head-to-head where a classifier-free alternative (`strong_g`) matches or beats it. This script forces both comparisons simultaneously so the verdict can't be gamed by cherry-picking the weaker foil. `strong_g` is elected post-loop (`gWhich = better of g1 vs g2`) so it is always presented at its best.
+- **One loop, all five arms, deferred routing.** All five arm arrays (`key_pp`, `vector`, `hyb`, `g1`, `g2`) are filled in the single golden-question loop, and the policy assignment (`armForType[r.type]`) runs in a second pass after `gWhich` is known. This avoids a double-pass over the database while keeping the `gWhich` election logically after all grounding data is collected.
+- **`rrf` is local, not imported.** The two-list RRF used for `g1` is a 10-line utility defined in this file. It is deliberately NOT shared with `grounding.ts` or `query_routing.ts` - it is a one-off experiment variant, and premature promotion to shared infra would blur the boundary between lab scaffolding (this file) and production plumbing (`query_routing.ts`, `grounding.ts`).
+- **The slug dump feeds `answer_principle_ab.py`** - that downstream script reads `principle_slugs.json` and calls the LLM judge, so retrieval and answer evaluation share exactly the same context sets with no re-retrieval. This is the same data-dependency chain documented in the running-reference table.
+- **`classifyType` is imported from `query_routing.ts`**, the same module `query_policy.ts` ships in production. Any classifier drift between the A/B and production would invalidate the measured +0.039/+0.042 claim - sharing the import guarantees they are identical.
+
+**Result (`GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`, balanced 24-Q set, K=5 C=3):**
+
+| policy | grnd@C | g@C:kw | g@C:vec | g@C:mixed | Δ vs baseline |
+|---|---|---|---|---|---|
+| baseline (`hyb`) | 0.823 | 0.925 | 0.745 | 0.763 | — |
+| **router** | **0.862** | **1.000** | 0.763 | 0.763 | **+0.039** |
+| strengthened-global (`g1`) | 0.837 | 1.000 | 0.745 | 0.658 | +0.014 |
+
+classifier 24/24 correct; router wins +2 / loses 0 / ties 22 questions.
+
 #### Entity-aware assembly — one-hop graph expansion (2026-06-07)
 
 Routing fixes *which arm* retrieves; it can't fix a **2-hop question** where the answer needs **two** entity pages in the same `C`-chunk budget and retrieval ranks the second one at `C+1`. We saw this in the answer A/B: `which venture firm is the angel investor associated with` retrieved both `ridgeline-capital` (rank 3, in budget) and `people/dev-patel` (rank 4, **out**) — the generator saw the firm but not the investor. GBrain is a knowledge graph, so there's a cheap fix the chapter's whole premise points at: `dev-patel` is a **1-hop neighbor** of the in-budget `ridgeline-capital` (`invested_in` / `founded` edges). Pull the neighbor's page into the context — one edge traversal, no NER. Assembly becomes *entity-aware*: it guarantees the graph-completion of an in-budget entity rather than blindly taking the top-`C` by score.
 
 The rule is deliberately high-precision: pull a demoted page **only** when it is *both* graph-connected to an in-budget page *and* itself retrieved-but-demoted (in the top-`K` pool, ranked past `C`). That keeps single-hop queries at exactly `C` and spends extra budget only along a real edge to an already-relevant page.
+
+**When to use:** Reach for `assembly.ts` when your workload contains genuine multi-hop questions - ones that need two entity pages co-present in the reader budget - AND those neighbor pages are small (entity pages, not 10-K sections). Skip it when failures are distractor-dominated (wrong pages outranking right ones) or when a larger `C` or a reranker can close the gap more cheaply.
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -1991,6 +3436,153 @@ The single fix is `What does Quanta Labs work on?` (F→P): the deal page `deals
 - **The graph was free.** GBrain already wired the edges at ingest (`invested_in`, `founded`); assembly just walks one hop. That's the "self-wiring memory" thesis paying off downstream — the structure built once is reused at read time with no extra model.
 `─────────────────────────────────────────────────`
 
+---
+
+`assembly_graph_ab.ts` is the **A/B harness** that measured whether 1-hop graph expansion (implemented in `assembly.ts`) actually moves entity coverage and answer quality. It routes each golden question through its typed arm, assembles two contexts - plain top-C and graph-expanded - scores both with the `coverage` metric, and dumps per-question slug lists so the downstream Python answer A/B (`assembly_answer_ab.py`) can reuse the retrieval without re-hitting the DB.
+
+**When to use:** reach for `assembly_graph_ab.ts` when you want to empirically measure the coverage and answer-quality impact of graph expansion on a new golden set or a new corpus, or when you need the `results/assembly_slugs.json` dump as input to `assembly_answer_ab.py` - not when you want to understand the expansion logic itself (that lives in `assembly.ts`).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  ENV["env: GOLDEN_EVAL<br/>POLICY_K · POLICY_C<br/>MAX_PULL"] --> BOOT["load config +<br/>create engine"]
+  BOOT --> GOLDEN["read golden_balanced.json<br/>GoldenQ list"]
+  GOLDEN --> LOOP["for each question"]
+  LOOP --> ROUTE["rankedFor(q)<br/>classifyType → arm<br/>keyword / vector / hybrid"]
+  ROUTE --> PLAIN["plain = ranked.slice(0,C)"]
+  ROUTE --> EXPAND["graphExpand(engine, ranked,<br/>C, maxPull)<br/>→ {slugs, pulled}"]
+  PLAIN --> COVP["setCoverage(plain, ents)<br/>= coverage(text, ents)"]
+  EXPAND --> COVE["setCoverage(expanded, ents)"]
+  COVP --> ROW["Row: q, type, plain_slugs,<br/>expanded_slugs, covPlain,<br/>covExp, pulled, size"]
+  COVE --> ROW
+  ROW --> DUMP["write assembly_slugs.json"]
+  DUMP --> REPORT["console report:<br/>fired / improved / hurt<br/>avg context size"]
+```
+*`assembly_graph_ab.ts` data flow: routes each golden question, assembles plain and expanded contexts in parallel, scores coverage, dumps slugs, prints the A/B report.*
+
+**Code `src/assembly_graph_ab.ts`:**
+
+```typescript
+/**
+ * assembly_graph_ab.ts — does GRAPH-EXPANDED assembly get more answer entities into the C-chunk
+ * budget than plain top-C? Measured on the balanced 24-Q set.
+ *
+ * For each question: route it to its type's arm (same classifier as production), take that arm's
+ * top-K ranked candidates, then assemble two contexts —
+ *   plain     = ranked.slice(0, C)                 (rank-only, the current behaviour)
+ *   expanded  = graphExpand(ranked, C, maxPull)    (top-C + 1-hop retrieved-but-demoted neighbors)
+ * — and score entity COVERAGE of each (fraction of the question's expected_entities present in the
+ * assembled pages' text). Reports where expansion pulls a neighbor and whether coverage rises,
+ * plus the context-size cost.
+ *
+ * Run: GOLDEN_EVAL=data/golden_balanced.json bun src/assembly_graph_ab.ts
+ */
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+import { graphExpand } from "./assembly.ts";
+import { coverage } from "./grounding.ts";
+import { classifyType, preprocessOR, TYPE_TO_STRATEGY } from "./query_routing.ts";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const GOLDEN = process.env.GOLDEN_EVAL ?? `${import.meta.dir}/../data/golden_balanced.json`;
+const K = Number(process.env.POLICY_K ?? "5");
+const C = Number(process.env.POLICY_C ?? "3");
+const MAX_PULL = Number(process.env.MAX_PULL ?? "2");
+
+interface GoldenQ { q: string; expected_entities: string[]; domain: string }
+const golden: GoldenQ[] = JSON.parse(readFileSync(GOLDEN, "utf-8")).questions;
+
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { embed } = await import(`${GB}/core/embedding.ts`);
+const { hybridSearch } = await import(`${GB}/core/search/hybrid.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+async function setCoverage(slugs: string[], ents: string[]): Promise<number> {
+  const text = (await Promise.all(slugs.map(sectionText))).join("\n");
+  return coverage(text, ents);
+}
+const slugsOf = (rs: { slug: string }[]) => rs.map(r => r.slug);
+
+// route a query to its type's arm and return that arm's ranked candidates (top-K)
+async function rankedFor(q: string): Promise<string[]> {
+  const strat = TYPE_TO_STRATEGY[classifyType(q)];
+  if (strat === "keyword") return slugsOf(await engine.searchKeyword(preprocessOR(q), { limit: K }));
+  if (strat === "vector") return slugsOf(await engine.searchVector(await embed(q), { limit: K }));
+  return slugsOf(await hybridSearch(engine, q, { limit: K, expansion: false, rrfK: 60 }));
+}
+
+const SLUG_DUMP = `${import.meta.dir}/../results/assembly_slugs.json`;
+interface Row {
+  q: string; type: string; expected_entities: string[];
+  plain_slugs: string[]; expanded_slugs: string[];
+  covPlain: number; covExp: number; pulled: string[]; size: number;
+}
+const rows: Row[] = [];
+for (const g of golden) {
+  const ranked = await rankedFor(g.q);
+  const plain = ranked.slice(0, C);
+  const { slugs: expanded, pulled } = await graphExpand(engine, ranked, { C, maxPull: MAX_PULL });
+  rows.push({
+    q: g.q, type: classifyType(g.q), expected_entities: g.expected_entities,
+    plain_slugs: plain, expanded_slugs: expanded,
+    covPlain: await setCoverage(plain, g.expected_entities),
+    covExp: await setCoverage(expanded, g.expected_entities),
+    pulled, size: expanded.length,
+  });
+}
+mkdirSync(dirname(SLUG_DUMP), { recursive: true });
+writeFileSync(SLUG_DUMP, JSON.stringify(rows.map(r => ({
+  q: r.q, type: r.type, expected_entities: r.expected_entities,
+  plain_slugs: r.plain_slugs, expanded_slugs: r.expanded_slugs, pulled: r.pulled,
+})), null, 2) + "\n");
+
+// ── report ───────────────────────────────────────────────────────────────────
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const f = (x: number) => x.toFixed(3);
+console.log(`assembly_graph_ab: ${rows.length} questions · K=${K} C=${C} maxPull=${MAX_PULL}\n`);
+
+const expandedRows = rows.filter(r => r.pulled.length > 0);
+console.log(`graph expansion fired on ${expandedRows.length}/${rows.length} questions:`);
+for (const r of expandedRows) {
+  const tag = r.covExp > r.covPlain + 1e-9 ? "↑ COVERAGE" : r.covExp < r.covPlain - 1e-9 ? "↓" : "= (already covered)";
+  console.log(`  ${tag}  cov ${f(r.covPlain)}→${f(r.covExp)}  +${r.pulled.length}p (size ${r.size})  pulled[${r.pulled.join(", ")}]  "${r.q.slice(0, 44)}"`);
+}
+
+const improved = rows.filter(r => r.covExp > r.covPlain + 1e-9).length;
+const hurt = rows.filter(r => r.covExp < r.covPlain - 1e-9).length;
+console.log(`\nentity coverage:  plain ${f(mean(rows.map(r => r.covPlain)))}  →  graph-expanded ${f(mean(rows.map(r => r.covExp)))}`);
+console.log(`questions improved: ${improved}  ·  hurt: ${hurt}  ·  unchanged: ${rows.length - improved - hurt}`);
+console.log(`avg context size:  plain ${C}  →  expanded ${f(mean(rows.map(r => r.size)))}  (pulls only where an edge says a retrieved page completes an in-budget entity)`);
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+- **GBrain is booted with dynamic imports from `GBRAIN_SRC`.** The engine, gateway, and embedding imports are deferred so the script can run against a different GBrain source tree via env - the same pattern `policy_eval.ts` and `route_eval.ts` use. `connectWithRetry` with `noRetry: true` fails fast rather than hanging if Postgres is down.
+- **`rankedFor` reuses the production classifier exactly.** `classifyType` + `TYPE_TO_STRATEGY` from `query_routing.ts` is the same code path the actuator (`query_policy.ts` with `QUERY_ROUTER=on`) uses. The A/B therefore measures expansion *on top of the same routing logic that ships* - not a synthetic baseline.
+- **`setCoverage` is the only scoring primitive.** It fetches each slug's compiled text (cached in `textCache` to avoid re-fetching the same page across the plain/expanded pair), concatenates, and calls the pure `coverage` function from `grounding.ts`. Caching is load-bearing: the plain and expanded slug sets overlap heavily (top-C is shared), so without the cache every question would re-fetch C pages twice.
+- **The slug dump is the handoff to `assembly_answer_ab.py`.** The JSON written to `results/assembly_slugs.json` contains only `plain_slugs`, `expanded_slugs`, and `pulled` - no page bodies. The Python answer script reads those slugs, fetches bodies from Postgres via `gbrain get`, and runs the generator. Keeping the dump slug-only means the TypeScript A/B (cheap, deterministic) and the Python answer A/B (expensive, needs a chat endpoint) are decoupled and can be re-run independently.
+- **The report prints only the questions where expansion fired**, not all 24. That keeps the output focused on the cases that matter - if `pulled` is empty, expansion was a no-op and the row is uninteresting. The `↑ COVERAGE` / `↓` / `= (already covered)` tags let you scan the firing questions at a glance.
+
 ##### Decision — measured, NOT shipped to production (2026-06-07)
 
 Graph expansion *works*, and it is left in the repo as a tested, reproducible module (`src/assembly.ts` + the two A/B probes) — but it is **deliberately not wired into the production actuator** (`query_policy.ts`). The benefit does not clear the cost-and-complexity bar. The full reasoning, because "we built it and chose not to ship it" is itself the lesson:
@@ -2005,7 +3597,164 @@ Graph expansion *works*, and it is left in the repo as a tested, reproducible mo
 
 **Verdict:** keep `assembly.ts` as a documented experiment; do not run it in the live path. **Revisit only if** a real workload is (a) heavy on *missing-neighbor* multi-hop questions AND (b) the neighbor pages are small (entity pages, not document sections) AND (c) a cheaper fix (rerank-to-swap-a-distractor, or a slightly larger `C`) has been ruled out first. On this corpus none of those hold, so the honest engineering call is: **measured, shelved.** This is the chapter's "what NOT to build" discipline applied to our own feature — the experiment that earns its place by telling us *not* to ship.
 
+##### Answer-quality A/B for graph expansion — `src/assembly_answer_ab.py`
+
+`assembly_graph_ab.ts` measured *coverage* and found it unchanged (0.986 → 0.986) — because related entity pages already name each other, so the string is in budget even when the page is not. Coverage cannot see whether having the neighbor's full page changes the generated answer. `assembly_answer_ab.py` closes that gap: it replays the same plain-vs-expanded slug sets (read from `results/assembly_slugs.json`) through a strong generator (Opus), LLM-judges each answer against `expected_entities`, and reports pass rates overall and for the 7 questions where expansion actually fired.
+
+**When to use:** reach for `assembly_answer_ab.py` when you want to know whether 1-hop graph expansion changes the *answer*, not just the *coverage score* - specifically after `assembly_graph_ab.ts` has dumped its slug file and you want a final yes/no on whether the expanded context makes the generator more correct.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SLUGS[(assembly_slugs.json<br/>plain_slugs · expanded_slugs<br/>pulled · expected_entities)] --> LOOP[for each question]
+  LOOP --> AP[_answer<br/>plain_slugs → context<br/>→ generator · Opus]
+  LOOP --> AE[_answer<br/>expanded_slugs → context<br/>→ generator · Opus]
+  AP --> JP[_judge<br/>PASS / FAIL<br/>vs expected_entities]
+  AE --> JE[_judge<br/>PASS / FAIL<br/>vs expected_entities]
+  JP --> ACC[accumulate pp · pe<br/>fired_pp · fired_pe]
+  JE --> ACC
+  ACC --> RPT["report: all-N pass rates<br/>+ fired-only pass rates<br/>Δ plain → expanded"]
+```
+*`assembly_answer_ab.py` flow. Both arms share the same generator and judge so the only variable is the slug set (plain top-C vs expanded top-C + pulled neighbor). The fired subset isolates the signal to questions where expansion actually changed the context.*
+
+**Code (`src/assembly_answer_ab.py`):**
+
+```python
+"""assembly_answer_ab.py — does GRAPH-EXPANDED assembly produce better ANSWERS than plain top-C?
+
+assembly_graph_ab.ts showed graph expansion fires on 7/24 questions but lexical entity COVERAGE
+doesn't move — because a related entity's page already names the other entity (ridgeline's page
+says "Dev Patel"), so the string is in budget even when the page isn't. Coverage is blind to that;
+the real question is whether having the neighbor's full PAGE (and the distractors it sits beside)
+changes the generated answer. So we judge the answers, pinned to a strong generator (Opus).
+
+Two arms per question (from results/assembly_slugs.json):
+  plain     — top-C context
+  expanded  — top-C + 1-hop graph-pulled neighbors
+Judge entity coverage of each answer. Report pass rates, focused on the questions where expansion
+actually pulled a neighbor.
+
+Run: CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/assembly_answer_ab.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import time
+
+from openai import APIConnectionError, APIError
+
+from ground_truth_ab import _MEMZERO_TMPL, _ask, _client, gbrain_get
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_SLUGS = _ROOT / "results" / "assembly_slugs.json"
+_MIN_BODY = 80
+
+_JUDGE_TMPL = (
+    "You are grading whether a candidate answer correctly identifies the required facts. "
+    "Reply with EXACTLY one word: PASS or FAIL.\n\n"
+    "The answer PASSES only if it correctly names/identifies ALL of these (synonyms / full entity "
+    "for an abbreviation are fine):\n{entities}\n\nCANDIDATE ANSWER:\n{answer}\n\nVerdict (PASS or FAIL):"
+)
+
+
+class LLMUnavailable(RuntimeError):
+    pass
+
+
+def _resilient(fn, *args, retries: int = 4, backoff: float = 2.0):
+    for attempt in range(retries):
+        try:
+            return fn(*args)
+        except (APIConnectionError, APIError) as exc:
+            if attempt == retries - 1:
+                raise LLMUnavailable(str(exc)) from exc
+            time.sleep(backoff * (attempt + 1))
+    raise LLMUnavailable("unreachable")
+
+
+def _context(slugs: list[str]) -> str:
+    bodies = [gbrain_get(s) for s in slugs]
+    short = [(s, len(b.strip())) for s, b in zip(slugs, bodies) if len(b.strip()) < _MIN_BODY]
+    if short:
+        raise RuntimeError(f"body too short {short}")
+    return "\n\n".join(bodies)
+
+
+def _answer(client, slugs: list[str], q: str) -> str:
+    msg = [{"role": "user", "content": _MEMZERO_TMPL.format(ctx=_context(slugs), q=q)}]
+    return _resilient(_ask, client, msg)[0]
+
+
+def _judge(client, answer: str, entities: list[str]) -> bool:
+    msg = [{"role": "user", "content": _JUDGE_TMPL.format(entities="; ".join(entities), answer=answer)}]
+    return _resilient(_ask, client, msg)[0].strip().upper().startswith("PASS")
+
+
+def main() -> None:
+    rows = json.loads(_SLUGS.read_text())
+    client = _client()
+    print(f"generator/judge: {os.getenv('CHAT_MODEL', '(default)')} · {len(rows)} questions\n")
+
+    pp = pe = 0
+    fired_pp = fired_pe = fired_n = 0
+    for r in rows:
+        ents = r["expected_entities"]
+        fired = len(r["pulled"]) > 0
+        try:
+            ap = _judge(client, _answer(client, r["plain_slugs"], r["q"]), ents)
+            ae = _judge(client, _answer(client, r["expanded_slugs"], r["q"]), ents)
+        except LLMUnavailable as exc:
+            print(f"  [skip] {r['q'][:46]} ({exc})")
+            continue
+        pp += ap; pe += ae
+        if fired:
+            fired_n += 1; fired_pp += ap; fired_pe += ae
+            tag = "FIXED " if (ae and not ap) else ("BROKE " if (ap and not ae) else "same  ")
+            print(f"  [{tag}] plain={'P' if ap else 'F'} expanded={'P' if ae else 'F'}  +{len(r['pulled'])}p  \"{r['q'][:44]}\"")
+
+    n = len(rows)
+    print(f"\nall {n} questions:        plain {pp / n:.3f}  →  graph-expanded {pe / n:.3f}  (Δ {(pe - pp) / n:+.3f})")
+    if fired_n:
+        print(f"the {fired_n} where expansion fired: plain {fired_pp / fired_n:.3f}  →  expanded {fired_pe / fired_n:.3f}  (Δ {(fired_pe - fired_pp) / fired_n:+.3f})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **Design principle - judge answers, not strings.** `assembly_graph_ab.ts` already measured lexical coverage and found it flat. This script exists because the *answer* is the real objective and coverage is its surrogate. Running a separate answer-quality A/B with a pinned strong generator (Opus via `CHAT_MODEL`) isolates the retrieval change from generation noise - the only thing that differs between the two arms is the slug set.
+- **`assembly_slugs.json` is the load-bearing input.** `assembly_graph_ab.ts` writes this file with `plain_slugs`, `expanded_slugs`, `pulled`, `expected_entities`, and `q` for every golden question. `assembly_answer_ab.py` consumes it purely - it never calls a retrieval arm itself. That separation keeps the answer A/B cheap and reproducible: re-run it any number of times without touching Postgres or the embedding service.
+- **`_judge_tmpl` is entity-coverage, not `pass_criteria`.** Unlike `verify_arch.py` or `answer_route_ab.py`, this script checks `expected_entities` (a list of required proper nouns) rather than a prose rubric. The entity list is narrower and binary - it is the right judge for the expansion experiment because expansion targets missing *entity pages*, so the verdict should hinge on whether those entities appear in the answer.
+- **`_resilient` wraps every LLM call.** Four retries with linear backoff guard against VibeProxy transient failures. A `LLMUnavailable` skips the question with a `[skip]` line rather than crashing - important because the full A/B over 24 questions with 2 arms x 2 calls each runs ~96 LLM round-trips; one flaky call should not abort the run.
+- **`_MIN_BODY = 80` is a fast sanity guard.** `gbrain_get` can return an empty or stub body if a slug is stale. Raising early (`body too short`) prevents the generator from answering from thin context and recording a misleading FAIL - it's cheaper to abort one question than to silently corrupt the pass-rate.
+- **`fired` partitioning surfaces the signal.** Overall pass rates dilute the effect across the 17 questions where expansion changed nothing. The `fired_*` counters isolate the 7 questions where `pulled` is non-empty - the only ones where the slug sets differ. That sub-rate (`0.714 → 0.857, Δ +0.143`) is the direct measure of expansion's effectiveness on its own firing condition.
+
+**Result (balanced 24-Q, Opus 4.5 generator + judge, `results/assembly_slugs.json`):** all-24 pass rate plain 0.792 → expanded **0.833** (Δ +0.042). The 7 fired questions: plain 0.714 → expanded **0.857** (Δ +0.143). One question fixed (`Quanta Labs work on?`, F→P); zero broke. Distractor-dominated failure (`which venture firm`) stayed F — expansion added the right page but did not remove the wrong distractors.
+
 #### Block C — `query_policy.ts`: the actuator
+
+The actuator closes the auto-eval loop by reading `results/search_policy.json` and routing each query through the engine arm that `auto_eval.ts` measured as best for this corpus. It is the right script to reach for when you want to run a query and have the corpus-tuned strategy applied automatically - not when you want to measure strategies (use `auto_eval.ts`) or when you need the raw GBrain CLI for one-off exploration.
+
+**When to use:** Reach for `query_policy.ts` (instead of bare `gbrain query`) whenever the corpus has been evaluated and you want retrieval steered by the measured-best strategy - global policy by default, per-query routing via `QUERY_ROUTER=on` only when traffic is mixed-type and the classify cost is justified. Use `auto_eval.ts` when you want to re-measure; use `auto_eval.ts` + `query_policy.ts` together as the full closed loop.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[query text] --> POL[(search_policy.json<br/>read winning arm + rrf_k)]
+  POL -->|file missing| FB[fallback<br/>hybrid · GBrain default]
+  POL --> SW{QUERY_ROUTER?}
+  SW -->|off · default| GA[global arm<br/>keyword / vector / hybrid]
+  SW -->|on · accuracy switch| RT[query_routing.ts<br/>classifyType + preprocessOR]
+  RT --> PA[per-query arm<br/>kw to keyword · vec to vector<br/>mixed to hybrid]
+  GA --> ENG[GBrain engine path]
+  PA --> ENG
+  FB --> ENG
+  ENG --> R[ranked slugs<br/>+ resolved-policy line]
+```
+*`query_policy.ts` actuator. It reads the arm the selector chose and runs the query through that engine path - never the stock hybrid-only `gbrain query`. `QUERY_ROUTER` off serves the single global arm (default); on flips to per-query routing via `query_routing.ts` (the accuracy switch). No policy file yet → hybrid fallback.*
 
 **Code (full source `src/query_policy.ts`):**
 
@@ -2118,6 +3867,25 @@ process.exit(0);
 - **Router OFF (default) = the global policy, *not* hardcoded hybrid.** `strategy` is whatever `auto_eval` wrote to `search_policy.json` — `keyword`, `vector`, **or** `hybrid`. On this 67-page mixed corpus that's `hybrid` (the Phase-6 `vector → hybrid` flip), but on a keyword-heavy or tiny corpus the same OFF path would route `keyword` or `vector`. The log prints the resolved arm (`global policy = hybrid rrf_k=60`) so the choice is never assumed. `hybrid` is only the **fallback** when no policy file exists yet.
 - **Router ON (opt-in, `QUERY_ROUTER=on`) ignores the single global arm and routes per query type** via `pickStrategy()` → `classifyType` + `TYPE_TO_STRATEGY` from `query_routing.ts`. The `kw` branch feeds the keyword arm the **OR-preprocessed** query (`kwQuery`), the validated path; `vec`/`mixed` embed/hybrid the raw query. Default off because routing is a *conditional* win — see the re-test above (gates: mixed-type traffic + OR-preprocessed keyword + a cheap classifier).
 - **One classifier, two callers.** `query_routing.ts` is imported by both this actuator and the A/B (`route_principle_ab.ts`), so production routes by the *exact* classifier the +0.039 / +0.042 numbers were measured on — no drift between "tested" and "shipped". The vector arm must `embed()` at run-time, which needs the same gateway bootstrap as the eval (`hybrid.ts:975` silently no-ops without it).
+
+**When to use:** reach for `query_routing.ts` (imported, no `main`) whenever you need the shared `classifyType` + `preprocessOR` + `TYPE_TO_STRATEGY` logic - import it into any caller that routes queries by type, rather than duplicating the classifier; use `query_policy.ts` instead when you want a runnable actuator that also reads `search_policy.json` and drives the GBrain engine end-to-end.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[query text] --> CL[classifyType]
+  CL -->|exact-token probe| KW[kw]
+  CL -->|prose paraphrase<br/>high function-word ratio| VEC[vec]
+  CL -->|natural question| MIX[mixed]
+  KW --> PRE[preprocessOR<br/>drop STOP · OR-join<br/>avoid conjunctive AND-to-zero]
+  PRE --> SK[keyword]
+  VEC --> SV[vector]
+  MIX --> SH[hybrid]
+  SK --> OUT[Strategy<br/>returned to caller]
+  SV --> OUT
+  SH --> OUT
+```
+*`query_routing.ts` - the shared classifier brain. One canonical `classifyType` + `preprocessOR`, imported by BOTH the production actuator (`query_policy.ts` under the router switch) AND the A/B that validated it (`route_principle_ab.ts`), so production routes by exactly the tested classifier. `preprocessOR` OR-joins keyword terms so GBrain's conjunctive FTS doesn't AND a verbose query to zero (g@C:kw 0.500 → 1.000).*
 
 **Code (full source `src/query_routing.ts` — the shared router brain):**
 
@@ -2250,6 +4018,22 @@ The **loop is the point**: every ingest re-runs the SELECTOR, which re-measures 
 - **Selector validity** — the max-grounding arm (`hybrid`) is also the answer-quality winner (`1.000` pass), and the ordering `keyword < vector < hybrid` holds on **both** axes (grounding `0.250 < 0.858 < 0.927`; answer `0.167 < 0.917 < 1.000`) → CONFIRMED.
 - **The residual (r=0.820, not 1.0) is instructive — and the gap it once flagged is now *closed*.** Earlier *"Where are the Notes to Consolidated Financial Statements located?"* grounded **1.000 on all three arms yet the answer FAILED** for every arm: a **false-positive grounding** — the chunks (`sections/brk_0034/0039/0040`) contained the `Item 8` / `Notes to Consolidated` substrings, but as a buried page-header marker, not a clean "*the Notes are in Item 8, pages 99–147*" statement. The **combined PageIndex+GBrain ingest** (see the combined-solution subsection) fixed exactly this: every section now carries a `**Location:** Item 8 — Notes to Consolidated Financial Statements · pages 99–147` breadcrumb *in its body*, so the shipped policy (`hybrid`) and `vector` now **answer it correctly** — only the `keyword` arm still fails (it retrieves the body without surfacing the location line at rank 0). What remains of the residual `r=0.820 < 1.0` is now a *mix*: keyword's leftover false-positives, **plus the reverse case** — the strong generator passing from *low*-grounding context (the 'not-so-secret weapon' question: `vector` grounds only 0.375 yet the answer PASSES — a false *negative* for the metric). The metric↔answer agreement **rose** (0.719 → 0.820) precisely because the structural fix landed: once the location is *in the page*, the cheap substring metric and answer quality line up. The residual is where they still diverge — a retrieval-*representation* effect (now partly a generator-strength effect), not pure noise.
 
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  HITS[retrieved hits<br/>per-rank coverage array] --> BS[budgetScore<br/>scan top-C only]
+  BS --> CV[coverage r<br/>entities matched / total]
+  BS --> DI[disc r<br/>1 / log2 rank+2<br/>rank0=1 · rank1=0.63]
+  CV --> MX[gDisc = max of<br/>coverage x disc<br/>over top-C]
+  DI --> MX
+  CV --> GF[gFull = max coverage<br/>over top-C]
+  MX --> OUT[BudgetScore<br/>gDisc drives policy]
+  GF --> OUT
+```
+*`grounding.ts` scoring flow. Pure functions, no I/O - which is why they live apart from `policy_eval.ts` and are unit-tested. `budgetScore` reads only the top-`C` ranks (the generator's budget); `gDisc` rewards early placement via `disc(rank)`, so an RRF reorder that demotes the answer chunk lowers the score and a chunk pushed past `C` scores 0.*
+
+**When to use:** Reach for `grounding.ts` whenever you need to compute `discounted grounding@C` or `answerable@C` outside of `policy_eval.ts` - for example, writing a new eval script, a unit test, or a one-off probe - because it is the single source of truth for both `coverage` and `disc`, and importing it keeps all scoring logic consistent and avoids reimplementing the position-discount formula by hand.
+
 **The load-bearing primitive — complete source** (`src/grounding.ts`, pure + unit-tested):
 
 ```typescript
@@ -2294,13 +4078,653 @@ export function budgetScore(coverages: number[], c: number): BudgetScore {
 }
 ```
 
+**Walkthrough:**
+- **`coverage` is the label-cheap gold.** It asks only "does this section's text contain the expected entity substrings?" - no per-slug relevance labels, so the golden set stays cheap to extend as the query distribution shifts. Lowercasing both sides makes it case-robust.
+- **`disc` encodes primacy, DCG-style.** `1/log2(rank+2)` gives rank-0 a weight of 1.0, rank-1 0.63, rank-2 0.5 - a smooth decay that punishes burying the answer. This is the exact signal a rank-blind `max`-over-top-K throws away, and it's why the metric can *see* an RRF reorder that demotes the dense answer below a keyword distractor.
+- **`budgetScore` scores the prompt the generator actually reads.** It scans only the first `c` ranks (the production injected-chunk count), so a hit past `C` contributes nothing - modelling "the answer fell out of the context window". `gDisc` (position-weighted) drives the policy; `gFull` (raw best coverage) feeds the separate `answerable@C` diagnostic.
+- **Pure + no I/O is the whole reason it's its own file.** Keeping the math free of engine/DB calls makes it unit-testable in isolation (the deterministic grounding tests) and reusable by every orchestration script below without dragging in GBrain - the same separation-of-concerns that lets the 0-LLM selector run on every ingest cheaply.
+
+**The deterministic contract — unit tests for `grounding.ts`** (`src/grounding.test.ts`)
+
+Because `grounding.ts` is pure math with no I/O, every correctness claim about the metric can be pinned by a fast offline test. `grounding.test.ts` exercises exactly the three failure modes the new metric was designed to catch: the `disc` decay values at each rank, RRF demotion (answer pushed from rank 0 to rank 1), and context-budget overflow (answer retrieved but pushed past `C` so the generator never reads it). Each test also runs the *old* rank-blind `max-over-top-K` side-by-side to document the delta - making the regression visible as executable specification rather than prose.
+
+**When to use:** reach for `grounding.test.ts` when you change any formula in `grounding.ts` (discount factor, coverage logic, budget window) and need to confirm the three failure modes are still caught - or when onboarding a reader who needs to understand *why* the metric is shaped this way before reading the policy eval scripts.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  IMP["import budgetScore,<br/>coverage, disc<br/>from grounding.ts"] --> T1["disc primacy test<br/>rank 0=1.0, 1=0.63, 2=0.5"]
+  IMP --> T2["coverage test<br/>case-insensitive fraction"]
+  IMP --> T3["rank-0 perfect score<br/>gDisc == 1.0"]
+  IMP --> T4["RRF demotion test<br/>old metric: blind<br/>new metric: sees demotion"]
+  IMP --> T5["budget overflow test<br/>rank 3 past C=3<br/>old: 1.0 · new: 0"]
+  IMP --> T6["partial coverage<br/>magnitude preserved"]
+  IMP --> T7["gFull vs gDisc<br/>position-blind vs weighted"]
+  OLD["oldRankBlind<br/>max over top-K"] --> T4
+  OLD --> T5
+```
+*`grounding.test.ts` call flow. Each test imports the three pure functions and runs `bun test` with no services. Tests T4 and T5 also invoke `oldRankBlind` (the superseded metric) to document exactly where it was blind - making the regression an executable specification.*
+
+**Code: `src/grounding.test.ts`**
+
+```typescript
+/**
+ * Verifies the budget-aware discounted grounding metric behaves where the old
+ * rank-blind max-over-top-K was blind: RRF reorders and budget overflow.
+ *
+ * Run: bun test src/grounding.test.ts
+ */
+import { expect, test } from "bun:test";
+
+import { budgetScore, coverage, disc } from "./grounding.ts";
+
+const C = 3;
+const oldRankBlind = (covs: number[], k: number) => Math.max(0, ...covs.slice(0, k)); // the metric we replaced
+
+test("disc encodes primacy: 1.0, 0.63, 0.5 at ranks 0,1,2", () => {
+  expect(disc(0)).toBe(1);
+  expect(disc(1)).toBeCloseTo(0.6309, 3);
+  expect(disc(2)).toBe(0.5);
+});
+
+test("coverage is fraction of expected entities present (case-insensitive)", () => {
+  expect(coverage("sam okafor anchors northstar", ["Sam Okafor", "Northstar"])).toBe(1);
+  expect(coverage("sam okafor only", ["Sam Okafor", "Northstar"])).toBe(0.5);
+  expect(coverage("nothing relevant", ["Sam Okafor"])).toBe(0);
+});
+
+test("answer at rank 0 scores a perfect 1.0", () => {
+  expect(budgetScore([1, 0, 0], C).gDisc).toBe(1);
+});
+
+test("RRF demotion (distractor at rank 0, answer at rank 1) is penalised — old metric was blind", () => {
+  const demoted = [0, 1, 0]; // answer pushed to rank 1 by a fused distractor
+  const top = [1, 0, 0];
+  // The failure the user named: old rank-blind max says both are identical...
+  expect(oldRankBlind(demoted, 5)).toBe(oldRankBlind(top, 5)); // both 1.0 — blind
+  // ...the new metric sees the demotion.
+  expect(budgetScore(demoted, C).gDisc).toBeCloseTo(0.6309, 3);
+  expect(budgetScore(demoted, C).gDisc).toBeLessThan(budgetScore(top, C).gDisc);
+});
+
+test("answer pushed PAST the context budget scores 0 — retrieved (in K) but out of the prompt", () => {
+  const pastBudget = [0, 0, 0, 1]; // answer at rank 3, budget C=3 reads ranks 0..2
+  expect(oldRankBlind(pastBudget, 5)).toBe(1); // old metric: still "in top-K", looks fine
+  expect(budgetScore(pastBudget, C).gDisc).toBe(0); // new metric: it never reaches the generator
+  expect(budgetScore(pastBudget, C).gFull).toBe(0);
+});
+
+test("partial coverage is preserved, not rounded up (answer-quality magnitude kept)", () => {
+  expect(budgetScore([0.5, 0, 0], C).gDisc).toBe(0.5); // half the entities, at rank 0
+  expect(budgetScore([0.5, 1, 0], C).gDisc).toBeCloseTo(0.6309, 3); // full@1 (0.63) beats half@0 (0.5)
+});
+
+test("gFull (answerable source) ignores position; gDisc (policy) respects it", () => {
+  const s = budgetScore([0, 1, 0], C);
+  expect(s.gFull).toBe(1); // a fully-covering section exists in budget → answerable
+  expect(s.gDisc).toBeCloseTo(0.6309, 3); // but it's demoted → graded down for the policy
+});
+```
+
+**Walkthrough:**
+- **Structure mirrors the metric's design contract, not test-by-test mechanics.** The test file is organised around the three failure modes the new metric was *designed to catch*: rank decay (`disc`), RRF reorder blindness, and context-budget overflow. Reading the tests in order is the fastest way to understand *why* `grounding.ts` is shaped the way it is - each test is a proof-by-example that the old `max-over-top-K` was insufficient.
+- **`oldRankBlind` is inlined as living documentation.** Rather than prose-commenting that the old metric was blind, the tests make it executable: `expect(oldRankBlind(demoted, 5)).toBe(oldRankBlind(top, 5))` pins *exactly* the failure (both return 1.0 regardless of rank), then the next assertion shows the new metric returns 0.63 for the demoted case. Any future reader who deletes `disc` from `grounding.ts` will see these two tests fail together - the regression is self-describing.
+- **Budget overflow test documents the hardest-to-see failure.** `pastBudget = [0, 0, 0, 1]` with `C=3` is the case where retrieval *looks* successful (top-K contains the answer) but the generator never reads it. `oldRankBlind(pastBudget, 5)` returns 1 - looks fine; both `gDisc` and `gFull` return 0 - the generator window is the real unit. This is the principal argument for `C` as a first-class parameter of the metric.
+- **No services, no I/O, pure Bun test.** `bun test src/grounding.test.ts` runs in milliseconds from any machine without GBrain, Postgres, or oMLX - the separation-of-concerns in `grounding.ts` pays off directly here as test isolation. This is what lets the metric be verified in CI without a live stack.
+
 The orchestration scripts consume this primitive: `policy_eval.ts` (selector — writes the policy), `route_eval.ts` (routing headroom + per-arm dump), `route_eval_kwpp.ts` + `route_principle_ab.ts` (the keyword-revival and per-query-routing A/Bs), `answer_route_ab.py` / `answer_principle_ab.py` (answer A/Bs), `verify_arch.py` (calibrator + selector audit). **What NOT to build** (each measured into the ground this phase): an LLM judge in the every-ingest selector (confounds retrieval choice with generation variance, *and* meters the loop); a rank-blind metric (can't see RRF demotion); a hand-picked `C` (scores a context the model never reads); **entity-aware graph expansion in the live path** (fixes only 1/24 — judge-noise magnitude — and only *missing-neighbor* 2-hop, not distractor failures; runtime token cost is unbounded in neighbor page size; kept as a tested module, shelved — see "Decision — measured, NOT shipped"). Most of the win was **deletion** — the final system is simpler than the naïve one *and* better, because each cut piece failed a measurement.
 
 **What we DID build (gated): the per-query router.** Unlike the shelved items above, per-query routing earned its place — it is shipped in `query_policy.ts` behind `QUERY_ROUTER`, **default-off**. On a single-type corpus the oracle ceiling equals global hybrid (Δ0), so you leave it off; once the workload spans query types and the keyword arm is OR-preprocessed it **reverses to +0.039 grounding / +0.042 answer** and you switch it on. So the router is not a "don't build" — it's a "build it, gate it on the workload."
 
+**The calibrator + selector audit — complete source** (`src/verify_arch.py`)
+
+This is the script behind the `r = +0.820` number above - the **one place the expensive LLM judge runs**, on purpose, as a one-off audit rather than in the every-ingest hot loop. The "measured policy, three layers" design rests on a single empirical claim: the cheap, deterministic SELECTOR metric (`discounted grounding@C`) predicts ANSWER quality well enough to pick the right arm *without* an LLM in the loop. `verify_arch.py` tests that claim directly. It pairs, for every arm × every `tenk` golden question (the ones carrying `pass_criteria`), the **cheap metric** (`grnd@C↓` from `arm_scores.json`, zero-LLM) with the **real objective** (generate an answer from that arm's top-C context, judge PASS/FAIL against the rubric with a strong model), then reports two different things at two different granularities: the **CALIBRATOR** (cell-level `corr(grounding, answer-pass)` - does the surrogate track the objective?) and the **SELECTOR validity** check (arm-level - does max-grounding also win on answers?).
+
+**When to use:** Reach for `verify_arch.py` once after building a new corpus (or after a major grounding-metric change) to confirm that the cheap surrogate still predicts answer quality well enough to justify keeping the LLM out of the hot-loop selector - use the sibling A/B scripts (`route_eval.ts`, `answer_route_ab.py`) for ongoing per-arm experiments instead.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  AS[(arm_scores.json<br/>grnd@C↓ per arm x Q<br/>0-LLM · route_eval.ts)] --> PAIR[for arm x tenk-Q:<br/>pair grnd@C↓ with answer]
+  GT[(W2.7 ground truth<br/>pass_criteria · tenk only)] --> PAIR
+  PAIR --> ANS[_answer<br/>generate from arm top-C<br/>strong model · Opus]
+  ANS --> JG[_judge<br/>PASS / FAIL vs pass_criteria]
+  JG --> CELLS[36 cells<br/>grnd , pass 0 or 1]
+  CELLS --> CAL[CALIBRATOR<br/>Pearson r · cell-level<br/>grnd vs pass<br/>+0.820]
+  CELLS --> SEL[SELECTOR audit<br/>per-arm mean grnd vs pass]
+  SEL --> V{argmax grnd<br/>== argmax pass?}
+  V -->|yes| OK[CONFIRMED]
+  V -->|no| MM[MISMATCH]
+```
+*`verify_arch.py` flow. The cheap grounding scores arrive pre-computed and zero-LLM; the expensive half (generate + judge with Opus) runs only here, off the hot path. CALIBRATOR correlates the two over all 36 `arm × question` cells; SELECTOR validity checks the arm-level winners match. This is the GATE/CALIBRATOR of Block D's three-layer diagram, run as a one-off audit.*
+
+**Code (full source `src/verify_arch.py`):**
+
+```python
+"""verify_arch.py — does the recommended architecture actually hold on this corpus?
+
+The "measured policy, three layers" design rests on ONE empirical claim: the cheap,
+deterministic SELECTOR metric (discounted grounding@C) predicts ANSWER quality well
+enough to pick the right arm without an LLM in the hot loop. This script tests that
+claim directly — the CALIBRATOR step — and confirms the SELECTOR's pick is the
+answer-quality winner (the GATE's job, run here as a one-off audit).
+
+For every arm (keyword/vector/hybrid) × every tenk golden question (those carry
+pass_criteria), it pairs:
+  - the cheap metric : discounted grounding@C  (from results/arm_scores.json, zero-LLM)
+  - the real objective: answer PASS/FAIL        (generate from that arm's top-C context,
+                                                 judge against pass_criteria — strong model)
+Then reports:
+  1. correlation(grounding, answer-pass) across all arm×question cells  → does the cheap
+     surrogate track the objective? (the architecture's load-bearing assumption)
+  2. per-arm mean grounding vs answer pass-rate → does the SELECTOR's winner (max grounding)
+     also win on answers? (selector validity)
+
+Inputs: results/arm_scores.json (from `bun src/route_eval.ts`) + the W2.7 ground truth.
+Run with a STRONG generator so the answer signal isn't generation-noise-limited:
+  OPENROUTER_BASE_URL=http://localhost:8317/v1 OPENROUTER_API_KEY=vibeproxy \
+  CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import statistics
+
+from answer_route_ab import LLMUnavailable, _answer, _judge, _pass_criteria_by_q
+from ground_truth_ab import _client
+
+_ARMS = ("keyword", "vector", "hybrid")
+_ARM_SCORES = pathlib.Path(__file__).resolve().parent.parent / "results" / "arm_scores.json"
+
+
+def _correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson r; None if either series is constant (correlation undefined)."""
+    if len(xs) < 2 or len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    return statistics.correlation(xs, ys)
+
+
+def main() -> None:
+    dump = json.loads(_ARM_SCORES.read_text())
+    criteria_by_q = _pass_criteria_by_q()
+    client = _client()
+
+    g_all: list[float] = []        # grounding per arm×question cell
+    p_all: list[float] = []        # answer pass (0/1) per cell
+    per_arm: dict[str, dict[str, list[float]]] = {a: {"g": [], "p": []} for a in _ARMS}
+
+    for item in dump:
+        q = item["q"].strip()
+        criteria = criteria_by_q.get(q)
+        if criteria is None:
+            continue  # entity questions have no rubric — skip
+        for arm in _ARMS:
+            grounding = float(item["grounding"][arm])
+            try:
+                passed = _judge(client, _answer(client, item["slugs"][arm], q), criteria)
+            except LLMUnavailable as exc:
+                print(f"  [skip] {arm:7s} {q[:44]} ({exc})")
+                continue
+            p = 1.0 if passed else 0.0
+            g_all.append(grounding)
+            p_all.append(p)
+            per_arm[arm]["g"].append(grounding)
+            per_arm[arm]["p"].append(p)
+            print(f"  {arm:7s} grnd={grounding:.3f} ans={'P' if passed else 'F'}  {q[:44]}")
+
+    n = len(g_all)
+    corr = _correlation(g_all, p_all)
+    print(f"\n=== CALIBRATOR — does the cheap metric predict answer quality? ===")
+    print(f"  cells judged: {n}")
+    print(f"  corr(discounted grounding@C, answer-pass) = "
+          f"{'n/a' if corr is None else f'{corr:+.3f}'}")
+
+    print(f"\n=== SELECTOR — is the max-grounding arm the answer-quality winner? ===")
+    print(f"  {'arm':8s} {'mean grnd':>10s} {'ans pass':>9s}")
+    arm_grnd = {a: statistics.fmean(per_arm[a]["g"]) if per_arm[a]["g"] else 0.0 for a in _ARMS}
+    arm_pass = {a: statistics.fmean(per_arm[a]["p"]) if per_arm[a]["p"] else 0.0 for a in _ARMS}
+    for a in _ARMS:
+        print(f"  {a:8s} {arm_grnd[a]:10.3f} {arm_pass[a]:9.3f}")
+    g_winner = max(_ARMS, key=lambda a: arm_grnd[a])
+    p_winner = max(_ARMS, key=lambda a: arm_pass[a])
+    verdict = "CONFIRMED" if g_winner == p_winner else "MISMATCH"
+    print(f"\n  selector pick (max grounding) = {g_winner};  answer winner = {p_winner}"
+          f"  → {verdict}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:** *(design principle first, then the details that make it trustworthy)*
+- **Design principle - this script earns the right to keep the LLM out of the hot loop.** The whole self-tuning economy (re-select on *every* ingest, free) depends on a deterministic metric standing in for an expensive judge. That substitution is only legitimate if someone *measured* that the cheap metric tracks the real objective. `verify_arch.py` is that measurement - the expensive judge run **once, deliberately, off the hot path**, the exact opposite of the rejected "judge in the selector" design. The output `r` is a license: high `r` → trust the proxy continuously and reserve the judge for event-triggered GATE/CALIBRATOR checks; low `r` → the architecture is unsafe and the judge would have to move into the loop, collapsing the economics.
+- **Cell-level pairing, not arm-means - because correlation needs spread.** It accumulates one `(grounding, pass)` pair per `arm × question` **cell** (`g_all`/`p_all`) → 36 points (3 arms × 12 `tenk` questions). Collapsing each arm to a single `(mean-grounding, mean-pass)` point leaves 3 points - too few for a meaningful `r`, and it hides the within-arm disagreements that are the whole diagnostic. The per-arm aggregates (`per_arm`) are computed **separately**, only for the SELECTOR-validity view.
+- **Strong generator is load-bearing, not a luxury.** Answers are generated and judged with Opus (the `CHAT_MODEL` env in the docstring). With a weak model, a FAIL could mean "the model couldn't write the answer" rather than "the context didn't contain it" - and the correlation would measure *generation* noise instead of *retrieval* quality. Pinning a strong generator makes a FAIL mean a retrieval-representation gap, which is precisely what the calibrator must detect.
+- **Two outputs, two questions, two granularities.** CALIBRATOR = `corr` over all cells: *does the cheap surrogate track the objective, point by point?* SELECTOR validity = per-arm `argmax grnd == argmax pass`: *does the arm the selector would pick also win on answers?* They can disagree (a high-but-imperfect `r` with a still-correct winner) - exactly the `r=0.820 < 1.0` yet `CONFIRMED` situation.
+- **`_correlation` guards the undefined case.** `statistics.correlation` is undefined when either series is constant (zero variance), so the helper returns `None` (printed `n/a`) if `<2` distinct values exist - e.g. very early, before the corpus produces any answer variation. Cheap defensiveness that keeps the audit from throwing on a thin brain.
+- **It reuses the A/B lineage, not bespoke plumbing.** `_answer`/`_judge`/`_pass_criteria_by_q` come from `answer_route_ab.py` and `_client` from `ground_truth_ab.py` - the same generate-and-judge code the routing experiments used, so the calibrator measures exactly what those A/Bs measured (no drift between "what we tested" and "what we audit").
+
+**Result (measured, `results/verify_arch.out`, re-verified 2026-06-07, judge = Claude Opus 4.5, 36 cells):** `corr(discounted grounding@C, answer-pass) = +0.820`. Per-arm SELECTOR view - `keyword 0.250 grnd / 0.167 pass`, `vector 0.858 / 0.917`, `hybrid 0.927 / 1.000` - so `argmax grnd = hybrid` and `argmax pass = hybrid` → **CONFIRMED**. The residual (`r < 1.0`) is the handful of cells where the two disagree (keyword's false-positive grounding on the Notes question; vector answering correctly from low-grounding context on the "not-so-secret weapon" question) - documented above as a retrieval-*representation* effect, not noise.
+
+#### Block D.1 — `route_eval.ts`: routing headroom + per-arm dump
+
+`route_eval.ts` is the **oracle experiment** that decides whether per-query routing is worth building. It runs all three retrieval arms over every golden question with the same discounted grounding@C as `policy_eval.ts`, then compares three routers: the *global* baseline (one arm for all queries), a *heuristic* zero-LLM classifier, and the *oracle ceiling* (each query gets its own best arm, label-peeking). The two JSON dumps it writes - `arm_scores.json` and `route_slugs.json` - are the pre-computed feed for every downstream Python A/B (`verify_arch.py`, `answer_route_ab.py`, `reader_ab.py`), so this script must run before any of them.
+
+**When to use:** reach for `route_eval.ts` when you want to know whether per-query routing has any headroom on your corpus before investing in a classifier - run it once on a new golden set; if oracle equals global, routing is all-risk-no-reward and you stop; if oracle beats global, the gap is the budget a classifier can spend on its own errors. Its siblings `route_eval_kwpp.ts` and `route_principle_ab.ts` extend this measurement to specific keyword fixes and 3-policy comparisons; use those only after `route_eval.ts` confirms there is headroom to investigate.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  GQ[(golden_eval.json<br/>questions + entities)] --> BOOT
+  ENV["GBRAIN_SRC / env vars<br/>K=5  C=3"] --> BOOT
+  BOOT["engine bootstrap<br/>loadConfig · createEngine<br/>connectWithRetry<br/>configureGateway"] --> ARMS
+  ARMS["for each arm:<br/>keyword · vector · hybrid"] --> EVAL
+  EVAL["runEval<br/>top-K slugs per query"] --> SCORE
+  SCORE["coverage + budgetScore<br/>→ gDisc per question"] --> CACHE
+  CACHE["sectionText cache<br/>getPage · compiled_truth"] --> SCORE
+  SCORE --> MATRIX["score matrix<br/>3 arms × N questions"]
+  MATRIX --> GLOBAL["global router<br/>every query → hybrid"]
+  MATRIX --> HEUR["heuristic router<br/>classify → kw or hybrid"]
+  MATRIX --> ORA["oracle router<br/>each query → best arm"]
+  GLOBAL --> RPT["per-question table<br/>+ summary means + Δ"]
+  HEUR --> RPT
+  ORA --> RPT
+  MATRIX --> SLUGDUMP[(route_slugs.json<br/>global vs routed slugs)]
+  MATRIX --> ARMDUMP[(arm_scores.json<br/>grnd + slugs per arm × Q)]
+```
+*`route_eval.ts` data flow. The engine bootstrap is identical to `policy_eval.ts`; the loop scores all three arms in one pass so the oracle comparison is exact (same corpus state, same embed run). Dumps feed the Python A/Bs without a second retrieval round.*
+
+**Code (`src/route_eval.ts`):**
+
+```typescript
+/**
+ * route_eval.ts — does PER-QUERY routing beat the single global policy?
+ *
+ * The global loop (policy_eval.ts) picks ONE arm for the whole corpus. But the best
+ * arm is query-dependent: proper-noun lookups favour keyword/hybrid, semantic factoids
+ * favour dense vector. This script measures whether routing each query to its own best
+ * arm beats committing to the global winner — and how close a CHEAP heuristic classifier
+ * gets to that ceiling.
+ *
+ * It scores three routers with the same budget-aware discounted grounding@C as the policy:
+ *   - global   : every query → the global winner (here hybrid). The baseline to beat.
+ *   - heuristic : a zero-LLM classifier picks an arm per query (the shippable router).
+ *   - oracle   : every query → its own best arm. The CEILING; unattainable in production
+ *                (it peeks at the labels) but it bounds how much routing can ever help.
+ *
+ * If oracle ≈ global, routing has no headroom on this corpus — report it and stop.
+ *
+ * Run: bun src/route_eval.ts        (needs the corpus loaded + OLLAMA_* up)
+ */
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+import { budgetScore, coverage } from "./grounding.ts";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const GOLDEN = process.env.GOLDEN_EVAL ?? `${import.meta.dir}/../data/golden_eval.json`;
+const SLUG_DUMP = `${import.meta.dir}/../results/route_slugs.json`;
+const ARM_DUMP = `${import.meta.dir}/../results/arm_scores.json`; // per-arm grounding + slugs (verify_arch.py)
+const K = Number(process.env.POLICY_K ?? "5");
+const C = Number(process.env.POLICY_C ?? "3");
+
+interface GoldenQ { q: string; expected_entities: string[]; domain: string }
+type Strategy = "keyword" | "vector" | "hybrid";
+const strategies: readonly Strategy[] = ["keyword", "vector", "hybrid"];
+const GLOBAL: Strategy = "hybrid"; // current global policy winner on the mixed corpus
+
+const golden: GoldenQ[] = JSON.parse(readFileSync(GOLDEN, "utf-8")).questions;
+
+// ── cheap, deterministic query classifier (the shippable router) ─────────────
+// Signal: proper-noun lookups (capitalised entity tokens, short query) are exact-term
+// territory → keyword's strength; everything else stays on the global hybrid default.
+const STOP = new Set(["What", "Who", "Where", "Which", "When", "How", "Why", "Does",
+  "Did", "Is", "Are", "The", "In", "Of", "A", "An"]);
+function classify(q: string): Strategy {
+  const properNouns = (q.match(/\b[A-Z][a-zA-Z]+\b/g) ?? []).filter(w => !STOP.has(w));
+  const words = q.split(/\s+/).length;
+  if (properNouns.length >= 2 && words <= 9) return "keyword"; // short proper-noun lookup
+  return "hybrid";
+}
+
+// ── engine bootstrap (identical sequence to policy_eval.ts / the CLI) ────────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { runEval } = await import(`${GB}/core/search/eval.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+const nPages = (await engine.listPages()).length;
+
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+
+// ── per-arm, per-question discounted grounding@C + top-C slugs ───────────────
+const score = {} as Record<Strategy, number[]>;      // score[arm][i] = gDisc for question i
+const slugsByArm = {} as Record<Strategy, string[][]>; // slugsByArm[arm][i] = top-C slugs (for the answer A/B)
+for (const strategy of strategies) {
+  const report = await runEval(
+    engine,
+    golden.map(g => ({ query: g.q, relevant: [] as string[] })),
+    { strategy, expand: false, limit: K },
+    K,
+  );
+  const row: number[] = [];
+  const slugs: string[][] = [];
+  for (let i = 0; i < golden.length; i++) {
+    const topC: string[] = report.queries[i].hits.slice(0, C);
+    const ents = golden[i].expected_entities;
+    const covs = await Promise.all(topC.map(async s => coverage(await sectionText(s), ents)));
+    row.push(budgetScore(covs, C).gDisc);
+    slugs.push(topC);
+  }
+  score[strategy] = row;
+  slugsByArm[strategy] = slugs;
+}
+
+// ── routers ──────────────────────────────────────────────────────────────────
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const bestArm = (i: number): Strategy =>
+  strategies.reduce((best, s) => (score[s][i] > score[best][i] ? s : best), strategies[0]);
+
+const globalScores    = golden.map((_, i) => score[GLOBAL][i]);
+const heuristicPicks  = golden.map(g => classify(g.q));
+const heuristicScores = golden.map((_, i) => score[heuristicPicks[i]][i]);
+const oracleScores    = golden.map((_, i) => score[bestArm(i)][i]);
+
+// ── report ───────────────────────────────────────────────────────────────────
+const pad = (s: string, n: number) => s.padEnd(n);
+const f = (x: number) => x.toFixed(3);
+console.log(`route_eval: ${golden.length} questions · ${nPages} pages · K=${K} C=${C}\n`);
+console.log(pad("#", 3) + pad("dom", 7) + pad("key", 7) + pad("vec", 7) + pad("hyb", 7) +
+  pad("best", 9) + pad("heur", 9) + "question");
+console.log("-".repeat(86));
+golden.forEach((g, i) => {
+  const best = bestArm(i);
+  const flag = best !== GLOBAL ? " *" : "";              // * = routing could beat global here
+  console.log(pad(String(i), 3) + pad(g.domain, 7) +
+    pad(f(score.keyword[i]), 7) + pad(f(score.vector[i]), 7) + pad(f(score.hybrid[i]), 7) +
+    pad(best + flag, 9) + pad(heuristicPicks[i], 9) + g.q.slice(0, 40));
+});
+console.log("-".repeat(86));
+const wins       = golden.filter((_, i) => bestArm(i) !== GLOBAL).length;
+const mGlobal    = mean(globalScores);
+const mHeuristic = mean(heuristicScores);
+const mOracle    = mean(oracleScores);
+console.log(`\nrouter             grounding@${C}   Δ vs global`);
+console.log(`global (${GLOBAL})    ${f(mGlobal)}        —`);
+console.log(`heuristic          ${f(mHeuristic)}        ${f(mHeuristic - mGlobal)}`);
+console.log(`oracle (ceiling)   ${f(mOracle)}        ${f(mOracle - mGlobal)}`);
+console.log(`\n${wins}/${golden.length} questions have a non-global best arm (routing headroom).`);
+
+// ── dump per-question slugs for the answer-quality A/B (answer_route_ab.py) ──
+const dump = golden.map((g, i) => {
+  const best = bestArm(i);
+  return {
+    q: g.q,
+    domain: g.domain,
+    best_arm: best,
+    global_arm: GLOBAL,
+    global_slugs: slugsByArm[GLOBAL][i],
+    routed_slugs: slugsByArm[best][i],
+  };
+});
+mkdirSync(dirname(SLUG_DUMP), { recursive: true });
+writeFileSync(SLUG_DUMP, JSON.stringify(dump, null, 2) + "\n");
+console.log(`wrote per-question slugs → ${SLUG_DUMP}`);
+
+// ── dump per-arm grounding + slugs for architecture verification (verify_arch.py) ──
+const armDump = golden.map((g, i) => ({
+  q: g.q,
+  domain: g.domain,
+  grounding: Object.fromEntries(strategies.map(s => [s, score[s][i]])),
+  slugs: Object.fromEntries(strategies.map(s => [s, slugsByArm[s][i]])),
+}));
+writeFileSync(ARM_DUMP, JSON.stringify(armDump, null, 2) + "\n");
+console.log(`wrote per-arm grounding+slugs → ${ARM_DUMP}`);
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+- **Design principle - build the ceiling before the classifier.** The oracle loop (`bestArm(i)`) asks "what is the theoretical maximum if routing were perfect?" at zero classifier cost. If oracle equals global hybrid, the ceiling is 0 - a real classifier can only lose (its mis-routes have no headroom to cover them). That single number kills or validates the routing feature before any classifier is written; this is why `route_eval.ts` runs *before* `route_principle_ab.ts`, not after.
+- **Single retrieval pass over all three arms, then compare in memory.** The outer `for (const strategy of strategies)` loop calls `runEval` once per arm and accumulates `score[strategy]` and `slugsByArm[strategy]`. All routers (global, heuristic, oracle) are then computed as pure index lookups into that matrix - no second DB round-trip. This keeps the corpus state identical across arms (same embed model, same pages) so the per-question best is a fair comparison.
+- **`sectionText` cache avoids O(N × K × arms) DB reads.** Each slug's compiled text is fetched at most once and stored in `textCache`. Without it, the `coverage` calls would hit Postgres for every `(question, arm, rank)` triple - 3 × K × N reads instead of at most N × K unique slugs. The cache is populated lazily inside the arm loop so it also serves subsequent arms that retrieve the same page.
+- **The heuristic classifier is deliberately dumb.** Two proper-noun tokens AND query length ≤ 9 words routes to keyword; everything else stays on hybrid. It intentionally captures only the most obvious exact-match queries ("Itochu Marubeni Mitsubishi"-style token lists). Its purpose is not to win - it is to show how much a zero-LLM, zero-cost classifier *loses* relative to the oracle ceiling. When heuristic < global, the classifier is net-negative, which is the key finding on the vector-skewed natural corpus.
+- **Two dumps serve two different consumers.** `route_slugs.json` carries `global_slugs` vs `routed_slugs` per question - shaped for `answer_route_ab.py`, which needs exactly two context sets to generate and compare answers. `arm_scores.json` carries all three arms' grounding scores AND slugs per question - shaped for `verify_arch.py` (which pairs grounding with answer-pass across all arm × question cells) and `reader_ab.py` (which fixes retrieval and A/Bs the generator). One retrieval run, two file formats, three downstream consumers - no redundant compute.
+- **`process.exit(0)` is load-bearing.** Bun's top-level await leaves open DB connections after `engine.disconnect?.()` returns; without the explicit exit the process would hang. This mirrors `policy_eval.ts` for the same reason.
+
 #### Block E — the reader is the lever, measured (2026-06-07)
 
 Retrieval is solved here (hybrid grounding ~0.93); the open question is the *generation* step — W2.7's 0.96 grounding → 0.25 answer gap, and the "Notes" question that grounds 1.000 yet answers 0/3. So we fixed retrieval (always the winning arm = hybrid, **full `gbrain get` bodies**) and A/B'd the READER STRATEGY against the golden `pass_criteria` (`src/reader_ab.py`; gen = the reader under test, judge = a fixed strong grader so the verdict isn't self-graded):
+
+**When to use:** Reach for `reader_ab.py` when retrieval is already solved (grounding ≥ 0.90) and you want to isolate whether the answer gap comes from the *reader prompt* or from *model capability* - it holds context fixed (always the winning arm) and sweeps four prompt strategies across two generator tiers with a single strong judge.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  ENV["env: GEN / JUDGE<br/>preset or raw override"] --> RESOLVE["_resolve(role)<br/>→ client + model id"]
+  RESOLVE --> GEN_CLIENT["gen client<br/>(reader under test)"]
+  RESOLVE --> JUDGE_CLIENT["judge client<br/>(fixed strong grader)"]
+  ARM_SCORES["results/arm_scores.json<br/>from route_eval.ts"] --> MAIN["main()"]
+  MAIN --> BUILD_CTX["build_context(slugs<br/>'hybrid')<br/>full bodies,<br/>snippet-guarded"]
+  BUILD_CTX --> READERS
+  subgraph READERS ["four reader strategies"]
+    R1["plain<br/>one LLM call"]
+    R2["authoritative<br/>one LLM call"]
+    R3["cite<br/>one LLM call"]
+    R4["extract-then-answer<br/>two LLM calls"]
+  end
+  READERS -->|"answer"| JUDGE["_judge()<br/>Opus grades PASS/FAIL"]
+  JUDGE --> PASSES["passes dict<br/>per strategy"]
+  PASSES --> TABLE["pass-rate table<br/>+ delta vs plain"]
+```
+*`reader_ab.py` data flow - retrieval is fixed at the hybrid arm; the four reader strategies are the only variable.*
+
+**Code: `src/reader_ab.py`**
+
+```python
+"""reader_ab.py — hold retrieval FIXED, vary the READER; which reader writes better answers?
+
+Retrieval is solved on this corpus (hybrid grounding ~0.93). The leverage is the
+generation step — W2.7's 0.96 grounding → 0.25 answer gap, and the "Notes" question that
+grounds 1.000 yet answers 0/3. So we fix the context (always the winning arm = hybrid,
+full `gbrain get` bodies) and A/B the READER STRATEGY against the same golden pass_criteria:
+
+  - plain          : "answer from the notes" (baseline)
+  - authoritative  : frame the notes as AUTHORITATIVE ground truth (memory-os) — don't
+                     re-derive, don't hedge
+  - extract        : authoritative + extract-then-answer (pull the answer-bearing span
+                     first, then compose)
+  - cite           : authoritative + require a source citation per claim
+
+Generator = the reader UNDER TEST; judge = a fixed STRONG grader (so the verdict isn't the
+generator grading itself). Each role is a NAMED MODEL PRESET — switch with no code change:
+
+  GEN=14b JUDGE=opus uv run python src/reader_ab.py     # weak gen, strong judge
+  GEN=haiku JUDGE=opus uv run python src/reader_ab.py   # mid gen, strong judge
+
+Presets resolve endpoint+key+model (see _PROFILES). Raw escape hatch: set <ROLE>_MODEL
+(+ optional <ROLE>_BASE_URL / <ROLE>_API_KEY) to bypass the registry. Both roles read .env
+for the oMLX key. Context comes from build_context() → full bodies, snippet-guarded.
+
+Inputs: results/arm_scores.json (from `bun src/route_eval.ts`) + the W2.7 ground truth.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
+
+from answer_route_ab import (
+    LLMUnavailable,
+    _JUDGE_TMPL,
+    _pass_criteria_by_q,
+    _resilient,
+    build_context,
+)
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / ".env")  # for the oMLX key used by the local-model presets
+
+_ARM_SCORES = _ROOT / "results" / "arm_scores.json"
+_FIXED_ARM = "hybrid"  # retrieval held fixed at the corpus-winning arm
+
+# ── model registry: name → (base_url, api_key, model id). Add a line to add a model. ──
+_VIBE = ("http://localhost:8317/v1", os.getenv("OPENROUTER_API_KEY", "vibeproxy"))   # cloud Claude
+_OMLX = ("http://localhost:8000/v1", os.getenv("LLM_API_KEY", "") or os.getenv("OLLAMA_API_KEY", ""))  # local MLX
+_PROFILES: dict[str, tuple[str, str, str]] = {
+    "haiku": (*_VIBE, "claude-haiku-4-5-20251001"),
+    "opus": (*_VIBE, "claude-opus-4-5-20251101"),
+    "14b": (*_OMLX, "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+    "qwen": (*_OMLX, "Qwen2.5-Coder-14B-Instruct-MLX-4bit"),
+}
+
+
+def _resolve(role: str, default_profile: str) -> tuple[OpenAI, str, str]:
+    """Resolve a role (GEN/JUDGE) to (client, model id, label). A named preset via
+    e.g. GEN=14b; or a raw override via <ROLE>_MODEL (+ optional <ROLE>_BASE_URL/API_KEY)."""
+    if os.getenv(f"{role}_MODEL"):  # raw escape hatch
+        base = os.getenv(f"{role}_BASE_URL", _VIBE[0])
+        key = os.getenv(f"{role}_API_KEY", _VIBE[1])
+        model = os.environ[f"{role}_MODEL"]
+        return OpenAI(base_url=base, api_key=key), model, model
+    name = os.getenv(role, default_profile)
+    if name not in _PROFILES:
+        raise SystemExit(f"unknown {role}={name!r}; choose from {sorted(_PROFILES)} "
+                         f"or set {role}_MODEL for a raw override")
+    base, key, model = _PROFILES[name]
+    return OpenAI(base_url=base, api_key=key), model, name
+
+
+# ── reader prompt strategies ─────────────────────────────────────────────────
+_PLAIN = (
+    "Using ONLY the notes below, answer the question. If a fact is not in the notes, "
+    "say you don't have it.\n\nNOTES:\n{ctx}\n\nQUESTION: {q}"
+)
+_AUTHORITATIVE = (
+    "The NOTES below are AUTHORITATIVE ground truth — trust them, never contradict them, "
+    "do not re-derive or re-fetch. Answer concisely from the notes. If the answer is not "
+    "in the notes, say 'insufficient context'.\n\nNOTES (authoritative):\n{ctx}\n\nQUESTION: {q}"
+)
+_CITE = _AUTHORITATIVE + "\n\nCite the source section in [brackets] for each factual claim."
+_EXTRACT_STEP = (
+    "From the notes below, copy VERBATIM the sentence(s) that contain the answer to the "
+    "question. If none do, reply exactly NONE.\n\nNOTES:\n{ctx}\n\nQUESTION: {q}"
+)
+_ANSWER_FROM_SPANS = (
+    "These extracted facts are AUTHORITATIVE. Answer the question concisely from them; "
+    "if they are insufficient, say 'insufficient context'.\n\nFACTS:\n{spans}\n\nQUESTION: {q}"
+)
+
+
+def _gen(client: OpenAI, messages: list[ChatCompletionMessageParam], model: str) -> str:
+    r = client.chat.completions.create(model=model, messages=messages, temperature=0)
+    return (r.choices[0].message.content or "").strip()
+
+
+def _one(client: OpenAI, prompt: str, model: str) -> str:
+    msg: list[ChatCompletionMessageParam] = [{"role": "user", "content": prompt}]
+    return _resilient(_gen, client, msg, model)
+
+
+def read_plain(client: OpenAI, ctx: str, q: str, model: str) -> str:
+    return _one(client, _PLAIN.format(ctx=ctx, q=q), model)
+
+
+def read_authoritative(client: OpenAI, ctx: str, q: str, model: str) -> str:
+    return _one(client, _AUTHORITATIVE.format(ctx=ctx, q=q), model)
+
+
+def read_cite(client: OpenAI, ctx: str, q: str, model: str) -> str:
+    return _one(client, _CITE.format(ctx=ctx, q=q), model)
+
+
+def read_extract(client: OpenAI, ctx: str, q: str, model: str) -> str:
+    spans = _one(client, _EXTRACT_STEP.format(ctx=ctx, q=q), model)
+    return _one(client, _ANSWER_FROM_SPANS.format(spans=spans, q=q), model)
+
+
+_READERS = {
+    "plain": read_plain,
+    "authoritative": read_authoritative,
+    "extract": read_extract,
+    "cite": read_cite,
+}
+_BASELINE = "plain"
+
+
+def _judge(client: OpenAI, answer: str, criteria: str, model: str) -> bool:
+    verdict = _one(client, _JUDGE_TMPL.format(criteria=criteria, answer=answer), model)
+    return verdict.strip().upper().startswith("PASS")
+
+
+def main() -> None:
+    dump = json.loads(_ARM_SCORES.read_text())
+    criteria_by_q = _pass_criteria_by_q()
+    gen_client, gen_model, gen_name = _resolve("GEN", "haiku")        # the reader under test
+    judge_client, judge_model, judge_name = _resolve("JUDGE", "opus")  # fixed strong grader
+    print(f"reader_ab: retrieval FIXED at '{_FIXED_ARM}' · gen={gen_name} ({gen_model}) "
+          f"· judge={judge_name} ({judge_model})\n")
+
+    passes: dict[str, list[float]] = {name: [] for name in _READERS}
+    for item in dump:
+        q = item["q"].strip()
+        criteria = criteria_by_q.get(q)
+        if criteria is None:
+            continue  # entity questions have no rubric — skip
+        ctx = build_context(item["slugs"][_FIXED_ARM])   # full bodies, snippet-guarded
+        marks: list[str] = []
+        for name, reader in _READERS.items():
+            try:
+                ok = _judge(judge_client, reader(gen_client, ctx, q, gen_model), criteria, judge_model)
+            except LLMUnavailable as exc:
+                marks.append(f"{name}=skip")
+                print(f"  [skip] {name} on {q[:40]} ({exc})")
+                continue
+            passes[name].append(1.0 if ok else 0.0)
+            marks.append(f"{name}={'P' if ok else 'F'}")
+        print(f"  {' '.join(marks):42s} {q[:44]}")
+
+    print(f"\nreader strategy     pass-rate   Δ vs {_BASELINE}")
+    base = sum(passes[_BASELINE]) / len(passes[_BASELINE]) if passes[_BASELINE] else 0.0
+    for name in _READERS:
+        vals = passes[name]
+        rate = sum(vals) / len(vals) if vals else 0.0
+        delta = "—" if name == _BASELINE else f"{rate - base:+.3f}"
+        print(f"  {name:16s}  {rate:.3f}      {delta}   (n={len(vals)})")
+    best = max(_READERS, key=lambda n: (sum(passes[n]) / len(passes[n])) if passes[n] else 0.0)
+    print(f"\n  best reader = {best}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **Design principle - hold one variable fixed.** Retrieval is already the corpus-winning arm (hybrid, grounding ~0.93); varying it here would confound the reader signal. `_FIXED_ARM = "hybrid"` pins context assembly to a single known-good configuration so every pass-rate difference is attributable to the prompt strategy alone.
+- **Two-role model registry (`_PROFILES` + `_resolve`).** Generator and judge are independent named presets resolved from environment variables (`GEN=haiku`, `JUDGE=opus`). The raw escape hatch (`<ROLE>_MODEL` / `<ROLE>_BASE_URL`) means any OpenAI-compatible endpoint drops in with no code change - the separation of `gen_client` and `judge_client` is intentional: self-grading (generator judging itself) inflates scores.
+- **Four prompt strategies as first-class functions.** Each reader (`read_plain`, `read_authoritative`, `read_cite`, `read_extract`) wraps the same `_one()` helper; `_READERS` is a dict so the main loop treats them uniformly and the table prints in insertion order. `read_extract` is the only two-call reader - it first extracts the answer-bearing span verbatim, then composes from that span - deliberately separated to test whether explicit extraction helps or just adds a lossy step.
+- **`build_context` from `answer_route_ab`** fetches full `gbrain get` bodies for the slugs pre-dumped by `route_eval.ts` into `arm_scores.json`. Importing rather than re-implementing this keeps the context assembly identical to the routing A/B (no calibration drift between what was benchmarked and what is being read here).
+- **Pass-rate table + delta vs baseline.** The final summary prints each strategy's pass-rate and its signed delta vs `plain` - the delta is the whole point: a positive delta would justify adopting the strategy; the measured result showed all deltas ≤ 0 (no prompt technique beat plain), which is the finding.
 
 **Two generator tiers, judge = Opus 4.5, fixed hybrid context:**
 
@@ -2386,6 +4810,148 @@ W2.7 scored **answer quality** across **index types** (Vector / GraphRAG / tree-
 
 Shapes converge: dense vector is strongest at 10-K *factoid retrieval* in both. And grounding 0.96 ≫ W2.7's vector answer-judge 0.25 ⇒ in W2.7 the bottleneck was **generation, not retrieval** — GBrain surfaces the answer-bearing section ~96% of the time; turning that into a correct answer is the separate, harder step.
 
+> **Path A script - `src/bench_w27_questions.ts`.** The "real Q" `grounding@5` row above (`vector/hybrid 0.96`, `keyword 0.19`) is produced by this script: it runs W2.7's own labeled financial questions (`{q, expected_entities}`) through GBrain's three arms over the 10-K and scores **substring grounding@K / answerable@K** - the *real-question* measurement that refuted the known-item proxy (Bad-Case Entry 20). Call it **Path A** (real W2.7 questions → GBrain retrieval); `load_brk_corpus.py` below is **Path B** (load the 10-K so the auto-eval loop can self-select an arm on it). Path A is *why* the policy moved off `keyword` to `vector/hybrid` on real financial queries, and its question set is the seed of `data/golden_eval.json` (the `tenk` domain) that `policy_eval.ts` now scores every ingest.
+
+`bench_w27_questions.ts` loads W2.7's human-authored financial questions, boots the same GBrain engine used in production, and for each of the three retrieval arms fetches the top-K pages, then scores entity coverage as substring grounding@K and answerable@K. It is the "honest" replacement for known-item proxy queries.
+
+**When to use:** reach for this script when you want to measure retrieval quality on the *same question set* W2.7 used and need a grounding-level (not answer-level) signal - i.e. does GBrain surface answer-bearing pages at all, regardless of whether the reader model can express the answer? Use `eval_brk16.py` instead when you need answer-pass-rate on the 16 canonical questions.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  EV1["eval_v2.json<br/>{q, expected_entities}"] --> DEDUP
+  EV2["eval.json<br/>{q, expected_entities}"] --> DEDUP
+  DEDUP["dedup by q<br/>N unique questions"] --> QRELS["qrels list<br/>query strings only"]
+  BOOT["GBrain engine<br/>loadConfig · createEngine<br/>connectWithRetry"] --> GATEWAY["configureGateway<br/>buildGatewayConfig"]
+  GATEWAY --> ENGINE[("engine<br/>hybrid-indexed")]
+  QRELS --> LOOP
+  ENGINE --> LOOP
+  LOOP{"for each strategy<br/>keyword / vector / hybrid"}
+  LOOP -->|"runEval (K hits)"| HITS["ranked slug list<br/>per question"]
+  HITS --> COVER["sectionText + coverage<br/>best top-K entity fraction"]
+  COVER -->|"grounding@K<br/>answerable@K"| TABLE["console table<br/>strategy · grounding · answerable"]
+```
+*`bench_w27_questions.ts` data flow - real W2.7 questions deduped from two eval files, then run through each GBrain arm; page bodies fetched lazily via `sectionText` cache and scored by substring entity coverage.*
+
+**Code - `src/bench_w27_questions.ts`:**
+
+```typescript
+/**
+ * bench_w27_questions.ts — the REAL W2.7 comparison (Path A, honest version).
+ *
+ * Runs W2.7's own labeled financial questions (data/eval_v2.json + eval.json:
+ * `{q, expected_entities}`) through GBrain retrieval over the brk 10-K, and scores
+ * by whether the RETRIEVED sections actually contain the expected entities
+ * (substring grounding@K). This replaces the known-item PROXY queries with real
+ * human questions.
+ *
+ * Metric note (kept honest): W2.7's three-way scored ANSWER quality across INDEX
+ * TYPES (vector / GraphRAG / tree-index). This scores RETRIEVAL grounding across
+ * GBrain's ARMS (keyword / vector / hybrid). Same corpus + same questions, but a
+ * retrieval metric, not an answer-generation metric — so compare the SHAPE of the
+ * findings (which method wins which query class), not the absolute numbers.
+ *
+ *   grounding@K   = mean over questions of the BEST top-K section's entity coverage
+ *                   (fraction of expected_entities found as substrings in it)
+ *   answerable@K  = fraction of questions where some top-K section covers ALL entities
+ *
+ * Run: bun src/bench_w27_questions.ts   (needs gbrain_brk loaded + OLLAMA_* up)
+ */
+import { readFileSync } from "node:fs";
+
+const GB = process.env.GBRAIN_SRC ?? `${import.meta.dir}/../../gbrain/src`;
+const EVAL_DIR = "/Users/yuxinliu/code/agent-prep/lab-02-7-pageindex/data";
+const K = Number(process.env.BENCH_K ?? "5");
+
+interface W27Q { q: string; expected_entities: string[]; type?: string }
+type Strategy = "keyword" | "vector" | "hybrid";
+
+// ── load + dedup W2.7's labeled questions ───────────────────────────────────
+const raw: W27Q[] = ["eval_v2.json", "eval.json"].flatMap(f =>
+  JSON.parse(readFileSync(`${EVAL_DIR}/${f}`, "utf-8")));
+const seen = new Set<string>();
+const questions = raw.filter(q => q.q && q.expected_entities?.length &&
+  !seen.has(q.q) && (seen.add(q.q), true));
+
+// ── engine bootstrap (same sequence as auto_eval.ts / the CLI) ──────────────
+const { loadConfig, toEngineConfig } = await import(`${GB}/core/config.ts`);
+const { createEngine } = await import(`${GB}/core/engine-factory.ts`);
+const { connectWithRetry } = await import(`${GB}/core/db.ts`);
+const { configureGateway, reconfigureGatewayWithEngine } = await import(`${GB}/core/ai/gateway.ts`);
+const { buildGatewayConfig } = await import(`${GB}/core/ai/build-gateway-config.ts`);
+const { runEval } = await import(`${GB}/core/search/eval.ts`);
+
+const config = loadConfig();
+configureGateway(buildGatewayConfig(config));
+const engine = await createEngine(toEngineConfig(config));
+await connectWithRetry(engine, toEngineConfig(config), { noRetry: true });
+await reconfigureGatewayWithEngine(engine);
+
+// section text cache (slug → "title + compiled_truth + timeline", lowercased)
+const textCache = new Map<string, string>();
+async function sectionText(slug: string): Promise<string> {
+  if (textCache.has(slug)) return textCache.get(slug)!;
+  const p = await engine.getPage(slug);
+  const t = p ? `${p.title}\n${p.compiled_truth}\n${p.timeline}`.toLowerCase() : "";
+  textCache.set(slug, t);
+  return t;
+}
+
+// fraction of expected_entities present as substrings in a section
+function coverage(text: string, entities: string[]): number {
+  const hit = entities.filter(e => text.includes(e.toLowerCase())).length;
+  return entities.length ? hit / entities.length : 0;
+}
+
+const strategies: readonly Strategy[] = ["keyword", "vector", "hybrid"];
+const qrels = questions.map(q => ({ query: q.q, relevant: [] as string[] }));
+
+const summary: Record<Strategy, { grounding: number; answerable: number }> =
+  {} as Record<Strategy, { grounding: number; answerable: number }>;
+
+for (const strategy of strategies) {
+  // reuse runEval purely to get ranked hits per query (metrics ignored — no gold slug)
+  const report = await runEval(engine, qrels, { strategy, expand: false, limit: K }, K);
+  let groundingSum = 0;
+  let answerable = 0;
+  for (let i = 0; i < questions.length; i++) {
+    const hits: string[] = report.queries[i].hits.slice(0, K);
+    const ents = questions[i].expected_entities.map(e => e.toLowerCase());
+    let best = 0;
+    for (const slug of hits) best = Math.max(best, coverage(await sectionText(slug), ents));
+    groundingSum += best;
+    if (best === 1) answerable++;
+  }
+  summary[strategy] = {
+    grounding: groundingSum / questions.length,
+    answerable: answerable / questions.length,
+  };
+}
+
+const pad = (s: string, n: number) => s.padEnd(n);
+console.log(`W2.7 real-question retrieval over brk 10-K — ${questions.length} questions · K=${K}\n`);
+console.log(pad("strategy", 12) + pad(`grounding@${K}`, 15) + pad(`answerable@${K}`, 15));
+console.log("-".repeat(42));
+for (const s of strategies) {
+  console.log(pad(s, 12) + pad(summary[s].grounding.toFixed(3), 15) + pad(summary[s].answerable.toFixed(3), 15));
+}
+console.log("\nmetric: retrieval grounding (do retrieved sections CONTAIN the expected entities), " +
+  "NOT answer quality. Compare the winner SHAPE vs W2.7's three-way, not absolute numbers.");
+
+await engine.disconnect?.();
+process.exit(0);
+```
+
+**Walkthrough:**
+
+- **Design principle first - grounding@K not answer quality.** The script deliberately scores whether retrieved sections *contain* the expected entity strings as substrings, not whether a reader model produces the right answer. That is a weaker, cheaper, LLM-free signal that answers a prior question: does GBrain even surface the answer-bearing page? If grounding is low no reader prompt will save you; if grounding is high the bottleneck shifts to generation. This is why the script exists as a standalone step before `eval_brk16.py`.
+- **Block 1 - load + dedup.** Both `eval_v2.json` and `eval.json` are read and merged, then deduped by the `q` string using a `Set`. The one-liner `!seen.has(q.q) && (seen.add(q.q), true)` is intentionally compact - it exploits the `&&` short-circuit so the side-effecting `seen.add` only fires when the predicate passes, avoiding a separate filter+forEach pair.
+- **Block 2 - engine bootstrap.** The import sequence (`loadConfig` → `createEngine` → `connectWithRetry` → `configureGateway`) mirrors `auto_eval.ts` and the GBrain CLI exactly. `{ noRetry: true }` is deliberate - a benchmark run should fail fast if the DB is not up rather than silently retrying and skewing timing.
+- **Block 3 - `sectionText` cache.** Page bodies are fetched lazily and memoized. The concatenation `title + compiled_truth + timeline` covers all three GBrain fields that hold entity-bearing text; lowercasing once at read time means every downstream `includes()` call is O(1) string search without repeated `.toLowerCase()` allocations.
+- **Block 4 - `runEval` reuse (important gotcha).** `runEval` was designed to score recall against gold slugs; here there are no gold slugs - `relevant: []` for every query. The function is called purely to get ranked hit lists per query. The internal MRR/nDCG scores it computes are discarded; only `report.queries[i].hits` is used. This is intentional reuse of existing plumbing rather than writing a raw search loop.
+- **Block 5 - grounding accumulation.** For each question the script takes the *best* coverage across the top-K hits (not average), because a retriever that surfaces the right page anywhere in K is doing its job. `answerable` counts questions where best coverage reaches 1.0 - i.e. every expected entity appears in at least one retrieved section.
+- **Block 6 - console table.** `padEnd` is used instead of a library formatter to keep the script dependency-free. The closing disclaimer line - "NOT answer quality" - is printed intentionally to prevent copy-pasting the numbers into a context where answer quality is the claim.
+
 ##### Results comparison — answer quality on the same 10-K (and why it's a wash, but GBrain's architecture still fits better)
 
 Now that `reader_ab.py` scores ANSWER pass-rate against the same `pass_criteria` W2.7 used, the two are finally on one axis:
@@ -2405,6 +4971,8 @@ Now that `reader_ab.py` scores ANSWER pass-rate against the same `pass_criteria`
 ##### The fix — PageIndex + GBrain combined ingest (closes the structural gap, measured)
 
 The structural-class loss isn't a law — it's a **dropped column at ingest**. PageIndex's `build_tree.py` already extracts per-section page ranges + hierarchy into `tree.json`; the flat loader just discarded them. So the combined design keeps both halves: **PageIndex's structure (built once) + GBrain's hybrid retrieval (cheap, every query), with no per-query tree navigation.**
+
+**When to use:** reach for `load_brk_corpus.py` when you want to benchmark keyword vs vector vs hybrid retrieval on a dense, exact-term-heavy corpus (10-K financials, legal docs, spec sheets) - use `ingest_agent.py` instead when the corpus is unstructured text that needs LLM extraction and graph reconciliation to become page-shaped.
 
 ```mermaid
 %%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
@@ -2432,6 +5000,18 @@ The single structural failure flipped to pass, **zero regressions** on the other
 > - `build_tree.py`, `_brk_corpus.py` — **W2.7's PageIndex lab**, `~/code/agent-prep/lab-02-7-pageindex/src/`. Artifacts they write: `tree.json`, `brk_corpus.json` in that lab's `data/`.
 > - `load_brk_corpus.py` (the tree→GBrain join), `eval_brk16.py` (the 16-question harness) — **this lab**, `~/code/agent-prep/lab-03-5-96-gbrain/src/`.
 > - `eval_ground_truth.json` (the 16 questions + `pass_criteria`) — `lab-02-7-pageindex/data/`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  BRK[(brk_corpus.json<br/>flat sections<br/>id · title · text)] --> J[join on section id]
+  TREE[(tree.json<br/>PageIndex hierarchy<br/>+ page ranges)] --> J
+  J --> LOC[add Location breadcrumb<br/>Item 8 · pages 99-147]
+  LOC --> PG[put_page · deterministic<br/>slug = sections/id<br/>no LLM · no reconcile]
+  PG --> EMB[embed --stale]
+  EMB --> AE[run_auto_eval<br/>keyword vs vector vs hybrid]
+```
+*`load_brk_corpus.py` data flow. The 10-K sections are already page-shaped, so this is a deterministic load (no LLM extraction, no graph reconcile - we test retrieval, not wiring). Joining the PageIndex `tree.json` in writes a `**Location:**` breadcrumb into each page body, which is what makes structural "where-is-X" questions answerable without per-query tree navigation. It ends by calling the same `run_auto_eval()` - the loop, pointed at a different corpus.*
 
 **Code — the tree→GBrain join (full source `src/load_brk_corpus.py`):** the `flatten_tree` +
 title-join + `**Location:**` breadcrumb is the combined-solution core.
@@ -2591,6 +5171,27 @@ if __name__ == "__main__":
     main()
 ```
 
+**Walkthrough:**
+- **Deterministic load, on purpose.** The W2.7 sections arrive as `{id, title, text}` - already page-shaped - so there is no LLM extraction and no `reconcile_graph()`. This block tests *retrieval* on a new corpus shape, not graph wiring, so skipping extraction keeps the experiment clean and cheap.
+- **The corpus choice IS the hypothesis.** The 19-page entity brain is semantic-heavy (vector wins, RRF adds nothing - Phase 6). A 10-K is the opposite: dollar figures, segment names, "operating earnings" - exact-term-heavy, where the keyword arm earns its weight and hybrid-RRF should win. Loading it lets `run_auto_eval()` test that directly (and it's what flipped the policy `vector → hybrid`).
+- **The tree-join is the combined PageIndex+GBrain fix.** Flat `brk_corpus.json` drops structure; `tree.json` carries per-section page ranges + hierarchy. Joining it writes a `**Location:** Item 8 · pages 99-147` breadcrumb *into the page body*, so structural "where are the Notes?" questions answer from the page itself - this is what closed the false-positive-grounding gap on the Notes question (Block D).
+- **It ends in the same loop.** `embed --stale` then `run_auto_eval()` - identical hook to `ingest_agent.py`, so a brand-new corpus self-selects its arm with no extra wiring.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  GT[(eval_ground_truth.json<br/>16 Qs + pass_criteria)] --> Q[per question]
+  Q --> SL[gbrain_query_slugs<br/>hybrid · C=3]
+  SL --> CTX[build_context<br/>full bodies]
+  CTX --> GEN[chat · gen=Opus<br/>answer from notes only]
+  GEN --> JG[judge=Opus<br/>vs pass_criteria]
+  JG --> ROW[pass / fail row]
+  ROW --> AGG[answer pass-rate<br/>before vs after<br/>structural ingest]
+```
+*`eval_brk16.py` flow. Retrieves each W2.7 question through GBrain's hybrid arm at `C=3` (the selector's budget), answers with Opus from those notes only, and judges against the same `pass_criteria` W2.7 used. Run before *and* after the PageIndex-structure ingest to see the structural questions start passing without regressing the rest - this is the answer-side half of the calibrator story.*
+
+**When to use:** Reach for `eval_brk16.py` when you want a full end-to-end answer-quality check against the 16-question W2.7 golden set - specifically to verify that a corpus change (such as the PageIndex-structure ingest enrichment) improves structural questions without regressing factual recall. Use `policy_eval.ts` instead when you only need to re-score retrieval grounding; use `eval_brk16.py` when you need the answer + judge layer to confirm that better grounding actually translates to correct answers.
+
 **Code — the 16-question verifier (full source `src/eval_brk16.py`, reuses `shared/`):**
 
 ```python
@@ -2655,6 +5256,12 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 ```
+
+**Walkthrough:**
+- **Opus as both generator AND judge is deliberate.** With a strong generator a failure cannot be blamed on a weak model - it isolates a *retrieval-representation* gap (the answer wasn't in the retrieved chunks in a usable form). This is the fix for the weak-model confound that muddied the earlier routing A/B; the eval measures retrieval, not generation horsepower.
+- **It reuses `shared/`, by the rule-of-three.** `resolve` / `chat` / `judge` / `load_pass_criteria` come from `shared/llm.py` and the GBrain query helpers from `shared/gbrain_cli.py` - infra introduced in earlier chapters and imported here, not re-implemented (the agent-prep `shared/` convention).
+- **`C=3`, full bodies - the same budget as the selector.** The verifier reads the same top-3 context the `discounted grounding@C` selector scores, so the cheap metric and the expensive answer-judge measure the *same prompt*. That alignment is what lets the calibrator (`r=+0.820`) license the cheap proxy in the hot loop.
+- **Before/after is the experiment.** Running the same questions pre- and post- the PageIndex-structure ingest is how the chapter proves the structural fix made the Notes question pass *without* regressing the other 15 - measured, not a vibe.
 
 `★ Insight ─────────────────────────────────────`
 - **A policy is only as good as its eval queries.** The convenient known-item proxy (titles as queries) selected `keyword`; the real golden set selected `vector`/`hybrid` — opposite verdicts on the *same corpus*. The whole value of the loop rides on a representative golden set, which is why it's the version-controlled centerpiece, not an afterthought. Convenience (auto-generated queries) bought a *wrong* policy.
@@ -2736,9 +5343,60 @@ OPENROUTER_BASE_URL=http://localhost:8317/v1 OPENROUTER_API_KEY=vibeproxy GEN=op
 
 **Deliverable:** `data/golden_eval.json` (18 real Qs) + `src/policy_eval.ts` (policy source) + `src/query_policy.ts` (actuator) + `src/load_brk_corpus.py`. `run_auto_eval()` prefers the golden eval, falling back to the known-item `src/auto_eval.ts` only at cold start (when no golden set exists). Tests: `tests/auto_eval.test.ts` (15), `tests/test_load_brk_corpus.py` (7); regression gate **24 pytest + 15 bun** green. Policy artifact `results/search_policy.json`; full numbers in `RESULTS.md`.
 
+#### Script roles — 离线审计 · 在线运行 · 测试 (what each `src/` file is for)
+
+All paths are relative to the lab repo `~/code/agent-prep/lab-03-5-96-gbrain/`. The split that matters in production: a **few** scripts run automatically in the agent's ingest→query path (online); **most** are run by hand to measure and decide (offline audit / A-B); a couple are one-off setup; one is a unit test.
+
+**在线运行 / Online runtime — the production agent path (run automatically, in the loop).**
+
+| file (location)           | role · when it runs                                                                                                      | chapter           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------- |
+| `src/ingest_agent.py`     | small-corpus ingest entrypoint: WRITE → reconcile → auto-eval → READ                                                     | Phase 3           |
+| `src/resumable_ingest.py` | large-corpus ingest entrypoint (per-file stream + checkpoint + merge)                                                    | Phase 8           |
+| `src/policy_eval.ts`      | **SELECTOR** — scores 3 arms on the golden set, writes `search_policy.json`; fired by `run_auto_eval()` **every ingest** | Phase 9 · Block B |
+| `src/auto_eval.ts`        | cold-start SELECTOR fallback (no golden set yet); also fired by `run_auto_eval()`                                        | Phase 9           |
+| `src/query_policy.ts`     | **actuator** — routes each query by the policy (global arm, or per-query with `QUERY_ROUTER=on`); runs **every query**   | Phase 9 · Block C |
+| `src/query_routing.ts`    | router/classifier library (imported, no `main`) — one canonical classifier shared by actuator + A/B                      | Phase 9 · Block C |
+| `src/grounding.ts`        | pure metric primitive library (`coverage`/`disc`/`budgetScore`, imported, no `main`)                                     | Phase 9 · Block D |
+| `src/assembly.ts`         | 1-hop graph-expansion library (`graphExpand`, imported; **gated/shelved** — not in the live path by default)             | Phase 9           |
+
+**离线审计 / Offline audit & A-B experiments — run by hand to measure & decide (NOT in the hot path).**
+
+| file (location) | role · what it measures | chapter |
+|---|---|---|
+| `src/verify_arch.py` | **CALIBRATOR** — `corr(grounding, answer-pass)` + selector-validity audit (the `r=+0.820`) | Phase 9 · Block D |
+| `src/route_eval.ts` | routing headroom + dumps `arm_scores.json` / `route_slugs.json` (feeds the Python A-Bs) | Phase 9 |
+| `src/route_eval_kwpp.ts` | keyword-revival probe (raw FTS vs OR-preprocessed) | Phase 9 |
+| `src/route_principle_ab.ts` | 3-way routing A-B on grounding (router vs global vs strengthened-global) | Phase 9 · Block E |
+| `src/assembly_graph_ab.ts` | graph-expansion A-B on coverage (plain vs 1-hop expanded) | Phase 9 |
+| `src/answer_route_ab.py` | answer-quality A-B for routing (reads `route_slugs.json`) | Phase 9 |
+| `src/answer_principle_ab.py` | answer-quality A-B across 3 policies (reads `principle_slugs.json`) | Phase 9 · Block E |
+| `src/assembly_answer_ab.py` | graph-expansion answer A-B (plain vs expanded) | Phase 9 |
+| `src/reader_ab.py` | reader A-B — generator/judge model sweep on fixed retrieval (`GEN`/`JUDGE` presets) | Phase 9 · Block E |
+| `src/ground_truth_ab.py` | memory-as-authoritative A-B (ground-truth hierarchy) | Phase 7 |
+| `src/eval_brk16.py` | 16-question answer verifier vs W2.7 `pass_criteria` (before/after structural ingest) | W2.7 comparison |
+| `src/bench_strategies.ts` | Phase-6 keyword/vector/hybrid benchmark — **engine-layer** (recall@3/MRR/nDCG@3) | Phase 6 |
+| `src/bench_rrf.py` | Phase-6 keyword-vs-hybrid benchmark — **CLI-layer** sibling (hit@3/MRR); the one that exposed BCJ Entry 8 | Phase 6 |
+| `src/bench_w27_questions.ts` | **Path A** — real W2.7 questions through GBrain arms, grounding@K (seeded `golden_eval.json`) | W2.7 comparison |
+
+**一次性设置 / 诊断 · One-off setup & diagnostics.**
+
+| file (location) | role | chapter |
+|---|---|---|
+| `src/load_brk_corpus.py` | **Path B** — deterministic load of the W2.7 10-K corpus into GBrain (no LLM extract) | W2.7 comparison |
+| `src/probe_mcp.py` | MCP smoke test — proves plain Python can drive GBrain's MCP before building the agent | Phase 3 |
+
+**测试 / Tests.**
+
+| file (location) | role | chapter |
+|---|---|---|
+| `src/grounding.test.ts` | unit tests for the grounding metric (`bun test`, no services) | Phase 9 |
+
+> **The one-line takeaway:** only the **online** group (8 files) runs in production - and within it the *self-tuning* is just `policy_eval.ts` / `auto_eval.ts` (every ingest) + `query_policy.ts` (every query); the **offline** group (14 files) is the measurement scaffolding that *justified* those choices once, off the hot path; the rest are setup + one unit test.
+
 #### Running reference — scripts, env, parameters
 
-Every Phase-9 script is parameterised by environment variables (and a couple by argv). This is the canonical "how do I run it" table — what each needs, and in what order.
+Every script in this chapter is parameterised by environment variables (and a couple by argv). This is the canonical "how do I run it" table — what each needs, and in what order. Phase-9 scripts first, then the ingest, library, benchmark, and Phase-7 scripts.
 
 **Services + shell (run all commands from `~/code/agent-prep/lab-03-5-96-gbrain/`):**
 - **`gbrain-pg`** — Postgres+pgvector container. `GBRAIN_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/gbrain`.
@@ -2746,23 +5404,33 @@ Every Phase-9 script is parameterised by environment variables (and a couple by 
 - **VibeProxy `:8317`** — OpenAI-compatible proxy to **cloud Claude** (`OPENROUTER_BASE_URL`/`OPENROUTER_API_KEY=vibeproxy`); used as the answer generator / judge.
 - Load the lab `.env` (`set -a; . ./.env; set +a`) and put `~/.bun/bin` on `PATH`. `.env` holds `GBRAIN_DATABASE_URL`, `OLLAMA_*`, `LLM_*` (oMLX key + local chat model), `OPENROUTER_*`.
 
-| script               | role                                  | params / env (default)                                                                                  | services                 | run                                                                                    |
-| -------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------- |
-| `grounding.test.ts`  | unit tests for the metric             | —                                                                                                       | none                     | `bun test src/grounding.test.ts`                                                       |
-| `policy_eval.ts`     | **SELECTOR** — write the policy       | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts`                  |
-| `query_policy.ts`    | actuator — global policy **or** per-query router | argv `"<query>" [limit=5]`; **`QUERY_ROUTER`** (off→global policy · on→type-route)        | pg + oMLX embed          | global: `bun src/query_policy.ts "Who is anchoring acme-seed?" 3` · router: `QUERY_ROUTER=on bun src/query_policy.ts "Item 1C Cybersecurity" 3` |
-| `query_routing.ts`   | **ROUTER brain** — type classifier + kw OR-preprocess (shared, no main) | — (imported)                                                       | none                     | imported by `query_policy.ts` + `route_principle_ab.ts` (one canonical classifier → production == tested) |
-| `route_eval.ts`      | routing headroom + **dumps**          | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json` |
-| `route_eval_kwpp.ts` | keyword-revival probe (raw vs OR-preprocessed) | `GOLDEN_EVAL`, `POLICY_K` (5), `POLICY_C` (3)                                                  | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts`                     |
-| `route_principle_ab.ts` | **3-way routing A/B** (grounding) — router vs global vs strengthened-global | `GOLDEN_EVAL`, `POLICY_K`/`_C`; writes `results/principle_slugs.json`        | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`                  |
-| `assembly.ts`        | **ASSEMBLY lib** — 1-hop graph expansion (`graphExpand`, shared, no main) | — (imported); uses `getLinks`/`getBacklinks`                                  | none                     | imported by `assembly_graph_ab.ts` (the entity-aware-assembly fix)                     |
-| `assembly_graph_ab.ts` | graph-expansion A/B (coverage) + slug dump | `GOLDEN_EVAL`, `POLICY_K`/`_C`, `MAX_PULL` (2); writes `results/assembly_slugs.json`           | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/assembly_graph_ab.ts`                   |
-| `load_brk_corpus.py` | ingest the 10-K corpus                | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`)                                                         | pg + oMLX embed          | `uv run python src/load_brk_corpus.py`                                                 |
-| `answer_route_ab.py` | answer A/B (routing)                  | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json`          | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py`             |
-| `answer_principle_ab.py` | answer-quality A/B (3 policies, entity coverage) | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `principle_slugs.json`                            | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`         |
-| `assembly_answer_ab.py` | graph-expansion answer A/B (plain vs expanded) | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `assembly_slugs.json`                              | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/assembly_answer_ab.py`          |
-| `verify_arch.py`     | **CALIBRATOR** — corr(metric, answer) | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json`                                 | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py`                 |
-| `reader_ab.py`       | reader A/B (fixed retrieval)          | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py`                                    |
+| script                   | role                                                                        | params / env (default)                                                                                  | services                 | run                                                                                                                                             |
+| ------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `grounding.test.ts`      | unit tests for the metric                                                   | —                                                                                                       | none                     | `bun test src/grounding.test.ts`                                                                                                                |
+| `policy_eval.ts`         | **SELECTOR** — write the policy                                             | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/policy_eval.ts` · sweep: `POLICY_C=5 bun src/policy_eval.ts`                                                                           |
+| `query_policy.ts`        | actuator — global policy **or** per-query router                            | argv `"<query>" [limit=5]`; **`QUERY_ROUTER`** (off→global policy · on→type-route)                      | pg + oMLX embed          | global: `bun src/query_policy.ts "Who is anchoring acme-seed?" 3` · router: `QUERY_ROUTER=on bun src/query_policy.ts "Item 1C Cybersecurity" 3` |
+| `query_routing.ts`       | **ROUTER brain** — type classifier + kw OR-preprocess (shared, no main)     | — (imported)                                                                                            | none                     | imported by `query_policy.ts` + `route_principle_ab.ts` (one canonical classifier → production == tested)                                       |
+| `route_eval.ts`          | routing headroom + **dumps**                                                | `POLICY_K` (5), `POLICY_C` (3)                                                                          | pg + oMLX embed          | `bun src/route_eval.ts` → writes `results/route_slugs.json`, `results/arm_scores.json`                                                          |
+| `route_eval_kwpp.ts`     | keyword-revival probe (raw vs OR-preprocessed)                              | `GOLDEN_EVAL`, `POLICY_K` (5), `POLICY_C` (3)                                                           | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_eval_kwpp.ts`                                                                              |
+| `route_principle_ab.ts`  | **3-way routing A/B** (grounding) — router vs global vs strengthened-global | `GOLDEN_EVAL`, `POLICY_K`/`_C`; writes `results/principle_slugs.json`                                   | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/route_principle_ab.ts`                                                                           |
+| `assembly.ts`            | **ASSEMBLY lib** — 1-hop graph expansion (`graphExpand`, shared, no main)   | — (imported); uses `getLinks`/`getBacklinks`                                                            | none                     | imported by `assembly_graph_ab.ts` (the entity-aware-assembly fix)                                                                              |
+| `assembly_graph_ab.ts`   | graph-expansion A/B (coverage) + slug dump                                  | `GOLDEN_EVAL`, `POLICY_K`/`_C`, `MAX_PULL` (2); writes `results/assembly_slugs.json`                    | pg + oMLX embed          | `GOLDEN_EVAL=data/golden_balanced.json bun src/assembly_graph_ab.ts`                                                                            |
+| `load_brk_corpus.py`     | ingest the 10-K corpus                                                      | `BRK_CORPUS` (path), `SLUG_PREFIX` (`sections`)                                                         | pg + oMLX embed          | `uv run python src/load_brk_corpus.py`                                                                                                          |
+| `answer_route_ab.py`     | answer A/B (routing)                                                        | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `route_slugs.json`          | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_route_ab.py`                                                                      |
+| `answer_principle_ab.py` | answer-quality A/B (3 policies, entity coverage)                            | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `principle_slugs.json`                                        | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/answer_principle_ab.py`                                                                  |
+| `assembly_answer_ab.py`  | graph-expansion answer A/B (plain vs expanded)                              | `CHAT_MODEL`, `MAX_BODY_CHARS` (0); reads `assembly_slugs.json`                                         | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/assembly_answer_ab.py`                                                                   |
+| `verify_arch.py`         | **CALIBRATOR** — corr(metric, answer)                                       | `OPENROUTER_BASE_URL`/`_API_KEY`, `CHAT_MODEL`; reads `arm_scores.json`                                 | pg + chat (`:8317`)      | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/verify_arch.py`                                                                          |
+| `reader_ab.py`           | reader A/B (fixed retrieval)                                                | **`GEN=`/`JUDGE=`** preset (`haiku`/`opus`/`14b`/`qwen`), `MAX_BODY_CHARS` (0); reads `arm_scores.json` | pg + gen/judge endpoints | `GEN=14b JUDGE=opus uv run python src/reader_ab.py`                                                                                             |
+| `ingest_agent.py` | ingest (small corpus): WRITE → reconcile → auto-eval → READ | `LLM_MODEL`/`LLM_BASE_URL`/`LLM_API_KEY`, `AUTO_EVAL` (1), `GBRAIN_BIN` | pg + oMLX (embed+chat) + bun | `uv run python src/ingest_agent.py` |
+| `resumable_ingest.py` | ingest (large corpus): per-file stream + checkpoint + merge | `LLM_*`; consts `CHUNK_CHARS` (6000) / `BATCH` (8) / `BIG_PAGE_CHARS` (8000) | pg + oMLX + bun | `uv run python src/resumable_ingest.py` (re-run to resume · restart: `rm -rf ~/brain/.ingest_*`) |
+| `probe_mcp.py` | MCP smoke test — list GBrain tools from plain Python | `GBRAIN_BIN`; server env `GBRAIN_DATABASE_URL`/`OLLAMA_*` | pg + oMLX + bun | `uv run python src/probe_mcp.py` |
+| `auto_eval.ts` | cold-start SELECTOR fallback (no golden set) — known-item proxy | `AUTO_EVAL_K`/`_QMIN`/`_QMAX`/`_RATIO`/`_SEED`/`_STRICT`/`_REGRESS_EPS`, `GBRAIN_SRC` | pg + oMLX embed | `bun src/auto_eval.ts` (auto-run by `run_auto_eval()` when `data/golden_eval.json` is absent) |
+| `grounding.ts` | pure metric primitive lib (`coverage`/`disc`/`budgetScore`, no `main`) | — (imported) | none | imported by `policy_eval.ts`/`route_eval.ts`/…; tests: `bun test src/grounding.test.ts` |
+| `bench_strategies.ts` | Phase-6 benchmark, **engine-layer** — recall@3 / MRR / nDCG@3 | `GBRAIN_SRC` | pg + oMLX embed | `bun src/bench_strategies.ts` |
+| `bench_rrf.py` | Phase-6 benchmark, **CLI-layer** sibling — hit@3 / MRR (exposed BCJ Entry 8) | — (hardcoded query set; shells to `gbrain`) | pg + oMLX + bun | `uv run python src/bench_rrf.py` |
+| `bench_w27_questions.ts` | **Path A** — real W2.7 questions → arms, grounding@K / answerable@K | `BENCH_K` (5), `GBRAIN_SRC` | pg + oMLX embed | `bun src/bench_w27_questions.ts` |
+| `ground_truth_ab.py` | memory-as-authoritative A/B (ground-truth hierarchy, Phase 7) | `CHAT_MODEL`, `OPENROUTER_BASE_URL`/`_API_KEY` | pg + chat (`:8317`) | `CHAT_MODEL=claude-opus-4-5-20251101 uv run python src/ground_truth_ab.py` |
+| `eval_brk16.py` | 16-question answer verifier vs W2.7 `pass_criteria` (before/after) | `GEN`/`JUDGE` (opus), `OPENROUTER_*`, `_C` (3) | pg + chat (`:8317`) | `GEN=opus JUDGE=opus uv run python src/eval_brk16.py` |
 
 **Data-dependency order (don't skip):** the four analysis scripts consume dumps, so retrieval runs first. `route_eval.ts` → writes `route_slugs.json` + `arm_scores.json` → which `answer_route_ab.py`, `verify_arch.py`, `reader_ab.py` then read. `policy_eval.ts` and `route_eval.ts` both need a **loaded corpus + oMLX embeddings up** (vector/hybrid arms embed at run-time); the three Python A/B scripts need a **chat endpoint** but NOT oMLX embeddings (slugs are already dumped; bodies come from Postgres via `gbrain get`). The **routing re-test** is its own chain: `route_principle_ab.ts` → writes `results/principle_slugs.json` → read by `answer_principle_ab.py` (pin a strong generator with `CHAT_MODEL`). The per-query **router itself ships in `query_policy.ts` behind `QUERY_ROUTER` (default off)** and shares one classifier with the A/B via `query_routing.ts`, so what production routes is exactly what the A/B scored.
 
