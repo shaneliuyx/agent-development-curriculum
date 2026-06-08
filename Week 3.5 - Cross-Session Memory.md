@@ -284,7 +284,7 @@ Verify the model is registered: `curl -H "Authorization: Bearer $OMLX_API_KEY" h
 ```bash
 # .env
 OMLX_BASE_URL=http://localhost:8000/v1
-OMLX_API_KEY=***REMOVED-OMLX-KEY***
+OMLX_API_KEY=<your-oMLX-key>
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
 EMBED_MODEL=bge-m3-mlx-fp16    # oMLX-served embedding model id; see Phase 1.1

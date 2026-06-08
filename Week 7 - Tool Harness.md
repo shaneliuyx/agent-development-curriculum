@@ -691,7 +691,7 @@ class ToolHarness:
     tools: list[Tool]
     model: str = os.getenv("MODEL_OPUS", "Qwen3.6-35B-A3B-nvfp4")
     base_url: str = os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1")
-    api_key: str = os.getenv("OMLX_API_KEY", "***REMOVED-OMLX-KEY***")
+    api_key: str = os.getenv("OMLX_API_KEY", "not-needed")
     max_iterations: int = 15
     max_retries: int = 3
     system_prompt: str = (
@@ -2049,7 +2049,7 @@ Run the full suite against both backends:
 # Local (Qwen3.6 via oMLX)
 MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4 \
 OMLX_BASE_URL=http://127.0.0.1:8000/v1 \
-OMLX_API_KEY=***REMOVED-OMLX-KEY*** \
+OMLX_API_KEY=<your-oMLX-key> \
 pytest tests/test_scenarios.py -v --tb=short 2>&1 | tee results/local_run.txt
 
 # Cloud (claude-haiku-4-5 via Anthropic API)

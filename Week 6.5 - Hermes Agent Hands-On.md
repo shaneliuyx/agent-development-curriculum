@@ -274,7 +274,7 @@ pip install -r requirements.txt   # if requirements-only
 cat > .env <<'EOF'
 HERMES_PROVIDER=openai
 OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-OPENAI_API_KEY=***REMOVED-OMLX-KEY***
+OPENAI_API_KEY=<your-oMLX-key>
 HERMES_DEFAULT_MODEL=Qwen3.6-35B-A3B-nvfp4
 HERMES_SKILL_STORE_DIR=~/code/agent-prep/lab-06.5-hermes-handson/skills_audit
 EOF

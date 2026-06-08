@@ -348,7 +348,7 @@ Your `.env` should already contain:
 
 ```bash
 OMLX_BASE_URL=http://127.0.0.1:8000/v1
-OMLX_API_KEY=***REMOVED-OMLX-KEY***
+OMLX_API_KEY=<your-oMLX-key>
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit   # claim splitter — structural task
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8               # NLI judge + router — cheap classification
 FAITH_THRESHOLD=0.80                            # min fraction of supported claims to pass

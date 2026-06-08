@@ -775,7 +775,7 @@ The print at the end is the only verification: if the number is less than 200, t
 ```bash
 # .env
 OMLX_BASE_URL=http://localhost:8000/v1
-OMLX_API_KEY=***REMOVED-OMLX-KEY***
+OMLX_API_KEY=<your-oMLX-key>
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8
 NEO4J_URI=bolt://localhost:7687

@@ -146,7 +146,7 @@ flowchart TD
 flowchart TD
     User["User: research task"] --> RA["ResearchAgent<br/>(instructions: gather 5 facts)<br/>model: Qwen3.6 via local_client"]
 
-    local_client["AsyncOpenAI<br/>base_url=http://127.0.0.1:8000/v1<br/>api_key=***REMOVED-OMLX-KEY***<br/>↓<br/>oMLX (Qwen3.6-35B-A3B-nvfp4)"]
+    local_client["AsyncOpenAI<br/>base_url=http://127.0.0.1:8000/v1<br/>api_key=$OMLX_API_KEY<br/>↓<br/>oMLX (Qwen3.6-35B-A3B-nvfp4)"]
 
     RA -->|"tool call"| ST1["search_web(query)"]
     RA -->|"tool call"| ST2["fetch_page(url)"]
@@ -355,7 +355,7 @@ import os, json, textwrap
 from openai import OpenAI
 
 OMLX_BASE_URL = os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1")
-OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "***REMOVED-OMLX-KEY***")
+OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "not-needed")
 MODEL_OPUS    = os.getenv("MODEL_OPUS",    "Qwen3.6-35B-A3B-nvfp4")
 
 omlx = OpenAI(base_url=OMLX_BASE_URL, api_key=OMLX_API_KEY)
@@ -405,7 +405,7 @@ MODEL_OPUS="Qwen3.6-35B-A3B-nvfp4"
 MODEL_SONNET="gemma-4-26B-A4B-it-heretic-4bit"
 MODEL_HAIKU="gpt-oss-20b-MXFP4-Q8"
 OMLX_BASE_URL="http://127.0.0.1:8000/v1"
-OMLX_API_KEY="***REMOVED-OMLX-KEY***"
+OMLX_API_KEY="<your-oMLX-key>"
 ```
 
 ### 1.5 Install framework deps (if not already installed from Week 0)
@@ -622,7 +622,7 @@ from src.tools_shared import web_search, fetch_url, write_summary
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OMLX_BASE_URL = os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1")
-OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "***REMOVED-OMLX-KEY***")
+OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "not-needed")
 MODEL_OPUS    = os.getenv("MODEL_OPUS",    "Qwen3.6-35B-A3B-nvfp4")
 
 # ── Tools (LangChain-wrapped) ─────────────────────────────────────────────────
@@ -842,7 +842,7 @@ from src.tools_shared import web_search, fetch_url, write_summary, get_last_summ
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OMLX_BASE_URL = os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1")
-OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "***REMOVED-OMLX-KEY***")
+OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "not-needed")
 MODEL_OPUS    = os.getenv("MODEL_OPUS",    "Qwen3.6-35B-A3B-nvfp4")
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
@@ -1068,7 +1068,7 @@ from src.tools_shared import web_search, fetch_url, write_summary, get_last_summ
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OMLX_BASE_URL = os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1")
-OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "***REMOVED-OMLX-KEY***")
+OMLX_API_KEY  = os.getenv("OMLX_API_KEY",  "not-needed")
 MODEL_OPUS    = os.getenv("MODEL_OPUS",    "Qwen3.6-35B-A3B-nvfp4")
 
 # ── THE TRICK: point the SDK client at local oMLX ─────────────────────────────
@@ -1250,7 +1250,7 @@ This is the most important chunk for interviews. The entire local-first story li
 # The entire trick — two lines
 local_client = AsyncOpenAI(
     base_url=OMLX_BASE_URL,   # "http://127.0.0.1:8000/v1" — your local oMLX server
-    api_key=OMLX_API_KEY,     # "***REMOVED-OMLX-KEY***" — oMLX accepts any non-empty string
+    api_key=OMLX_API_KEY,     # the configured key — oMLX accepts any non-empty string
 )
 # Passed to every Agent via OpenAIResponsesModel(openai_client=local_client)
 # The SDK calls client.responses.create(...) — it does not know or care where it points.
@@ -1546,7 +1546,7 @@ Record yourself hitting: Anthropic's "Building effective agents" recommends this
 | `LangGraph: KeyError: 'messages'` on first invoke | State TypedDict key mismatch with init dict | Verify every key in `AgentState` is present in the dict passed to `graph.invoke(...)` |
 | `AgentExecutor` import still works but deprecated warning fires | Using old LangChain agent helpers | Switch to `langgraph.prebuilt.create_react_agent` |
 | LlamaIndex agent loops indefinitely without calling `write_summary` | Model not following tool-termination instruction | Add stronger instruction: "You MUST call write_summary after gathering all five facts. Do not ask for clarification." Also verify tool description says "call this to terminate." |
-| OpenAI Agents SDK throws `AuthenticationError` against oMLX | SDK validates `api_key` format | Set `api_key` to any non-empty string; oMLX accepts `***REMOVED-OMLX-KEY***` or any value |
+| OpenAI Agents SDK throws `AuthenticationError` against oMLX | SDK validates `api_key` format | Set `api_key` to any non-empty string; oMLX accepts any non-empty string |
 | `create_react_agent` produces empty responses | Model not emitting tool calls in expected JSON format | Switch to `MODEL_OPUS` (Qwen3.6 has the strongest tool-calling training); lower `temperature` to 0.0 |
 | `SqliteSaver` fails with `database is locked` | Concurrent writes from test runs | Use a unique DB path per run: `f"results/checkpoint_{uuid4()}.db"` |
 | Phoenix shows no traces for LlamaIndex | LlamaIndex instrumentor not imported before agent construction | Move `LlamaIndexInstrumentor().instrument(...)` call to the top of the file, before any LlamaIndex imports |

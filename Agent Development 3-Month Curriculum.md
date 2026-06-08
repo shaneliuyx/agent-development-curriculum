@@ -318,7 +318,7 @@ uv pip install qdrant-client outlines instructor pydantic ragas trulens-eval \
 from openai import OpenAI
 
 # Single endpoint, three model tiers — oMLX routes by model name
-omlx = OpenAI(base_url="http://localhost:8000/v1", api_key="***REMOVED-OMLX-KEY***")
+omlx = OpenAI(base_url="http://localhost:8000/v1", api_key=os.getenv("OMLX_API_KEY", "not-needed"))
 
 # Pick the tier per task (these names match ~/.omlx/settings.json):
 opus   = "Qwen3.6-35B-A3B-nvfp4"               # tool calling, agent loops

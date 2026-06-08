@@ -491,7 +491,7 @@ Expected:
 
 ```
 OMLX_BASE_URL=http://127.0.0.1:8000/v1
-OMLX_API_KEY=***REMOVED-OMLX-KEY***
+OMLX_API_KEY=<your-oMLX-key>
 MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit
 MODEL_HAIKU=gpt-oss-20b-MXFP4-Q8

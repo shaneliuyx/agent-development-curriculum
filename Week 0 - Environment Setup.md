@@ -112,7 +112,7 @@ Launch `/Applications/vMLX.app`. In the vMLX **Settings → Server** tab, note t
 
 ```bash
 # oMLX on :8000
-curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer ***REMOVED-OMLX-KEY***" | jq '.data[].id'
+curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_API_KEY" | jq '.data[].id'
 
 # vMLX — replace 8003 with the actual port from vMLX Settings
 curl -s http://127.0.0.1:8003/v1/models | jq '.data[].id'
@@ -125,7 +125,7 @@ Expected: a list of model IDs from each server. If you get `curl: (7) Failed to 
 ```bash
 # oMLX / sonnet (Gemma 26B)
 curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer ***REMOVED-OMLX-KEY***" \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-26B-A4B-it-heretic-4bit",
@@ -195,7 +195,7 @@ Both files are gitignored — `.env.example` is a local-only template so you nev
 cat > .env.example <<'EOF'
 # ===== Local inference =====
 OMLX_BASE_URL=http://127.0.0.1:8000/v1
-OMLX_API_KEY=***REMOVED-OMLX-KEY***
+OMLX_API_KEY=<your-oMLX-key>
 VMLX_BASE_URL=http://127.0.0.1:8003/v1       # update to your vMLX port
 VMLX_API_KEY=not-used
 
@@ -523,7 +523,7 @@ from qdrant_client.http.models import Distance, VectorParams, PointStruct
 HOME = os.path.expanduser("~")
 
 # 1. oMLX chat completion (sonnet tier — Gemma 26B)
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="***REMOVED-OMLX-KEY***")
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key=os.getenv("OMLX_API_KEY", "not-needed"))
 t0 = time.time()
 resp = client.chat.completions.create(
     model="gemma-4-26B-A4B-it-heretic-4bit",
