@@ -79,7 +79,7 @@ flowchart TD
     class Direct,Answer terminal
 ```
 
-**Reading the diagram:** the **two blue diamonds** are the agent decision points (decide-to-retrieve, grade-relevance) — these are what make it "agentic" rather than fixed-pipeline. The **red rewrite node** is the recovery path that single-pass RAG doesn't have. The **dashed iteration loop** is bounded by `max_iter` (the only thing standing between the agent and an infinite query-rewrite spiral). Compare this to your Week 3 baseline, which is purely linear: query → retrieve → rerank → compress → answer, with no grading, no loop, no recovery.
+**Reading the diagram:** the **two diamonds** are the agent decision points (decide-to-retrieve, grade-relevance) — these are what make it "agentic" rather than fixed-pipeline. The **red rewrite node** is the recovery path that single-pass RAG doesn't have. The **dashed iteration loop** is bounded by `max_iter` (the only thing standing between the agent and an infinite query-rewrite spiral). Compare this to your Week 3 baseline, which is purely linear: query → retrieve → rerank → compress → answer, with no grading, no loop, no recovery.
 
 ---
 
@@ -111,15 +111,15 @@ The implementation in LangGraph is a `StateGraph(MessagesState)` with conditiona
 
 The [AgenticRAG-Survey](https://github.com/asinghcsu/AgenticRAG-Survey) paper (Aditi Singh, Abul Ehtesham, Saket Kumar, Tala Talaei Khoei, Feb 2025, 1.6k⭐) is the canonical taxonomy reference. It identifies **seven major architecture families**:
 
-| # | Architecture | One-line description | When it wins |
-|---|---|---|---|
-| 1 | **Single-agent RAG** | The 5-node canonical (Concept 1 above) | Default for most production systems |
-| 2 | **Multi-agent RAG** | Multiple specialist agents (researcher / synthesizer / critic) collaborating on retrieval | Genuinely complex queries needing role-specialized retrieval (e.g., legal + technical + financial sub-questions) |
-| 3 | **Hierarchical agentic RAG** | Tree of agents — coordinator delegates to sub-coordinators which delegate to workers | Very large knowledge bases (>10M docs) where a single retriever scope is too broad |
-| 4 | **Corrective agentic RAG (CRAG)** | Adds a confidence threshold — when retrieved docs score below threshold, falls back to web search or alternative source | Open-domain questions where local corpus may not have the answer |
-| 5 | **Adaptive agentic RAG** | Dynamically picks retrieval strategy based on question complexity (no retrieval / single-step / multi-step) | Mixed query workloads — some simple, some complex, system shouldn't pay multi-step cost on simple |
-| 6 | **Graph-based agentic RAG** | Combines GraphRAG (Week 2.5) with agent loop — agent traverses knowledge graph, decides next hop | Highly relational corpora (org charts, research citation networks, code dependencies) |
-| 7 | **Agentic Document Workflows (ADW)** | Document-centric — agent processes individual documents through a multi-step workflow (extract → enrich → cross-reference → output) | Document-heavy workflows like contract review, research synthesis, regulatory filings |
+| #   | Architecture                         | One-line description                                                                                                                | When it wins                                                                                                     |
+| --- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 1   | **Single-agent RAG**                 | The 5-node canonical (Concept 1 above)                                                                                              | Default for most production systems                                                                              |
+| 2   | **Multi-agent RAG**                  | Multiple specialist agents (researcher / synthesizer / critic) collaborating on retrieval                                           | Genuinely complex queries needing role-specialized retrieval (e.g., legal + technical + financial sub-questions) |
+| 3   | **Hierarchical agentic RAG**         | Tree of agents — coordinator delegates to sub-coordinators which delegate to workers                                                | Very large knowledge bases (>10M docs) where a single retriever scope is too broad                               |
+| 4   | **Corrective agentic RAG (CRAG)**    | Adds a confidence threshold — when retrieved docs score below threshold, falls back to web search or alternative source             | Open-domain questions where local corpus may not have the answer                                                 |
+| 5   | **Adaptive agentic RAG**             | Dynamically picks retrieval strategy based on question complexity (no retrieval / single-step / multi-step)                         | Mixed query workloads — some simple, some complex, system shouldn't pay multi-step cost on simple                |
+| 6   | **Graph-based agentic RAG**          | Combines GraphRAG (Week 2.5) with agent loop — agent traverses knowledge graph, decides next hop                                    | Highly relational corpora (org charts, research citation networks, code dependencies)                            |
+| 7   | **Agentic Document Workflows (ADW)** | Document-centric — agent processes individual documents through a multi-step workflow (extract → enrich → cross-reference → output) | Document-heavy workflows like contract review, research synthesis, regulatory filings                            |
 
 **The three you must know cold for interviews:** single-agent (Concept 1, the default), CRAG (#4, the most-cited confidence-recovery pattern), Adaptive-RAG (#5, the most-cited efficiency-routing pattern). The other four are situational; name them as "see the Singh survey for the full taxonomy."
 
@@ -189,75 +189,79 @@ git clone https://github.com/GiovanniPasq/agentic-rag-for-dummies.git
 
 ### 1.4 Adapt for local oMLX + your Week 1 Qdrant collection
 
-The official notebook uses OpenAI by default — repoint to your local oMLX. Save as `src/01_canonical_agentic_rag.py`:
+The canonical notebook uses **OpenAI in three places** — the chat model in *every* node (`gpt-4o`/`gpt-4-turbo`/`gpt-3.5`), the embeddings, and a Chroma store it builds from 3 blog posts. Reusing your local assets means editing those cells in `langgraph_agentic_rag.ipynb` **directly** — a single drop-in `.py` does not work, because the notebook's retriever and per-node LLM calls are spread across several cells (see the walkthrough). Three swaps.
+
+**(1) Setup cell — point the LLM at local oMLX (no OpenAI key, env-driven):**
 
 ```python
-"""LangChain canonical Agentic RAG, adapted to local oMLX + Week 1 Qdrant collection."""
-import os
+import os, sys
+from dotenv import load_dotenv
+load_dotenv(os.path.expanduser("~/code/agent-prep/lab-03.7-agentic-rag/.env"))
+sys.path.insert(0, os.path.expanduser("~/code/agent-prep/shared"))   # for rag_hybrid
+
 from langchain_openai import ChatOpenAI
-from langchain_qdrant import QdrantVectorStore
+LLM_BASE_URL = os.getenv("LLM_BASE_URL") or os.getenv("OMLX_BASE_URL", "http://localhost:8000/v1")
+LLM_API_KEY  = os.getenv("LLM_API_KEY")  or os.getenv("OMLX_API_KEY", "not-needed")
+LLM_MODEL    = os.getenv("LLM_MODEL")    or os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
+os.environ.setdefault("OPENAI_API_KEY", LLM_API_KEY)   # langchain still wants *a* key
+
+def _llm(**kw):                                          # one client, reused by every node
+    return ChatOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, model=LLM_MODEL, temperature=0, **kw)
+```
+
+**(2) Retriever cell — reuse the existing `bge_m3_hnsw` collection via `rag_hybrid` (NOT `QdrantVectorStore`):**
+
+```python
 from qdrant_client import QdrantClient
-from langchain_core.tools import create_retriever_tool
-from langgraph.prebuilt import create_react_agent
-from langgraph.graph import StateGraph, MessagesState, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from rag_hybrid import BGE_M3, BGE_RERANKER_V2_M3, CrossEncoderReranker, DenseEncoder, autoconfig
 
-# Local oMLX endpoint (sonnet tier — Gemma 26B)
-llm = ChatOpenAI(
-    model=os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit"),
-    base_url=os.getenv("OMLX_BASE_URL", "http://127.0.0.1:8000/v1"),
-    api_key=os.getenv("OMLX_API_KEY", "***REMOVED-OMLX-KEY***"),
-    temperature=0.0,
-)
+_qdrant   = QdrantClient(url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"), timeout=60)
+_encoder  = DenseEncoder(autoconfig.encoder_config_for(BGE_M3))        # the SAME encoder that indexed
+_reranker = CrossEncoderReranker(autoconfig.recommend(BGE_M3, BGE_RERANKER_V2_M3).reranker)
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "bge_m3_hnsw")
 
-# Week 1 Qdrant collection (already populated with bge-m3 embeddings)
-client = QdrantClient(url="http://127.0.0.1:6333")
-# NOTE: vector store needs an embedding function compatible with what was indexed.
-# Reuse your Week 1 BGE-M3 wrapper here.
-from langchain_huggingface import HuggingFaceEmbeddings
-embeddings = HuggingFaceEmbeddings(
-    model_name=os.path.expanduser("~/models/bge-m3"),
-    model_kwargs={"device": "mps"},
-)
-vectorstore = QdrantVectorStore(
-    client=client, collection_name="bge_m3_hnsw", embedding=embeddings,
-)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-retriever_tool = create_retriever_tool(
-    retriever, name="search_corpus", description="Search the corpus for documents relevant to the query."
-)
+def retrieve_passages(query, k=4, pool=30):
+    qv  = _encoder.encode([query])[0]
+    pts = _qdrant.query_points(QDRANT_COLLECTION, query=qv.tolist(), limit=pool, with_payload=True).points
+    return [t for _doc_id, t, _score in _reranker.rerank(query, pts, top_k=k)]   # 2-stage: dense -> rerank
+```
 
-# Build the 5-node graph
-# (Following the LangChain official example structure; abridged here — see notebook for full nodes.)
-# ... generate_query_or_respond, grade_documents, rewrite_question, generate_answer ...
+**(3) Tool + nodes — wrap retrieval as a tool, route every node through `_llm()`:**
 
-graph = StateGraph(MessagesState)
-# graph.add_node("generate_query_or_respond", ...)
-# graph.add_node("retrieve", ToolNode([retriever_tool]))
-# graph.add_node("grade_documents", ...)
-# graph.add_node("rewrite_question", ...)
-# graph.add_node("generate_answer", ...)
-# (Wire up edges per the canonical diagram — see official notebook)
-app = graph.compile()
+```python
+from langchain_core.tools import tool
 
-# Smoke test
-result = app.invoke({"messages": [("user", "Your test query here")]})
-print(result["messages"][-1].content)
+@tool
+def retrieve_corpus(query: str) -> str:
+    """Search the local corpus and return the most relevant passages."""
+    p = retrieve_passages(query, k=4)
+    return "\n\n".join(p) if p else "No relevant documents found."
+tools = [retrieve_corpus]
+
+# In each graph node: replace ChatOpenAI(model="gpt-4o"/...) with _llm();
+# replace grade's .with_structured_output(grade) with a bare 'yes'/'no' prompt parsed in Python;
+# replace generate's hub.pull("rlm/rag-prompt") with an inline PromptTemplate (no network).
 ```
 
 ### Code walkthrough
 
-**Chunk 1 — Local-first model wiring (lines 5-13):** Points the LangChain `ChatOpenAI` client at your oMLX endpoint instead of OpenAI. The `base_url` + `api_key` swap is the entire local adaptation — no other changes needed because oMLX exposes the same OpenAI-compatible API surface.
+**Why `QdrantVectorStore` (the obvious choice) does NOT work here — the core gotcha.** `bge_m3_hnsw` was built in Week 1 by `shared/rag_hybrid` — an *unnamed* 1024-d dense vector with payload `{doc_id, text}`. LangChain's `QdrantVectorStore` assumes a **LangChain-created** layout (its own `page_content`/`metadata` payload keys + vector name), so pointing it at this foreign collection silently returns nothing (or errors on the missing keys). That is exactly why the earlier drop-in snippet failed. The fix reuses the **same `DenseEncoder` (BGE-M3) that indexed the collection** — so query vectors are comparable to stored vectors — and wraps the lab's tested two-stage retrieval (dense search → BGE-reranker-v2-m3) from `baseline_handrolled.py` as a `@tool`. You reuse the encoder *and* the reranker, not just the raw vectors.
 
-**Chunk 2 — Reuse Week 1 vectorstore (lines 16-30):** Critical detail — point `QdrantVectorStore` at the same `bge_m3_hnsw` collection you populated in Week 1. The `embeddings` argument must match the model used at indexing time (BGE-M3) for correct query-vector / doc-vector compatibility.
+**Local model = no structured output, no LangSmith hub.** Small local models (Gemma-26B via oMLX) don't reliably honor OpenAI `.with_structured_output()` / function-schema grading, and `hub.pull("rlm/rag-prompt")` needs LangSmith + network. So the synced notebook grades with a bare `yes`/`no` prompt parsed in Python (`out.startswith("y")`) and inlines the RAG prompt as a `PromptTemplate`. Both changes make the notebook self-contained and robust on a local model.
 
-**Chunk 3 — `create_retriever_tool` (lines 31-34):** Wraps the retriever as a LangChain Tool. The `description` is what `generate_query_or_respond` reads when deciding whether to invoke retrieval — make it specific to your corpus, not generic ("Search the corpus" is too vague; "Search 10K MS MARCO passages on diverse topics" is what the LLM actually needs).
+**The one real fragility — tool-calling.** The `agent` node does `_llm().bind_tools(tools)`; the entire agentic loop depends on the model *emitting a tool call*. Gemma does basic tool-calling but can be flaky under load. If the agent never retrieves, flip the LLM to Claude via VibeProxy (OpenAI-compatible, reliable tool-calls) without touching any other cell:
 
-> **Why:** the description is part of the agent's prompt — vague descriptions cause the agent to over-invoke retrieval on questions it could answer directly, wasting time and tokens.
+```bash
+export LLM_BASE_URL=http://localhost:8317/v1
+export LLM_MODEL=claude-sonnet-4-5-20250929
+```
 
-**Chunk 4 — Graph compilation (lines 36-44):** The full node implementations come from the official notebook (skipped here for brevity). The structure: `StateGraph(MessagesState)` for the type system, conditional edges via `tools_condition` for the decide-to-retrieve branch, custom edge function for the relevance-grading branch.
+Embeddings stay local regardless — VibeProxy is chat-only (Anthropic has no `/v1/embeddings`); the W3.5.9 "embeddings stay local" rule applies here too.
 
-**Common modifications:** swap `MODEL_SONNET` for `MODEL_OPUS` (Qwen3.6-35B) for stronger grading on harder corpora; change `search_kwargs={"k": 5}` to `{"k": 10}` if your reranker is downstream.
+> [!warning] Never hardcode the oMLX key
+> An earlier draft of this section shipped the real key as a `getenv` default. Keep `OMLX_API_KEY` in the lab's gitignored `.env` only — never as a literal in a notebook or chapter.
+
+**Common modifications:** raise `k`/`pool` in `retrieve_passages` for a larger reranked context; point `LLM_MODEL` at a bigger oMLX model (or Claude) for stronger grading on harder corpora. The graph topology (nodes + conditional edges) is unchanged from the canonical notebook — only the LLM, embeddings, and vector store are repointed.
 
 ### 1.5 Run the notebook + capture observations
 
