@@ -1060,7 +1060,7 @@ flowchart TD
   GH -->|"pass"| DONE([answer])
   GH -->|"relevance fail"| CR["8 · CorrectiveRAG<br/>(rewrite + retry, max 2)"]
   CR -->|"pass"| DONE
-  CR -->|"still fail"| WS["web_search() executed<br/>→ synth from web → answer"]
+  CR -->|"still fail"| WS["web_search_planned() executed<br/>(Complex → fan out + interleave)<br/>→ synth from web → answer"]
   classDef slice fill:#dff0d8,stroke:#3c763d,stroke-width:2px;
   class MR,RR,SY slice;
 ```
@@ -1178,8 +1178,14 @@ def corrective_loop(query, top_k=6, max_iters=THRESHOLDS.max_rewrite):  # max_re
             break
     return out
 
-# web search: Tavily SDK (if key) → DuckDuckGo (free) → clear error; mirrors crag_variant.py
+# web backend precedence: SEARXNG_URL → TAVILY_API_KEY → DuckDuckGo (keyless except Tavily)
 def web_search(query, k=4):
+    if os.getenv("SEARXNG_URL"):                       # free local metasearch — best ranking (§ below)
+        import urllib.parse, urllib.request
+        u = os.environ["SEARXNG_URL"].rstrip("/") + "/search?" + urllib.parse.urlencode(
+            {"q": query, "format": "json"})
+        with urllib.request.urlopen(u, timeout=15) as r:
+            return [d["content"] for d in json.load(r).get("results", [])[:k] if d.get("content")]
     if os.getenv("TAVILY_API_KEY"):
         from tavily import TavilyClient
         r = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
@@ -1187,16 +1193,31 @@ def web_search(query, k=4):
     from ddgs import DDGS
     with DDGS() as d: return [x["body"] for x in d.text(query, max_results=k) if x.get("body")]
 
-# Orchestrator: single pass → grade → corrective loop → EXECUTE web-search fallback
+# fan-out: a Complex "compare X and Y" query → decompose → web-search each atomic sub-query →
+# round-robin INTERLEAVE (fair under synthesize's 8000-char passage cap) → dedup union.
+# Simple queries stay single-shot. This is execute_plan()'s corpus fan-out, on the WEB surface.
+def web_search_planned(query, decision, k=8):
+    if decision.get("label") != "Complex":
+        return web_search(query, k)
+    from decompose import decompose_query
+    lookups = [n for n in decompose_query(query) if n.get("type") != "synthesis"]
+    per_sub = [web_search(n["text"], k) for n in lookups]      # each atomic figure, its own search
+    docs = [h for i in range(max(map(len, per_sub), default=0))
+            for h in (s[i] for s in per_sub if i < len(s))]    # q1d1,q2d1,q1d2,q2d2,... interleaved
+    return list(dict.fromkeys(docs))                           # dedup, preserve interleaved order
+
+# Orchestrator: single pass → grade → corrective loop → EXECUTE fanned-out web fallback
 def answer(query, top_k=6):
+    decision = decide_complexity(query)                         # Simple/Complex — gates the web fan-out
     rr = rerank(query, multi_retrieve(query), top_k); sy = synthesize(query, rr)
     gr = grade_relevance(sy["answer"], query)
     out = {"query": query, "answer": sy["answer"], "hits": rr, "grade_relevance": gr, "source": "corpus",
-           "selfrag": selfrag_checks(sy["answer"], rr, query), "drift_filtered": sy["drift_filtered"]}
+           "decision": decision, "selfrag": selfrag_checks(sy["answer"], rr, query),
+           "drift_filtered": sy["drift_filtered"]}
     if not gr["pass"]:                                           # corpus retrieval looked off-topic
         out["corrective"] = corrective_loop(query, top_k)
         if not out["corrective"]["grade_relevance"]["pass"]:    # STILL bad → EXECUTE web search
-            web_docs = web_search(query)                        # real Tavily/DDG call, run in-process
+            web_docs = web_search_planned(query, decision)      # fan out if Complex; else single-shot
             wsy = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
                                      for i, d in enumerate(web_docs)])    # ground the web docs too
             out["answer"], out["source"] = wsy["answer"], "web"
@@ -1209,6 +1230,7 @@ def answer(query, top_k=6):
 - **Nodes 6/7 `grade_*`** decide whether the answer is good enough or the corrective loop must fire (`answer()` checks `if not gr["pass"]`). `grade_hallucination` is programmatic (faithfulness ≥ 0.5 *and* citation ≥ 0.5). `grade_relevance` went through **three versions** (the arc below): keyword overlap (fooled by question-echoing abstentions → loop unreachable), then an LLM YES/NO judge (noisy on Gemma), and finally a **deterministic short-circuit on the canonical `"I don't know"`** plus an LLM fallback for genuine partial answers. The code shown is that final version.
 - **Node 8 `corrective_loop` terminates by construction.** It's a counted `for i in range(max_iters)` (`max_rewrite=2`): the `break` is an early exit when the answer is already good, but even if the grade *never* passes, `range(2)` exhausts and the loop returns its best attempt. Termination is guaranteed by the loop's *shape*, not by any success condition - you can prove it halts by reading one line. Contrast §3.2: the LangGraph structural rewrite is a graph *cycle* with no built-in counter, so on a never-passing grade it runs until the runtime's `recursion_limit` aborts it with `GraphRecursionError`. Same idea; the `for` **bounds itself and fails safe** (returns a result), the cycle **borrows a runtime guard and fails loud** (raises). (Both are finite - a `for range(N)` is never *unbounded* even for huge `N` - so "runaway" here means "loops until an external limit crashes it," not "loops forever.")
 - **`answer()` is the CRAG decision in plain Python:** one forward pass; if relevance fails, run the corrective loop; if that *still* fails, **search the web and synthesize from the results**. That escalation - corpus → rewrite → web - is exactly what `crag_variant.py` does as a LangGraph graph. (This started as a *suggestion* - `next_action=web_search` for the host to act on; one `web_search()` call in the fallback now *executes* it inline, so the pipeline answers out-of-corpus 10/10 like CRAG - see the result below.)
+- **The web fallback *fans out* on Complex queries (`web_search_planned`).** A single "compare X and Y" web search is doomed - no one page holds both figures - so a Complex-labelled query is **decomposed** (the Phase 7 planner) into atomic sub-queries, each web-searched independently, the results **round-robin interleaved** and unioned, then synthesized against the original query. This is `execute_plan()`'s corpus fan-out applied on the *web* surface (out-of-corpus answers live on the web, not in Qdrant). Simple queries stay single-shot - no planner cost. Note this fan-out is **automatic** (gated only by `decide_complexity`), unlike the *corpus* decomposition which stays behind `ENABLE_DECOMPOSITION=1`. The "compare BNSF vs Berkshire Energy 2023 revenue" case that motivated it - and why the web *backend* matters as much as the fan-out - is the [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|web-fallback decomposition debug log]].
 
 > [!tip] Hand-rolled vs LangGraph CRAG — when to reach for each
 > Same corrective-RAG idea, two engineering trade-offs:
@@ -1247,12 +1269,23 @@ out-of-corpus (10 q): corrective fired 10/10 | web search EXECUTED 10/10 | answe
           | halluc→FAIL | rel→FAIL (abstain) | corrective→FAIL | web→4 docs → re-synth | final→source=web
 ```
 
-Each row's `steps:` line is an execution trace (`out["steps"]`, rendered by `_fmt_steps`) - it makes the **corpus → abstain → corrective → web** path visible per query, which is how you *confirm* the pipeline took the route you think it did (the recurring §3.2/§3.3 theme: every wrong prediction was caught by logging the actual path). Two production touches worth copying from the current code: the web backend is the **official `tavily` SDK** (the `langchain_community` wrapper was sunset in LangChain 0.3.25), and the fallback **splits its `except`** - a missing web dependency (`ImportError`) is a *config bug* that breaks every query → **fail loud** with a fix hint; a network/API/no-results miss is *per-query* → **fail soft** (record `web_error`, abstain). Same `try`, two failure classes, two responses.
+Each row's `steps:` line is an execution trace (`out["steps"]`, rendered by `_fmt_steps`) - it makes the **corpus → abstain → corrective → web** path visible per query, which is how you *confirm* the pipeline took the route you think it did (the recurring §3.2/§3.3 theme: every wrong prediction was caught by logging the actual path). Two production touches worth copying from the current code: the web backend follows a **precedence chain** - `SEARXNG_URL` (free local metasearch) → official `tavily` SDK (the `langchain_community` wrapper was sunset in LangChain 0.3.25) → DuckDuckGo - so the best free option wins when present and it degrades to keyless DDG otherwise; and the fallback **splits its `except`** - a missing web dependency (`ImportError`) is a *config bug* that breaks every query → **fail loud** with a fix hint; a network/API/no-results miss is *per-query* → **fail soft** (record `web_error`, abstain). Same `try`, two failure classes, two responses.
 
 Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because detecting `"I don't know"` is a string match, not a judgment. This is the cleanest of the three fixes: a canonical abstention moves reliability **off the model entirely**, and it *retroactively repairs v1's keyword grader too* (a bare `"I don't know"` no longer echoes the question → overlap ≈ 0). The transferable rule: **when you can make an upstream output canonical, do that instead of building a smarter downstream classifier.**
 
 > [!note] The arc, and what each step taught
 > **v1** keyword grader → **0/10** (the loop was unreachable - grader fooled by the question-echoing abstention). **v2** LLM-judges-the-answer → **5/10** (Gemma noisy: a hard target + a brittle binary output). **v3** canonical `"I don't know"` + substring check → **10/10** (deterministic). Three transferable rules fall out: **(a)** grade the **retrieval**, not the answer text (CRAG's `evaluate` - the docs are unambiguously irrelevant); **(b)** ask for a **score + threshold**, not a binary, so the judge's uncertainty has a buffer; **(c)** best of all, make the **generator** emit a canonical abstention so detection needs no judge. Final step to make it fully apples-to-apples: *execute* the web search instead of suggesting it - one function (`web_search()`, Tavily/DuckDuckGo) wired into `answer()`'s fallback - and the pipeline **answers all 10 from real, grounded ([#N]-cited, drift-filtered) web evidence**, exactly like CRAG. The only remaining difference is *plain functions vs a LangGraph graph*. The bounded loop held throughout: one rewrite per fire, no runaway.
+
+**One web search isn't enough for a comparison — fan out, then mind the *backend*.** The 10/10 out-of-corpus run above used *single-entity* questions ("who won the 2025 NBA Finals?"). A **multi-hop** question exposes a second failure: ask `Compare BNSF Railway and Berkshire Energy 2023 revenue` and a single web search returns generic hits with no one passage holding *both* figures → the pipeline (correctly) abstains. The fix is `web_search_planned` (above): decompose → search each atomic sub-query → interleave → synthesize. But fixing the *fan-out* exposed a third failure - the *backend's ranking*:
+
+| Backend / path | BNSF 2023 | BHE 2023 | Outcome |
+|---|---|---|---|
+| any, single-shot comparison | — | — | full `I don't know` |
+| Tavily, fan-out (k=6) | `$23.876B` ✓ | `**** billion` (Statista paywall) | half-grounded |
+| DuckDuckGo, fan-out | `$23.876B` ✓ | `I don't know` | worse (DDG dropped BHE) |
+| **SearXNG, fan-out (k=8)** | **`$23.876B` ✓** | **`US$26.198B` ✓** | **both grounded + cited** |
+
+*Numbers from `baseline_handrolled.py` probes, 2026-06-11 — a representative SearXNG run.* Tavily and DuckDuckGo **both** rank a *paywalled* Statista snippet (`**** billion`) above the free Wikipedia figure for BHE - so swapping between them can't fix it (they share ranking signals). A **SearXNG** metasearch aggregates Google + Startpage and *reranks*, floating Wikipedia into the top results, so both figures ground. That asymmetry - same query, opposite outcome on a metasearch vs. a single engine - is the teaching point: **two retrievers that share a backend aren't an independent confirmation of "unreachable."** ⚠️ **Live web ranking is non-deterministic** - repeat runs reorder results, so a given call may surface a weaker source (e.g. a `$23.35B` 2024-corporate figure instead of the `$23.876B` 2023 number, or a wrong BHE sub-segment). SearXNG makes the authoritative free source *reachable in the top-k*, not *guaranteed first* - which is exactly why the pipeline grounds what the passages contain and abstains rather than fabricates when they're thin. Full diagnosis (including a *wrong* conclusion of mine that SearXNG corrected): [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|the web-fallback decomposition debug log]].
 
 > [!abstract] Phase 3 — lessons learnt
 > 1. **CRAG = retrieve → *score the retrieval* → route (corpus / web / both).** A *scored evaluator*, not a yes/no grader, is what lets it escalate **out of** the corpus — where the rewrite loop could only re-ask the same empty corpus.
@@ -1261,6 +1294,7 @@ Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because
 > 4. **Bound loops by construction.** The hand-rolled `for range(2)` terminates and returns its best attempt; the LangGraph cycle needed an external `recursion_limit` and crashed on out-of-corpus (§3.2). Same algorithm, safer shape.
 > 5. **Suggestion vs execution is a one-function switch.** The hand-rolled pipeline first *emitted* `next_action=web_search` (host-mediated — testable, auditable), then *executed* `web_search()` inline (autonomous — answers 10/10 from real web evidence); the change was a single function call, not an architecture rewrite. `crag_variant.py` executes by construction. Neither posture is strictly better — pick per how much control vs autonomy you want — but switching is cheap.
 > 6. **Verify branches by running the trigger.** "Is the rewrite fired?" / "why 10/10 answered?" — three predicted behaviours this lab got wrong were only caught by logging the actual path (rewrite never fired in v1; single-pass *abstained* not hallucinated; CRAG count was Tavily-vs-DDG). A conditional branch's real behaviour is unknown until you feed it the case it's meant to catch.
+> 7. **Fan out multi-hop questions, and the *backend* is part of the retriever.** A "compare X and Y" web search is doomed single-shot; decompose → search each atomic sub-query → interleave → synthesize, and both figures ground. But two engines (Tavily, DDG) failing the *same* way isn't a hard ceiling - they share ranking signals - a **metasearch (SearXNG)** that reranks across engines surfaced the free figure both buried. Decomposition belongs on whichever surface holds the answer (corpus *or* web); retrieval quality is the *combination* of query shape **and** backend ranking. (Full arc + a corrected wrong conclusion: [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|debug log]].)
 
 ---
 
@@ -1375,7 +1409,7 @@ flowchart TD
   GH -->|"hallucination fails"| REGEN["regenerate (max_regen)"]
   GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite)"]
   REGEN --> SR
-  CRAG -->|"still fails"| FALLBACK["web_search() executed<br/>→ synth from web → answer"]
+  CRAG -->|"still fails"| FALLBACK["web_search_planned() executed<br/>(Complex → fan out + interleave)<br/>→ synth from web → answer"]
   CRAG -->|"now passes"| OUT
   FALLBACK --> OUT
 ```
@@ -1489,8 +1523,14 @@ def corrective_loop(query, top_k=6, max_iters=THRESHOLDS.max_rewrite):   # max_r
             break
     return out
 
-# Web fallback — Tavily SDK (if key) → DuckDuckGo (free); executed inline. Mirrors crag_variant.py.
+# Web fallback — backend precedence SEARXNG_URL → Tavily SDK → DuckDuckGo; executed inline.
 def web_search(query, k=4):
+    if os.getenv("SEARXNG_URL"):                         # free local metasearch — best free-source ranking
+        import urllib.parse, urllib.request
+        u = os.environ["SEARXNG_URL"].rstrip("/") + "/search?" + urllib.parse.urlencode(
+            {"q": query, "format": "json"})
+        with urllib.request.urlopen(u, timeout=15) as r:
+            return [d["content"] for d in json.load(r).get("results", [])[:k] if d.get("content")]
     if os.getenv("TAVILY_API_KEY"):
         from tavily import TavilyClient
         r = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
@@ -1498,20 +1538,24 @@ def web_search(query, k=4):
     from ddgs import DDGS
     with DDGS() as d: return [x["body"] for x in d.text(query, max_results=k) if x.get("body")]
 
-# Orchestrator — single pass → grade → corrective loop → EXECUTE web fallback
+# web_search_planned(query, decision): Complex → decompose → search each sub-query →
+# interleave → union; Simple → single-shot. (Full body in §3.3 — same function, one file.)
+
+# Orchestrator — single pass → grade → corrective loop → EXECUTE fanned-out web fallback
 def answer(query, top_k=6):
-    if os.getenv("ENABLE_DECOMPOSITION") == "1" and decide_complexity(query)["label"] == "Complex":
-        from decompose import decompose_query            # Phase 7: plan sub-queries (optional)
+    decision = decide_complexity(query)                  # Simple/Complex — gates the web fan-out
+    # (Complex AND ENABLE_DECOMPOSITION=1 also fans out the CORPUS path via execute_plan; the
+    #  web fan-out below is automatic — gated by `decision` alone, not the env flag.)
     rr = rerank(query, multi_retrieve(query), top_k); sy = synthesize(query, rr)
     gr = grade_relevance(sy["answer"], query)
-    out = {"query": query, "answer": sy["answer"], "hits": rr, "source": "corpus",
+    out = {"query": query, "answer": sy["answer"], "hits": rr, "source": "corpus", "decision": decision,
            "selfrag": selfrag_checks(sy["answer"], rr, query), "grade_relevance": gr,
            "grade_hallucination": grade_hallucination(sy["answer"], rr, query),
            "drift_filtered": sy["drift_filtered"]}
     if not gr["pass"]:                                   # corpus retrieval looked off-topic
         out["corrective"] = corrective_loop(query, top_k)
         if not out["corrective"]["grade_relevance"]["pass"]:        # rewrite ALSO failed → web
-            web_docs = web_search(query)                            # real Tavily/DDG call, executed
+            web_docs = web_search_planned(query, decision)          # fan out if Complex; else single-shot
             out["answer"] = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
                                                for i, d in enumerate(web_docs)])["answer"]
             out["source"], out["next_action"] = "web", {"type": "web_search", "executed": True}
@@ -1525,7 +1569,7 @@ def answer(query, top_k=6):
 - **Block 2 — `multi_retrieve` (original + keyword-only RRF).** Issues two Qdrant queries: original query text + keyword-only variant (stripped of stopwords / function words). Cormack-style RRF (`1/(60+rank)`) fuses the rankings. Variant generation is the cheap recall-augmentation that doesn't need decomposition; covers the case where the original query has too much syntactic noise to dense-match well.
 - **Block 3 — `synthesize` with `[#i]` citation binding + drift filter.** The W2.7-discovered explained-refusal pattern transferred — the prompt forces inline `[#N]` citations on every bullet. The drift filter post-pass drops any bullet whose keywords don't overlap its cited passage; cheap pre-faithfulness guardrail before RAGAS-style judge runs.
 - **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
-- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** (`web_search()`: Tavily SDK → DuckDuckGo) and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
+- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. Two refinements from §3.3 carry in here: the web backend is a **precedence chain** (`SEARXNG_URL` → Tavily SDK → DuckDuckGo), and a **Complex** query **fans out** (`web_search_planned`: decompose → search each atomic sub-query → interleave → union) so "compare X and Y" grounds *both* figures instead of issuing one doomed comparison search. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
 
 **Result (measured — out-of-corpus run, 10 questions; full numbers in `RESULTS.md`):**
 
@@ -1534,14 +1578,15 @@ def answer(query, top_k=6):
 | **out-of-corpus (10 q)** | **corrective 10/10 · web executed 10/10 · answered 10/10**; ~1m35s total ≈ **~9.5 s/q** for the full corpus→corrective→web path |
 | per-query, corpus answers (no CRAG fire) | ~4-7 s (dominated by the one `synthesize` LLM call) |
 | + CRAG loop fires (1 rewrite + re-synth) | +~5-10 s |
-| + web fallback (search + re-synthesize) | +~2-4 s (Tavily/DDG call + 1 LLM call) |
+| + web fallback (search + re-synthesize) | +~2-4 s (1 web call + 1 LLM call); **Complex fan-out**: +1 planner call + 1 web call *per sub-query* |
 
 Per-stage: `decide_complexity` / `selfrag` / grades are <0.01 s (no LLM); `multi_retrieve` + `rerank` ~0.8 s. The cost is the **LLM calls** (`synthesize`, `grade_relevance`, `rewrite_query`). The 3-arm *quality* comparison vs the LangGraph CRAG is §3.2-§3.3 + `lab-03.7-agentic-rag/RESULTS.md`.
 
 `★ Insight ─────────────────────────────────────`
 - **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
 - **`shared/tree_index.split_large_nodes` and this lab's `decompose.py` solve different problems but pair well.** Tree-split fragments a long document into navigable units (build-time); decompose fragments a complex query into atomic sub-queries (query-time). Together: the agent sees a fine-grained tree AND can plan multi-step queries against it.
-- **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search()`: Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
+- **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search`: `SEARXNG_URL` → Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
+- **The backend is part of the retriever, not a detail.** The same fan-out grounds a comparison query on SearXNG but half-abstains on Tavily/DuckDuckGo — because those two rank a paywalled snippet above the free figure (§3.3 table). When you wire a web fallback, the *engine's ranking* is a first-class quality lever; a free metasearch that reranks across engines can beat a managed API on free-source recall. Full arc: [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|debug log]].
 `─────────────────────────────────────────────────`
 
 Run smoke test (loads encoder + reranker + Qdrant; first run ~5-15 s warmup):
@@ -1643,12 +1688,14 @@ def topo_sort(plan: list[dict]) -> list[dict]:
 | `decide_complexity("Compare BNSF vs Berkshire Energy and explain why")` | `{"label": "Complex", "score": 1.55}` |
 | `topo_sort([q3 depends q1,q2; q1; q2])` | `["q1", "q2", "q3"]` |
 
-End-to-end LLM-decomposition pending first calibrated run. Set `ENABLE_DECOMPOSITION=1` in `.env` to wire `decompose_query` into the Phase 6 pipeline.
+`decompose_query` is wired into the pipeline on **two** surfaces, with different gating:
+- **Web fallback — automatic.** A Complex query that escalates to the web fans out through `web_search_planned` (decompose → per-sub-query search → interleave) with **no flag** — gated only by `decide_complexity`. This is the calibrated, measured path: it turns the "compare BNSF vs Berkshire Energy 2023 revenue" abstain into a both-figures-cited answer (§3.3 result table).
+- **Corpus path — opt-in.** Set `ENABLE_DECOMPOSITION=1` in `.env` to also fan out *in-corpus* multi-hop retrieval via `execute_plan` (topo-exec + citation remap). Off by default so the committed §2.5/§2.6 corpus numbers stay reproducible.
 
 `★ Insight ─────────────────────────────────────`
 - **Query planning > query rewriting on multi-hop.** Single-shot rewriting (W3.7 Phase 1-4) helps recall on individual queries; decomposition makes multi-hop synthesis tractable by retrieving for each leaf separately + a final synthesis pass that combines. Both have their place — route by query shape.
 - **JSON-mode + topological sort = composable.** The plan is a DAG, not a tree. Some sub-queries depend on others; topo_sort gives the executor a stream-friendly ordering. Lookups can fan out in parallel; synthesis sub-queries run after their inputs land. Same shape as Airflow's DAG executor.
-- **The decomposer is opt-in via `ENABLE_DECOMPOSITION=1`.** Default off because most queries don't benefit (single-step factoid) and decomposition adds 1 LLM call (~3-5s). Empirical default: on for Complex-classified queries, off for Simple. Worth re-measuring per corpus.
+- **Two gating policies, by surface.** The *corpus* decomposer is opt-in via `ENABLE_DECOMPOSITION=1` (default off — most factoid queries don't benefit, and it adds 1 LLM call ~3-5s, plus it would perturb the committed corpus numbers). The *web-fallback* decomposer is **always on for Complex queries** — because by the time the pipeline reaches the web, the corpus has already failed, so the extra planner + per-sub-query searches are a justified cost on a path that would otherwise abstain. Same function, different default, chosen by which surface is paying.
 `─────────────────────────────────────────────────`
 
 ---
@@ -1657,7 +1704,7 @@ End-to-end LLM-decomposition pending first calibrated run. Set `ENABLE_DECOMPOSI
 
 > Added 2026-05-07. None of the prior labs in W0-W3.7 expose themselves as MCP servers. This phase closes that gap: wraps the hand-rolled pipeline as 3 MCP tools that Claude Desktop / Cursor can call.
 
-The pattern matters because **MCP is the production interface for "lab as tool" composition** in 2026. Once your lab is an MCP server, any host (Claude Desktop, Cursor, Continue, custom agents) can register it via `mcp-config.json` and the user can invoke `@rag_query` / `@rag_status` / `@rag_decompose` like built-in functions. Pairs naturally with the W2.7 tree-index lab — imagine asking Claude Desktop questions about a 10-K via `@rag_query` while a parallel `@tree_query` MCP tool routes to the tree-index pipeline.
+The pattern matters because **MCP is the production interface for "lab as tool" composition** in 2026. Once your lab is an MCP server, any host (Claude Desktop, Cursor, Continue, custom agents) can register it via `mcp-config.json` and Claude calls its `rag_query` / `rag_status` / `rag_decompose` tools automatically (with per-action approval; in Claude Desktop they're toggled under the message box's `+` → **Connectors** — `@`-mention hosts like Cursor let you call them by name). Pairs naturally with the W2.7 tree-index lab — imagine asking Claude Desktop questions about a 10-K via `@rag_query` while a parallel `@tree_query` MCP tool routes to the tree-index pipeline.
 
 **Architecture:**
 
@@ -1726,13 +1773,42 @@ $ python src/mcp_server.py
 # Ctrl-C to stop.
 ```
 
-**Claude Desktop integration** (one-time, ~5 min):
+**Claude Desktop integration** (one-time, ~5 min — per the [official MCP user quickstart](https://modelcontextprotocol.io/quickstart/user)):
 
-1. Open `~/Library/Application Support/Claude/claude_desktop_config.json`.
-2. Merge in the snippet from `lab-03.7-agentic-rag/mcp-config.json` under `mcpServers`.
-3. Update absolute paths + `OMLX_API_KEY` in the snippet's `env`.
-4. Restart Claude Desktop.
-5. In a chat, type "@rag" and you should see `rag_query`, `rag_status`, `rag_decompose` in the tool palette.
+1. In Claude Desktop, open **Settings**, scroll the sidebar to the **"Desktop app"** section (below the account settings), and click **Developer** (wrench 🔧 icon) → **Edit Config**. This creates/opens `~/Library/Application Support/Claude/claude_desktop_config.json`. *(No "Edit Config" button in your version? Edit that file directly, creating it if missing — `mkdir -p ~/Library/Application\ Support/Claude` first.)*
+2. Merge the snippet from `lab-03.7-agentic-rag/mcp-config.json` under the `"mcpServers"` key. **Use `uv` as the `command`** so the server runs inside the lab's venv — bare `python` uses *system* Python and won't find `fastmcp` / `qdrant-client` (an `ImportError` that kills the server silently):
+   ```json
+   "agentic-rag": {
+     "command": "uv",
+     "args": ["--directory", "/ABS/PATH/agent-prep/lab-03.7-agentic-rag",
+              "run", "python", "src/mcp_server.py"],
+     "env": {"OMLX_BASE_URL": "http://localhost:8000/v1", "OMLX_API_KEY": "not-needed",
+             "MODEL_SONNET": "gemma-4-26B-A4B-it-heretic-4bit",
+             "QDRANT_URL": "http://127.0.0.1:6333", "QDRANT_COLLECTION": "bge_m3_hnsw"}
+   }
+   ```
+3. Set the **absolute** `--directory` path (relative paths fail) + the `env` values for your setup.
+4. **Fully quit** Claude Desktop (Cmd+Q — closing the window isn't enough) and reopen it, so it reloads the config and starts the server.
+5. In the message box, click the **`+` button → Connectors** — your **`agentic-rag`** server appears in the list as a toggle (make sure it's **on**). Then just ask a question; Claude calls `rag_query` / `rag_status` / `rag_decompose` automatically (you approve each call). You don't type "@rag" to invoke them; the host routes as needed. *(Older Claude Desktop builds surfaced tools behind a 🔨 hammer icon instead; current builds use `+` → Connectors, with a "Tool access: Load tools when needed" option for lazy loading.)*
+
+> [!warning] If `agentic-rag` doesn't appear under `+` → Connectors (official troubleshooting)
+> 1. Validate the JSON — one trailing comma breaks the whole file. 2. Paths must be **absolute, not relative**. 3. Test the server by hand: `cd lab-03.7-agentic-rag && uv run python src/mcp_server.py` — it should start with **no `ImportError`**. 4. Read the logs: `tail -n 40 -f ~/Library/Logs/Claude/mcp*.log` (general MCP) and `~/Library/Logs/Claude/mcp-server-agentic-rag.log` (this server's stderr).
+
+**Test it in Claude Desktop** (verified end-to-end: server imports clean, oMLX `:8000` + Qdrant `bge_m3_hnsw` up). Type each prompt in a chat and click **Allow** on the tool-call popup. Start with `rag_status` — it touches only Qdrant (no LLM, no retrieval), so if it returns, the MCP transport + env + collection all work:
+
+| #   | prompt                                                                                        | tool            | expected                                                                                                                                  |
+| --- | --------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | *Use agentic-rag's rag_status tool.*                                                          | `rag_status`    | `collection: bge_m3_hnsw`, `points_count: 10000`, model + config — the fastest smoke test                                                 |
+| 2   | *Use agentic-rag to answer: how do I cancel SiriusXM service?*                                | `rag_query`     | grounded answer with `[#N]` citations from the corpus + selfrag / grade fields                                                            |
+| 3   | *Use agentic-rag to answer: which team won the 2025 NBA Finals?*                              | `rag_query`     | corpus can't answer → corrective loop → **web fallback** → real answer (`source: web`) — the full §3.3 pipeline, live in a mainstream app |
+| 4   | *Use agentic-rag's rag_decompose on: Compare BNSF Railway and Berkshire Energy 2023 revenue.* | `rag_decompose` | JSON sub-query plan (lookup + synthesis with `depends_on`)                                                                                |
+| 5   | *Use agentic-rag to answer: Compare BNSF Railway and Berkshire Energy 2023 revenue.*           | `rag_query`     | Complex + out-of-corpus → **web fan-out**: decompose → 2 atomic searches → interleave → **both** figures cited (`source: web`, `next_action.fanout` shows `q1/q2`). Needs SearXNG for the BHE figure (see note). |
+
+> [!note] What to expect when testing
+> - **First tool call is slow (~10-30 s)** — the server loads the BGE-M3 encoder + reranker on first use. Not a hang; subsequent calls are fast.
+> - **Web backend precedence (prompts 3 & 5): `SEARXNG_URL` → `TAVILY_API_KEY` → DuckDuckGo.** Add the relevant key to the config's `env`. For **prompt 5** (a comparison) the backend *matters*: SearXNG grounds both figures, while Tavily/DDG half-abstain on the paywalled BHE figure (§3.3). Start SearXNG with `docker compose -f searxng/docker-compose.yml up -d`, then set `"SEARXNG_URL": "http://localhost:8080"`. Single-entity prompt 3 works on any backend.
+> - **Prereqs:** oMLX (`:8000`) + Qdrant (`:6333`, collection `bge_m3_hnsw`) must be running locally — `python smoke-test.py` from the repo root checks both. On error, read `tail -n 40 ~/Library/Logs/Claude/mcp-server-agentic-rag.log`.
+> - **Order matters:** if `rag_status` works but `rag_query` fails, the problem is the *pipeline* (oMLX / encoder), not the *connection* — the cheap tool localizes the fault.
 
 `★ Insight ─────────────────────────────────────`
 - **MCP-server wrapping is the cheapest curriculum-to-portfolio bridge.** Every existing lab can wrap its `answer()` / equivalent in ~50 LOC of FastMCP and become a tool a hiring manager can demo in Claude Desktop during a screen-share. Higher portfolio signal than "I built X locally" because it shows X composes with current-year tooling.
