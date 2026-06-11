@@ -1041,6 +1041,12 @@ flowchart TD
 **Block A — retrieve and synthesize (nodes 1-4, the single-pass slice):**
 
 ```python
+# Shared stopword sets — small for overlap SCORING (faithfulness/coverage/drift), large for keyword
+# RETRIEVAL queries. _KEYWORD_STOPWORDS is a superset, so the shared core lives in one place.
+_STOPWORDS = frozenset({"the", "a", "an", "of", "to", "in"})
+_KEYWORD_STOPWORDS = _STOPWORDS | {"and", "or", "is", "what", "who", "how", "with", "for",
+                                   "this", "be", "have", "i", "you", "it", "they", ...}   # ~40 words
+
 # Node 1: ComplexityDecider — heuristic, routes to optional decomposition (Phase 6)
 def decide_complexity(query):
     cap  = len(re.findall(r"\b[A-Z][a-zA-Z]+\b", query))          # named-entity count
@@ -1051,7 +1057,7 @@ def decide_complexity(query):
 # Node 2: MultiRetrieve — original + keyword-only query, fused with Reciprocal Rank Fusion
 def multi_retrieve(query, k=30, rrf_k=60):
     variants = [query]
-    kw = _keyword_variant(query)                                 # strip ~40 stopwords
+    kw = _keyword_variant(query)                                 # drop _KEYWORD_STOPWORDS (~40)
     if kw and kw != query.lower(): variants.append(kw)
     rrf = {}
     for v in variants:
@@ -1081,7 +1087,7 @@ def synthesize(query, hits):
     for b in (ln.strip() for ln in text.splitlines() if ln.strip()):
         m = re.search(r"\[#(\d+)\]", b)
         if m and 0 <= int(m.group(1)) - 1 < len(hits):
-            bk = set(re.findall(r"\w+", b.lower())) - {"the", "a", "an", "of", "to", "in"}
+            bk = set(re.findall(r"\w+", b.lower())) - _STOPWORDS
             if bk & set(re.findall(r"\w+", hits[int(m.group(1)) - 1]["text"].lower())):
                 kept.append(b)                                   # bullet supported by its cited passage
             else: dropped += 1                                   # DRIFT: drop unsupported bullet
@@ -1094,6 +1100,7 @@ def synthesize(query, hits):
 - **Node 2 `multi_retrieve`** runs the query *twice* - verbatim and stripped-to-keywords - and fuses the two ranked lists with **Reciprocal Rank Fusion** (`1/(60+rank)`). Two query phrasings catch passages either alone would miss; RRF needs no score calibration.
 - **Node 3 `rerank`** is precision after recall: the BGE cross-encoder rescues the top-6 by scoring each `(query, passage)` pair directly. **Nodes 2-3-4 are exactly `run_single_pass`** - the §3.2 single-pass arm.
 - **Node 4 `synthesize`** is the §3.1 generation diagram in code: the grounded prompt (cite `[#N]`, **emit a canonical `"I don't know"` when the answer isn't in the passages**) **plus** the drift filter (drop any bullet whose words don't overlap its cited passage). The grounded prompt is *why* single-pass abstains instead of hallucinating; the *canonical* abstention is what makes that abstention reliably detectable downstream — the key fix in the v1→v3 arc below.
+- **Two stopword sets, two jobs.** `_KEYWORD_STOPWORDS` (the large set) builds keyword *retrieval queries* — drop question words/auxiliaries/pronouns so the dense search keys on distinctive content terms. `_STOPWORDS` (the small set) is for overlap *scoring* (faithfulness / coverage / drift filter) — drop only grammatical glue, because question words still carry signal when comparing an answer against its cited passage. Same idea (ignore noise words), opposite aggressiveness — so they share one core: `_KEYWORD_STOPWORDS = _STOPWORDS | {...}`.
 
 **Block B — self-check, grade, correct, orchestrate (nodes 5-8 + the pipeline):**
 
@@ -1104,8 +1111,8 @@ def selfrag_checks(answer, hits, query):
     cited = [b for b in bullets if re.search(r"\[#\d+\]", b)]
     faithful = sum(1 for b in cited
         if (m := re.search(r"\[#(\d+)\]", b)) and 0 <= int(m.group(1))-1 < len(hits)
-        and len(set(re.findall(r"\w+", b.lower())) &
-                set(re.findall(r"\w+", hits[int(m.group(1))-1]["text"].lower()))) >= 3)
+        and len((set(re.findall(r"\w+", b.lower())) - _STOPWORDS) &
+                (set(re.findall(r"\w+", hits[int(m.group(1))-1]["text"].lower())) - _STOPWORDS)) >= 3)
     qk = set(re.findall(r"\w+", query.lower()))
     cit  = len(cited) / (len(bullets) or 1)
     faith = (faithful / (len(bullets) or 1)) if cited else 0.0
