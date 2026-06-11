@@ -1048,7 +1048,7 @@ _STOPWORDS = frozenset({"the", "a", "an", "of", "to", "in"})
 _KEYWORD_STOPWORDS = _STOPWORDS | {"and", "or", "is", "what", "who", "how", "with", "for",
                                    "this", "be", "have", "i", "you", "it", "they", ...}   # ~40 words
 
-# Node 1: ComplexityDecider — heuristic, routes to optional decomposition (Phase 6)
+# Node 1: ComplexityDecider — heuristic, routes to optional decomposition (Phase 7)
 def decide_complexity(query):
     cap  = len(re.findall(r"\b[A-Z][a-zA-Z]+\b", query))          # named-entity count
     cues = sum(c in query.lower() for c in _COMPLEX_CUES)         # "compare","vs","and",...
@@ -1097,7 +1097,7 @@ def synthesize(query, hits):
 ```
 
 **Walkthrough (A):**
-- **Node 1 `decide_complexity`** scores the query (named-entity count + cue words like "compare"/"vs"/"and") and labels it Simple/Complex - a cheap router that gates optional LLM decomposition (Phase 6). No model call.
+- **Node 1 `decide_complexity`** scores the query (named-entity count + cue words like "compare"/"vs"/"and") and labels it Simple/Complex - a cheap router that gates optional LLM decomposition (Phase 7). No model call.
 - **Node 2 `multi_retrieve`** runs the query *twice* - verbatim and stripped-to-keywords - and fuses the two ranked lists with **Reciprocal Rank Fusion** (`1/(60+rank)`). Two query phrasings catch passages either alone would miss; RRF needs no score calibration.
 - **Node 3 `rerank`** is precision after recall: the BGE cross-encoder rescues the top-6 by scoring each `(query, passage)` pair directly. **Nodes 2-3-4 are exactly `run_single_pass`** - the §3.2 single-pass arm.
 - **Node 4 `synthesize`** is the §3.1 generation diagram in code: the grounded prompt (cite `[#N]`, **emit a canonical `"I don't know"` when the answer isn't in the passages**) **plus** the drift filter (drop any bullet whose words don't overlap its cited passage). The grounded prompt is *why* single-pass abstains instead of hallucinating; the *canonical* abstention is what makes that abstention reliably detectable downstream — the key fix in the v1→v3 arc below.
@@ -1350,40 +1350,140 @@ flowchart TD
   FALLBACK --> OUT
 ```
 
-**Code (lab wrapper — full pipeline in `src/baseline_handrolled.py`):**
+**Code (`src/baseline_handrolled.py` — the complete pipeline, top-to-bottom):**
 
 ```python
-# src/baseline_handrolled.py — top-level entry (excerpt)
-def answer(query: str, top_k: int = 6) -> dict[str, Any]:
-    decision = decide_complexity(query)
-    sub_queries = [{"id": "q1", "text": query}]
-    if os.getenv("ENABLE_DECOMPOSITION", "0") == "1" and decision["label"] == "Complex":
-        from decompose import decompose_query
-        sub_queries = decompose_query(query) or sub_queries
+import os, re
+# Stopword sets: small for overlap SCORING (faithfulness/coverage/drift), large (superset) for
+# keyword RETRIEVAL queries. One shared core: _KEYWORD_STOPWORDS = _STOPWORDS | {...}
+_STOPWORDS = frozenset({"the", "a", "an", "of", "to", "in"})
+_KEYWORD_STOPWORDS = _STOPWORDS | {"and", "or", "is", "what", "who", "how", "with", "for",
+                                   "this", "be", "have", "i", "you", "it", "they", ...}   # ~40
+_COMPLEX_CUES = ["compare", "vs", "versus", "difference", "and", "explain why", "step by step", ...]
 
-    hits = multi_retrieve(query)            # RRF over original + keyword-only
-    rr = rerank(query, hits, top_k=top_k)   # BGE-reranker-v2-m3
-    sy = synthesize(query, rr)              # bullets + [#i] cites + drift filter
-    sr = selfrag_checks(sy["answer"], rr, query)
-    gh = grade_hallucination(sy["answer"], rr, query)
+# Node 1 — ComplexityDecider (heuristic; gates optional Phase-7 decomposition). No LLM call.
+def decide_complexity(query):
+    cap  = len(re.findall(r"\b[A-Z][a-zA-Z]+\b", query))            # named-entity count
+    cues = sum(c in query.lower() for c in _COMPLEX_CUES)
+    score = min(cap, 4)*0.15 + min(cues, 3)*0.25 + (0.2 if " and " in query.lower() else 0)
+    return {"label": "Complex" if score >= 0.5 else "Simple", "score": round(score, 3)}
+
+# Node 2 — MultiRetrieve (original + keyword-only query, fused with Reciprocal Rank Fusion)
+def _keyword_variant(query):
+    return " ".join(w for w in re.findall(r"\w+", query.lower()) if w not in _KEYWORD_STOPWORDS)
+def multi_retrieve(query, k=30, rrf_k=60):
+    variants = [query]
+    kw = _keyword_variant(query)
+    if kw and kw != query.lower(): variants.append(kw)
+    rrf = {}
+    for v in variants:
+        for rank, h in enumerate(_retrieve_qdrant(v, k=k), start=1):   # dense kNN over Qdrant
+            s = 1.0 / (rrf_k + rank)                                   # Cormack RRF weight
+            rrf[h["id"]] = ({**h, "_rrf_score": rrf[h["id"]]["_rrf_score"] + s}
+                            if h["id"] in rrf else {**h, "_rrf_score": s})
+    return sorted(rrf.values(), key=lambda x: -x["_rrf_score"])[:k]
+
+# Node 3 — Rerank (BGE cross-encoder over (query, passage), keep top-6)
+def rerank(query, hits, top_k=6):
+    scores = _reranker._model.predict([(query, h["text"]) for h in hits])
+    return [h for h, _ in sorted(zip(hits, scores), key=lambda x: -x[1])][:top_k]
+
+# Node 4 — Synthesize (cited bullets + drift filter + canonical "I don't know")
+SYNTHESIZE_PROMPT = ("Use ONLY the passages below. Answer in 3-5 bullets, each with a [#N] citation. "
+                     "Do not invent claims. If the passages do not contain the answer, reply with "
+                     "EXACTLY: I don't know\n\nPassages:\n{passages}\n\nQuestion: {q}\nAnswer:")
+def synthesize(query, hits):
+    if not hits: return {"answer": "I don't know", "drift_filtered": 0}
+    passages = "\n\n".join(f"[#{i+1}] {h['text']}" for i, h in enumerate(hits))
+    text = omlx.chat.completions.create(model=MODEL, temperature=0.0, max_tokens=400,
+        messages=[{"role": "user", "content": SYNTHESIZE_PROMPT.format(
+            passages=passages[:8000], q=query)}]).choices[0].message.content.strip()
+    kept, dropped = [], 0
+    for b in (ln.strip() for ln in text.splitlines() if ln.strip()):
+        m = re.search(r"\[#(\d+)\]", b)
+        if m and 0 <= int(m.group(1)) - 1 < len(hits):
+            bk = set(re.findall(r"\w+", b.lower())) - _STOPWORDS
+            pk = set(re.findall(r"\w+", hits[int(m.group(1)) - 1]["text"].lower()))
+            if bk & pk: kept.append(b)                                 # bullet supported by its cite
+            else:       dropped += 1                                   # DRIFT: drop unsupported bullet
+        else: kept.append(b)
+    return {"answer": "\n".join(kept), "drift_filtered": dropped}
+
+# Node 5 — SelfRAG checks (programmatic: citation / faithfulness / coverage → confidence). No LLM.
+def selfrag_checks(answer, hits, query):
+    bullets = [l for l in answer.splitlines() if l.strip()]
+    cited = [b for b in bullets if re.search(r"\[#\d+\]", b)]
+    faithful = sum(1 for b in cited
+        if (m := re.search(r"\[#(\d+)\]", b)) and 0 <= int(m.group(1))-1 < len(hits)
+        and len((set(re.findall(r"\w+", b.lower())) - _STOPWORDS) &
+                (set(re.findall(r"\w+", hits[int(m.group(1))-1]["text"].lower())) - _STOPWORDS)) >= 3)
+    qk  = set(re.findall(r"\w+", query.lower())) - _STOPWORDS
+    cit = len(cited) / (len(bullets) or 1)
+    fai = (faithful / (len(bullets) or 1)) if cited else 0.0
+    cov = len(qk & set(re.findall(r"\w+", answer.lower()))) / max(len(qk), 1)
+    return {"citation_rate": cit, "faithfulness_rate": fai, "coverage": cov,
+            "confidence": round((cit + fai + cov) / 3, 3)}
+
+# Nodes 6/7 — Grade. Hallucination = programmatic; relevance = LLM judge + canonical short-circuit (§3.3)
+def grade_hallucination(answer, hits, query):
+    sr = selfrag_checks(answer, hits, query)
+    return {"pass": sr["faithfulness_rate"] >= 0.5 and sr["citation_rate"] >= 0.5, "selfrag": sr}
+GRADE_RELEVANCE_PROMPT = ("Does the ANSWER actually answer the QUESTION with specific information, "
+                          "or decline / say it's insufficient? Reply ONE word: YES or NO.\n\n"
+                          "Question: {q}\nAnswer: {a}\nVerdict:")
+def grade_relevance(answer, query):
+    if "i don't know" in answer.lower():                              # canonical abstention → no LLM
+        return {"pass": False, "verdict": "abstain"}
+    v = (omlx.chat.completions.create(model=MODEL, temperature=0.0, max_tokens=5,
+        messages=[{"role": "user", "content": GRADE_RELEVANCE_PROMPT.format(q=query, a=answer)}]
+        ).choices[0].message.content or "").strip().lower()
+    return {"pass": v.startswith("y"), "verdict": v[:12]}
+
+# Node 8 — CorrectiveRAG (rewrite + retry, bounded by max_rewrite=2 → terminates by construction)
+def rewrite_query(query):
+    return (omlx.chat.completions.create(model=MODEL, temperature=0.3, max_tokens=80,
+        messages=[{"role": "user", "content": REWRITE_PROMPT.format(q=query)}]
+        ).choices[0].message.content or query).strip().split("\n")[0]
+def corrective_loop(query, top_k=6, max_iters=THRESHOLDS.max_rewrite):   # max_rewrite = 2
+    q, out = query, {}
+    for i in range(max_iters):                          # counted for-loop: cannot run away
+        q = rewrite_query(q) if i > 0 else q            # i=0 reuses query; rewrite fires at i>=1
+        rr = rerank(q, multi_retrieve(q), top_k); sy = synthesize(q, rr)
+        out = {"answer": sy["answer"], "selfrag": selfrag_checks(sy["answer"], rr, q),
+               "grade_relevance": grade_relevance(sy["answer"], q), "rewritten_query": q, "iteration": i}
+        if out["grade_relevance"]["pass"] and out["selfrag"]["confidence"] >= THRESHOLDS.selfrag_conf:
+            break
+    return out
+
+# Web fallback — Tavily SDK (if key) → DuckDuckGo (free); executed inline. Mirrors crag_variant.py.
+def web_search(query, k=4):
+    if os.getenv("TAVILY_API_KEY"):
+        from tavily import TavilyClient
+        r = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
+        return [d["content"] for d in r.get("results", []) if d.get("content")]
+    from ddgs import DDGS
+    with DDGS() as d: return [x["body"] for x in d.text(query, max_results=k) if x.get("body")]
+
+# Orchestrator — single pass → grade → corrective loop → EXECUTE web fallback
+def answer(query, top_k=6):
+    if os.getenv("ENABLE_DECOMPOSITION") == "1" and decide_complexity(query)["label"] == "Complex":
+        from decompose import decompose_query            # Phase 7: plan sub-queries (optional)
+    rr = rerank(query, multi_retrieve(query), top_k); sy = synthesize(query, rr)
     gr = grade_relevance(sy["answer"], query)
-
-    out = {"query": query, "decision": decision, "sub_queries": sub_queries,
-           "hits": rr, "answer": sy["answer"], "selfrag": sr,
-           "grade_hallucination": gh, "grade_relevance": gr,
+    out = {"query": query, "answer": sy["answer"], "hits": rr, "source": "corpus",
+           "selfrag": selfrag_checks(sy["answer"], rr, query), "grade_relevance": gr,
+           "grade_hallucination": grade_hallucination(sy["answer"], rr, query),
            "drift_filtered": sy["drift_filtered"]}
-
-    if not gr["pass"]:                      # CRAG: rewrite + retry
-        crag = corrective_loop(query, top_k=top_k)
-        out["corrective"] = crag
-        if not crag["grade_relevance"]["pass"]:               # STILL bad → execute web search inline
-            web_docs = web_search(query)                       # real Tavily/DDG call (run in-process)
-            wsy = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
-                                     for i, d in enumerate(web_docs)])   # ground web docs too
-            out["answer"], out["source"] = wsy["answer"], "web"
-            out["next_action"] = {"type": "web_search", "executed": True}
+    if not gr["pass"]:                                   # corpus retrieval looked off-topic
+        out["corrective"] = corrective_loop(query, top_k)
+        if not out["corrective"]["grade_relevance"]["pass"]:        # rewrite ALSO failed → web
+            web_docs = web_search(query)                            # real Tavily/DDG call, executed
+            out["answer"] = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
+                                               for i, d in enumerate(web_docs)])["answer"]
+            out["source"], out["next_action"] = "web", {"type": "web_search", "executed": True}
     return out
 ```
+*(The real file adds an `out["steps"]` execution trace appended per stage — rendered by `_fmt_steps` in the `--out-of-corpus` runner — elided here for length; see §3.3's result for the trace.)*
 
 **Walkthrough:**
 
@@ -1393,19 +1493,16 @@ def answer(query: str, top_k: int = 6) -> dict[str, Any]:
 - **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
 - **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** (`web_search()`: Tavily SDK → DuckDuckGo) and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
 
-**Result (estimated, lab not yet end-to-end run on a calibrated eval):**
+**Result (measured — out-of-corpus run, 10 questions; full numbers in `RESULTS.md`):**
 
-| Stage | Wall time |
+| arm / stage | measured |
 |---|---|
-| `decide_complexity` (no LLM) | <0.01 s |
-| `multi_retrieve` (2 × Qdrant queries) | ~0.3 s |
-| `rerank` (BGE-reranker batch) | ~0.5 s |
-| `synthesize` (1 LLM call) | ~3-6 s |
-| `selfrag_checks` + grades (no LLM) | <0.01 s |
-| **Total per query (no CRAG loop fire)** | **~4-7 s** |
-| CRAG loop (1 rewrite + 1 retry) | adds ~5-10 s |
+| **out-of-corpus (10 q)** | **corrective 10/10 · web executed 10/10 · answered 10/10**; ~1m35s total ≈ **~9.5 s/q** for the full corpus→corrective→web path |
+| per-query, corpus answers (no CRAG fire) | ~4-7 s (dominated by the one `synthesize` LLM call) |
+| + CRAG loop fires (1 rewrite + re-synth) | +~5-10 s |
+| + web fallback (search + re-synthesize) | +~2-4 s (Tavily/DDG call + 1 LLM call) |
 
-First measured run will populate `lab-03.7-agentic-rag/results/RESULTS.md`. Comparison vs LangGraph canonical (Phase 1-4) becomes the chapter's central artifact.
+Per-stage: `decide_complexity` / `selfrag` / grades are <0.01 s (no LLM); `multi_retrieve` + `rerank` ~0.8 s. The cost is the **LLM calls** (`synthesize`, `grade_relevance`, `rewrite_query`). The 3-arm *quality* comparison vs the LangGraph CRAG is §3.2-§3.3 + `lab-03.7-agentic-rag/RESULTS.md`.
 
 `★ Insight ─────────────────────────────────────`
 - **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
@@ -1481,9 +1578,11 @@ def topo_sort(plan: list[dict]) -> list[dict]:
     while ready:
         cur = ready.pop(0); out.append(cur); seen.add(cur["id"])
         for n in plan:
-            if n["id"] in seen: continue
+            if n["id"] in seen or n in ready: continue          # guard against double-enqueue
             if all(d in seen for d in n.get("depends_on", [])):
                 ready.append(n)
+    for n in plan:                                              # residual cycles: append in order
+        if n["id"] not in seen: out.append(n)
     return out
 ```
 
