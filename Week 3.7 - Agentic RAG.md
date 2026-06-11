@@ -1230,7 +1230,7 @@ def answer(query, top_k=6):
 - **Nodes 6/7 `grade_*`** decide whether the answer is good enough or the corrective loop must fire (`answer()` checks `if not gr["pass"]`). `grade_hallucination` is programmatic (faithfulness ≥ 0.5 *and* citation ≥ 0.5). `grade_relevance` went through **three versions** (the arc below): keyword overlap (fooled by question-echoing abstentions → loop unreachable), then an LLM YES/NO judge (noisy on Gemma), and finally a **deterministic short-circuit on the canonical `"I don't know"`** plus an LLM fallback for genuine partial answers. The code shown is that final version.
 - **Node 8 `corrective_loop` terminates by construction.** It's a counted `for i in range(max_iters)` (`max_rewrite=2`): the `break` is an early exit when the answer is already good, but even if the grade *never* passes, `range(2)` exhausts and the loop returns its best attempt. Termination is guaranteed by the loop's *shape*, not by any success condition - you can prove it halts by reading one line. Contrast §3.2: the LangGraph structural rewrite is a graph *cycle* with no built-in counter, so on a never-passing grade it runs until the runtime's `recursion_limit` aborts it with `GraphRecursionError`. Same idea; the `for` **bounds itself and fails safe** (returns a result), the cycle **borrows a runtime guard and fails loud** (raises). (Both are finite - a `for range(N)` is never *unbounded* even for huge `N` - so "runaway" here means "loops until an external limit crashes it," not "loops forever.")
 - **`answer()` is the CRAG decision in plain Python:** one forward pass; if relevance fails, run the corrective loop; if that *still* fails, **search the web and synthesize from the results**. That escalation - corpus → rewrite → web - is exactly what `crag_variant.py` does as a LangGraph graph. (This started as a *suggestion* - `next_action=web_search` for the host to act on; one `web_search()` call in the fallback now *executes* it inline, so the pipeline answers out-of-corpus 10/10 like CRAG - see the result below.)
-- **The web fallback *fans out* on Complex queries (`web_search_planned`).** A single "compare X and Y" web search is doomed - no one page holds both figures - so a Complex-labelled query is **decomposed** (the Phase 7 planner) into atomic sub-queries, each web-searched independently, the results **round-robin interleaved** and unioned, then synthesized against the original query. This is `execute_plan()`'s corpus fan-out applied on the *web* surface (out-of-corpus answers live on the web, not in Qdrant). Simple queries stay single-shot - no planner cost. Note this fan-out is **automatic** (gated only by `decide_complexity`), unlike the *corpus* decomposition which stays behind `ENABLE_DECOMPOSITION=1`. The "compare BNSF vs Berkshire Energy 2023 revenue" case that motivated it - and why the web *backend* matters as much as the fan-out - is the [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|web-fallback decomposition debug log]].
+- **The web fallback *fans out* on Complex queries (`web_search_planned`).** A single "compare X and Y" web search is doomed - no one page holds both figures - so a Complex-labelled query is **decomposed** (the Phase 7 planner) into atomic sub-queries, each web-searched independently, the results **round-robin interleaved** and unioned, then synthesized against the original query. This is `execute_plan()`'s corpus fan-out applied on the *web* surface (out-of-corpus answers live on the web, not in Qdrant). Simple queries stay single-shot - no planner cost. Note this fan-out is **automatic** (gated only by `decide_complexity`), unlike the *corpus* decomposition which stays behind `ENABLE_DECOMPOSITION=1`. The "compare BNSF vs Berkshire Energy 2023 revenue" case that motivated it - and why the web *backend* matters as much as the fan-out - is the full debug log in §3.3.1 below.
 
 > [!tip] Hand-rolled vs LangGraph CRAG — when to reach for each
 > Same corrective-RAG idea, two engineering trade-offs:
@@ -1285,7 +1285,7 @@ Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because
 | DuckDuckGo, fan-out | `$23.876B` ✓ | `I don't know` | worse (DDG dropped BHE) |
 | **SearXNG, fan-out (k=8)** | **`$23.876B` ✓** | **`US$26.198B` ✓** | **both grounded + cited** |
 
-*Numbers from `baseline_handrolled.py` probes, 2026-06-11 — a representative SearXNG run.* Tavily and DuckDuckGo **both** rank a *paywalled* Statista snippet (`**** billion`) above the free Wikipedia figure for BHE - so swapping between them can't fix it (they share ranking signals). A **SearXNG** metasearch aggregates Google + Startpage and *reranks*, floating Wikipedia into the top results, so both figures ground. That asymmetry - same query, opposite outcome on a metasearch vs. a single engine - is the teaching point: **two retrievers that share a backend aren't an independent confirmation of "unreachable."** ⚠️ **Live web ranking is non-deterministic** - repeat runs reorder results, so a given call may surface a weaker source (e.g. a `$23.35B` 2024-corporate figure instead of the `$23.876B` 2023 number, or a wrong BHE sub-segment). SearXNG makes the authoritative free source *reachable in the top-k*, not *guaranteed first* - which is exactly why the pipeline grounds what the passages contain and abstains rather than fabricates when they're thin. Full diagnosis (including a *wrong* conclusion of mine that SearXNG corrected): [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|the web-fallback decomposition debug log]].
+*Numbers from `baseline_handrolled.py` probes, 2026-06-11 — a representative SearXNG run.* Tavily and DuckDuckGo **both** rank a *paywalled* Statista snippet (`**** billion`) above the free Wikipedia figure for BHE - so swapping between them can't fix it (they share ranking signals). A **SearXNG** metasearch aggregates Google + Startpage and *reranks*, floating Wikipedia into the top results, so both figures ground. That asymmetry - same query, opposite outcome on a metasearch vs. a single engine - is the teaching point: **two retrievers that share a backend aren't an independent confirmation of "unreachable."** ⚠️ **Live web ranking is non-deterministic** - repeat runs reorder results, so a given call may surface a weaker source (e.g. a `$23.35B` 2024-corporate figure instead of the `$23.876B` 2023 number, or a wrong BHE sub-segment). SearXNG makes the authoritative free source *reachable in the top-k*, not *guaranteed first* - which is exactly why the pipeline grounds what the passages contain and abstains rather than fabricates when they're thin. Full diagnosis (including a *wrong* conclusion of mine that SearXNG corrected): §3.3.1 below.
 
 > [!abstract] Phase 3 — lessons learnt
 > 1. **CRAG = retrieve → *score the retrieval* → route (corpus / web / both).** A *scored evaluator*, not a yes/no grader, is what lets it escalate **out of** the corpus — where the rewrite loop could only re-ask the same empty corpus.
@@ -1294,7 +1294,119 @@ Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because
 > 4. **Bound loops by construction.** The hand-rolled `for range(2)` terminates and returns its best attempt; the LangGraph cycle needed an external `recursion_limit` and crashed on out-of-corpus (§3.2). Same algorithm, safer shape.
 > 5. **Suggestion vs execution is a one-function switch.** The hand-rolled pipeline first *emitted* `next_action=web_search` (host-mediated — testable, auditable), then *executed* `web_search()` inline (autonomous — answers 10/10 from real web evidence); the change was a single function call, not an architecture rewrite. `crag_variant.py` executes by construction. Neither posture is strictly better — pick per how much control vs autonomy you want — but switching is cheap.
 > 6. **Verify branches by running the trigger.** "Is the rewrite fired?" / "why 10/10 answered?" — three predicted behaviours this lab got wrong were only caught by logging the actual path (rewrite never fired in v1; single-pass *abstained* not hallucinated; CRAG count was Tavily-vs-DDG). A conditional branch's real behaviour is unknown until you feed it the case it's meant to catch.
-> 7. **Fan out multi-hop questions, and the *backend* is part of the retriever.** A "compare X and Y" web search is doomed single-shot; decompose → search each atomic sub-query → interleave → synthesize, and both figures ground. But two engines (Tavily, DDG) failing the *same* way isn't a hard ceiling - they share ranking signals - a **metasearch (SearXNG)** that reranks across engines surfaced the free figure both buried. Decomposition belongs on whichever surface holds the answer (corpus *or* web); retrieval quality is the *combination* of query shape **and** backend ranking. (Full arc + a corrected wrong conclusion: [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|debug log]].)
+> 7. **Fan out multi-hop questions, and the *backend* is part of the retriever.** A "compare X and Y" web search is doomed single-shot; decompose → search each atomic sub-query → interleave → synthesize, and both figures ground. But two engines (Tavily, DDG) failing the *same* way isn't a hard ceiling - they share ranking signals - a **metasearch (SearXNG)** that reranks across engines surfaced the free figure both buried. Decomposition belongs on whichever surface holds the answer (corpus *or* web); retrieval quality is the *combination* of query shape **and** backend ranking. (Full arc + a corrected wrong conclusion: §3.3.1 below.)
+
+### 3.3.1 — Web-fallback decomposition: full debug log (2026-06-11)
+
+> The full arc behind §3.3's fan-out + SearXNG result. It started as *"why didn't my RAG do a web search?"* and ended with three real fixes — query fan-out, result interleaving, and a metasearch backend — plus one corrected wrong conclusion of my own. Every number traces to a runnable probe, not prose.
+
+#### The symptom
+
+Testing the live MCP server in Claude Desktop:
+
+```
+Use agentic-rag to answer: Compare BNSF Railway and Berkshire Energy 2023 revenue.
+```
+
+`rag_query` returned `"I don't know"`. Claude then answered from its **own training memory** (`BNSF ≈ $23.9B`, `BHE ≈ $26.0B`) and *offered* to search the web — making it look like the RAG had skipped web search entirely.
+
+#### Layered diagnosis — three questions, three different fixes
+
+The single symptom ("I don't know") hid three independent layers. Running probes separated them; stopping at layer 1 would have debugged the wrong thing.
+
+| Layer | Question | Probe finding |
+|-------|----------|---------------|
+| 1 | Did the web fallback **run**? | **Yes** — `source: web`, `next_action.executed: True`, `web_error: None` |
+| 2 | Did web **return docs**? | **Yes** — 4 docs (Tavily) |
+| 3 | Did those docs **contain the answer**? | **No** — for the *comparison* phrasing, no single passage held both figures |
+
+And a fourth, separate finding about the **host**, not the pipeline:
+
+> The numbers Claude showed (`$26.0B`) did **not** come from the tool. The tool returned `"I don't know"`. The host model **overrode the abstaining tool with parametric memory** — and flagged it itself ("working from memory rather than the document"). This is exactly the judgment-atrophy failure mode: a confident answer that *looks* grounded but isn't.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  S["symptom: 'I don't know'<br/>+ host gives $26.0B from memory"] --> L1{"web ran?"}
+  L1 -->|"yes (source=web)"| L2{"web returned docs?"}
+  L2 -->|"yes (4 docs)"| L3{"docs contain<br/>BOTH figures?"}
+  L3 -->|"no — single-shot<br/>comparison search"| ABS["synthesize() correctly<br/>abstains (no fabrication)"]
+  S -.->|"separate issue"| HOST["host bypassed tool,<br/>answered from memory"]
+  classDef bad fill:#fde,stroke:#c44; classDef ok fill:#dfd,stroke:#4a4
+  class ABS ok; class HOST bad
+```
+
+#### Probe evidence — single-shot vs atomic
+
+The comparison query failed, but its **atomic** sub-queries each grounded cleanly (Tavily):
+
+```
+Q: "BNSF Railway 2023 annual revenue"
+   source=web → "$23.876 billion, an 8% decrease from 2022 [#1]"   ✓
+Q: "Berkshire Hathaway Energy 2023 annual revenue"
+   source=web → web ran, but top doc is a paywalled Statista snippet ("**** billion")   ✗
+Q: "Compare BNSF Railway and Berkshire Energy 2023 revenue"
+   source=web → "I don't know"   ✗ (no single passage holds both)
+```
+
+**Conclusion:** the bottleneck is *query shape* and *passage content*, not connectivity. A "compare X and Y" question is a doomed single web search; two atomic lookups are not.
+
+#### Fix 1 — observability (`mcp_server.py`)
+
+`rag_query` didn't return `source`, so the host couldn't tell web had already run and re-offered it. Added `source` + `web_docs_found` to the tool's return — the orchestrating model now reasons from the actual path, not a guess.
+
+#### Fix 2 — fan out the web fallback (`web_search_planned`)
+
+The corpus path already decomposed (gated behind `ENABLE_DECOMPOSITION=1` via `execute_plan`), but the **web fallback searched the original `query` as one shot**. The fix: when `decide_complexity` labels a query Complex, decompose into atomic sub-queries and web-search each `lookup` independently, then union the passages — the same idea as the corpus fan-out, applied on the *web* surface because out-of-corpus answers live on the web.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q["Complex query"] --> D["decompose_query<br/>(Phase 7 planner)"]
+  D --> A1["web_search<br/>('BNSF 2023 revenue')"]
+  D --> A2["web_search<br/>('BHE 2023 revenue')"]
+  A1 --> M["interleave + dedup<br/>→ union"]
+  A2 --> M
+  M --> SY["synthesize(original query)<br/>→ both figures, [#N]-cited"]
+```
+
+Result: BNSF went from **total abstain → `$23.876 billion [#1]`**, cited. The architecture was correct; the second entity was still weak — which surfaced the next bug.
+
+#### Fix 3 — interleave the fan-out results (fairness)
+
+Appending *all* of sub-query-1's docs, then *all* of sub-query-2's, biases every comparison: `synthesize()` caps passages at 8000 chars, so the **second entity gets truncated out**. Fix: **round-robin interleave** (`q1d1, q2d1, q1d2, q2d2, …`) so both entities sit near the top. Measured effect: BHE's best doc moved from `[#7]` → `[#2]` across the two runs. A real bug I'd *introduced* by doubling the doc count — not a tuning knob.
+
+#### The wrong conclusion (and its correction)
+
+After Tavily and DuckDuckGo *both* failed to ground BHE, I concluded:
+
+> *"The bottleneck is the source, not the engine — engine swap ruled out."*
+
+**This was wrong, and SearXNG proved it.** BHE's figure was on a free page the whole time — **Wikipedia, `US$26.198 billion`, plain text**. Tavily and DDG both ranked Statista's *paywalled* snippet above Wikipedia, so I never saw it and wrongly inferred a hard ceiling. Two retrievers that **share ranking signals** failing the same way is *not* independent confirmation of "unreachable" — it's one bias sampled twice.
+
+#### Fix 4 — SearXNG metasearch backend
+
+A local [SearXNG](https://github.com/searxng/searxng) instance aggregates Google + Startpage and **reranks**, floating Wikipedia above the paywall snippet. Wired in as the top of the `web_search` precedence chain (free, no key): `SEARXNG_URL → TAVILY_API_KEY → DuckDuckGo`. With it, the comparison query grounds **both** figures, both cited (`BNSF $23.876B [#5]` + `BHE US$26.198B [#4]`). `k` sensitivity: the authoritative free source ranks ~3rd–4th, so per-sub-query depth `WEB_FANOUT_K` defaults to **8** (at 6 the synthesizer settled for an imprecise `$25.6B`).
+
+#### Outcome
+
+The measured before→after across all three backends is the **§3.3 table above** (single-shot abstains → Tavily/DDG fan-out half-grounds with BHE paywalled → SearXNG fan-out grounds both). Its non-determinism caveat applies: a representative run, live ranking reorders, SearXNG makes the free source *reachable in the top-k* not *guaranteed first*. Single-entity regression check (`"Who is the CEO of OpenAI as of 2026?"`) correctly stayed `single` (Simple → no decompose) → `"Sam Altman [#1,#2,#4,#5,#7]"` — no regression. *Numbers from `src/baseline_handrolled.py` probes, 2026-06-11, against a live SearXNG on `:8080`.*
+
+#### Transferable lessons
+
+1. **One symptom, many layers.** "I don't know" meant *ran? returned docs? contained the answer?* — three independent fixes. Separate them with probes before touching code.
+2. **Tool results must expose the path taken.** A missing `source` field made the host re-offer a step already done. Return *what ran*, not just the final string.
+3. **Honest partial > confident hallucination.** The tool abstained on a figure it couldn't ground; the *host* fabricated it from memory. The tool was right. Grounding that refuses to fabricate is the property you want — verify the host doesn't undo it.
+4. **Decomposition belongs on whichever surface holds the answer** — corpus *or* web. Fan out the retriever that can actually reach the fact.
+5. **Two engines failing the same way ≠ a hard ceiling** if they share a backend. A metasearch that aggregates + reranks is an independent third sample. (My wrong "engine swap ruled out" was caught only by *running* the third engine, not by reasoning.)
+6. **Watch for bugs you introduce while fixing one.** Doubling docs under a fixed passage cap silently truncated entity #2 — interleaving restored fairness.
+
+#### Files changed
+
+- `src/baseline_handrolled.py` — `_searxng_search`, 3-tier `web_search`, `web_search_planned` (decompose + interleave), rewired `answer()` web fallback, `WEB_FANOUT_K` (default 8).
+- `src/mcp_server.py` — `rag_query` returns `source` + `web_docs_found`.
+- `searxng/` — `docker-compose.yml`, `settings.yml`, `README.md` (free local backend).
+- `.env.example`, `mcp-config.json` — `SEARXNG_URL` documented in the precedence chain.
 
 ---
 
@@ -1586,7 +1698,7 @@ Per-stage: `decide_complexity` / `selfrag` / grades are <0.01 s (no LLM); `multi
 - **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
 - **`shared/tree_index.split_large_nodes` and this lab's `decompose.py` solve different problems but pair well.** Tree-split fragments a long document into navigable units (build-time); decompose fragments a complex query into atomic sub-queries (query-time). Together: the agent sees a fine-grained tree AND can plan multi-step queries against it.
 - **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search`: `SEARXNG_URL` → Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
-- **The backend is part of the retriever, not a detail.** The same fan-out grounds a comparison query on SearXNG but half-abstains on Tavily/DuckDuckGo — because those two rank a paywalled snippet above the free figure (§3.3 table). When you wire a web fallback, the *engine's ranking* is a first-class quality lever; a free metasearch that reranks across engines can beat a managed API on free-source recall. Full arc: [[Week 3.7 - Agentic RAG - Web-Fallback Decomposition Debug Log|debug log]].
+- **The backend is part of the retriever, not a detail.** The same fan-out grounds a comparison query on SearXNG but half-abstains on Tavily/DuckDuckGo — because those two rank a paywalled snippet above the free figure (§3.3 table). When you wire a web fallback, the *engine's ranking* is a first-class quality lever; a free metasearch that reranks across engines can beat a managed API on free-source recall. Full arc: §3.3.1.
 `─────────────────────────────────────────────────`
 
 Run smoke test (loads encoder + reranker + Qdrant; first run ~5-15 s warmup):
