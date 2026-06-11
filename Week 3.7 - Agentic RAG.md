@@ -888,7 +888,22 @@ The graph lives in `src/crag_variant.py` (importable, exports `crag_app`); the �
 """CRAG (Corrective RAG) over the local corpus + web fallback. Exports `crag_app`."""
 import os, re, sys
 from typing import Literal, Required, TypedDict
-# ... oMLX _llm(), and retrieve_passages() reusing rag_hybrid (BGE-M3 + reranker over Qdrant) ...
+from langchain_openai import ChatOpenAI
+from qdrant_client import QdrantClient
+from rag_hybrid import BGE_M3, BGE_RERANKER_V2_M3, CrossEncoderReranker, DenseEncoder, autoconfig
+
+def _llm(**kw):                                          # oMLX, OpenAI-compatible
+    return ChatOpenAI(base_url=os.getenv("OMLX_BASE_URL", "http://localhost:8000/v1"),
+                      api_key=os.getenv("OMLX_API_KEY", "not-needed"),
+                      model=os.getenv("MODEL_SONNET"), temperature=0, **kw)
+
+_qdrant = QdrantClient(url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"), timeout=60)
+_encoder = DenseEncoder(autoconfig.encoder_config_for(BGE_M3))           # BGE-M3, reused
+_reranker = CrossEncoderReranker(autoconfig.recommend(BGE_M3, BGE_RERANKER_V2_M3).reranker)
+def retrieve_passages(query, k=6, pool=30):                              # dense → rerank → top-k
+    qv = _encoder.encode([query])[0]
+    pts = _qdrant.query_points("bge_m3_hnsw", query=qv.tolist(), limit=pool, with_payload=True).points
+    return [text for _id, text, _score in _reranker.rerank(query, pts, top_k=k)]
 
 CONF_UPPER = float(os.getenv("CRAG_UPPER", "0.7"))   # ≥ this → corpus is enough
 CONF_LOWER = float(os.getenv("CRAG_LOWER", "0.3"))   # ≤ this → corpus failed → web
@@ -974,10 +989,22 @@ from week3_pipeline import run_single_pass        # corpus-only
 from structural_rag import app as structural_app  # corpus-only, always retrieves
 from crag_variant import crag_app                 # corpus + web fallback
 
-OUT_OF_CORPUS = ["What is the most capable Claude model Anthropic released in 2026?",
-                 "Which team won the 2025 NBA Finals?", ...]   # 10 post-cutoff questions
+OUT_OF_CORPUS = [
+    "What is the most capable Claude model Anthropic released in 2026?",
+    "Which team won the 2025 NBA Finals?",
+    "What is the official release date of GPT-5?",
+    "Who won the 2025 Nobel Prize in Physics?",
+    "What AI regulation did the European Union pass in 2025?",
+    "What is the newest Apple silicon chip announced in 2025?",
+    "What is the latest stable version of Python released in 2026?",
+    "Who is the CEO of OpenAI as of 2026?",
+    "What was the headline feature of the iPhone announced in 2025?",
+    "Which country hosted the 2025 G20 summit?"]
 
-_ABSTAIN = ("don't know", "not in the", "no relevant", "cannot find", "no information", ...)
+_ABSTAIN = ("don't know", "do not know", "not in the", "no relevant", "cannot find", "unable to",
+            "does not contain", "do not contain", "not contain information", "no information",
+            "insufficient", "i'm not sure", "not provided", "do not have", "does not provide",
+            "do not mention", "no mention", "rewrite loop", "recursion limit")
 def answered(text):                               # did the arm actually answer, or punt?
     return not any(p in (text or "").lower() for p in _ABSTAIN)
 
@@ -1045,8 +1072,11 @@ flowchart TD
 # Shared stopword sets — small for overlap SCORING (faithfulness/coverage/drift), large for keyword
 # RETRIEVAL queries. _KEYWORD_STOPWORDS is a superset, so the shared core lives in one place.
 _STOPWORDS = frozenset({"the", "a", "an", "of", "to", "in"})
-_KEYWORD_STOPWORDS = _STOPWORDS | {"and", "or", "is", "what", "who", "how", "with", "for",
-                                   "this", "be", "have", "i", "you", "it", "they", ...}   # ~40 words
+_KEYWORD_STOPWORDS = _STOPWORDS | {
+    "and", "or", "is", "are", "was", "were", "what", "who", "where", "when", "why", "how",
+    "did", "do", "does", "with", "for", "on", "at", "by", "this", "that", "those", "these",
+    "be", "been", "have", "has", "had", "i", "you", "he", "she", "it", "we", "they",
+    "my", "your", "their"}
 
 # Node 1: ComplexityDecider — heuristic, routes to optional decomposition (Phase 7)
 def decide_complexity(query):
@@ -1357,9 +1387,13 @@ import os, re
 # Stopword sets: small for overlap SCORING (faithfulness/coverage/drift), large (superset) for
 # keyword RETRIEVAL queries. One shared core: _KEYWORD_STOPWORDS = _STOPWORDS | {...}
 _STOPWORDS = frozenset({"the", "a", "an", "of", "to", "in"})
-_KEYWORD_STOPWORDS = _STOPWORDS | {"and", "or", "is", "what", "who", "how", "with", "for",
-                                   "this", "be", "have", "i", "you", "it", "they", ...}   # ~40
-_COMPLEX_CUES = ["compare", "vs", "versus", "difference", "and", "explain why", "step by step", ...]
+_KEYWORD_STOPWORDS = _STOPWORDS | {
+    "and", "or", "is", "are", "was", "were", "what", "who", "where", "when", "why", "how",
+    "did", "do", "does", "with", "for", "on", "at", "by", "this", "that", "those", "these",
+    "be", "been", "have", "has", "had", "i", "you", "he", "she", "it", "we", "they",
+    "my", "your", "their"}
+_COMPLEX_CUES = ["compare", "vs", "versus", "difference", "differences", "and", "explain why",
+                 "how do", "trade-off", "trade off", "step by step", "all", "list every", "each"]
 
 # Node 1 — ComplexityDecider (heuristic; gates optional Phase-7 decomposition). No LLM call.
 def decide_complexity(query):
@@ -1561,14 +1595,22 @@ JSON output:"""
 def decompose_query(query: str) -> list[dict]:
     """LLM-driven JSON sub-query planner. Falls back to [{single query}]
     on any error so callers can always proceed."""
-    resp = omlx.chat.completions.create(
-        model=MODEL, temperature=0.2, max_tokens=512,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user",
-                   "content": DECOMPOSE_PROMPT.format(query=query)}],
-    )
-    parsed = json.loads(resp.choices[0].message.content or "{}")
-    return [...]  # validated cleaning per id/text/depends_on/type
+    _single = [{"id": "q1", "text": query, "depends_on": [], "type": "lookup"}]
+    try:
+        resp = omlx.chat.completions.create(
+            model=MODEL, temperature=0.2, max_tokens=512,
+            response_format={"type": "json_object"},                  # force strict JSON
+            messages=[{"role": "user", "content": DECOMPOSE_PROMPT.format(query=query)}])
+        items = json.loads(resp.choices[0].message.content or "{}").get("sub_queries", [])
+        cleaned = [{"id": str(it.get("id", f"q{i}")),
+                    "text": str(it.get("text", "")).strip() or query,
+                    "depends_on": list(it.get("depends_on", []) or []),
+                    "type": str(it.get("type", "lookup")).lower()}
+                   for i, it in enumerate(items, start=1)]
+        return cleaned or _single
+    except Exception as e:                                            # any LLM/JSON error → single query
+        print(f"[decompose] fallback — {type(e).__name__}: {e}", file=sys.stderr)
+        return _single
 
 def topo_sort(plan: list[dict]) -> list[dict]:
     """Topological order: lookups first, synthesis after their dependencies."""
