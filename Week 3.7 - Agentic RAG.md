@@ -177,15 +177,64 @@ source ~/code/agent-prep/.venv/bin/activate
 uv pip install -U langchain langgraph langchain-openai langchain-community langchain-qdrant
 ```
 
-### 1.3 Clone the official example notebook
+### 1.3 Get the notebook, prepare `.env`, and register the kernel
+
+**Get the notebook** - two routes, same destination (`langgraph_agentic_rag.ipynb`):
 
 ```bash
-# Get just the one notebook + dependencies, not the whole langgraph repo
+cd ~/code/agent-prep/lab-03.7-agentic-rag
+
+# (a) the canonical UPSTREAM notebook (OpenAI-wired) — you then apply the §1.4 edits yourself:
 curl -sL https://raw.githubusercontent.com/langchain-ai/langgraph/main/examples/rag/langgraph_agentic_rag.ipynb -o langgraph_agentic_rag.ipynb
 
-# OR skim GiovanniPasq's "for dummies" version if you want a smaller starting point:
-git clone https://github.com/GiovanniPasq/agentic-rag-for-dummies.git
+# (b) OR the ALREADY-ADAPTED version shipped in this curriculum's lab repo (local oMLX + Qdrant,
+#     no OpenAI) — lives at lab-03.7-agentic-rag/langgraph_agentic_rag.ipynb in github.com/shaneliuyx/agent-prep
 ```
+
+Use (a) if you want to see the OpenAI→local diff with your own eyes (that diff *is* §1.4); use (b) to run immediately.
+
+**Install deps into the lab's OWN `uv` venv.** Labs are per-directory `uv` projects (`agent-prep/CLAUDE.md`), so the notebook runs in the *lab's* `.venv`, **not** the Week-0 root venv:
+
+```bash
+cd ~/code/agent-prep/lab-03.7-agentic-rag
+uv sync                                                                  # this lab's deps
+uv pip install -U langchain langchain-core langchain-openai langgraph python-dotenv qdrant-client
+# Retrieval reuses shared/rag_hybrid (sentence-transformers + FlagEmbedding + BGE-M3),
+# already present in the lab venv. No chromadb / langchainhub / OpenAI needed.
+```
+
+**Prepare `.env` - REQUIRED.** The notebook reads oMLX + Qdrant settings from `.env`, and there is **no `.env` until you create one**. Skipping this is the #1 cause of a `401 Invalid API key` at the `agent` node (the key silently falls back to a placeholder oMLX rejects):
+
+```bash
+cp .env.example .env       # then set the values below
+```
+
+```bash
+# ~/code/agent-prep/lab-03.7-agentic-rag/.env   (GITIGNORED — never commit it)
+OMLX_BASE_URL=http://localhost:8000/v1
+OMLX_API_KEY=not-needed            # oMLX with auth OFF accepts any non-empty string;
+                                   # set your real key here ONLY if you enabled oMLX auth
+MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit   # any tool-calling-capable oMLX model id
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION=bge_m3_hnsw      # your Week-1 collection (BGE-M3, 1024-d dense)
+```
+
+> [!warning] `.env` hygiene - learned the hard way
+> Keep the key in `.env` only (it's gitignored). **Never hardcode it as a literal or `getenv` default** in the notebook or chapter - an earlier draft did, and the value had to be purged from public git history with `git filter-repo` and the oMLX key rotated. If oMLX auth is off, `not-needed` is fine; if on, the key is a real secret - env only.
+
+**Register the lab venv as a Jupyter kernel - REQUIRED.** Jupyter/VS Code must execute the notebook in the lab venv (which carries `rag_hybrid`'s ML deps); a generic kernel gives `ModuleNotFoundError: sentence_transformers` in the retriever cell:
+
+```bash
+uv run python -m ipykernel install --user \
+  --name lab-03-7-agentic-rag --display-name "Python (lab-03.7-agentic-rag)"
+```
+
+Then in Jupyter / VS Code, **select the "Python (lab-03.7-agentic-rag)" kernel** before running any cell.
+
+> [!tip] The two pre-flight checks that prevent the only two errors everyone hits
+> 1. **No `.env`** → `401 Invalid API key` at the `agent` node → create the `.env` above.
+> 2. **Wrong kernel** → `ModuleNotFoundError: sentence_transformers` in the retriever cell → select the lab kernel above.
+> Run the notebook's setup cell first; it should print `LLM -> http://localhost:8000/v1 ...` and `Qdrant -> http://127.0.0.1:6333 collection=bge_m3_hnsw`.
 
 ### 1.4 Adapt for local oMLX + your Week 1 Qdrant collection
 
@@ -280,72 +329,515 @@ For each, capture in `observations/run-canonical.md`:
 
 ## Phase 2 — Comparison Harness: Single-Pass vs Agentic (~2.5 hours)
 
-### 2.1 Wire the comparison
+**Goal:** run the **same dev-set questions** through two pipelines on the **same local corpus** and capture, per query, the numbers that decide whether the agentic loop is worth its cost: **answer quality** (RAGAS faithfulness + context_recall, scored in §2.5), **latency**, and **LLM call count**. The agentic loop is only justified where it buys quality the single pass can't - and it always costs more calls and wall-clock. This phase produces the raw artifact (`results/comparison_raw.json`); §2.5-§2.6 score and stratify it.
 
-Save as `src/02_comparison_harness.py`:
+> **What changed vs the first draft.** The original harness imported two placeholder modules (`week3_pipeline`, `canonical_agentic_rag`) that didn't exist, plus a digit-prefixed file (`01_canonical_agentic_rag.py`) that *can't* be imported (Python module names can't start with a digit) and whose graph was all commented out. Phase 2 now ships three real, importable modules.
+
+### 2.1 The three modules
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  DEV[(dev_set.jsonl<br/>question + short_answer)] --> H[02_comparison_harness.py]
+  H -->|per question| SP[week3_pipeline.run_single_pass<br/>retrieve to rerank to ONE synth]
+  H -->|per question| AG[canonical_agentic_rag.app.invoke<br/>agent to retrieve to grade to gen]
+  SP --> R[(results/comparison_raw.json<br/>answer · latency · llm_calls · contexts)]
+  AG --> R
+  SP -.->|reuses| RH[shared/rag_hybrid<br/>BGE-M3 + reranker over bge_m3_hnsw]
+  AG -.->|reuses| RH
+  R --> RAGAS[RAGAS scoring §2.5<br/>faithfulness · context_recall]
+```
+*Both pipelines hit the SAME local retrieval (rag_hybrid over `bge_m3_hnsw`) and the SAME oMLX model - so the only variable is the control flow (one pass vs agentic loop). The harness times each and counts LLM turns; RAGAS scores the answers afterward.*
+
+| file | role | when it runs |
+|------|------|--------------|
+| `src/week3_pipeline.py` | single-pass baseline - `run_single_pass(q) -> (answer, contexts)` | the control arm |
+| `src/canonical_agentic_rag.py` | Phase-1 agentic graph as an **importable** module exporting `app` | the treatment arm |
+| `src/02_comparison_harness.py` | driver - runs both over the dev set, writes raw results | the experiment |
+
+**When to use which:** `week3_pipeline` is the cheap baseline you ship by default; `canonical_agentic_rag` is what you reach for when the corpus or query mix needs the retrieve→grade→rewrite loop; `02_comparison_harness` is how you *prove* which one a given workload actually needs, instead of assuming.
+
+### 2.2 The single-pass baseline (`week3_pipeline.py`)
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[question] --> MR[multi_retrieve<br/>original + keyword-only RRF]
+  MR --> RR[rerank top_k=6<br/>BGE-reranker]
+  RR --> SY[synthesize<br/>ONE oMLX call]
+  SY --> A[answer + contexts]
+```
+*`week3_pipeline` flow - one retrieval, one synthesis, no grading/rewrite loop. It reuses the lab's tested `multi_retrieve / rerank / synthesize` from `baseline_handrolled.py`, so the baseline shares the exact retrieval stack with the agentic arm.*
+
+**Code (`src/week3_pipeline.py`):**
 
 ```python
-"""Run the Week 3 single-pass pipeline AND the Week 3.7 Agentic pipeline on the same dev set.
-Capture per-query: faithfulness, context_recall, latency, total LLM calls."""
-import json, time
-from pathlib import Path
+"""Week 3 SINGLE-PASS RAG baseline: retrieve -> rerank -> ONE synthesis call."""
+from __future__ import annotations
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # sibling modules
+from baseline_handrolled import multi_retrieve, rerank, synthesize
 
-# Import your Week 3 single-pass pipeline
-from week3_pipeline import run_single_pass  # adapt path
 
-# Import the canonical Agentic RAG graph from Phase 1
-from canonical_agentic_rag import app as agentic_app
-
-# Load Week 3 dev set
-dev = [json.loads(l) for l in open("data/dev_set.jsonl")]
-
-results = []
-for q in dev:
-    # Single-pass run
-    t0 = time.time()
-    sp_answer, sp_contexts = run_single_pass(q["question"])
-    sp_latency = time.time() - t0
-    sp_calls = 1  # single-pass = 1 LLM synthesis call (excluding grading)
-
-    # Agentic run
-    t0 = time.time()
-    ag_result = agentic_app.invoke({"messages": [("user", q["question"])]})
-    ag_latency = time.time() - t0
-    ag_answer = ag_result["messages"][-1].content
-    ag_calls = sum(1 for m in ag_result["messages"] if m.type == "ai")  # count AI message turns
-
-    results.append({
-        "qid": q["qid"], "question": q["question"], "ground_truth": q["short_answer"],
-        "single_pass": {"answer": sp_answer, "latency": sp_latency, "llm_calls": sp_calls, "contexts": sp_contexts},
-        "agentic": {"answer": ag_answer, "latency": ag_latency, "llm_calls": ag_calls},
-    })
-
-Path("results/comparison_raw.json").write_text(json.dumps(results, indent=2))
+def run_single_pass(question: str, top_k: int = 6) -> tuple[str, list[str]]:
+    hits = multi_retrieve(question)
+    reranked = rerank(question, hits, top_k=top_k)
+    out = synthesize(question, reranked)
+    contexts = [h.get("text", "") for h in reranked]
+    return out["answer"], contexts
 ```
 
-### Code walkthrough
+**Walkthrough:**
+- **It reuses the hand-rolled retrieval, not a fresh one.** Importing `multi_retrieve/rerank/synthesize` from `baseline_handrolled.py` guarantees the baseline and the agentic arm retrieve over the *same* `bge_m3_hnsw` collection with the *same* BGE-M3 encoder + reranker - so a quality gap between arms is a control-flow effect, not a retrieval-stack confound.
+- **One synthesis call, by definition.** No grading, no rewrite, no corrective loop - that is the "single pass". The harness records `llm_calls = 1` for this arm, the cost floor the agentic arm is measured against.
+- **Returns `contexts` for RAGAS.** `context_recall` needs the retrieved passages, so the function returns them alongside the answer.
+- **`sys.path` for sibling imports** is the same pattern `baseline_handrolled.py` itself uses - run it with the lab's `uv` venv.
 
-**Chunk 1 — Pipeline imports (lines 1-9):** The harness imports both pipelines as black boxes. Keep the Week 3 single-pass module unchanged — modifying it would invalidate the comparison.
+### 2.3 The agentic arm (`canonical_agentic_rag.py`)
 
-**Chunk 2 — Per-query timing + call-counting (lines 17-30):** The two metrics that matter for the comparison are **latency** (wall-clock cost) and **LLM call count** (compute cost). Single-pass has a fixed call count (1); agentic varies per query — that variance IS the data.
+This is the Phase-1 graph (§1.4) packaged as an importable module exporting `app` - oMLX `_llm()`, the `rag_hybrid` retriever `@tool`, and the `agent → retrieve → grade → {generate | rewrite}` loop - so the comparison runs *the same agent you built in Phase 1*. See §1.4 for the full node code; the only addition is module packaging:
 
-> **Why:** the agentic pipeline's promise is "I'll spend more compute on the queries that need it." If the call-count distribution doesn't match query difficulty, the pipeline isn't earning its complexity tax.
+```python
+# src/canonical_agentic_rag.py  (tail — graph identical to the Phase-1 notebook)
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent)
+workflow.add_node("retrieve", ToolNode(tools))
+workflow.add_node("rewrite", rewrite)
+workflow.add_node("generate", generate)
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges("agent", tools_condition, {"tools": "retrieve", END: END})
+workflow.add_conditional_edges("retrieve", grade_documents)
+workflow.add_edge("generate", END)
+workflow.add_edge("rewrite", "agent")
+app = workflow.compile()        # <- importable: `from canonical_agentic_rag import app`
+```
 
-**Common modifications:** add a `temperature` field to compare quality vs determinism trade-off; capture which `grade_documents` decisions were made for later qualitative review.
+> [!warning] Why this file exists separately from `01_canonical_agentic_rag.py`
+> `01_canonical_agentic_rag.py` is the chapter's illustrative stub - and **un-importable**: a module name can't start with a digit (`import 01_foo` is a SyntaxError), and its graph nodes were commented out. `canonical_agentic_rag.py` is the real, importable graph. Keep the numbered file for reading order; import the clean-named one.
 
-### 2.2 Score with RAGAS
+### 2.4 The harness (`02_comparison_harness.py`)
 
-Reuse the RAGAS harness from Week 3 (`src/02b_ragas_eval.py`). Run it twice — once with `single_pass.answer` + `single_pass.contexts`, once with `agentic.answer` + (the agentic pipeline's final retrieved contexts). Compare faithfulness, answer_relevancy, context_precision, context_recall.
+**Code (`src/02_comparison_harness.py`):**
 
-### 2.3 Stratify by query difficulty
+```python
+"""single-pass + BOTH agentic graphs (canonical skip-allowed + structural fix) on one dev set."""
+import argparse, json, os, sys, time
+from pathlib import Path
 
-The interesting comparison isn't "which pipeline wins on average" — it's "where does each one win?" Stratify the dev set into three buckets:
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # sibling modules
+from week3_pipeline import run_single_pass
+from canonical_agentic_rag import app as canonical_app    # agent DECIDES whether to retrieve
+from structural_rag import app as structural_app          # retrieval is STRUCTURAL (§2.5.1)
 
-- **Easy** — single-pass answer matches ground truth exactly
-- **Medium** — single-pass answer is partially correct
-- **Hard / ambiguous** — single-pass answer is wrong or "insufficient context"
+# --dev-set / --out are CLI params, so §2.6's hard set flows through unchanged
+_p = argparse.ArgumentParser()
+_p.add_argument("--dev-set", default=os.getenv("DEV_SET", os.path.expanduser(
+    "~/code/agent-prep/lab-03-rag-eval/data/dev_set.jsonl")))
+_p.add_argument("--out", default="results/comparison_raw.json")
+args = _p.parse_args()
+dev = [json.loads(l) for l in open(os.path.expanduser(args.dev_set)) if l.strip()]
 
-Run RAGAS on each bucket separately. The expected pattern: agentic and single-pass tie or single-pass wins on Easy (cheaper, equally good), agentic wins on Hard (the rewrite loop recovers what single-pass dropped).
+def run_agentic(app, question):
+    """Invoke a graph; return {answer, latency, llm_calls, contexts}. Contexts = ToolMessages
+    so RAGAS (§2.5) can score context_* per arm. recursion_limit guards the rewrite->retrieve loop."""
+    t0 = time.time()
+    msgs = app.invoke({"messages": [("user", question)]}, {"recursion_limit": 25})["messages"]
+    return {"answer": msgs[-1].content, "latency": time.time() - t0,
+            "llm_calls": sum(1 for m in msgs if getattr(m, "type", None) == "ai"),
+            "contexts": [p for m in msgs if getattr(m, "type", None) == "tool"
+                         for p in m.content.split("\n\n") if p.strip()]}
+
+results = []
+for i, q in enumerate(dev):
+    question = q["question"]
+    t0 = time.time()
+    sp_answer, sp_contexts = run_single_pass(question)
+    sp = {"answer": sp_answer, "latency": time.time() - t0, "llm_calls": 1, "contexts": sp_contexts}
+    results.append({
+        "qid": q.get("source_doc_id") or f"q{i}", "question": question,
+        "ground_truth": q.get("short_answer", ""),
+        "single_pass": sp,
+        "agentic_canonical": run_agentic(canonical_app, question),
+        "agentic_structural": run_agentic(structural_app, question),
+    })
+
+out = Path(os.path.expanduser(args.out)); out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(results, indent=2))
+print(f"wrote {out} ({len(results)} rows)")
+```
+
+**Walkthrough:**
+- **`sys.path.insert` is the import fix.** The two pipeline modules are siblings in `src/`; adding the script's own dir to `sys.path` makes `from week3_pipeline import ...` resolve when you run `python src/02_comparison_harness.py`. (Pyright flags the imports as unresolved - a static false positive; they resolve at runtime.)
+- **`--dev-set` / `--out` are CLI params** (env `DEV_SET` is still the default). Dev rows carry `{source_doc_id, source_text, question, short_answer}` - there is **no `qid`**, so the harness derives one from `source_doc_id` (or the row index). This is what lets §2.6 push a harder set through the same harness unchanged: `--dev-set data/hard_dev_set.jsonl --out results/comparison_hard.json`.
+- **`run_agentic(app, …)` runs both agentic graphs through identical instrumentation.** The harness scores **three arms** - `single_pass`, `agentic_canonical` (the skip-allowed graph, `canonical_agentic_rag.py`), and `agentic_structural` (the §2.5.1 fix, `structural_rag.py`). One shared helper captures latency/contexts/`llm_calls` the same way for both agentic arms, so the canonical-vs-structural comparison is apples-to-apples (different instrumentation per arm would be a confound).
+- **`llm_calls` is the cost axis.** Single-pass is hard-coded to 1 (the synthesis call). The agentic arm counts AI message turns (`getattr(m, "type") == "ai"`) - one per `agent` invocation plus tool-call turns - so a query that loops `agent → retrieve → grade → rewrite → agent` costs visibly more than one that answers in a single turn. This is the number that makes "the loop isn't free" concrete.
+- **Latency is wall-clock per arm**, captured around each call so you can show the agentic tax (typically 2-5x on a query that triggers a rewrite).
+- **`getattr` guards the final message.** The `generate` node returns a plain string that LangGraph coerces into a message; `getattr(m, "type", None)` avoids an `AttributeError` if any message lacks `.type`.
+
+**Result (measured — 50-question dev set, oMLX Gemma-26B; from `results/comparison_raw.json`):**
+
+```bash
+cd ~/code/agent-prep/lab-03.7-agentic-rag
+uv run python src/02_comparison_harness.py            # default dev set → results/comparison_raw.json (50 rows)
+```
+
+| arm | latency mean | retrieval skips | rewrites fired |
+|-----|--------------|-----------------|----------------|
+| single-pass | **1.59 s** (1.00×) | 0 / 50 | n/a |
+| agentic_canonical (skip-allowed) | **3.07 s** (1.93×) | **15 / 50** | 0 / 50 |
+| agentic_structural (the fix) | **1.56 s** (0.98×) | 0 / 50 | 0 / 50 |
+
+**The cost axis at a glance:** the canonical (skip-allowed) graph pays ~1.9× latency - an extra LLM round-trip just for the agent to *decide* whether to retrieve - and still skips retrieval on 15/50 questions. The structural fix deletes that decision call, lands at **parity** with single-pass, and never skips. **Neither agentic arm ever fires a rewrite (0/50)** - the recovery path, the whole point of the loop, stays dormant on this corpus. The full RAGAS quality picture is in §2.5; the diagnosis and the structural fix are in **§2.5.1**.
+
+> [!warning] Read `llm_calls` with care - a measurement caveat
+> The harness counts *AI-typed* messages, so it reports a misleadingly low `llm_calls` for the agentic arms: the `generate` node returns a plain string (LangGraph coerces it to a non-AI message) and the grade step isn't an AI turn. Each agentic arm really makes ~2-3 model calls per query (canonical: agent-decision + grade + generate; structural: grade + generate). Treat **latency as the reliable cost signal**, or wrap every model call in a counter before trusting `llm_calls`.
+
+> [!tip] Why the loop never fired - and what it would actually take
+> These dev questions are answerable from the corpus, so the first retrieval grades *relevant* and the rewrite branch is skipped. §2.6 tested this directly: even a **constructed-hard** set (gold passage buried or out of the retrieval pool) **still** didn't fire a rewrite - the reranker rescued the buried cases, and on the one truly unreachable case the grader waved through plausible-but-wrong passages. So *difficulty alone doesn't wake the loop*; **visibly-failed retrieval does** - out-of-corpus queries where the grader can tell (Phase 3 / CRAG, §3). If you expected loops and got none on Gemma, also confirm tool-calling fires (the **canonical** arm depends on it; route through Claude with `LLM_BASE_URL=http://localhost:8317/v1 LLM_MODEL=claude-sonnet-4-5-20250929`). The **structural** arm needs no tool-calling - that's the point of §2.5.1.
+
+`★ Insight ─────────────────────────────────────`
+- **Same retrieval, same model, different control flow - that's a clean experiment.** Both arms import the same `rag_hybrid` stack and the same oMLX model, so any quality delta is attributable to the agentic loop alone, not a retrieval or model confound. Most "agentic RAG beats baseline" claims fail this control.
+- **The agentic loop's cost is a turn count, not a vibe.** Counting AI message turns turns "agents are expensive" into a per-query integer you can put next to the quality delta - the exact trade-off a production decision needs.
+- **A tie is a finding - measured here.** Built correctly (structural retrieval, §2.5.1) the agentic RAG fired **0 rewrites** and matched single-pass at **parity latency**; the skip-allowed canonical paid ~1.9× *and* lost quality. The right call: ship single-pass, keep the structural graph as the near-free upgrade path. The harness licensed that with data, not vibes.
+`─────────────────────────────────────────────────`
+
+### 2.5 Score with RAGAS
+
+Latency tells you the *cost*; RAGAS tells you the *quality* - so you can put the two next to each other. `02b_ragas_eval.py` reads `results/comparison_raw.json` (no re-running the pipelines) and scores **both arms** on four reference-based metrics, **backed by local models**:
+
+- **faithfulness** - is the answer grounded in the retrieved contexts (no hallucination)? *(needs answer + contexts)*
+- **answer_relevancy** - does the answer actually address the question? *(needs question + answer + embeddings)*
+- **context_precision** - are the retrieved contexts on-topic (not padded with distractors)? *(needs question + contexts + ground_truth)*
+- **context_recall** - did retrieval surface everything the ground-truth answer needs? *(needs contexts + ground_truth)*
+
+> [!danger] The load-bearing gotcha: RAGAS defaults to OpenAI
+> RAGAS uses an LLM judge **and** an embedding model for these metrics, and **both default to `api.openai.com`**. On this local-first stack you MUST wrap your own: oMLX as the judge (`LangchainLLMWrapper(ChatOpenAI(base_url=...))`) and local BGE-M3 as the embedder (`LangchainEmbeddingsWrapper(HuggingFaceEmbeddings(...))`). Skip this and every metric silently tries OpenAI and errors. This is the same wiring as the Week-3 RAGAS harness.
+
+> [!warning] Environment adjustments - the RAGAS import quagmire (read before installing)
+> Standing RAGAS up on this local-first stack took **two dependency fixes plus venv discipline**. All four points below bit during this lab - each is given as symptom → cause → fix so you can trace the error you actually see to the line that fixes it.
+>
+> **1. Wrong venv → `ModuleNotFoundError`.** `uv pip install` honors an active `VIRTUAL_ENV`. If any *other* venv is active when you install, the packages land there, but `uv run` always targets the lab's own `.venv` - so it can't see them: `ModuleNotFoundError: No module named 'langchain_huggingface'`. **Fix:** strip the env var for the install, then always run via `uv run` so install and run share one venv.
+> ```bash
+> cd ~/code/agent-prep/lab-03.7-agentic-rag
+> env -u VIRTUAL_ENV uv pip install -U ragas datasets langchain-huggingface
+> ```
+>
+> **2. `xai_sdk` poisons the import chain.** `ragas → instructor` eager-imports *every* provider backend at import time, including xAI's `xai_sdk`, which pulls a `protobuf` it can't parse. So merely `import ragas` dies with `ValueError: Unsupported protobuf version: 7.35.0` - even though you never touch xAI. **Fix:** uninstall the unused SDK (cleaner than pinning `protobuf` for the whole venv).
+> ```bash
+> env -u VIRTUAL_ENV uv pip uninstall xai_sdk
+> ```
+>
+> **3. ragas hard-imports a removed Vertex class.** ragas 0.4.x unconditionally runs `from langchain_community.chat_models.vertexai import ChatVertexAI` - a class **removed** in langchain-community ≥0.3 - so `import ragas` fails with `ModuleNotFoundError: ...chat_models.vertexai` on a current langchain stack. We configure `ChatOpenAI` (oMLX), never Vertex. **Fix (in the script, not the shell):** a small **compat shim** stubs the unused Vertex classes in `sys.modules` *before* `import ragas` (shown in the code below). Delete it once ragas stops the unconditional import.
+>
+> **4. The agentic arm needs its `contexts`** (captured in §2.4). If your `results/comparison_raw.json` predates that line, **re-run the harness first** (`uv run python src/02_comparison_harness.py`) or `02b` exits loudly.
+>
+> **Verify the env is sound:** run `uv run python src/02b_ragas_eval.py`. If it reaches the `agentic.contexts missing` guard *instead of* an import traceback, every import resolved - the guard firing is the success signal, not a failure.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  RAW[(comparison_raw.json<br/>single_pass + agentic<br/>answer · contexts)] --> DS[per-arm Dataset<br/>question · answer<br/>contexts · ground_truth]
+  DS --> EV[ragas.evaluate]
+  JLLM[oMLX judge<br/>LangchainLLMWrapper] --> EV
+  EMB[local BGE-M3<br/>LangchainEmbeddingsWrapper] --> EV
+  EV --> M[faithfulness · answer_relevancy<br/>context_precision · context_recall]
+  M --> OUT[(ragas_scores.json<br/>single-pass vs agentic)]
+```
+*`02b_ragas_eval.py` flow. It scores each arm's `{question, answer, contexts, ground_truth}` rows; the judge LLM + embedder are both local. No pipeline re-runs - it consumes the Phase-2 raw artifact.*
+
+**Code (`src/02b_ragas_eval.py`):**
+
+```python
+"""Score BOTH arms (single-pass + agentic) from results/comparison_raw.json with RAGAS,
+backed by LOCAL models: oMLX judge LLM + local BGE-M3 judge embeddings.
+
+    env -u VIRTUAL_ENV uv pip install -U ragas datasets langchain-huggingface
+    env -u VIRTUAL_ENV uv pip uninstall xai_sdk      # see §2.5 "Environment adjustments"
+    uv run python src/02b_ragas_eval.py
+"""
+from __future__ import annotations
+import json, os, sys, types, warnings
+from pathlib import Path
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+from dotenv import load_dotenv
+from datasets import Dataset
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+
+# compat shim: ragas 0.4.x hard-imports Vertex classes removed in langchain-community >=0.3.
+# We use ChatOpenAI, never Vertex - stub them in sys.modules BEFORE `import ragas`.
+_vx = types.ModuleType("langchain_community.chat_models.vertexai")
+_vx.ChatVertexAI = type("ChatVertexAI", (), {})
+sys.modules.setdefault("langchain_community.chat_models.vertexai", _vx)
+import langchain_community.llms as _lcl            # ragas imports llms.VertexAI too
+if not hasattr(_lcl, "VertexAI"):
+    _lcl.VertexAI = type("VertexAI", (), {})
+
+from ragas import evaluate
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import LangchainLLMWrapper
+from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
+from ragas.run_config import RunConfig
+
+load_dotenv(os.path.expanduser("~/code/agent-prep/lab-03.7-agentic-rag/.env"))
+sys.path.insert(0, os.path.expanduser("~/code/agent-prep/shared"))
+from rag_hybrid import autoconfig   # device probe for the embedder
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW, OUT = ROOT / "results" / "comparison_raw.json", ROOT / "results" / "ragas_scores.json"
+
+
+def ragas_backends():
+    """LOCAL judge LLM (oMLX) + LOCAL embedder (BGE-M3). RAGAS would call OpenAI otherwise."""
+    llm = ChatOpenAI(model=os.getenv("MODEL_SONNET"),
+                     base_url=os.getenv("OMLX_BASE_URL", "http://localhost:8000/v1"),
+                     api_key=os.getenv("OMLX_API_KEY", "not-needed"), temperature=0.0)
+    emb = HuggingFaceEmbeddings(
+        model_name=os.path.expanduser("~/models/bge-m3"),               # same BGE-M3 as retrieval
+        model_kwargs={"device": autoconfig.probe_system().device},      # mps / cuda / cpu
+        encode_kwargs={"normalize_embeddings": True})
+    return LangchainLLMWrapper(llm), LangchainEmbeddingsWrapper(emb)
+
+
+def dataset_for(rows, arm):
+    return Dataset.from_list([{
+        "question": r["question"], "answer": r[arm]["answer"],
+        "contexts": r[arm].get("contexts", []), "ground_truth": r["ground_truth"],
+    } for r in rows])
+
+
+# single-pass + BOTH agentic arms (canonical skip-allowed vs the structural fix, §2.5.1)
+ARMS = ("single_pass", "agentic_canonical", "agentic_structural")
+
+
+def main():
+    rows = json.loads(RAW.read_text())
+    for arm in ("agentic_canonical", "agentic_structural"):
+        if not rows or arm not in rows[0]:
+            sys.exit(f"{arm} missing — re-run 02_comparison_harness.py (§2.4) first.")
+
+    ragas_llm, ragas_emb = ragas_backends()
+    metrics = [Faithfulness(llm=ragas_llm), AnswerRelevancy(llm=ragas_llm, embeddings=ragas_emb),
+               ContextPrecision(llm=ragas_llm), ContextRecall(llm=ragas_llm)]
+    rc = RunConfig(timeout=300, max_retries=3, max_workers=2)   # local judge is slow → low workers
+
+    out = {}
+    for arm in ARMS:
+        print(f"\n=== scoring {arm} ({len(rows)} rows) ===")
+        scores = evaluate(dataset_for(rows, arm), metrics=metrics,
+                          llm=ragas_llm, embeddings=ragas_emb, run_config=rc)
+        df = scores.to_pandas()
+        out[arm] = {c: float(df[c].mean()) for c in df.columns if df[c].dtype.kind in "fi"}
+
+    OUT.write_text(json.dumps(out, indent=2, default=str))
+    print(f"\n  {'metric':18}{'single-pass':>13}{'canonical':>12}{'structural':>12}")
+    for m in ("faithfulness", "answer_relevancy", "context_precision", "context_recall"):
+        print(f"  {m:18}{out['single_pass'].get(m, float('nan')):>13.3f}"
+              f"{out['agentic_canonical'].get(m, float('nan')):>12.3f}"
+              f"{out['agentic_structural'].get(m, float('nan')):>12.3f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Walkthrough:**
+- **`ragas_backends()` is the whole local adaptation.** Wrapping `ChatOpenAI(base_url=oMLX)` as the judge and a local `HuggingFaceEmbeddings("~/models/bge-m3")` as the embedder is what keeps RAGAS off OpenAI. The embedder reuses the **same BGE-M3** the corpus was indexed with, and `autoconfig.probe_system().device` picks `mps`/`cuda`/`cpu` so it's portable (the Week-3 lesson - don't hardcode `device="mps"`).
+- **It consumes the raw artifact, not the pipelines.** Scoring reads `comparison_raw.json` - so it's fast, deterministic, and decoupled from the (slow) retrieval/generation. Re-score as often as you like without re-running the agent.
+- **Each arm becomes a RAGAS `Dataset` of `{question, answer, contexts, ground_truth}`.** That's the exact schema the four metrics need - `ground_truth` comes from the dev set's `short_answer`, `contexts` from each arm's retrieved passages (single-pass returns them; the agentic arm's were captured from its `ToolMessage`s in §2.4).
+- **`RunConfig(max_workers=2)` is deliberate.** A local oMLX judge is far slower than OpenAI; low concurrency + a 300 s timeout + retries stops the eval from hammering the server into 5xx/timeouts. Raise `max_workers` only if your oMLX box has headroom.
+- **The guard fails loudly** if `agentic.contexts` is absent - the common mistake is scoring a `comparison_raw.json` produced before the §2.4 context-capture line, which silently gives the agentic arm empty contexts and meaningless `context_*` scores.
+- **The compat shim runs before `import ragas`.** ragas 0.4.x unconditionally imports Vertex classes that current langchain-community removed; stubbing them in `sys.modules` first lets `import ragas` succeed without installing Vertex deps we never use. It's a *temporary* workaround for an upstream eager-import - delete it once ragas fixes the import (see §2.5 "Environment adjustments" for the full diagnosis).
+
+**Result (measured — 50-question dev set, `results/ragas_scores.json`):**
+
+```bash
+# one-time env setup is in §2.5 "Environment adjustments" above
+uv run python src/02_comparison_harness.py   # re-run first if agentic.contexts is missing (§2.4)
+uv run python src/02b_ragas_eval.py          # prints the table + writes results/ragas_scores.json
+```
+
+| metric | single-pass | agentic | winner |
+|---|---|---|---|
+| faithfulness | **0.980** | 0.876 | single-pass (+0.104) |
+| answer_relevancy | 0.755 | **0.786** | agentic (+0.031) |
+| context_precision | **0.982** | 0.694 | single-pass (+0.288) |
+| context_recall | **1.000** | 0.700 | single-pass (+0.300) |
+
+*Means over 50 dev questions, both arms retrieving **k=6**. Here `agentic` = the canonical skip-allowed graph; all §2.5/§2.5.1 numbers come from one unified 3-arm run (`results/ragas_scores.json`, written by `02b`). oMLX was the judge LLM, local BGE-M3 the judge embedder.*
+
+**Read it with Phase 2 next to it.** Phase 2 already showed the agentic loop fired **0 rewrites in 50 questions** at **~1.9× the latency** (canonical 3.07s vs single-pass 1.59s). RAGAS adds the quality half: single-pass wins **three of four** metrics, and agentic's only win (`answer_relevancy`, +0.031) is inside the judge's run-to-run noise (see below). So on this corpus + model the loop costs ~1.9× latency and *lowers* grounding and retrieval quality for no real relevancy gain - the measured case to **ship single-pass** holds.
+
+> [!check] We controlled for retrieval depth - the gap is architectural, not passage-count
+> The first pass was *uncontrolled*: single-pass carried 6 reranked passages, the agentic tool only `k=4` (avg 2.8/question after the 15 no-retrieval rows). Suspecting `context_recall` was a passage-count artifact, we bumped the agentic tool to `k=6` (`canonical_agentic_rag.py:67`) and **re-ran the harness** to regenerate contexts. Result: `context_precision` (0.694) and `context_recall` (0.700) came back **identical to the k=4 run, to 16 decimal places**. Matching depth changed nothing. Two verified reasons:
+> 1. **The agent skips retrieval on 15 of 50 questions** (ctx-count distribution `{0: 15, 6: 35}`) - it answers 30% of questions from parametric memory instead of calling `retrieve_corpus`. Those rows score recall 0 regardless of `k`.
+> 2. **On the 35 rows where it *does* retrieve, it returns the same passages as single-pass** - verified 6/6 passage overlap on a spot-checked row (same corpus, same reranker, same top-6). Retrieval *quality* isn't worse; retrieval is just *missing* 30% of the time.
+>
+> So the gap is exact arithmetic, not a quality difference - each context metric is binary per row (perfect when retrieved, zero when skipped):
+> ```
+> context_recall = (35 retrieve-rows × 1.0  +  15 skip-rows × 0) / 50 = 0.700   ← exactly
+> context_precision ≈ (35 × 0.99 + 15 × 0) / 50 = 0.694
+> ```
+> Agentic's context scores are just **single-pass quality × the 35/50 retrieve-rate**; the **30% skip-rate is the entire gap**. Faithfulness drops the same way - the 15 ungrounded answers pull it from 0.980 to 0.876 (one skip-row answered *"In most professional environments, an experienced worker has several strategic advantages…"* - a fluent parametric essay with nothing retrieved to ground it). The metric landing on an exact `n/50` fraction is the fingerprint: a per-row binary, which points straight at the skip-rate as the sole cause. This is the canonical agentic-RAG failure mode - **a tool-calling agent under-retrieving when it's overconfident** - not a measurement artifact.
+
+> [!tip] Design principle - RAG vs an agentic app
+> The skip-retrieval edge is **fine in an agentic *app*** - a general assistant *should* answer "hi" or "2+2" without searching. It is **wrong in a RAG.** A RAG's contract is *"every answer is grounded in our data,"* so retrieval must be a **guaranteed edge, not a tool the agent may decline.** The canonical LangGraph graph is a sound *agent-with-a-retrieval-tool*; calling it "RAG" while it can route `agent → END` is a category error - that `agent → END` path is what produced the 15 ungrounded answers. **If it's RAG, force the retrieve call** (`tool_choice="required"`) and let the agent reformulate the *query*, never decide *whether* to search. Retrieval mandatory is *necessary* for grounding - still pair it with faithfulness + abstain-on-miss for *accuracy*.
+
+> [!important] What this proves - and what it does *not*
+> This is **the wrong tool for *this* job, not a wrong architecture.** The dev set is single-hop factual QA over one corpus - the regime where single-pass is strongest and the agentic loop has nothing to do (hence **0/50 rewrites**: the corrective machinery added cost but never fired). The takeaway is about *matching architecture to task*: don't buy agency you won't use.
+> - **The skip-rate is a fixable implementation bug, not the paradigm.** Force the retrieve call (mandatory first tool, or a system prompt that says "always search before answering") and agentic's quality climbs to single-pass's - it retrieves the *same* passages. The agent under-retrieved because the local model was overconfident, not because agency is wrong.
+> - **We applied the fix and re-measured (§2.5.1) - it *ties* single-pass at near-equal latency.** Forcing retrieval at the LLM layer failed (oMLX ignores `tool_choice`), so we wired retrieval *structurally*. That recovered every metric to ≈ single-pass (faithfulness 0.876→**1.000**, context_recall 0.700→**1.000**) **and** dropped latency from ~1.9× to **~1.0×** (deleting the agent's tool-deciding LLM call). A correctly-built RAG here is a *near-free equal*, not a downgrade - but the grade/rewrite loop still fires **0/50**, so it's unused insurance. **Single-pass stays the simpler default; the structural RAG is its legitimate near-free sibling.**
+> - **Agentic RAG earns its cost where this lab doesn't go** - multi-hop questions needing iterative retrieval, query decomposition, ambiguous queries needing reformulation, or routing across multiple tools/sources. The honest headline is *"match the architecture to the task,"* not *"agentic is wrong."*
+
+> [!note] Judge non-determinism - treat sub-0.05 gaps as noise
+> The RAGAS judge is a local oMLX model at `temperature=0`, but MLX sampling isn't bit-deterministic. Re-scoring the **same** `comparison_raw.json` three times gave agentic (canonical) `faithfulness` of 0.897 / 0.856 / 0.876 across runs - a ~±0.04 band - while the LLM-free context metrics stayed identical to 16 digits. Lesson: with a local judge, only trust quality-metric gaps comfortably larger than that band. Single-pass's faithfulness lead over canonical (+0.104) clears it; the relevancy gaps (≤0.031) do not.
+
+The table above is the **canonical, skip-allowed graph** - the LangGraph default. The next subsection records what happened when we took the *RAG-contract* principle seriously, rebuilt retrieval as a structural edge, and re-measured. It doubles as the full decision log of this investigation.
+
+#### 2.5.1 Fixing it — structural retrieval (the decision log)
+
+The skip-allowed result prompted a chain of questions. Recording it in order, because the *reasoning path* is the lesson, not just the final number.
+
+**The investigation:**
+1. *"If the loop never rewrites (0/50), why is agentic worse than single-pass?"* — Traced the graph: the divergence isn't the rewrite branch, it's one node earlier. The `agent` node decides *whether* to retrieve; on **15/50** questions it emitted no tool call → routed `agent → END` → answered from parametric memory. Single-pass always retrieves. (Spot-check: a skip-row answered with a fluent generic essay; single-pass grounded the same question with a citation.)
+2. *"Is the gap just a passage-count artifact?"* — Controlled it: bumped the tool `k=4 → k=6`, re-ran the harness. `context_precision`/`recall` came back **identical to 16 digits** → not passage count, architectural. (Incidental finding: the local RAGAS judge wobbles ~±0.06 run-to-run; treat sub-0.05 gaps as noise.)
+3. *"Why didn't the skipped questions trigger a rewrite?"* — `grade_documents` (the only path to `rewrite`) sits **downstream of `retrieve`**. Skip-rows take `agent → END` and never reach the grader. **Rewrite corrects *bad* retrieval; it's blind to *absent* retrieval** — which is why it fired 0/50.
+4. *Design principle* — a RAG must not be able to decline retrieval (the [!tip] above). Retrieval is a structural guarantee, not an LLM tool-choice.
+5. *"Force the tool call, then."* — `tool_choice="required"` **and** the explicit named-function form are **both ignored by oMLX/gemma** (probe returned `tool_calls: NONE`). The LLM layer cannot enforce retrieval on this local model — so the textbook fix *silently fails* here, which is itself the point: a RAG can't depend on model cooperation for its core guarantee.
+6. *The fix* — move the guarantee into the **graph topology**: `START → retrieve` unconditionally, and delete the `agent`/`tools_condition` discretion node entirely.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  subgraph Before["skip-allowed"]
+    A1[START] --> AG["agent<br/>(decides: retrieve?)"]
+    AG -->|"no tool call"| E1["END<br/>(ungrounded · 15/50)"]
+    AG -->|"tool call"| R1[retrieve] --> G1[grade] --> GEN1[generate] --> E2[END]
+    G1 -->|"irrelevant"| RW1[rewrite] --> AG
+  end
+  subgraph After["structural RAG"]
+    A2[START] --> R2["retrieve<br/>(ALWAYS)"] --> G2[grade] --> GEN2[generate] --> E3[END]
+    G2 -->|"irrelevant"| RW2[rewrite] --> R2
+  end
+```
+*The fix in one move: the `agent → END` escape (left) becomes impossible because there is no agent node — retrieval is the first thing that happens (right).*
+
+```python
+# BEFORE — the agent's LLM call decides whether to retrieve (and skipped 15/50)
+def agent(state):
+    return {"messages": [_llm().bind_tools(tools).invoke(state["messages"])]}
+_workflow.add_conditional_edges("agent", tools_condition, {"tools": "retrieve", END: END})
+
+# AFTER — retrieval is a structural edge; no node, and no model, can skip it
+def retrieve(state):
+    query = state["messages"][-1].content              # the question, or a rewrite's reformulation
+    passages = retrieve_passages(query, k=6)
+    content = "\n\n".join(passages) or "No relevant documents found."
+    return {"messages": [ToolMessage(content=content, tool_call_id="retrieve")]}
+_workflow.add_edge(START, "retrieve")
+_workflow.add_conditional_edges("retrieve", grade_documents)   # generate | rewrite
+_workflow.add_edge("rewrite", "retrieve")                      # reformulate → retrieve again
+```
+
+**Re-measured (50-question dev set, this session's artifacts):**
+
+| metric | single-pass | skip-allowed (canonical) | **structural (fixed)** |
+|---|---|---|---|
+| faithfulness | 0.980 | 0.876 | **1.000** |
+| answer_relevancy | 0.755 | 0.786 | **0.785** |
+| context_precision | 0.982 | 0.694 | **0.982** |
+| context_recall | 1.000 | 0.700 | **1.000** |
+| latency (× single-pass) | 1.00× | 1.93× | **0.98×** |
+| retrieval skips | 0/50 | 15/50 | **0/50** |
+
+*All three arms from one unified run (`02_comparison_harness.py` → `results/comparison_raw.json` → `02b` → `results/ragas_scores.json`). Absolute latency wobbles run-to-run; the **ratio collapse ~1.9× → ~1.0×** is the stable signal — it comes from deleting the agent's tool-deciding LLM call, leaving the structural RAG just one cheap `grade` call heavier than single-pass (so it lands at parity, even marginally faster).*
+
+**Revised verdict.** The original "agentic RAG is ~2× slower *and* lower quality" indicted a **mis-built** graph (agent discretion + a tool call the local model can't reliably make), not the paradigm. Built as a *real RAG* — structural retrieval — it **matches single-pass on all four metrics at ~equal latency (0.98×)** (and even edges faithfulness, 1.000 vs 0.980, within judge noise). The grade/rewrite loop still earns nothing *here* (0/50 rewrites on a clean single-hop corpus), so **single-pass remains the simpler default for this workload**; the structural RAG is its near-free equal and the correct skeleton the moment retrieval gets noisy enough for the loop to fire (Phase 3's CRAG variant, §3).
+
+### 2.6 Stratify by query difficulty
+
+§2.5 showed the structural RAG *matches* single-pass on average. But an average hides the real question: **is there a regime where the corrective loop actually wins?** To answer it we stratify by difficulty - but *how you define difficulty decides whether the test is honest*.
+
+> [!danger] The circular trap - don't define difficulty by the outcome
+> The tempting bucketing is "easy = single-pass got it right, hard = single-pass got it wrong." That's **circular**: you've defined the hard bucket as *the questions single-pass fails*, so of course the alternative looks better there - it's selection bias, the demo-gaming failure mode. A fair difficulty label must be computed **before any pipeline answers**, independent of who wins.
+
+**A fair, outcome-independent axis: the retrieval rank of the known-gold passage.** Every dev row carries its gold passage (`source_text`). Encode the question, retrieve the dense top-30 from Qdrant, and find *where the gold passage lands*. That rank is a pure property of the question-vs-corpus, decided before generation:
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q["dev question<br/>(+ known gold passage)"] --> ENC[BGE-M3 encode]
+  ENC --> RET["Qdrant dense<br/>top-30"]
+  RET --> RANK["rank of the gold<br/>passage in results"]
+  RANK -->|"rank 1"| E["easy<br/>(already top-1)"]
+  RANK -->|"rank 2-5"| M["medium<br/>(rerank surfaces it)"]
+  RANK -->|"rank 6-30"| H["hard<br/>(in pool, buried)"]
+  RANK -->|"not in top-30"| U["unreachable<br/>(only a rewrite retrieves it)"]
+```
+*Difficulty = gold-passage retrieval rank. The `unreachable` bucket is the key one: the gold isn't in the first pool at all, so single-pass **structurally cannot** answer it - only the rewrite loop (reformulate → new query → new pool) has a shot. That's the falsifiable test of whether the loop earns its cost.*
+
+**Why this is needed at all:** the lab's stock dev sets are single-hop MS-MARCO - one passage per question, gold at rank 1, so single-pass scores ~perfectly and *every* bucket favors it. There's nothing to stratify. So we generate a genuinely harder set over the **same corpus**, fairly.
+
+**The generator (`src/make_hard_dev_set.py`):**
+
+```python
+# difficulty = retrieval rank of the KNOWN gold passage - outcome-independent, not gameable
+def difficulty_of(rank):                 # rank = gold's position in dense top-30, or None
+    if rank == 1:           return "easy"          # already top-1: nothing to fix
+    if rank and rank <= 5:  return "medium"        # near top: the reranker likely surfaces it
+    if rank:                return "hard"          # rank 6-30: in the pool but buried
+    return "unreachable"                           # gold NOT in pool: only a query rewrite retrieves it
+
+# the gold passage is located in the corpus by TEXT (corpus doc_id is a sequential index,
+# NOT the dev set's MS-MARCO source_doc_id), then we rank it in the question's retrieval:
+gold_id = text2id.get(norm(row["source_text"]))           # None -> skip & report (never silently drop)
+hits    = qdrant.query_points(COLLECTION, query=encode(row["question"]), limit=30).points
+ranked  = [str(h.payload["doc_id"]) for h in hits]
+rank    = ranked.index(gold_id) + 1 if gold_id in ranked else None
+row["difficulty"], row["gold_rank"] = difficulty_of(rank), rank
+```
+
+**Walkthrough:**
+- **It measures difficulty, doesn't assume it.** The generator prints the full distribution + a gold-rank histogram. If the corpus retrieves so cleanly that `hard`/`unreachable` are near-empty, that's a *finding* (this corpus leaves no room for the loop) - we report it, not force a thin bucket.
+- **Gold is matched by text, not id** - the Qdrant payload `doc_id` is a sequential `0..9999`, unrelated to the dev set's MS-MARCO `source_doc_id`. 93/100 candidates' gold text is in the corpus; the rest are skipped and counted.
+- **`pool=30` mirrors the pipeline's rerank input.** Gold in the pool (rank ≤30) *can* be rescued by the reranker; gold outside it cannot - which is exactly what separates `hard` from `unreachable`.
+
+**The scripts are parameterized** so any dev set flows through unchanged:
+
+```bash
+# 1) build the fair hard set (difficulty = gold retrieval rank, NOT "who won")
+uv run python src/make_hard_dev_set.py \
+    --source ~/code/agent-prep/lab-03-rag-eval/data/dev_candidates.jsonl \
+    --out data/hard_dev_set.jsonl --pool 30          # keeps medium,hard,unreachable
+
+# 2) run all three arms on it (single-pass + canonical + structural)
+uv run python src/02_comparison_harness.py \
+    --dev-set data/hard_dev_set.jsonl --out results/comparison_hard.json
+
+# 3) RAGAS per arm, then read the table next to each row's 'difficulty' field
+uv run python src/02b_ragas_eval.py \
+    --raw results/comparison_hard.json --out results/ragas_hard.json
+```
+
+**Result (measured — `results/ragas_hard.json` + `comparison_hard.json`):**
+
+The **distribution is the headline**. Of 100 candidates (`pool=30`): **80 had the gold passage already at rank 1**; only **13 were non-trivial** (9 `medium`, 3 `hard`, **1 `unreachable`**); 7 had no gold-in-corpus and were skipped. BGE-M3 over single-passage QA is strong enough that a hard regime barely exists on this corpus - that fact alone is most of the answer.
+
+RAGAS over the 13 hard questions (small *n* - read as directional, not significant):
+
+| metric | single-pass | canonical (skip) | structural |
+|---|---|---|---|
+| faithfulness | 0.904 | 0.726 | **1.000** |
+| answer_relevancy | 0.796 | 0.820 | **0.876** |
+| context_precision | **0.897** | 0.419 | **0.897** |
+| context_recall | **0.923** | 0.462 | **0.923** |
+
+Two findings, both consistent with §2.5:
+- **The skip-allowed canonical graph degrades *more* as questions get harder.** Per-bucket retrieved-context counts: on the 9 `medium` questions canonical averaged just **2.0** passages/question (vs 6.0 for single-pass and structural) - it skipped retrieval on more of them, and its `context_recall` cratered to **0.462**. Exactly backwards: the harder the question, the more the discretion-graph opts out. structural (always retrieves) holds at 6.0 and matches single-pass.
+- **The `unreachable` question (n=1) was *not* rescued by the rewrite loop** - the prediction is **falsified**. *"What happens to moisture when it is heated?"* - gold ("Moisture rarefies when heated") wasn't in the dense top-30. structural retrieved 6 *plausible-but-wrong* passages (about hydrates boiling off), **the grader passed them as relevant → `generate`, so no rewrite fired** (6 contexts = a single retrieval). The one question engineered to need reformulation didn't get it: an over-lenient grader accepted on-topic-looking distractors. single-pass missed identically; canonical skipped retrieval entirely (0 contexts).
+
+**Verdict.** Even on a *constructed-hard* set, the rewrite loop never usefully fires on this corpus - the retriever is too good (so `medium`/`hard` stay answerable in one pass) and the grader too lenient (so the one `unreachable` case never triggers a rewrite). structural still wins by **never skipping**; canonical still loses by **skipping more under pressure**. The loop's genuine payoff needs retrieval that *visibly* fails - out-of-corpus queries where the grader can actually tell - which **Phase 3 (CRAG, §3)** measures directly. The honest §2.6 takeaway: *on a strong retriever over in-corpus QA, the corrective loop is dormant; difficulty alone doesn't wake it - retrieval failure does.*
 
 ---
 
@@ -355,51 +847,365 @@ The canonical Agentic RAG (Phase 1) handles the case where retrieved docs are ir
 
 ### 3.1 Add the CRAG node
 
-Save as `src/03_crag_variant.py`:
+CRAG replaces the binary *relevant/not* grader with a **scored retrieval evaluator** and adds a **web-search fallback**. Built on the structural RAG (§2.5.1 - retrieval is a guaranteed edge): always retrieve from the corpus, score how well it answers, then route on confidence.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  S[START] --> R[retrieve_corpus<br/>BGE-M3 + rerank, k=6]
+  R --> E["evaluate<br/>(LLM scores 0.0-1.0)"]
+  E -->|"score ≥ 0.7 (Correct)"| G[generate<br/>from corpus]
+  E -->|"score ≤ 0.3 (Incorrect)"| W[web_search<br/>DuckDuckGo / Tavily]
+  E -->|"else (Ambiguous)"| C[combine<br/>corpus + web]
+  W --> G2[generate<br/>from web]
+  C --> G3[generate<br/>from both]
+  G --> X[END]
+  G2 --> X
+  G3 --> X
+```
+*CRAG flow. The evaluator's score, not a yes/no, is what enables the three-way route - the key difference from the canonical grader, which can only loop back to rewrite.*
+
+**Inside generation - why no arm hallucinates on out-of-corpus.** The `generate` box above is one node, but the *grounding* that makes an arm say "I can't" instead of inventing lives inside it. The two corpus arms generate differently, and it's worth seeing both. **Single-pass uses `synthesize()` (`baseline_handrolled.py`)** - two stacked grounding layers:
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  H["retrieved passages<br/>(numbered [#1]..[#6])"] --> P["grounded prompt<br/>answer ONLY from passages,<br/>cite [#N], say 'insufficient' if absent"]
+  P --> L["oMLX LLM (temp 0)"]
+  L --> DF{"drift filter:<br/>does the bullet share keywords<br/>with the passage it cites?"}
+  DF -->|"no overlap"| D["DROP bullet<br/>(unsupported / hallucinated cite)"]
+  DF -->|"overlap"| K[keep bullet]
+  K --> A["grounded answer,<br/>or 'insufficient context'"]
+  D --> A
+```
+*`synthesize()` - layer 1 is the **prompt** (answer only from context, abstain if absent); layer 2 is the **drift filter** (`baseline_handrolled.py:174-191`), a *programmatic* check that drops any bullet whose words don't overlap the passage it cites. On out-of-corpus queries the passages are irrelevant, so layer 1 already returns "the passages do not contain this; context is insufficient [#1-6]" - which is exactly why single-pass **abstains** rather than hallucinates (it is **not** the weak arm; §3.2).*
+
+**CRAG's `generate` node (`crag_variant.py`) keeps layer 1, drops layer 2.** It uses the same grounded prompt ("answer using only the context; if it lacks the answer, say you don't know") on whichever docs its route supplied (corpus / web / both), but **no drift filter** - it leans on the evaluator's routing plus the prompt's abstain instruction instead. So every arm here is grounded by prompt; only single-pass adds the mechanical second net. That's the design knob: prompt-grounding is cheap and usually enough; the drift filter is the belt-and-suspenders option when you can't tolerate a stray unsupported sentence.
+
+The graph lives in `src/crag_variant.py` (importable, exports `crag_app`); the §3.2 runner imports it. Core code:
 
 ```python
-"""CRAG variant — adds confidence-threshold + web-fallback to the canonical 5-node graph."""
-from typing import Literal
-from langgraph.graph import StateGraph, MessagesState
+"""CRAG (Corrective RAG) over the local corpus + web fallback. Exports `crag_app`."""
+import os, re, sys
+from typing import Literal, Required, TypedDict
+# ... oMLX _llm(), and retrieve_passages() reusing rag_hybrid (BGE-M3 + reranker over Qdrant) ...
 
-def grade_with_confidence(state) -> dict:
-    """Grade retrieved docs and return a confidence score (0.0–1.0).
-    Three-bucket output: Correct (use), Incorrect (web fallback), Ambiguous (combine)."""
-    # Use a small classifier or LLM-based judge
-    # Simplest: prompt LLM with "rate relevance 0-1" then bucket
-    ...
+CONF_UPPER = float(os.getenv("CRAG_UPPER", "0.7"))   # ≥ this → corpus is enough
+CONF_LOWER = float(os.getenv("CRAG_LOWER", "0.3"))   # ≤ this → corpus failed → web
 
-def web_fallback(state) -> dict:
-    """Fall back to web search when local retrieval scores Incorrect."""
-    from langchain_community.tools.tavily_search import TavilySearchResults
-    # OR use Exa MCP if you wired it up in Week 0
-    web_tool = TavilySearchResults(max_results=3)  # requires TAVILY_API_KEY
-    # Or use built-in WebSearch
-    ...
+def web_search(query: str, k: int = 3) -> list[str]:
+    """Pluggable + graceful: Tavily (if key) → DuckDuckGo (free) → clear error. No key required."""
+    if os.getenv("TAVILY_API_KEY"):
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        return [r["content"] for r in TavilySearchResults(max_results=k).invoke(query)]
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS            # older package name
+    with DDGS() as ddg:
+        return [r["body"] for r in ddg.text(query, max_results=k) if r.get("body")]
 
-def combine_local_and_web(state) -> dict:
-    """When confidence is Ambiguous, retrieve from both local + web and combine."""
-    ...
+class CRAGState(TypedDict, total=False):
+    question: Required[str]
+    corpus_docs: list[str]; web_docs: list[str]; score: float; source: str; answer: str
 
-# Build CRAG graph: same as canonical but add the three new nodes after grade_documents
-graph = StateGraph(MessagesState)
-# graph.add_node("grade_with_confidence", grade_with_confidence)
-# Conditional edge from grade based on bucket:
-#   Correct -> generate_answer
-#   Incorrect -> web_fallback -> generate_answer
-#   Ambiguous -> combine_local_and_web -> generate_answer
-crag_app = graph.compile()
+def retrieve_corpus(state) -> dict:
+    return {"corpus_docs": retrieve_passages(state["question"], k=6)}
+
+def evaluate(state) -> dict:
+    """The CRAG retrieval evaluator: score 0.0–1.0 how well the corpus answers the question."""
+    docs = state.get("corpus_docs") or []
+    if not docs:
+        return {"score": 0.0}
+    prompt = PromptTemplate(template=(
+        "On a scale 0.0 to 1.0, how well do these documents let you fully and correctly "
+        "answer the question? Reply ONLY a number.\n\nDocuments:\n{context}\n\n"
+        "Question: {question}\n\nScore:"), input_variables=["context", "question"])
+    raw = (prompt | _llm() | StrOutputParser()).invoke(
+        {"context": "\n\n".join(docs), "question": state["question"]})
+    m = re.search(r"\d*\.?\d+", raw)
+    return {"score": max(0.0, min(1.0, float(m.group()))) if m else 0.0}
+
+def decide(state) -> Literal["generate", "web", "combine"]:
+    s = state.get("score", 0.0)
+    return "generate" if s >= CONF_UPPER else "web" if s <= CONF_LOWER else "combine"
+
+def web_node(state) -> dict:      return {"web_docs": web_search(state["question"]), "source": "web"}
+def combine_node(state) -> dict:  return {"web_docs": web_search(state["question"]), "source": "both"}
+
+def generate(state) -> dict:
+    docs = ((state.get("corpus_docs") or []) if state.get("source") != "web" else []) \
+           + (state.get("web_docs") or [])
+    prompt = PromptTemplate(template=(
+        "Answer using only the context below. If it lacks the answer, say you don't know. "
+        "Three sentences max.\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"),
+        input_variables=["context", "question"])
+    ans = (prompt | _llm() | StrOutputParser()).invoke(
+        {"context": "\n\n".join(docs) or "(no documents)", "question": state["question"]})
+    return {"answer": ans, "source": state.get("source", "corpus")}
+
+g = StateGraph(CRAGState)
+for name, fn in [("retrieve_corpus", retrieve_corpus), ("evaluate", evaluate),
+                 ("web", web_node), ("combine", combine_node), ("generate", generate)]:
+    g.add_node(name, fn)
+g.add_edge(START, "retrieve_corpus"); g.add_edge("retrieve_corpus", "evaluate")
+g.add_conditional_edges("evaluate", decide, {"generate": "generate", "web": "web", "combine": "combine"})
+g.add_edge("web", "generate"); g.add_edge("combine", "generate"); g.add_edge("generate", END)
+crag_app = g.compile()
 ```
+
+**Walkthrough:**
+- **The evaluator returns a *score*, not a verdict - that's the whole CRAG idea.** A 0.0–1.0 confidence (parsed from the LLM with a regex + clamp) supports three routes, where the canonical binary grader supported only *generate vs rewrite*. The thresholds (`CRAG_UPPER`/`CRAG_LOWER`) are env-tunable - the paper uses a trained T5 evaluator; an LLM judge is the local stand-in.
+- **`web_search` degrades gracefully and needs no key.** Tavily if `TAVILY_API_KEY` is set, else **DuckDuckGo** (free), else a clear install error. This keeps the lab runnable on the local-first stack without spending the cloud budget.
+- **Three routes, one `generate`.** `Correct` answers from the corpus; `Incorrect` drops the corpus entirely and answers from web; `Ambiguous` concatenates both. `generate` reads `source` to decide which docs to use, and the abstain instruction ("if it lacks the answer, say you don't know") keeps it honest when neither source has it.
+- **Built on structural retrieval, not the agent graph.** No tool-calling, no skip path - the corpus is always retrieved and *then judged*, so CRAG inherits §2.5.1's grounding guarantee and adds correction on top.
+
+> [!tip] Smoke-test the routing before the full run
+> `uv run python src/crag_variant.py "Who is the current CEO of OpenAI?"` should print `source=web` (the corpus scores ~0 and CRAG falls back). An in-corpus question (e.g. about the indexed pandas passages) should print `source=corpus score≈1.0`. If web returns nothing, confirm network + `uv pip install ddgs`.
 
 ### 3.2 Run CRAG on out-of-corpus queries
 
-Construct a 10-question test set of queries your local corpus *cannot* answer (current events, post-corpus-cutoff topics, niche entities not in MS MARCO). Run all three pipelines:
+This is where the corrective loop finally earns its cost (§2.6 predicted it: the loop needs *visible* retrieval failure, which out-of-corpus queries produce). The runner `src/03_crag_eval.py` ships 10 questions the 2018 MS-MARCO corpus **cannot** answer (post-cutoff / niche - e.g. *"Who is the CEO of OpenAI as of 2026?"*, *"Which team won the 2025 NBA Finals?"*) and runs three arms on each:
 
-- Week 3 single-pass — should fail (no answer or wrong answer)
-- Phase 1 canonical Agentic — should also fail (rewrites can't conjure data that isn't there)
-- Phase 3 CRAG — should succeed via web fallback
+```python
+"""§3.2 — single-pass, structural RAG, CRAG on OUT-OF-CORPUS queries."""
+from week3_pipeline import run_single_pass        # corpus-only
+from structural_rag import app as structural_app  # corpus-only, always retrieves
+from crag_variant import crag_app                 # corpus + web fallback
 
-Capture results in `observations/crag-out-of-corpus.md`. CRAG's lift here is the headline result of Phase 3.
+OUT_OF_CORPUS = ["What is the most capable Claude model Anthropic released in 2026?",
+                 "Which team won the 2025 NBA Finals?", ...]   # 10 post-cutoff questions
+
+_ABSTAIN = ("don't know", "not in the", "no relevant", "cannot find", "no information", ...)
+def answered(text):                               # did the arm actually answer, or punt?
+    return not any(p in (text or "").lower() for p in _ABSTAIN)
+
+for q in OUT_OF_CORPUS:
+    sp, _ = run_single_pass(q)
+    try:                                           # structural's rewrite loop RUNS AWAY on
+        st = structural_app.invoke({"messages": [("user", q)]},
+                                   {"recursion_limit": 12})["messages"][-1].content
+    except GraphRecursionError:                    # out-of-corpus: docs never grade relevant
+        st = "(rewrite loop hit the recursion limit — no answer)"   # → rewrite forever
+    cr = crag_app.invoke({"question": q})          # cr["source"] ∈ {corpus, web, both}
+    # tally answered(sp) / answered(st) / answered(cr["answer"]) + cr["source"]
+# writes observations/crag-out-of-corpus.md
+```
+
+```bash
+uv run python src/03_crag_eval.py                 # built-in 10 out-of-corpus questions
+# or point it at your own set:
+DEV_SET=data/my_out_of_corpus.jsonl uv run python src/03_crag_eval.py
+```
+
+The prediction: the corpus-only arms (single-pass, structural) **abstain or hallucinate** (the gold isn't in MS-MARCO), while CRAG's evaluator scores the corpus low and **routes to web** - the one regime where the loop adds what single-pass structurally can't.
+
+> [!danger] The rewrite loop *runs away* on out-of-corpus queries - measured live
+> This is the sharpest evidence that *rewrite ≠ correction*. On these questions the structural RAG's `grade_documents` never sees a relevant doc (the answer isn't in the corpus), so it routes to `rewrite → retrieve → grade → rewrite → …` **forever**, until LangGraph raises `GraphRecursionError`. Reformulating the query cannot conjure data the corpus doesn't contain - so the loop spins instead of stopping. The runner catches it and scores it as a (failed) abstain. **This is precisely why CRAG exists:** a *scored* evaluator says "corpus can't answer this" and escapes to a *different source* (web), where the rewrite loop only knew how to re-ask the same empty corpus. (Lower `recursion_limit` to fail faster; it's a runaway-cost guard, not a fix.)
+
+**Result (measured — built-in 10 out-of-corpus questions, `observations/crag-out-of-corpus.md`):**
+
+| arm | answered | what actually happened |
+|---|---|---|
+| single-pass | **0 / 10** | corpus only - **abstains honestly** on all 10: *"the passages do not contain this; context is insufficient [#1-6]."* Fails gracefully - no answer, no lie, one cheap call. |
+| structural RAG | **0 / 10** | corpus only - the **rewrite loop runs away** on all 10 (hits the recursion limit). Same non-answer as single-pass, but ~12 LLM calls **and** a crash to get there. Strictly worse. |
+| **CRAG** | **10 / 10** (Tavily) | evaluator scored the corpus **0.00 on all 10 → routed to web 10/10** → answered all 10 from real web evidence (OKC Thunder won the 2025 NBA Finals; GPT-5 shipped 2025-08-07; Apple M5; Sam Altman; South Africa hosted the G20; 2025 Nobel Physics → Clarke/Devoret/Martinis). On the free DuckDuckGo backend the same run lands 5-9/10 - the *routing* is identical, only the *web answer quality* differs. |
+
+*Every cell from `observations/crag-out-of-corpus.md`. The real ranking: **CRAG (the only arm that answers anything - 10/10 real web answers on a Tavily run) > single-pass (10 honest abstains) > structural (10 non-answers via a runaway loop)**. This is the first lab result where the corrective machinery beats the baseline - because the failure (corpus can't answer) is finally one the evaluator can **see and route around** (to the web), instead of one the rewrite loop re-asks forever. single-pass isn't *wrong* here - it correctly says "I can't" - it just can't reach beyond the corpus; CRAG can. **The routing is the robust result** (corpus scored 0.00 → web on 10/10, deterministic); the *answer count* tracks web-backend quality - **Tavily 10/10, free DuckDuckGo 5-9/10** - so report routing as the finding and the count as backend-dependent. (Note: even CRAG's "answers" should be spot-checked - a few are carefully hedged, e.g. it correctly says the EU AI Act predates 2025; "answered" only means non-abstaining, not verified-correct.)*
+
+> [!warning] We measured this wrong the first time - reading the outputs fixed it
+> The first run reported single-pass *"answered 10/10"* and the verdict here read *"all 10 hallucinated."* **Both were false.** Single-pass actually **abstains** on all 10 (*"the passages do not contain this; context is insufficient"*) - the `answered()` abstain-phrase list had `"does not contain"` but the model said `"do not contain information"` / `"insufficient"`, so honest *"I don't know"* was miscounted as an answer. A **10/10 on questions the corpus cannot possibly know** is too-good-to-be-true; the fix was reading the raw answers (`uv run python src/03_crag_eval.py --show`), not trusting the count. Keyword abstention-detection is brittle in *both* directions (a hallucinator scores "answered" too) - for a real accuracy number, judge each answer against a web-sourced ground truth. The routing behaviour (corpus 0.00 → web) is the robust, teachable result; the per-arm "answered" tallies are a coarse proxy.
+
+### 3.3 The hand-rolled counterpart — `baseline_handrolled.py` (Self-RAG + CRAG, no LangGraph)
+
+§3.1 built CRAG as a LangGraph graph. `baseline_handrolled.py` is the **same corrective ideas written as plain functions + one orchestrator** - no LangGraph, no graph state, read top-to-bottom. It's also the home of the single-pass arm: `run_single_pass` (§2.2) calls only the **MultiRetrieve → Rerank → Synthesize** slice (green below); the grading + corrective loop + web-fallback are the rest of this file - a full hand-rolled Self-RAG + CRAG.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  Q[query] --> CD["1 · ComplexityDecider<br/>(heuristic: caps + cue words)"]
+  CD --> MR["2 · MultiRetrieve<br/>(orig + keyword query, RRF-fused)"]
+  MR --> RR["3 · Rerank<br/>(BGE cross-encoder → top-6)"]
+  RR --> SY["4 · Synthesize<br/>(cited bullets + drift filter)"]
+  SY --> SR["5 · SelfRAG checks<br/>(faithfulness · citation · coverage)"]
+  SR --> GH["6/7 · Grade<br/>(hallucination + relevance)"]
+  GH -->|"pass"| DONE([answer])
+  GH -->|"relevance fail"| CR["8 · CorrectiveRAG<br/>(rewrite + retry, max 2)"]
+  CR -->|"pass"| DONE
+  CR -->|"still fail"| WS["next_action:<br/>suggest web_search"]
+  classDef slice fill:#dff0d8,stroke:#3c763d,stroke-width:2px;
+  class MR,RR,SY slice;
+```
+*The full hand-rolled pipeline. The **green slice (nodes 2-3-4)** IS the §3.2 single-pass arm; nodes 1, 5, 6/7, 8 are the Self-RAG/CRAG half. Note node 8 terminates **by construction** - a counted `for i in range(2)` that exhausts and returns its best attempt - where §3.2's LangGraph rewrite cycle had no built-in counter and aborted with `GraphRecursionError`.*
+
+**Block A — retrieve and synthesize (nodes 1-4, the single-pass slice):**
+
+```python
+# Node 1: ComplexityDecider — heuristic, routes to optional decomposition (Phase 6)
+def decide_complexity(query):
+    cap  = len(re.findall(r"\b[A-Z][a-zA-Z]+\b", query))          # named-entity count
+    cues = sum(c in query.lower() for c in _COMPLEX_CUES)         # "compare","vs","and",...
+    score = min(cap, 4)*0.15 + min(cues, 3)*0.25 + (0.2 if " and " in query.lower() else 0)
+    return {"label": "Complex" if score >= 0.5 else "Simple", "score": round(score, 3)}
+
+# Node 2: MultiRetrieve — original + keyword-only query, fused with Reciprocal Rank Fusion
+def multi_retrieve(query, k=30, rrf_k=60):
+    variants = [query]
+    kw = _keyword_variant(query)                                 # strip ~40 stopwords
+    if kw and kw != query.lower(): variants.append(kw)
+    rrf = {}
+    for v in variants:
+        for rank, h in enumerate(_retrieve_qdrant(v, k=k), start=1):   # dense kNN over Qdrant
+            s = 1.0 / (rrf_k + rank)                             # Cormack RRF weight
+            rrf[h["id"]] = ({**h, "_rrf_score": rrf[h["id"]]["_rrf_score"] + s}
+                            if h["id"] in rrf else {**h, "_rrf_score": s})
+    return sorted(rrf.values(), key=lambda x: -x["_rrf_score"])[:k]
+
+# Node 3: Rerank — BGE cross-encoder over (query, passage), keep top-6
+def rerank(query, hits, top_k=6):
+    scores = _reranker._model.predict([(query, h["text"]) for h in hits])
+    return [h for h, _ in sorted(zip(hits, scores), key=lambda x: -x[1])][:top_k]
+
+# Node 4: Synthesize — cited bullets + DRIFT FILTER (anti-hallucination, §3.1) + CANONICAL abstention
+SYNTHESIZE_PROMPT = ("Use ONLY the passages below. Answer in 3-5 bullets. Each bullet MUST "
+                     "include a citation [#N]. Do not invent claims. If the passages do not "
+                     "contain the answer, reply with EXACTLY: I don't know"
+                     "\n\nPassages:\n{passages}\n\nQuestion: {q}\nAnswer:")
+def synthesize(query, hits):
+    if not hits: return {"answer": "I don't know", "drift_filtered": 0}   # canonical abstention
+    passages = "\n\n".join(f"[#{i+1}] {h['text']}" for i, h in enumerate(hits))
+    text = omlx.chat.completions.create(model=MODEL, temperature=0.0, max_tokens=400,
+        messages=[{"role": "user", "content": SYNTHESIZE_PROMPT.format(
+            passages=passages[:8000], q=query)}]).choices[0].message.content.strip()
+    kept, dropped = [], 0
+    for b in (ln.strip() for ln in text.splitlines() if ln.strip()):
+        m = re.search(r"\[#(\d+)\]", b)
+        if m and 0 <= int(m.group(1)) - 1 < len(hits):
+            bk = set(re.findall(r"\w+", b.lower())) - {"the", "a", "an", "of", "to", "in"}
+            if bk & set(re.findall(r"\w+", hits[int(m.group(1)) - 1]["text"].lower())):
+                kept.append(b)                                   # bullet supported by its cited passage
+            else: dropped += 1                                   # DRIFT: drop unsupported bullet
+        else: kept.append(b)
+    return {"answer": "\n".join(kept), "drift_filtered": dropped}
+```
+
+**Walkthrough (A):**
+- **Node 1 `decide_complexity`** scores the query (named-entity count + cue words like "compare"/"vs"/"and") and labels it Simple/Complex - a cheap router that gates optional LLM decomposition (Phase 6). No model call.
+- **Node 2 `multi_retrieve`** runs the query *twice* - verbatim and stripped-to-keywords - and fuses the two ranked lists with **Reciprocal Rank Fusion** (`1/(60+rank)`). Two query phrasings catch passages either alone would miss; RRF needs no score calibration.
+- **Node 3 `rerank`** is precision after recall: the BGE cross-encoder rescues the top-6 by scoring each `(query, passage)` pair directly. **Nodes 2-3-4 are exactly `run_single_pass`** - the §3.2 single-pass arm.
+- **Node 4 `synthesize`** is the §3.1 generation diagram in code: the grounded prompt (cite `[#N]`, **emit a canonical `"I don't know"` when the answer isn't in the passages**) **plus** the drift filter (drop any bullet whose words don't overlap its cited passage). The grounded prompt is *why* single-pass abstains instead of hallucinating; the *canonical* abstention is what makes that abstention reliably detectable downstream — the key fix in the v1→v3 arc below.
+
+**Block B — self-check, grade, correct, orchestrate (nodes 5-8 + the pipeline):**
+
+```python
+# Node 5: SelfRAG checks — programmatic (keyword overlap), not an LLM judge
+def selfrag_checks(answer, hits, query):
+    bullets = [ln for ln in answer.splitlines() if ln.strip()]
+    cited = [b for b in bullets if re.search(r"\[#\d+\]", b)]
+    faithful = sum(1 for b in cited
+        if (m := re.search(r"\[#(\d+)\]", b)) and 0 <= int(m.group(1))-1 < len(hits)
+        and len(set(re.findall(r"\w+", b.lower())) &
+                set(re.findall(r"\w+", hits[int(m.group(1))-1]["text"].lower()))) >= 3)
+    qk = set(re.findall(r"\w+", query.lower()))
+    cit  = len(cited) / (len(bullets) or 1)
+    faith = (faithful / (len(bullets) or 1)) if cited else 0.0
+    cov  = len(qk & set(re.findall(r"\w+", answer.lower()))) / max(len(qk), 1)
+    return {"citation_rate": cit, "faithfulness_rate": faith, "coverage": cov,
+            "confidence": round((cit + faith + cov) / 3, 3)}
+
+# Nodes 6/7: Grade — hallucination (faithful + cited) and relevance (query overlap)
+def grade_hallucination(answer, hits, query):
+    sr = selfrag_checks(answer, hits, query)
+    return {"pass": sr["faithfulness_rate"] >= 0.5 and sr["citation_rate"] >= 0.5, "selfrag": sr}
+GRADE_RELEVANCE_PROMPT = ("Does the ANSWER actually answer the QUESTION with specific information, "
+                          "or decline / say it's insufficient? Reply ONE word: YES or NO.\n\n"
+                          "Question: {q}\nAnswer: {a}\nVerdict:")
+def grade_relevance(answer, query):                      # v3 — see the arc below
+    if "i don't know" in answer.lower():                 # canonical abstention → deterministic, no LLM
+        return {"pass": False, "verdict": "abstain"}
+    verdict = (omlx.chat.completions.create(model=MODEL, temperature=0.0, max_tokens=5,
+        messages=[{"role": "user", "content": GRADE_RELEVANCE_PROMPT.format(q=query, a=answer)}]
+        ).choices[0].message.content or "").strip().lower()
+    return {"pass": verdict.startswith("y"), "verdict": verdict[:12]}  # LLM fallback for partial answers
+
+# Node 8: CorrectiveRAG — rewrite the query and retry, BOUNDED by max_rewrite (no runaway)
+def corrective_loop(query, top_k=6, max_iters=THRESHOLDS.max_rewrite):  # max_rewrite = 2
+    q, out = query, {}
+    for i in range(max_iters):
+        q = rewrite_query(q) if i > 0 else q                     # LLM rephrases for recall
+        rr = rerank(q, multi_retrieve(q), top_k); sy = synthesize(q, rr)
+        out = {"answer": sy["answer"], "selfrag": selfrag_checks(sy["answer"], rr, q),
+               "grade_relevance": grade_relevance(sy["answer"], q), "iteration": i}
+        if out["grade_relevance"]["pass"] and out["selfrag"]["confidence"] >= THRESHOLDS.selfrag_conf:
+            break
+    return out
+
+# Orchestrator: single pass → grade → corrective loop → suggest web-search fallback
+def answer(query, top_k=6):
+    rr = rerank(query, multi_retrieve(query), top_k); sy = synthesize(query, rr)
+    gr = grade_relevance(sy["answer"], query)
+    out = {"query": query, "answer": sy["answer"], "hits": rr, "grade_relevance": gr,
+           "selfrag": selfrag_checks(sy["answer"], rr, query), "drift_filtered": sy["drift_filtered"]}
+    if not gr["pass"]:                                           # corpus retrieval looked off-topic
+        out["corrective"] = corrective_loop(query, top_k)
+        if not out["corrective"]["grade_relevance"]["pass"]:    # STILL bad → escalate out of corpus
+            out["next_action"] = {"type": "web_search", "query": query}
+    return out
+```
+
+**Walkthrough (B):**
+- **Node 5 `selfrag_checks` is three *programmatic* self-evaluations**, not an LLM judge: citation rate (bullets that cite), faithfulness rate (bullets whose words overlap their cited passage by ≥3 keywords), and coverage (query keywords present in the answer). Their mean is a `confidence` score. Deterministic and free - but coarse (keyword overlap, not semantics).
+- **Nodes 6/7 `grade_*`** decide whether the answer is good enough or the corrective loop must fire (`answer()` checks `if not gr["pass"]`). `grade_hallucination` is programmatic (faithfulness ≥ 0.5 *and* citation ≥ 0.5). `grade_relevance` went through **three versions** (the arc below): keyword overlap (fooled by question-echoing abstentions → loop unreachable), then an LLM YES/NO judge (noisy on Gemma), and finally a **deterministic short-circuit on the canonical `"I don't know"`** plus an LLM fallback for genuine partial answers. The code shown is that final version.
+- **Node 8 `corrective_loop` terminates by construction.** It's a counted `for i in range(max_iters)` (`max_rewrite=2`): the `break` is an early exit when the answer is already good, but even if the grade *never* passes, `range(2)` exhausts and the loop returns its best attempt. Termination is guaranteed by the loop's *shape*, not by any success condition - you can prove it halts by reading one line. Contrast §3.2: the LangGraph structural rewrite is a graph *cycle* with no built-in counter, so on a never-passing grade it runs until the runtime's `recursion_limit` aborts it with `GraphRecursionError`. Same idea; the `for` **bounds itself and fails safe** (returns a result), the cycle **borrows a runtime guard and fails loud** (raises). (Both are finite - a `for range(N)` is never *unbounded* even for huge `N` - so "runaway" here means "loops until an external limit crashes it," not "loops forever.")
+- **`answer()` is the CRAG decision in plain Python:** one forward pass; if relevance fails, run the corrective loop; if that *still* fails, **search the web and synthesize from the results**. That escalation - corpus → rewrite → web - is exactly what `crag_variant.py` does as a LangGraph graph. (This started as a *suggestion* - `next_action=web_search` for the host to act on; one `web_search()` call in the fallback now *executes* it inline, so the pipeline answers out-of-corpus 10/10 like CRAG - see the result below.)
+
+> [!tip] Hand-rolled vs LangGraph CRAG — when to reach for each
+> Same corrective-RAG idea, two engineering trade-offs:
+> - **Hand-rolled (`baseline_handrolled.py`)**: every node is a plain function - trivial to read, unit-test, and step through in a debugger; loops are bounded by a `for range(...)` by construction; zero framework. Best for *learning the algorithm* and for small, stable pipelines.
+> - **LangGraph (`crag_variant.py`)**: graph state, conditional edges, checkpointing, streaming, and a drawable graph for free - but cyclic paths need an explicit `recursion_limit` guard (the §3.2 runaway). Best when the graph grows, branches, or needs observability/resumability.
+> The hand-rolled version is the better *teacher*; the LangGraph version is the better *platform*. Knowing both - and that they implement the same CRAG - is the point of Phase 3.
+
+**Run it on out-of-corpus (`uv run python src/baseline_handrolled.py --out-of-corpus`) - two versions, a real debugging arc:**
+
+***v1 — keyword `grade_relevance`: the corrective loop fires 0/10 (never runs).*** It scored **query↔answer keyword overlap**, and the abstention *echoes the question* (*"the passages do not contain information regarding **the most capable Claude model … in 2026**…"*) → overlap ≈ 1.0 ≥ 0.2 → **pass**. `answer()` runs the loop only `if not gr["pass"]`, so a fooled "pass" skipped the loop and the web escalation entirely. **The corrective branch was present but unreachable** - so comparing it to `crag_variant.py` was not apples-to-apples.
+
+***v2 — LLM `grade_relevance` ("did the ANSWER actually answer, or abstain?"): the loop fires and `rewrite_query` is triggered.*** Proof - the literal rephrasings it produced:
+
+```
+- ...most capable Claude model...2026?  | grade:no  | corrective:yes rewrites:1 | web_search
+    rewrite_query fired → 'Which Anthropic Claude model is the most powerful version released during 2026?'
+- Which team won the 2025 NBA Finals?   | grade:no  | corrective:yes rewrites:1 | web_search
+    rewrite_query fired → 'Who was the champion of the 2025 NBA championship series?'
+- ...newest Apple silicon chip...2025?  | grade:no  | corrective:yes rewrites:1 | web_search
+    rewrite_query fired → 'Which latest Apple M-series processor was unveiled in 2025?'
+  ...
+out-of-corpus (10 q): corrective fired 5/10 | rewrites 1 each | suggested web_search 4/10
+```
+
+- **`rewrite_query` genuinely fires** - the rephrasings are visibly different queries. `rewrites:1` (not 2) because the loop's first pass `i=0` reuses the original query; `rewrite_query` only runs at `i=1`. The corrective machinery is real and reachable once the grader works.
+- **But it fires only 5/10 - the local judge is inconsistent.** Gemma graded 5 of 10 *identical-style* abstentions as "yes, answered," so correction is *noisily* gated.
+
+**Why v2 is still noisy - same model, different reliability.** `crag_variant.py`'s evaluator scored the corpus **0.00 on all 10 - consistent** - while this LLM `grade_relevance` flip-flops, *on the same Gemma*. Two reasons: **(a) different target** - CRAG grades the **retrieved docs** ("can these docs answer?"), which are unambiguously off-topic (easy call); this grades the **answer text** ("did this answer answer?"), an abstention that *echoes the question* (hard call - linguistically *about* the topic). **(b) different output** - CRAG emits a **0-1 score binned by a threshold** (`≤0.3 → web`), which absorbs wobble; this emits a **binary YES/NO**, which converts the same wobble into a hard flip. Reliability is a property of the *harness* (what you judge + how you read it), not the weights.
+
+***v3 — fix the *generator*, not the judge: `synthesize()` emits a canonical `"I don't know"`.*** Rather than build a smarter judge, make the abstention unambiguous at the source. Change the synthesis prompt to *"if the passages do not contain the answer, reply with EXACTLY: I don't know,"* and let `grade_relevance` short-circuit on it (a substring check - no LLM call):
+
+```
+out-of-corpus (10 q): corrective fired 10/10 | rewrites 1 each | web search EXECUTED 10/10 | answered via web 10/10
+   web answer: * The 2025 Nobel Prize in Physics → Clarke, Devoret, Martinis [#1]. *   (grounded, [#N]-cited, drift-filtered)
+```
+
+Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because detecting `"I don't know"` is a string match, not a judgment. This is the cleanest of the three fixes: a canonical abstention moves reliability **off the model entirely**, and it *retroactively repairs v1's keyword grader too* (a bare `"I don't know"` no longer echoes the question → overlap ≈ 0). The transferable rule: **when you can make an upstream output canonical, do that instead of building a smarter downstream classifier.**
+
+> [!note] The arc, and what each step taught
+> **v1** keyword grader → **0/10** (the loop was unreachable - grader fooled by the question-echoing abstention). **v2** LLM-judges-the-answer → **5/10** (Gemma noisy: a hard target + a brittle binary output). **v3** canonical `"I don't know"` + substring check → **10/10** (deterministic). Three transferable rules fall out: **(a)** grade the **retrieval**, not the answer text (CRAG's `evaluate` - the docs are unambiguously irrelevant); **(b)** ask for a **score + threshold**, not a binary, so the judge's uncertainty has a buffer; **(c)** best of all, make the **generator** emit a canonical abstention so detection needs no judge. Final step to make it fully apples-to-apples: *execute* the web search instead of suggesting it - one function (`web_search()`, Tavily/DuckDuckGo) wired into `answer()`'s fallback - and the pipeline **answers all 10 from real, grounded ([#N]-cited, drift-filtered) web evidence**, exactly like CRAG. The only remaining difference is *plain functions vs a LangGraph graph*. The bounded loop held throughout: one rewrite per fire, no runaway.
+
+> [!abstract] Phase 3 — lessons learnt
+> 1. **CRAG = retrieve → *score the retrieval* → route (corpus / web / both).** A *scored evaluator*, not a yes/no grader, is what lets it escalate **out of** the corpus — where the rewrite loop could only re-ask the same empty corpus.
+> 2. **Evaluator quality decides whether correction ever fires.** The *same* Gemma was reliable grading **docs** with a **score + threshold** (CRAG: 0.00 ×10) and noisy grading the **answer text** with a **binary** (hand-rolled v2: 5/10). Grade the retrieval, not the answer; prefer a score over a label.
+> 3. **A canonical abstention beats a smarter judge.** Making `synthesize()` emit `"I don't know"` turned detection into a substring match — **0/10 → 10/10, deterministic** — and repaired *every* grader version at once. Fix the producer, not the consumer.
+> 4. **Bound loops by construction.** The hand-rolled `for range(2)` terminates and returns its best attempt; the LangGraph cycle needed an external `recursion_limit` and crashed on out-of-corpus (§3.2). Same algorithm, safer shape.
+> 5. **Suggestion vs execution is a one-function switch.** The hand-rolled pipeline first *emitted* `next_action=web_search` (host-mediated — testable, auditable), then *executed* `web_search()` inline (autonomous — answers 10/10 from real web evidence); the change was a single function call, not an architecture rewrite. `crag_variant.py` executes by construction. Neither posture is strictly better — pick per how much control vs autonomy you want — but switching is cheap.
+> 6. **Verify branches by running the trigger.** "Is the rewrite fired?" / "why 10/10 answered?" — three predicted behaviours this lab got wrong were only caught by logging the actual path (rewrite never fired in v1; single-pass *abstained* not hallucinated; CRAG count was Tavily-vs-DDG). A conditional branch's real behaviour is unknown until you feed it the case it's meant to catch.
 
 ---
 
