@@ -1033,7 +1033,7 @@ flowchart TD
   GH -->|"pass"| DONE([answer])
   GH -->|"relevance fail"| CR["8 · CorrectiveRAG<br/>(rewrite + retry, max 2)"]
   CR -->|"pass"| DONE
-  CR -->|"still fail"| WS["next_action:<br/>suggest web_search"]
+  CR -->|"still fail"| WS["web_search() executed<br/>→ synth from web → answer"]
   classDef slice fill:#dff0d8,stroke:#3c763d,stroke-width:2px;
   class MR,RR,SY slice;
 ```
@@ -1148,16 +1148,29 @@ def corrective_loop(query, top_k=6, max_iters=THRESHOLDS.max_rewrite):  # max_re
             break
     return out
 
-# Orchestrator: single pass → grade → corrective loop → suggest web-search fallback
+# web search: Tavily SDK (if key) → DuckDuckGo (free) → clear error; mirrors crag_variant.py
+def web_search(query, k=4):
+    if os.getenv("TAVILY_API_KEY"):
+        from tavily import TavilyClient
+        r = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
+        return [d["content"] for d in r.get("results", []) if d.get("content")]
+    from ddgs import DDGS
+    with DDGS() as d: return [x["body"] for x in d.text(query, max_results=k) if x.get("body")]
+
+# Orchestrator: single pass → grade → corrective loop → EXECUTE web-search fallback
 def answer(query, top_k=6):
     rr = rerank(query, multi_retrieve(query), top_k); sy = synthesize(query, rr)
     gr = grade_relevance(sy["answer"], query)
-    out = {"query": query, "answer": sy["answer"], "hits": rr, "grade_relevance": gr,
+    out = {"query": query, "answer": sy["answer"], "hits": rr, "grade_relevance": gr, "source": "corpus",
            "selfrag": selfrag_checks(sy["answer"], rr, query), "drift_filtered": sy["drift_filtered"]}
     if not gr["pass"]:                                           # corpus retrieval looked off-topic
         out["corrective"] = corrective_loop(query, top_k)
-        if not out["corrective"]["grade_relevance"]["pass"]:    # STILL bad → escalate out of corpus
-            out["next_action"] = {"type": "web_search", "query": query}
+        if not out["corrective"]["grade_relevance"]["pass"]:    # STILL bad → EXECUTE web search
+            web_docs = web_search(query)                        # real Tavily/DDG call, run in-process
+            wsy = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
+                                     for i, d in enumerate(web_docs)])    # ground the web docs too
+            out["answer"], out["source"] = wsy["answer"], "web"
+            out["next_action"] = {"type": "web_search", "executed": True}
     return out
 ```
 
@@ -1326,13 +1339,13 @@ flowchart TD
   RR --> SY["Synthesize<br/>bullets with [#i] citations<br/>+ drift filter"]
   SY --> SR["SelfRAG checks<br/>citation_rate +<br/>faithfulness_rate +<br/>coverage"]
   SR --> GH["grade_hallucination<br/>pass = faith ≥ 0.5 AND<br/>cite ≥ 0.5"]
-  SR --> GR["grade_relevance<br/>pass = qkeys ∩ akeys ≥ 0.2"]
+  SR --> GR["grade_relevance<br/>LLM judge + canonical<br/>I-dont-know short-circuit"]
   GH -->|"both pass"| OUT["{answer, hits, selfrag,<br/>grades, decision}"]
   GR -->|"both pass"| OUT
   GH -->|"hallucination fails"| REGEN["regenerate (max_regen)"]
   GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite)"]
   REGEN --> SR
-  CRAG -->|"still fails"| FALLBACK["next_action: web_search<br/>(host-level handoff)"]
+  CRAG -->|"still fails"| FALLBACK["web_search() executed<br/>→ synth from web → answer"]
   CRAG -->|"now passes"| OUT
   FALLBACK --> OUT
 ```
@@ -1363,8 +1376,12 @@ def answer(query: str, top_k: int = 6) -> dict[str, Any]:
     if not gr["pass"]:                      # CRAG: rewrite + retry
         crag = corrective_loop(query, top_k=top_k)
         out["corrective"] = crag
-        if not crag["grade_relevance"]["pass"]:
-            out["next_action"] = {"type": "web_search", ...}
+        if not crag["grade_relevance"]["pass"]:               # STILL bad → execute web search inline
+            web_docs = web_search(query)                       # real Tavily/DDG call (run in-process)
+            wsy = synthesize(query, [{"id": f"web{i}", "text": d, "payload": {}}
+                                     for i, d in enumerate(web_docs)])   # ground web docs too
+            out["answer"], out["source"] = wsy["answer"], "web"
+            out["next_action"] = {"type": "web_search", "executed": True}
     return out
 ```
 
@@ -1374,7 +1391,7 @@ def answer(query: str, top_k: int = 6) -> dict[str, Any]:
 - **Block 2 — `multi_retrieve` (original + keyword-only RRF).** Issues two Qdrant queries: original query text + keyword-only variant (stripped of stopwords / function words). Cormack-style RRF (`1/(60+rank)`) fuses the rankings. Variant generation is the cheap recall-augmentation that doesn't need decomposition; covers the case where the original query has too much syntactic noise to dense-match well.
 - **Block 3 — `synthesize` with `[#i]` citation binding + drift filter.** The W2.7-discovered explained-refusal pattern transferred — the prompt forces inline `[#N]` citations on every bullet. The drift filter post-pass drops any bullet whose keywords don't overlap its cited passage; cheap pre-faithfulness guardrail before RAGAS-style judge runs.
 - **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
-- **Block 5 — `corrective_loop` (CRAG: rewrite + retry).** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If still fails after max iterations, set `next_action = {"type": "web_search"}` so the host (Claude Desktop / Cursor via MCP server) knows to route to its web-search tool and feed results back.
+- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** (`web_search()`: Tavily SDK → DuckDuckGo) and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
 
 **Result (estimated, lab not yet end-to-end run on a calibrated eval):**
 
@@ -1393,7 +1410,7 @@ First measured run will populate `lab-03.7-agentic-rag/results/RESULTS.md`. Comp
 `★ Insight ─────────────────────────────────────`
 - **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
 - **`shared/tree_index.split_large_nodes` and this lab's `decompose.py` solve different problems but pair well.** Tree-split fragments a long document into navigable units (build-time); decompose fragments a complex query into atomic sub-queries (query-time). Together: the agent sees a fine-grained tree AND can plan multi-step queries against it.
-- **CRAG's "next_action: web_search" is the host-level handoff pattern.** This lab doesn't run web search itself — it emits a structured `next_action` in the response and lets the MCP host (Claude Desktop / Cursor via Phase 8's mcp_server) route to a web-search MCP tool. Decoupling intent from execution is what makes this pattern composable across hosts.
+- **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search()`: Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
 `─────────────────────────────────────────────────`
 
 Run smoke test (loads encoder + reranker + Qdrant; first run ~5-15 s warmup):
