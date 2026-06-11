@@ -1388,6 +1388,12 @@ After Tavily and DuckDuckGo *both* failed to ground BHE, I concluded:
 
 A local [SearXNG](https://github.com/searxng/searxng) instance aggregates Google + Startpage and **reranks**, floating Wikipedia above the paywall snippet. Wired in as the top of the `web_search` precedence chain (free, no key): `SEARXNG_URL → TAVILY_API_KEY → DuckDuckGo`. With it, the comparison query grounds **both** figures, both cited (`BNSF $23.876B [#5]` + `BHE US$26.198B [#4]`). `k` sensitivity: the authoritative free source ranks ~3rd–4th, so per-sub-query depth `WEB_FANOUT_K` defaults to **8** (at 6 the synthesizer settled for an imprecise `$25.6B`).
 
+#### Fix 5 — re-grade the shipped answer
+
+Running the CLI on the fixed pipeline surfaced a *new* contradiction: the top-level `answer` was the grounded 3-bullet web answer, but right beside it sat `grade_relevance: abstain`, `selfrag.confidence: 0.0`, `grade_hallucination: FAIL`. The output *looked* broken while being correct. Cause: the web fallback overwrote `out["answer"]` but **never re-ran the graders** — those scores still described the *discarded corpus pass*. Any consumer keying on `grade_relevance.pass` or `selfrag.confidence` (the MCP host, an eval harness) would wrongly reject a correct answer.
+
+The fix: after the fallback, re-run `selfrag_checks` + `grade_hallucination` + `grade_relevance` against the **web** answer, and flip `out["hits"]` to `web_hits` so the answer's `[#N]` citations resolve against the passages they actually cite (otherwise faithfulness compares web bullets to corpus garbage → back to `0.0`). Measured: the BNSF-vs-BHE answer flips from `abstain` / `0.0` to **`grade_relevance.pass=true`, `confidence=0.875`** — answer text unchanged. A grade is a claim *about* an artifact; when a branch swaps the artifact, re-grade at the swap or every downstream metric reads the wrong pass. (The `corrective.answer` stays `"I don't know"` — that's the *corpus* rewrite, which correctly abstains; only the top-level grades, which describe what shipped, are updated.)
+
 #### Outcome
 
 The measured before→after across all three backends is the **§3.3 table above** (single-shot abstains → Tavily/DDG fan-out half-grounds with BHE paywalled → SearXNG fan-out grounds both). Its non-determinism caveat applies: a representative run, live ranking reorders, SearXNG makes the free source *reachable in the top-k* not *guaranteed first*. Single-entity regression check (`"Who is the CEO of OpenAI as of 2026?"`) correctly stayed `single` (Simple → no decompose) → `"Sam Altman [#1,#2,#4,#5,#7]"` — no regression. *Numbers from `src/baseline_handrolled.py` probes, 2026-06-11, against a live SearXNG on `:8080`.*
@@ -1400,10 +1406,11 @@ The measured before→after across all three backends is the **§3.3 table above
 4. **Decomposition belongs on whichever surface holds the answer** — corpus *or* web. Fan out the retriever that can actually reach the fact.
 5. **Two engines failing the same way ≠ a hard ceiling** if they share a backend. A metasearch that aggregates + reranks is an independent third sample. (My wrong "engine swap ruled out" was caught only by *running* the third engine, not by reasoning.)
 6. **Watch for bugs you introduce while fixing one.** Doubling docs under a fixed passage cap silently truncated entity #2 — interleaving restored fairness.
+7. **Grade the artifact that ships, not the one you discarded.** The web fallback swapped `answer` but not its evaluation, so a correct answer wore a stale `abstain`/`0.0`. Evaluation and generation must stay synced: re-grade at the point you swap the answer — and move its evidence (`hits`) with it, so citations resolve.
 
 #### Files changed
 
-- `src/baseline_handrolled.py` — `_searxng_search`, 3-tier `web_search`, `web_search_planned` (decompose + interleave), rewired `answer()` web fallback, `WEB_FANOUT_K` (default 8).
+- `src/baseline_handrolled.py` — `_searxng_search`, 3-tier `web_search`, `web_search_planned` (decompose + interleave), rewired `answer()` web fallback, re-grade-after-web-fallback (Fix 5), `WEB_FANOUT_K` (default 8).
 - `src/mcp_server.py` — `rag_query` returns `source` + `web_docs_found`.
 - `searxng/` — `docker-compose.yml`, `settings.yml`, `README.md` (free local backend).
 - `.env.example`, `mcp-config.json` — `SEARXNG_URL` documented in the precedence chain.
