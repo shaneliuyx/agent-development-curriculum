@@ -896,8 +896,9 @@ CONF_LOWER = float(os.getenv("CRAG_LOWER", "0.3"))   # ≤ this → corpus faile
 def web_search(query: str, k: int = 3) -> list[str]:
     """Pluggable + graceful: Tavily (if key) → DuckDuckGo (free) → clear error. No key required."""
     if os.getenv("TAVILY_API_KEY"):
-        from langchain_community.tools.tavily_search import TavilySearchResults
-        return [r["content"] for r in TavilySearchResults(max_results=k).invoke(query)]
+        from tavily import TavilyClient                       # official SDK (langchain wrapper sunset)
+        resp = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
+        return [r["content"] for r in resp.get("results", []) if r.get("content")]
     try:
         from ddgs import DDGS
     except ImportError:
@@ -1197,9 +1198,13 @@ out-of-corpus (10 q): corrective fired 5/10 | rewrites 1 each | suggested web_se
 ***v3 — fix the *generator*, not the judge: `synthesize()` emits a canonical `"I don't know"`.*** Rather than build a smarter judge, make the abstention unambiguous at the source. Change the synthesis prompt to *"if the passages do not contain the answer, reply with EXACTLY: I don't know,"* and let `grade_relevance` short-circuit on it (a substring check - no LLM call):
 
 ```
-out-of-corpus (10 q): corrective fired 10/10 | rewrites 1 each | web search EXECUTED 10/10 | answered via web 10/10
-   web answer: * The 2025 Nobel Prize in Physics → Clarke, Devoret, Martinis [#1]. *   (grounded, [#N]-cited, drift-filtered)
+out-of-corpus (10 q): corrective fired 10/10 | web search EXECUTED 10/10 | answered via web 10/10
+   web answer: * The 2025 Nobel Prize in Physics → Clarke, Devoret, Martinis [#1]. *  (grounded, [#N]-cited)
+   steps: decide→Simple | retrieve→30 after RRF | rerank→top-6 | synth→1 bullet | selfrag→conf=0.0
+          | halluc→FAIL | rel→FAIL (abstain) | corrective→FAIL | web→4 docs → re-synth | final→source=web
 ```
+
+Each row's `steps:` line is an execution trace (`out["steps"]`, rendered by `_fmt_steps`) - it makes the **corpus → abstain → corrective → web** path visible per query, which is how you *confirm* the pipeline took the route you think it did (the recurring §3.2/§3.3 theme: every wrong prediction was caught by logging the actual path). Two production touches worth copying from the current code: the web backend is the **official `tavily` SDK** (the `langchain_community` wrapper was sunset in LangChain 0.3.25), and the fallback **splits its `except`** - a missing web dependency (`ImportError`) is a *config bug* that breaks every query → **fail loud** with a fix hint; a network/API/no-results miss is *per-query* → **fail soft** (record `web_error`, abstain). Same `try`, two failure classes, two responses.
 
 Now it fires **10/10, deterministically** - the Gemma flip-flop is gone, because detecting `"I don't know"` is a string match, not a judgment. This is the cleanest of the three fixes: a canonical abstention moves reliability **off the model entirely**, and it *retroactively repairs v1's keyword grader too* (a bare `"I don't know"` no longer echoes the question → overlap ≈ 0). The transferable rule: **when you can make an upstream output canonical, do that instead of building a smarter downstream classifier.**
 
