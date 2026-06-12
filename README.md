@@ -24,7 +24,7 @@ Week 3.5.8 — Two-Tier Memory Architecture       ← guild operational + EverCo
 Week 3.5.9 — Requirement-Driven Memory Arch.    ← LongMemEval decomposition + 6-backend matrix (1-tier / 2-tier / hybrid / three-tier HyperMem L3)
 Week 3.5.95 — Self-Observability Memory         ← PAI v7.6 OBSERVABILITY + LEARNING self-facing axes + Phase 7 heat-scored eviction (BAI-LAB/MemoryOS leverage; importance-exempt) — lab executed, tests 6/6
 Week 3.5.96 — Self-Wiring Memory (GBrain)       ← markdown-first deterministic graph + hybrid retrieval (measured: pure-vector > RRF on 19-page corpus — 83→95 is corpus-dependent, not universal) + Ground-Truth Hierarchy A/B (ClaudioDrews/memory-os) (Garry Tan / YC, MIT, lab executed)
-Week 3.7 — Agentic RAG                          ← canonical 5-node graph
+Week 3.7 — Agentic RAG                          ← measured: canonical skip-allowed graph mis-built (faithfulness 0.876 vs single-pass 0.980, 15/50 skips) → structural always-retrieve = 1.000 at parity; CRAG web fallback decomposes comparisons (per-sub rerank) over a SearXNG backend, 10/10 out-of-corpus; web_search promoted to shared (lab executed)
 Week 4  — ReAct From Scratch                    ← + §1.5 MLX Studio gateway role-map (2026-05-15 sync)
 Week 4.5 — Model Routing and Effort Tiering     ← local Qwen-1.5B classifier + cost-latency Pareto front (SPEC, v0)
 Week 4.6 — Durable Agent Runtime + Topologies   ← AutoGPT executor/scheduler/lock kernel + PraisonAI 4-mode process (SPEC, v0)
