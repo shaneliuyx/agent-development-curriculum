@@ -1394,6 +1394,16 @@ Running the CLI on the fixed pipeline surfaced a *new* contradiction: the top-le
 
 The fix: after the fallback, re-run `selfrag_checks` + `grade_hallucination` + `grade_relevance` against the **web** answer, and flip `out["hits"]` to `web_hits` so the answer's `[#N]` citations resolve against the passages they actually cite (otherwise faithfulness compares web bullets to corpus garbage → back to `0.0`). Measured: the BNSF-vs-BHE answer flips from `abstain` / `0.0` to **`grade_relevance.pass=true`, `confidence=0.875`** — answer text unchanged. A grade is a claim *about* an artifact; when a branch swaps the artifact, re-grade at the swap or every downstream metric reads the wrong pass. (The `corrective.answer` stays `"I don't know"` — that's the *corpus* rewrite, which correctly abstains; only the top-level grades, which describe what shipped, are updated.)
 
+#### Fix 6 — accuracy (per-sub-query rerank) + reproducibility (cache) + promotion to shared
+
+**The "stable but wrong" trap.** The reproducibility cache (below) made the answer *deterministic* — but a deterministic answer can be reproducibly *wrong*. The fan-out had unioned both entities' web docs and reranked that union against the *whole* comparison query; the cross-encoder scored BHE's docs higher, so the top-k came back BHE-heavy → 3 BHE bullets, **BNSF's `$23.876B` silently dropped**. Stability was hiding an accuracy regression.
+
+**The accuracy fix — rerank scope.** Rerank **each sub-query's docs against its OWN sub-query** (not the comparison) and keep the top few, then interleave — so each entity's figure-passage surfaces in its own lane and neither dominates. Same cross-encoder, different *scope*; that scope was the whole bug. The BNSF-vs-BHE answer now carries one grounded, cited figure **per entity**. (`rerank_results` in `shared/web_search.py`.)
+
+**Reproducibility — an original-query-level cache.** A metasearch is non-deterministic: the same query returns a different pool run-to-run (engines bot-block / time out / rotate; language is header-inferred — pinning `SEARXNG_LANGUAGE` + `SEARXNG_ENGINES` shrinks but can't remove it, and pinning a *small* engine set backfires when Google's scraper is blocked → empty pool). So web results are cached on disk, at the **original-query** level: the LLM decomposer's sub-query phrasing varies run-to-run, so per-sub-query keys miss — the stable key is the original question. First run hits the live web; every repeat replays the same pool → the same answer. `WEB_CACHE=0` forces live.
+
+**Promotion to shared.** `web_search` (backend + cache) and `rerank_results` were duplicated across `baseline_handrolled.py` and `crag_variant.py`, so they moved to **`shared/web_search.py`** (one source of truth — `crag_variant` is upgraded from Tavily/DDG-only to the SearXNG-first chain for free), with the SearXNG docker setup alongside in **`shared/searxng/`**. A `--trace` CLI flag prints the step-by-step process trace; default prints just the answer.
+
 #### Outcome
 
 The measured before→after across all three backends is the **§3.3 table above** (single-shot abstains → Tavily/DDG fan-out half-grounds with BHE paywalled → SearXNG fan-out grounds both). Its non-determinism caveat applies: a representative run, live ranking reorders, SearXNG makes the free source *reachable in the top-k* not *guaranteed first*. Single-entity regression check (`"Who is the CEO of OpenAI as of 2026?"`) correctly stayed `single` (Simple → no decompose) → `"Sam Altman [#1,#2,#4,#5,#7]"` — no regression. *Numbers from `src/baseline_handrolled.py` probes, 2026-06-11, against a live SearXNG on `:8080`.*
@@ -1529,13 +1539,17 @@ flowchart TD
   GR -->|"pass"| OUT
   GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite=2)"]
   CRAG -->|"now passes"| OUT
-  CRAG -->|"still fails"| FALLBACK["web_search_planned — WEB fan-out<br/>(Complex, automatic): decompose →<br/>web_search each → interleave → union"]
+  CRAG -->|"still fails"| FALLBACK["web_search_planned — WEB fan-out (Complex):<br/>decompose → web_search each (cached) →<br/>per-sub-query rerank → interleave"]
   FALLBACK --> WSY["Synthesize from web<br/>→ re-grade shipped answer (Fix 5)"]
   WSY --> OUT
 ```
 *Decomposition drives fan-out on **two** surfaces, not just the web: `execute_plan` over the **corpus** (opt-in, `ENABLE_DECOMPOSITION=1`) and `web_search_planned` over the **web fallback** (automatic for Complex). Same pattern both times — N atomic sub-queries retrieved independently, then merged + reranked — applied wherever the answer might live. The Simple path skips both and runs a single `MultiRetrieve → Rerank`.*
 
-**Code (`src/baseline_handrolled.py` — the complete pipeline, top-to-bottom):**
+**Code (`src/baseline_handrolled.py` — the pipeline, top-to-bottom).** The web-search *backend*
+(SearXNG → Tavily → DuckDuckGo) + on-disk reproducibility cache + cross-encoder `rerank_results`
+were **promoted to `shared/web_search.py`** (imported at the top), since `crag_variant.py` needs the
+same backend — one source of truth. What stays in this file is the lab-specific orchestration
+(`web_search_planned`, `execute_plan`, `answer`). The shared module is shown right after:
 
 ```python
 """Hand-rolled Self-RAG + CRAG pipeline (Phase 5 baseline for W3.7).
@@ -1562,7 +1576,6 @@ Pipeline (single file, no LangGraph — that's Phase 1-4 of the lab):
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
@@ -1580,6 +1593,9 @@ sys.path.insert(0, str(_REPO_ROOT / "shared"))
 from rag_hybrid import (  # noqa: E402
     BGE_M3, BGE_RERANKER_V2_M3,
     CrossEncoderReranker, DenseEncoder, autoconfig,
+)
+from web_search import (  # noqa: E402  — promoted infra (shared/web_search.py); see shared/README
+    cache_lookup, cache_store, rerank_results, web_search,
 )
 
 load_dotenv()
@@ -1856,42 +1872,11 @@ def corrective_loop(query: str, top_k: int = 6,
 
 # ---------- Pipeline orchestration -----------------------------------------
 
-def _searxng_search(base_url: str, query: str, k: int) -> list[str]:
-    """Query a SearXNG instance's JSON API (free, self-hosted, no key). Aggregates many
-    engines (Google, Startpage, ...) and — crucially for §3.3 — ranks free encyclopedic /
-    press sources ABOVE the Statista paywall snippet that Tavily and DuckDuckGo surface
-    first, so a figure like BHE's 2023 revenue (US$26.198B, Wikipedia) lands in a readable
-    snippet instead of a redacted `**** billion`. stdlib urllib only (no curl / no dep)."""
-    import urllib.parse
-    import urllib.request
-    url = base_url.rstrip("/") + "/search?" + urllib.parse.urlencode(
-        {"q": query, "format": "json"})
-    with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310 — operator-set local URL
-        results = json.load(resp).get("results", [])
-    return [r["content"] for r in results[:k] if r.get("content")]
-
-
-def web_search(query: str, k: int = 4) -> list[str]:
-    """Real web search for the CRAG fallback. Backend precedence:
-      1. SEARXNG_URL  — free self-hosted metasearch, best free-source ranking (§3.3)
-      2. TAVILY_API_KEY — managed API (good, but ranks paywalled aggregators high)
-      3. DuckDuckGo   — free, no key, weakest ranking
-    else a clear error. Mirrors crag_variant.py so the two CRAGs are comparable."""
-    if os.getenv("SEARXNG_URL"):
-        return _searxng_search(os.environ["SEARXNG_URL"], query, k)
-    if os.getenv("TAVILY_API_KEY"):
-        # Official Tavily SDK (tavily-python) — replaces the sunset
-        # langchain_community.TavilySearchResults wrapper (deprecated in LC 0.3.25).
-        # Drops the langchain dependency from this file entirely (OpenAI client is raw).
-        from tavily import TavilyClient
-        resp = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
-        return [r["content"] for r in resp.get("results", []) if r.get("content")]
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-    with DDGS() as ddg:
-        return [r["body"] for r in ddg.text(query, max_results=k) if r.get("body")]
+# web_search backend (SearXNG → Tavily → DuckDuckGo) + on-disk reproducibility cache now live in
+# shared/web_search.py (promoted infra — both this file and crag_variant.py import it; see
+# shared/README). Imported at the top: `web_search`, `cache_lookup`, `cache_store`. What stays below
+# is the LAB-SPECIFIC orchestration — web_search_planned (decompose → per-sub-query rerank →
+# interleave) and execute_plan — the pieces that couple to decompose_query + rerank, not infra.
 
 
 # Per-sub-query web depth for the fanned-out fallback. Higher than web_search's k=4
@@ -1918,42 +1903,72 @@ def web_search_planned(query: str, decision: dict[str, Any],
     Simple queries keep the single-shot path (one search, no planner cost). Degrades to a
     single web_search(query) on any decompose error so the fallback always runs.
 
+    REPRODUCIBILITY: the final deduped doc pool is cached on disk keyed by the ORIGINAL query,
+    so the same question always yields the same pool — even though the LLM decomposer's sub-query
+    PHRASING varies run-to-run (which would otherwise miss the per-sub-query web cache → different
+    pools → a drifting answer). This is the level the cache has to sit at: per-sub-query caching
+    alone isn't enough because the keys themselves (the planner's wording) aren't stable.
+
     Returns (deduped_web_docs, fanout_log). web_search's own ImportError (missing ddgs /
     tavily) is NOT caught here — it propagates so answer()'s config-bug handler fires.
     """
-    if decision.get("label") != "Complex":
-        return web_search(query, k=per_query_k), [f"single:{query[:32]}"]
-    try:
-        from decompose import decompose_query  # type: ignore
-        plan = decompose_query(query)
-        lookups = [n for n in plan if n.get("type") != "synthesis"] or plan
-    except Exception as e:  # noqa: BLE001  — planner miss → single-shot, never block the fallback
-        return (web_search(query, k=per_query_k),
-                [f"single(decompose-failed:{type(e).__name__}):{query[:32]}"])
+    # Cache at the ORIGINAL-query level (not per-sub-query): the LLM decomposer's sub-query phrasing
+    # varies run-to-run, so per-sub-query keys miss; the original question is the stable key. Cache
+    # API lives in shared/web_search.py (cache_lookup / cache_store honor WEB_CACHE).
+    pkey = f"planned|{decision.get('label')}|k={per_query_k}|{query}"
+    hit = cache_lookup(pkey)
+    if hit is not None:
+        return hit, [f"cache-hit:{query[:40]}"]
 
-    per_sub: list[list[str]] = []
-    log: list[str] = []
-    for n in lookups:
-        sub = (n.get("text") or "").strip() or query
-        hits = web_search(sub, k=per_query_k)   # ImportError here propagates by design
-        per_sub.append(hits)
-        log.append(f"{n.get('id', '?')}({sub[:24]}):{len(hits)}")
-    # Round-robin interleave (q1d1, q2d1, q1d2, q2d2, ...) so BOTH entities sit near the
-    # top of the union. synthesize() caps passages at 8000 chars; naive q1-then-q2
-    # concatenation would push the 2nd entity's best doc past the cap and bias every
-    # comparison toward whoever was searched first. Interleaving keeps it fair.
     docs: list[str] = []
-    for i in range(max(map(len, per_sub), default=0)):
-        for hits in per_sub:
-            if i < len(hits):
-                docs.append(hits[i])
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for d in docs:
-        if d not in seen:
-            seen.add(d)
-            uniq.append(d)
-    return uniq, log
+    log: list[str] = []
+    if decision.get("label") != "Complex":
+        docs, log = web_search(query, k=per_query_k), [f"single:{query[:32]}"]
+    else:
+        lookups: list[dict[str, Any]] | None
+        try:
+            from decompose import decompose_query  # type: ignore
+            plan = decompose_query(query)
+            lookups = [n for n in plan if n.get("type") != "synthesis"] or plan
+        except Exception as e:  # noqa: BLE001  — planner miss → single-shot, never block the fallback
+            lookups = None
+            docs = web_search(query, k=per_query_k)   # ImportError here propagates by design
+            log = [f"single(decompose-failed:{type(e).__name__}):{query[:32]}"]
+        if lookups is not None:
+            per_sub: list[list[str]] = []
+            log = []
+            keep = max(3, per_query_k // 2)
+            for n in lookups:
+                sub = (n.get("text") or "").strip() or query
+                raw = web_search(sub, k=per_query_k)   # ImportError here propagates by design
+                # ACCURACY: rerank THIS sub-query's docs against THIS sub-query (not the overall
+                # comparison) and keep the top `keep`. Two reasons: (1) the passage that actually
+                # holds this entity's figure surfaces to the top; (2) both entities stay represented
+                # after interleave. A union-rerank against the whole "compare X and Y" query instead
+                # lets the more-relevant entity's docs dominate and silently drops the other's figure
+                # — the "stable but wrong" bug (3 BHE bullets, no BNSF number). Per-sub-query rerank
+                # makes each search yield its own valuable result.
+                ranked = rerank_results(sub, raw, keep, _reranker)  # shared cross-encoder rerank
+                per_sub.append(ranked)
+                log.append(f"{n.get('id', '?')}({sub[:24]}):{len(raw)}→top{len(ranked)}")
+            # Round-robin interleave (q1d1, q2d1, q1d2, q2d2, ...) so BOTH entities sit near the
+            # top of the union. synthesize() caps passages at 8000 chars; naive q1-then-q2
+            # concatenation would push the 2nd entity's best doc past the cap and bias every
+            # comparison toward whoever was searched first. Interleaving keeps it fair.
+            interleaved: list[str] = []
+            for i in range(max(map(len, per_sub), default=0)):
+                for hits in per_sub:
+                    if i < len(hits):
+                        interleaved.append(hits[i])
+            seen: set[str] = set()
+            docs = []
+            for d in interleaved:
+                if d not in seen:
+                    seen.add(d)
+                    docs.append(d)
+
+    cache_store(pkey, docs)
+    return docs, log
 
 
 def _n_bullets(answer_text: str) -> int:
@@ -2108,6 +2123,11 @@ def answer(query: str, top_k: int = 6) -> dict[str, Any]:
                 ) from e
             except Exception as e:  # noqa: BLE001  — genuine per-query failure (network / API / no results)
                 web_docs, out["web_error"] = [], f"{type(e).__name__}: {e}"
+            # web_search_planned already reranked each sub-query's docs against its OWN sub-query
+            # and interleaved them, so both entities' figure-passages are present and balanced. Do
+            # NOT rerank the union against the comparison query here — that re-introduces the
+            # one-entity-dominates bug. Synthesize directly over the balanced pool. (Determinism
+            # comes from the on-disk cache in web_search_planned, not from a union-rerank.)
             web_hits = [{"id": f"web{i}", "text": d, "payload": {}} for i, d in enumerate(web_docs)]
             wsy = synthesize(query, web_hits)
             out["answer"], out["source"] = wsy["answer"], "web"
@@ -2207,11 +2227,184 @@ def run_out_of_corpus() -> None:
 
 
 if __name__ == "__main__":
-    if "--out-of-corpus" in sys.argv or "-b" in sys.argv:
+    args = sys.argv[1:]
+    if "--out-of-corpus" in args or "-b" in args:
         run_out_of_corpus()
     else:
-        q = " ".join(sys.argv[1:]) or "What did Buffett write about non-controlled businesses in 2023?"
-        print(json.dumps(answer(q), indent=2, default=str))
+        # --trace → print the step-by-step process trace + final answer; otherwise just the answer.
+        trace = "--trace" in args
+        q = " ".join(a for a in args if a != "--trace") \
+            or "What did Buffett write about non-controlled businesses in 2023?"
+        out = answer(q)
+        if trace:
+            print(f"source: {out['source']}  |  decision: {out['decision']['label']} "
+                  f"|  grade_relevance: {out['grade_relevance']}")
+            print("trace:")
+            for s in out["steps"]:
+                res = s["result"]
+                if isinstance(res, dict):
+                    res = f"conf={res.get('confidence', '?')}"
+                print(f"  {_STEP_LABELS.get(s['step'], s['step']):10} → {res}")
+            print(f"\nanswer:\n{out['answer']}")
+        else:
+            print(out["answer"])
+```
+
+**Promoted infra — `shared/web_search.py`** (the web backend + reproducibility cache + cross-encoder `rerank_results` that BOTH `baseline_handrolled.py` and `crag_variant.py` import — one source of truth; `shared/searxng/` ships a `docker-compose.yml` for the free local backend):
+
+```python
+"""Cached web-search backend (SearXNG → Tavily → DuckDuckGo) — shared infra.
+
+Promoted from lab-03.7-agentic-rag (W3.7 Agentic RAG §3.3) where the CRAG web fallback first
+needed it. Both `baseline_handrolled.py` (hand-rolled CRAG) and `crag_variant.py` (LangGraph CRAG)
+import it, so the backend + cache live in exactly one place.
+
+Public API:
+  web_search(query, k=4)        — cached backend call; precedence SEARXNG_URL → TAVILY_API_KEY → DDG.
+  cache_lookup(key) / cache_store(key, docs)
+                                — generic disk-cache access for callers that cache at a HIGHER level
+                                  than one query (e.g. a fanned-out planned query whose whole doc
+                                  pool should replay as one unit). Honor the WEB_CACHE toggle.
+  web_cache_key(query, k)       — the per-query cache key (backend + determinism-config aware).
+  web_cache_enabled()           — the WEB_CACHE env toggle.
+
+Determinism + accuracy rationale (full story: W3.7 chapter §3.3.1): a metasearch is inherently
+non-deterministic — the same query returns a different doc pool run-to-run because engines
+bot-block / time out / rotate and language is header-inferred. So SearXNG language + engines are
+pinned via env, and results are cached on disk for reproducible runs. Accuracy (each sub-search
+yielding its figure, not one entity dominating) is the CALLER's job via per-sub-query rerank — see
+`baseline_handrolled.web_search_planned`.
+
+Env: SEARXNG_URL, SEARXNG_LANGUAGE (default "en"), SEARXNG_ENGINES (optional allowlist),
+     TAVILY_API_KEY, WEB_CACHE (1/0, default 1), WEB_CACHE_PATH (default ./.web_cache.json).
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+_WEB_CACHE_FILE = Path(os.getenv("WEB_CACHE_PATH", str(Path.cwd() / ".web_cache.json")))
+
+
+def web_cache_enabled() -> bool:
+    return os.getenv("WEB_CACHE", "1") == "1"
+
+
+def _read_cache() -> dict[str, list[str]]:
+    try:
+        return json.loads(_WEB_CACHE_FILE.read_text()) if _WEB_CACHE_FILE.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def cache_lookup(key: str) -> list[str] | None:
+    """Return cached docs for `key`, or None on miss / cache-disabled."""
+    if not web_cache_enabled():
+        return None
+    return _read_cache().get(key)
+
+
+def cache_store(key: str, docs: list[str]) -> None:
+    """Persist `docs` under `key` (no-op when cache disabled). Best-effort: a write failure must
+    never break the caller's answer."""
+    if not web_cache_enabled():
+        return
+    cache = _read_cache()
+    cache[key] = docs
+    try:
+        _WEB_CACHE_FILE.write_text(json.dumps(cache))
+    except OSError:
+        pass
+
+
+def web_cache_key(query: str, k: int) -> str:
+    """Key includes the backend + its determinism-affecting config, so switching engine / language /
+    backend invalidates stale entries instead of silently replaying a different source's pool."""
+    if os.getenv("SEARXNG_URL"):
+        backend = (f"searxng:{os.environ['SEARXNG_URL']}:{os.getenv('SEARXNG_LANGUAGE', 'en')}"
+                   f":{os.getenv('SEARXNG_ENGINES', '')}")
+    else:
+        backend = "tavily" if os.getenv("TAVILY_API_KEY") else "ddg"
+    return f"{backend}|k={k}|{query}"
+
+
+def _searxng_search(base_url: str, query: str, k: int) -> list[str]:
+    """Query a SearXNG instance's JSON API (free, self-hosted, no key). Aggregates many engines
+    (Google, Startpage, ...) and ranks free encyclopedic / press sources ABOVE the Statista paywall
+    snippet that Tavily and DuckDuckGo surface first. stdlib urllib only (no curl / no dep).
+
+    STABILITY: pin `language` (env SEARXNG_LANGUAGE, default "en") and an optional `engines`
+    allowlist (env SEARXNG_ENGINES, e.g. "google,duckduckgo,wikipedia") so the same query returns a
+    more stable pool — auto language detection from headers and a rotating engine set are the two
+    biggest variance sources. (Pinning a SMALL engine set can backfire: Google's scraper is
+    intermittently bot-blocked, collapsing a tiny pool to empty — so the allowlist defaults to all.)
+    """
+    import urllib.parse
+    import urllib.request
+    params = {"q": query, "format": "json",
+              "language": os.getenv("SEARXNG_LANGUAGE", "en")}  # pin lang → no header-based drift
+    engines = os.getenv("SEARXNG_ENGINES", "").strip()
+    if engines:
+        params["engines"] = engines                            # pin engine set → stable pool
+    url = base_url.rstrip("/") + "/search?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310 — operator-set local URL
+        results = json.load(resp).get("results", [])
+    return [r["content"] for r in results[:k] if r.get("content")]
+
+
+def _web_search_live(query: str, k: int) -> list[str]:
+    """The actual network call, backend precedence:
+      1. SEARXNG_URL  — free self-hosted metasearch, best free-source ranking
+      2. TAVILY_API_KEY — managed API (good, but ranks paywalled aggregators high)
+      3. DuckDuckGo   — free, no key, weakest ranking
+    ImportError (missing tavily/ddgs) propagates — the caller's config-bug handler turns it into a
+    loud, actionable error rather than a silent abstain."""
+    if os.getenv("SEARXNG_URL"):
+        return _searxng_search(os.environ["SEARXNG_URL"], query, k)
+    if os.getenv("TAVILY_API_KEY"):
+        # Official Tavily SDK (tavily-python) — replaces the sunset
+        # langchain_community.TavilySearchResults wrapper (deprecated in LC 0.3.25).
+        from tavily import TavilyClient
+        resp = TavilyClient(api_key=os.environ["TAVILY_API_KEY"]).search(query, max_results=k)
+        return [r["content"] for r in resp.get("results", []) if r.get("content")]
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+    with DDGS() as ddg:
+        return [r["body"] for r in ddg.text(query, max_results=k) if r.get("body")]
+
+
+def web_search(query: str, k: int = 4) -> list[str]:
+    """Cached wrapper over _web_search_live for reproducible runs. Cache hit → replay; miss → fetch
+    live + persist. WEB_CACHE=0 disables (always live)."""
+    key = web_cache_key(query, k)
+    hit = cache_lookup(key)
+    if hit is not None:
+        return hit
+    docs = _web_search_live(query, k)
+    cache_store(key, docs)
+    return docs
+
+
+def rerank_results(query: str, docs: list[str], top_k: int, reranker: Any) -> list[str]:
+    """Rerank web-result STRINGS against `query` with a cross-encoder, keep top_k.
+
+    This is the ACCURACY half of the web fallback. A fanned-out comparison must rerank each
+    sub-query's docs against THAT sub-query (not the broad "compare X and Y" query) so the passage
+    holding that entity's figure surfaces and neither entity dominates — see
+    `baseline_handrolled.web_search_planned`. The reranker MODEL stays in rag_hybrid (a shared
+    package); it's passed IN here so this module stays light (pure stdlib + optional web libs, no
+    torch import unless the caller already loaded one). `reranker` is a rag_hybrid
+    CrossEncoderReranker; the one place that reaches into its predict() lives here, not scattered."""
+    if not docs:
+        return []
+    reranker._ensure_loaded()
+    scores = reranker._model.predict([(query, d) for d in docs],
+                                     batch_size=reranker.cfg.spec.batch_size)
+    return [d for d, _ in sorted(zip(docs, scores), key=lambda x: -x[1])][:top_k]
 ```
 
 **Walkthrough:**
@@ -2220,7 +2413,7 @@ if __name__ == "__main__":
 - **Block 2 — `multi_retrieve` (original + keyword-only RRF).** Issues two Qdrant queries: original query text + keyword-only variant (stripped of stopwords / function words). Cormack-style RRF (`1/(60+rank)`) fuses the rankings. Variant generation is the cheap recall-augmentation that doesn't need decomposition; covers the case where the original query has too much syntactic noise to dense-match well.
 - **Block 3 — `synthesize` with `[#i]` citation binding + drift filter.** The W2.7-discovered explained-refusal pattern transferred — the prompt forces inline `[#N]` citations on every bullet. The drift filter post-pass drops any bullet whose keywords don't overlap its cited passage; cheap pre-faithfulness guardrail before RAGAS-style judge runs.
 - **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
-- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. Two refinements from §3.3 carry in here: the web backend is a **precedence chain** (`SEARXNG_URL` → Tavily SDK → DuckDuckGo), and a **Complex** query **fans out** (`web_search_planned`: decompose → search each atomic sub-query → interleave → union) so "compare X and Y" grounds *both* figures instead of issuing one doomed comparison search. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
+- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. Three refinements from §3.3.1 carry in here: (1) the web backend is a **precedence chain** (`SEARXNG_URL` → Tavily SDK → DuckDuckGo), now living in `shared/web_search.py` (promoted infra, imported by both CRAGs); (2) a **Complex** query **fans out** (`web_search_planned`: decompose → web-search each atomic sub-query → **rerank each against its OWN sub-query** + interleave) so "compare X and Y" grounds *both* figures — each entity's figure-passage surfaces and neither dominates — instead of issuing one doomed comparison search; (3) results are **cached at the original-query level** for reproducible runs. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
 
 **Result (measured — out-of-corpus run, 10 questions; full numbers in `RESULTS.md`):**
 
