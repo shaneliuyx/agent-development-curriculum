@@ -1512,26 +1512,28 @@ The lab-03.7 directory now exists at `~/code/agent-prep/lab-03.7-agentic-rag/` w
 **Architecture:**
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  Q["query"] --> DC["ComplexityDecider<br/>heuristic: cap-entity count<br/>+ cue keywords + conjunctions"]
-  DC -->|"label='Complex' AND<br/>ENABLE_DECOMPOSITION=1"| DEC["LLMDecomposer<br/>(Phase 7)<br/>→ topo-sort sub-queries"]
-  DC -->|"label='Simple' OR decompose disabled"| SQ["sub_queries = [query]"]
-  DEC --> SQ
-  SQ --> MR["MultiRetrieve<br/>original + keyword-only<br/>→ RRF fuse"]
-  MR --> RR["Rerank<br/>BGE-reranker-v2-m3"]
-  RR --> SY["Synthesize<br/>bullets with [#i] citations<br/>+ drift filter"]
-  SY --> SR["SelfRAG checks<br/>citation_rate +<br/>faithfulness_rate +<br/>coverage"]
-  SR --> GH["grade_hallucination<br/>pass = faith ≥ 0.5 AND<br/>cite ≥ 0.5"]
-  SR --> GR["grade_relevance<br/>LLM judge + canonical<br/>I-dont-know short-circuit"]
-  GH -->|"both pass"| OUT["{answer, hits, selfrag,<br/>grades, decision}"]
-  GR -->|"both pass"| OUT
-  GH -->|"hallucination fails"| REGEN["regenerate (max_regen)"]
-  GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite)"]
-  REGEN --> SR
-  CRAG -->|"still fails"| FALLBACK["web_search_planned() executed<br/>(Complex → fan out + interleave)<br/>→ synth from web → answer"]
+  Q["query"] --> DC["ComplexityDecider<br/>cap-entity count + cue<br/>keywords + conjunctions"]
+  DC -->|"label='Complex' AND<br/>ENABLE_DECOMPOSITION=1"| DEC["decompose_query<br/>(Phase 7)<br/>→ N atomic sub-queries"]
+  DC -->|"label='Simple' OR<br/>decompose disabled"| SQ["sub_queries = [query]"]
+  DEC --> EP["execute_plan — CORPUS fan-out<br/>each sub-query → MultiRetrieve + Rerank;<br/>synthesis nodes combine deps<br/>→ union → rerank vs original"]
+  SQ --> MR["MultiRetrieve<br/>original + keyword-only → RRF"]
+  MR --> RR["Rerank<br/>BGE-reranker-v2-m3 → top-6"]
+  EP --> SY["Synthesize<br/>bullets with [#i] citations<br/>+ drift filter"]
+  RR --> SY
+  SY --> SR["SelfRAG checks<br/>citation + faithfulness<br/>+ coverage"]
+  SR --> GH["grade_hallucination<br/>faith ≥ 0.5 AND cite ≥ 0.5<br/>(recorded, non-gating)"]
+  SR --> GR["grade_relevance<br/>LLM judge + canonical<br/>I-dont-know short-circuit<br/>(the gate)"]
+  GH -.->|"recorded"| OUT["{answer, hits, selfrag,<br/>grades, source}"]
+  GR -->|"pass"| OUT
+  GR -->|"relevance fails"| CRAG["CorrectiveRAG<br/>rewrite_query → retry<br/>(max_rewrite=2)"]
   CRAG -->|"now passes"| OUT
-  FALLBACK --> OUT
+  CRAG -->|"still fails"| FALLBACK["web_search_planned — WEB fan-out<br/>(Complex, automatic): decompose →<br/>web_search each → interleave → union"]
+  FALLBACK --> WSY["Synthesize from web<br/>→ re-grade shipped answer (Fix 5)"]
+  WSY --> OUT
 ```
+*Decomposition drives fan-out on **two** surfaces, not just the web: `execute_plan` over the **corpus** (opt-in, `ENABLE_DECOMPOSITION=1`) and `web_search_planned` over the **web fallback** (automatic for Complex). Same pattern both times — N atomic sub-queries retrieved independently, then merged + reranked — applied wherever the answer might live. The Simple path skips both and runs a single `MultiRetrieve → Rerank`.*
 
 **Code (`src/baseline_handrolled.py` — the complete pipeline, top-to-bottom):**
 
