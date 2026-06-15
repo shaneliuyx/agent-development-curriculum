@@ -1020,13 +1020,15 @@ def agent_run(
 
     for iteration in range(MAX_ITER):
 
-        # --- context-size guard ---
+        # --- context-size guard (FIFO-evict the oldest tool result) ---
+        # Shown inline for clarity. The shipped lab extracts this into a helper,
+        # _evict_if_over_limit(scratchpad), so the eviction policy is unit-testable
+        # (Phase 5, Scenario 10 asserts oldest-drop, not merely "didn't crash").
+        # Evict the coldest partition first — analogous to a tiered store.
         if scratchpad.estimated_tokens() > CONTEXT_TOKEN_LIMIT:
-            # Trim the oldest tool result entries to recover headroom.
-            # This is analogous to evicting the coldest partition from a tiered store.
             tool_entries = [e for e in scratchpad.entries if e.role == "tool"]
             if tool_entries:
-                scratchpad.entries.remove(tool_entries[0])
+                scratchpad.entries.remove(tool_entries[0])   # drop the oldest
 
         messages = context_for_llm(user_msg, scratchpad)
 
@@ -1949,6 +1951,8 @@ You should see at least two rows: one `tool_call` (the `python_repl` call) and o
 > **Analogy (Infra):** This is your pipeline regression suite. Each scenario is a test case in the bad-case journal. You run these before every significant change to the loop, exactly as you would run `Terraform test` before merging a model change.
 
 Save as `tests/test_bad_cases.py`. Run with `pytest tests/test_bad_cases.py -v`.
+
+> **Measured (2026-06-15):** `uv run pytest tests/test_bad_cases.py` → **17 passed** (the 15 scenarios + Scenario 2's second case + a deeper oldest-drop eviction test). The first green run surfaced two *test* bugs (not loop bugs): a missing `python_repl` import in Scenario 8, and an undersized fixture in Scenario 10 — and motivated extracting `react.py::_evict_if_over_limit` so Scenario 10 asserts oldest-drop directly, not just "the loop didn't crash." Full table + provenance in the lab's `RESULTS.md`.
 
 ```python
 """
