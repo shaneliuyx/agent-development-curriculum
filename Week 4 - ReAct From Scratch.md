@@ -317,7 +317,15 @@ uv pip install sqlite-utils pytest
 
 ### 1.3 Verify the `.env` file
 
-Your `.env` should contain the following. Confirm each line exists before moving to Phase 2.
+The lab ships a template — copy it, then confirm each line:
+
+```bash
+cp .env.example .env          # then edit if your model ids / ports differ
+```
+
+> **Run everything with `uv run` (or activate the lab venv first).** This is the #1 smoke-test failure: the lab's deps (`openai`, …) and its `src/` package live in the lab's own venv. Invoking the **system** `python` gives `ModuleNotFoundError: No module named 'src.react'` (and missing `openai`). Use `uv run python …` from the lab root, or `source .venv/bin/activate` once per shell. `src/` has no `__init__.py` — it resolves as a namespace package, which works **only when you run from the lab root**.
+
+`.env.example` contains:
 
 ```bash
 # .env — oMLX exposes ONE OpenAI-compatible endpoint on :8000/v1 and routes
@@ -341,7 +349,7 @@ Quick sanity check — this should return the model name with no error:
 
 ```bash
 set -a; source .env; set +a
-python -c "
+uv run python -c "
 import os
 from openai import OpenAI
 c = OpenAI(base_url=os.getenv('OMLX_URL'), api_key=os.getenv('OMLX_API_KEY', 'not-needed'))
@@ -357,7 +365,8 @@ print(r.choices[0].message.content)
 Confirm every model you plan to route to is actually served (one endpoint lists them all):
 
 ```bash
-python -c "
+set -a; source .env; set +a
+uv run python -c "
 import os
 from openai import OpenAI
 c = OpenAI(base_url=os.getenv('OMLX_URL','http://127.0.0.1:8000/v1'), api_key='not-needed')
@@ -367,6 +376,22 @@ for tier in ('MODEL_SONNET','MODEL_FAST','MODEL_OPUS','MODEL_HAIKU'):
     print(f'  {tier:13s} {mid!s:60s} {\"OK\" if mid in served else \"NOT SERVED\"}')
 "
 ```
+
+Finally, confirm the tools import and self-register (run from the lab root, via `uv run`):
+
+```bash
+uv run python -c "
+import src.tools                       # importing registers the 4 tools
+from src.react import _TOOLS
+print('registered:', list(_TOOLS.keys()))
+from src.tools import python_repl
+print('python_repl:', python_repl('print(2 ** 10)'))   # -> 1024
+"
+```
+
+Expected: `registered: ['web_search', 'python_repl', 'read_file', 'write_file']` then `python_repl: 1024`.
+
+> **`web_search` needs a backend.** It delegates to `shared/web_toolkit`, which defaults to SearXNG at `:8080`. If SearXNG isn't running you'll get `web_search error: SearchError: SearXNG request failed …` — that is the tool degrading gracefully, not a code bug. To get live results either start W3.7's SearXNG container, or set `SEARXNG_URL=` (empty) in `.env` to fall through to DuckDuckGo (`uv pip install ddgs`). `python_repl` / `read_file` / `write_file` need no network.
 
 > **Gotcha:** With one endpoint there is no per-port silent-routing trap, but two oMLX-specific failures replace it. (1) **Wrong model id → `404 model not found`**: oMLX uses bare ids (`gemma-4-26B-A4B-it-heretic-4bit`), not the `models/`-prefixed or `lmstudio-community/`-prefixed forms other servers use — copy the id verbatim from `GET /v1/models`. (2) **Heavy model → `507` memory-ceiling error**, not a hang: oMLX's memory_guard refuses to load a model whose projected footprint exceeds the ceiling (on a 48 GB box, ~37.44 GB usable) while another model is hot — e.g. the 31B heretic at 47.6 GB projected. Only one heavy model is hot at a time; expect a cold-load (~10–30 s) when you switch to a non-resident model. Do not proceed to Phase 2 with a failing sanity check — every subsequent step depends on it.
 
