@@ -332,7 +332,7 @@ OMLX_URL=http://127.0.0.1:8000/v1
 # OMLX_URL + MODEL_SONNET; swap MODEL_* to retier — the URL never changes.
 # Model ids are the BARE served names from GET /v1/models (no `models/` prefix).
 MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit                          # workhorse / default (most roles)
-MODEL_FAST=Qwen2.5-Coder-7B-Instruct-MLX-4bit                        # classify — fast 4 GB, reason=1.00; tools need client parser
+MODEL_FAST=Qwen3.5-4B-MLX-4bit                                       # classify — fast 4 GB, all 4 dims, structured tools (no parser)
 MODEL_OPUS=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit            # hard_loop — larger reasoning, tool=1.00 (format poor)
 MODEL_HAIKU=MLX-Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-4bit  # fast tool-only (ping ~149 ms); think-blocks fail format
 ```
@@ -382,17 +382,17 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 
 | Tier | Model | Ping (median ms) | Tool | JSON | Reason | Instr |
 |---|---|---|---|---|---|---|
-| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | 353 | **1.00** | **1.00** | **1.00** | **1.00** |
-| haiku | `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled-4bit` | **149** | **1.00** | 0.00 | 0.00 | 0.00 |
-| fast | `Qwen2.5-Coder-7B-Instruct-MLX-4bit` (4 GB) | 241 | 1.00 † | 0.67 | **1.00** | 0.33 |
-| opus_qwen | `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` | 713 | **1.00** | 0.00 | 0.33 | 0.00 |
+| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | 316 | **1.00** | **1.00** | **1.00** | **1.00** |
+| haiku | `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled-4bit` | **149** | **1.00** | 0.00 | 0.83 | 0.00 |
+| fast | `Qwen3.5-4B-MLX-4bit` (4 GB) | 235 | **1.00** | **1.00** | 0.83 | **1.00** |
+| opus_qwen | `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` | 724 | **1.00** | 0.00 | 0.83 | 0.00 |
 | opus_lazy | `gemma-4-31B-uncensored-heretic` (`Gemma4-31`) | — | — | — | — | — |
 
-† `fast` tool calls are **text-parsed**, not server-structured: oMLX ships no tool-call parser for the Qwen2.5 family, so the call arrives as `<tools>`/`<function>` text and is recovered client-side by `extract_text_tool_calls()` (Scenario 15). Without that parser the raw score is 0.00.
+> **Methodology note (2026-06-15 re-baseline).** The reason probe's generation cap was raised 64→512 tokens after the original run reported false `reason=0` for verbose-but-correct models. With room to finish, the reasoning-distilled models recover to `reason=0.83` (they *can* reason; they just show their work) — the original `reason=0` was largely a probe artifact, not a capability gap. The surviving real weakness is **terse-format** output: json/instr stay `0.00` for the reasoning models (those caps are deliberately tight). The `fast` tier (Qwen3.5-4B) tool-calls **structured** — Qwen3.5 is server-parsed, so unlike the previous Qwen2.5-Coder-7B fast tier it needs no client parser.
 
 `opus_lazy` returns no scores because it **cannot load**: oMLX's memory_guard rejects it with a `507` — *"projected memory 47.60 GB would exceed the memory ceiling 37.44 GB"* — once the other models are warm. On a 48 GB box, one heavy model is hot at a time.
 
-**Why `fast` is the 7B and not the 14B.** The same probe on `Qwen2.5-Coder-14B` measured **448 ms** — *slower* than the 353 ms Gemma-26B workhorse, with the same loose format scores (json 0.67, instr 0.33) and the same parser dependency. It is strictly dominated, so it earns no tier. The **7B** is the keeper: at 241 ms and 4 GB it is the fastest model that still emits *usable text answers* (reason=1.00), which the faster 35B-A3B cannot (reason=0.00 — its think-blocks eat the answer). The 7B's niche is cheap, high-frequency, simple-case triage where loose formatting is acceptable.
+**Why `fast` is Qwen3.5-4B.** Several small models were probed for this tier; the 4B won by clearing all four dimensions at 4 GB / ~235 ms: tool **1.00 structured**, json **1.00**, instr **1.00**, reason **0.83** (3/3 correct once the token cap was raised). The alternatives lost: the previous `Qwen2.5-Coder-7B` is the same speed but tool-calls only *text-parsed* (needs the client parser) and scores json 0.67 / instr 0.33; `Qwen2.5-Coder-14B` is *slower* than the Gemma-26B workhorse (448 ms) and strictly dominated; `Qwen3.5-9B-OptiQ-4bit` **fails to load** (oMLX returns `500` on every call — the OptiQ quant is incompatible with this engine build). The 4B is the rare small model that is both fast *and* clean across tool/json/reason/instr — the niche the `fast` tier exists for.
 
 **The reasoning-distilled trap — tool passes, format collapses:**
 
@@ -401,13 +401,13 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 | Tool calling (3 trials) | 3/3 structured `tool_calls` | 3/3 structured `tool_calls` |
 | JSON-only output | 1.00 | **0.00** — `<think>` preamble + clipped JSON |
 | Strict word-count (instr) | 1.00 | **0.00** — reasoning consumes the token budget |
-| Reasoning (integer answer) | 1.00 | 0.00–0.33 — correct answer buried in `<think>` |
+| Reasoning (integer answer) | 1.00 | 0.83 — correct *given a generous token cap*; the original 0.00 was a 64-token-cap artifact |
 | Verdict | **Workhorse** — every reliable role | Tool-call emission ONLY; never format-sensitive roles |
 
 The reasoning-distilled models are not broken — they are *misapplied* under tight token caps. They emit a `<think>…</think>` block before answering, so "return only JSON" gets prose and "exactly 3 words" gets an essay. Suppressing thinking (oMLX's `enable_thinking` / `reasoning_effort` chat-template kwargs) is the lever that would recover their format scores; until then they are safe only for raw `tool_calls`, where the structured field is unaffected by the reasoning preamble.
 
 `★ Insight ─────────────────────────────────────`
-- **The role map collapses onto one workhorse.** Gemma-26B is the *only* model at 1.00 on tool **and** json **and** reason **and** instr. The 31B heretic can't load (memory ceiling); both reasoning-distilled models pass `tool` but score ~0 on every format dimension. The measured fleet supports one reliable generalist, not a stable of specialists — the honest opposite of the aspirational tier ladder.
+- **The role map collapses onto one workhorse.** Gemma-26B is the *only* model at 1.00 on tool **and** json **and** reason **and** instr. The 31B heretic can't load (memory ceiling); both reasoning-distilled models pass `tool` and `reason` but score ~0 on the terse-format dimensions (json/instr) — their `<think>` blocks bust tight output caps. The measured fleet supports one reliable generalist plus a fast 4B specialist, not the full aspirational tier ladder.
 - **Tool calling is a model × server-parser pairing, not a model property.** This lab's previous write-up recorded `gemma-4-31B-uncensored-heretic` at tool=0.00 and concluded "the uncensored fine-tune destroyed function-call alignment." That conclusion was a **vMLX artifact**: on oMLX the same heretic weights tool-call correctly (when they fit). What changed was the server's tool-call *parser*, not the model. oMLX parses Gemma / Qwen3 / gpt-oss families into structured `tool_calls`; it does **not** parse Qwen2.5-Coder, which leaks `<tools>`/`<function>` text on *both* the OpenAI and Anthropic surfaces. Probe the pairing, never the model alone.
 - **Memory ceiling fails loud, which is better.** The old multi-port fleet OOMed as cascading `APIConnectionError` — silent thrash. oMLX returns a clean `507` with the exact GB arithmetic (`47.60 GB > 37.44 GB`). An explicit ceiling you can reason about beats a fleet that quietly degrades; design the role map around "one heavy model hot at a time," not around wishful co-residency.
 `─────────────────────────────────────────────────`
@@ -418,13 +418,13 @@ The reasoning-distilled models are not broken — they are *misapplied* under ti
 |---|---|---|
 | `loop` (default ReAct driver) | Gemma-26B | Only model at 1.00 across tool + json + reason + instr |
 | `tool_arg` (synthesize tool arguments) | Gemma-26B | tool=1.00 structured, reliable arguments |
-| `classify` (cheap pre-loop / obs sidecar) | Qwen2.5-Coder-7B (`fast`) | 241 ms + 4 GB + reason=1.00 → fastest model that still answers correctly; non-tool triage, so the 7B's parser/format limits don't bite. (The 149 ms 35B-A3B is faster but reason=0 — useless for real triage.) |
+| `classify` (cheap pre-loop / obs sidecar) | Qwen3.5-4B (`fast`) | 235 ms + 4 GB, clears all four dims (structured tools, json/instr 1.00, reason 0.83) → fastest model that still answers *and* formats correctly. (The 149 ms 35B-A3B is faster but instr=0 — can't emit a clean label.) |
 | `reason` (math / multi-step) | Gemma-26B | reason=1.00, 353 ms warm |
 | `compose` (post-tool answer drafting) | Gemma-26B | instr/json=1.00; clean prose, no think-block noise |
 | `finisher` (post-loop polish) | Gemma-26B | Reliable formatting; no loadable heavy alternative (31B OOMs) |
 | `hard_loop` (larger reasoning attempt, still needs tools) | Qwen3.5-27B-Distilled | Only *other* loadable tool-capable model (tool=1.00); format caveat — use for tool-driven reasoning, not formatted output |
 
-> **How `recommend()` picks the cheap roles — "fastest" is not enough.** The probe's auto-recommendation (`scripts/probe_fleet.py::recommend`) assigns the content roles by argmax over the relevant axis (`tool`, `json`, `reason`, `instr`), but the *cheap* roles (`cheap_classifier`, `obs_summarizer_sidecar`) need a guard: pure argmax over `ping` recommends the 149 ms 35B-A3B, which scores `reason=0` and therefore cannot actually produce a classification. So `recommend()` floors on capability first — **fastest model with `reason ≥ 0.5`**, falling back to the full pool only if none qualify. That excludes the reasoning-distilled MoE and lands on the 4 GB Qwen2.5-Coder-7B (241 ms, `reason=1.00`), matching `src/models.py`'s `classify → fast` routing. The lesson is general: a cheap role's selector must be "fastest model that can still do the job," never "fastest model." A 149 ms model that returns empty output is infinitely slow at producing a usable answer.
+> **How `recommend()` picks the cheap roles — "fastest" is not enough, and one floor isn't either.** The probe assigns content roles by argmax over the relevant axis (`tool`, `json`, `reason`, `instr`), but the *cheap* roles (`cheap_classifier`, `obs_summarizer_sidecar`) need a capability guard or pure `ping`-argmax picks the 149 ms 35B-A3B — which can't actually classify. The guard evolved with the data: a `reason ≥ 0.5` floor alone is **insufficient**, because once the reason cap was raised the reasoning-distilled MoE clears `reason=0.83` yet still scores `instr=0` (it reasons but can't emit a clean label). So the floor requires **both `reason ≥ 0.5` AND `instr ≥ 0.5`**, then picks the fastest survivor (fallback: full pool if none qualify). That lands on Qwen3.5-4B (235 ms, reason 0.83, instr 1.00), matching `src/models.py`'s `classify → fast`. The general lesson: a cheap role's selector is "fastest model that can do *every* part of the job" — reasoning *and* formatting — not just the headline axis.
 
 **Three bad-case scenarios discovered via the probe harness (used in Phase 5):**
 
@@ -459,7 +459,7 @@ flowchart TD
     L2["react.py loop"] --> R["role -> model<br/>ROLE_MAP"]
     R --> G[":8000/v1 oMLX<br/>model-routed"]
     G --> M1["gemma-4-26B<br/>heretic-4bit<br/>(workhorse)"]
-    G --> M2["Qwen2.5-Coder-7B<br/>(classify, fast)"]
+    G --> M2["Qwen3.5-4B<br/>(classify, fast)"]
     G --> M3["Qwen3.5-27B<br/>Distilled<br/>(hard_loop)"]
   end
 ```
@@ -476,8 +476,8 @@ Probe-driven mapping as of 2026-06-15 (oMLX :8000, M5 Pro 48 GB) — see
 data/fleet_probe_20260615_omlx.json:
   loop, tool_arg, reason, compose, finisher -> Gemma-26B
       (the ONLY model at 1.00 across tool+json+reason+instr)
-  classify -> Qwen2.5-Coder-7B (fast 4 GB, ~241 ms, reason=1.00) — cheap
-      non-tool triage; loose format + parser-only tools don't bite here
+  classify -> Qwen3.5-4B (fast 4 GB, ~235 ms, all four dims) — cheap
+      triage; server-parsed so tools are structured if ever needed here
   hard_loop -> Qwen3.5-27B-Claude-Distilled
       (only OTHER loadable tool-capable model; larger reasoning attempt)
 
@@ -498,7 +498,7 @@ _OMLX_URL = os.getenv("OMLX_URL", "http://127.0.0.1:8000/v1")
 # Bare served ids (GET /v1/models) — no `models/` prefix on oMLX.
 _SONNET_MODEL = os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
 _OPUS_MODEL   = os.getenv("MODEL_OPUS",   "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit")
-_FAST_MODEL   = os.getenv("MODEL_FAST",   "Qwen2.5-Coder-7B-Instruct-MLX-4bit")
+_FAST_MODEL   = os.getenv("MODEL_FAST",   "Qwen3.5-4B-MLX-4bit")
 
 API_KEY = os.getenv("OMLX_API_KEY", "not-needed")  # oMLX ignores; SDK requires non-empty
 
@@ -518,8 +518,8 @@ ROLE_MAP: dict[str, Endpoint] = {
     # roles route here; reasoning-distilled models fail strict format.
     "loop":      Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=30),
     "tool_arg":  Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=30),
-    # classify = cheap, high-frequency, NON-tool triage → fast 7B. (Route a
-    # tool role to _FAST_MODEL only with the client text parser; see §1.4.)
+    # classify = cheap, high-frequency triage → fast Qwen3.5-4B (all 4 dims,
+    # server-parsed, so it can also tool-call structured if ever needed here).
     "classify":  Endpoint(_OMLX_URL, _FAST_MODEL, timeout_s=15),
     "reason":    Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=45),
     "compose":   Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=45),
@@ -557,7 +557,7 @@ def get_client(role: Role) -> tuple[OpenAI, str]:
 
 **Block 3 — `@dataclass(frozen=True) Endpoint`.** Immutable per-role config. `ROLE_MAP` is module-level shared state; if a caller mutated an `Endpoint` (`map["loop"].timeout_s = 60`) the change would leak to every subsequent caller. Freezing forbids the mutation at construction. CLAUDE.md immutability rule applied to runtime-shared state.
 
-**Block 4 — `ROLE_MAP` with 7 roles, one URL.** All roles share `_OMLX_URL`; the variation is `model` + `timeout_s`. Five reliable roles point at the Gemma-26B workhorse (the only all-1.00 model); `classify` — cheap, high-frequency, non-tool triage — points at the fast 4 GB Qwen2.5-Coder-7B (241 ms, reason=1.00); `hard_loop` points at Qwen3.5-27B for a larger tool-capable reasoning attempt. Per-role timeouts encode task shape: classify is the cheapest (15 s), reason/compose are content-bearing (45 s), hard_loop may cold-load a non-resident 27B (90 s). Note: the 7B only tool-calls via the client parser, so it is safe on `classify` precisely because triage needs no tools — never route a tool-bearing role to it without `extract_text_tool_calls`.
+**Block 4 — `ROLE_MAP` with 7 roles, one URL.** All roles share `_OMLX_URL`; the variation is `model` + `timeout_s`. Five reliable roles point at the Gemma-26B workhorse (the only all-1.00 model); `classify` — cheap, high-frequency triage — points at the fast 4 GB Qwen3.5-4B (235 ms; clears all four dims); `hard_loop` points at Qwen3.5-27B for a larger tool-capable reasoning attempt. Per-role timeouts encode task shape: classify is the cheapest (15 s), reason/compose are content-bearing (45 s), hard_loop may cold-load a non-resident 27B (90 s). The 4B is Qwen3.5, which oMLX server-parses, so it tool-calls structured — no client parser dependency on this tier (unlike the Qwen2.5-Coder-7B it replaced).
 
 **Block 5 — `_CLIENT_CACHE` keyed by `(url, timeout)`.** All roles share one URL, but timeouts vary (15/30/45/60/90). Timeout is bound at client construction, not per request, so distinct timeouts need distinct httpx clients. Keying the cache on `(url, timeout)` yields ~5 clients covering all 7 roles — correctness plus reuse.
 
@@ -566,7 +566,7 @@ def get_client(role: Role) -> tuple[OpenAI, str]:
 **Result** (measured 2026-06-15, `data/fleet_probe_20260615_omlx.json`):
 
 - Workhorse Gemma-26B warm latency: **353 ms** median; tool/json/reason/instr all **1.00** — one model covers five roles with no quality compromise.
-- `hard_loop` Qwen3.5-27B: tool=1.00, ping 713 ms, but reason 0.33 / instr 0.00 — usable for tool-driven reasoning, not formatted output (documented caveat in ROLE_MAP).
+- `hard_loop` Qwen3.5-27B: tool=1.00, ping 724 ms, reason 0.83 but instr 0.00 — usable for tool-driven reasoning, not strict-format output (documented caveat in ROLE_MAP).
 - Memory ceiling: only one heavy model hot at a time (37.44 GB guard). Switching to a non-resident model costs a ~10–30 s cold load; the 31B heretic never loads at all (`507`).
 - Client cache: ~5 distinct clients cover all 7 roles after warm-up (one URL, five timeout tiers).
 
