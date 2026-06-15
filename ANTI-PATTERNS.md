@@ -159,6 +159,11 @@ Entries derived from observed BCJ entries are marked `(BCJ)` with cross-link; en
 *Symptom:* Chapter draft includes "Result: 14/20 PASS in 4.2s" before the test has been run. Soundbite cites a number that came from estimation, not measurement.
 *Fix:* Always mark TBD until measured. Once measured, replace with the actual `pytest --durations` output or `RESULTS.md` row. Per the curriculum's real-data discipline, only OBSERVED entries are load-bearing for interview soundbites. (BCJ provenance preamble convention)
 
+### AP-405 — A benchmark cap that converts a correctness test into a brevity test (HIGH)
+
+*Symptom:* A known-capable model scores implausibly low on an eval (e.g. `reason=0` for a model that clearly does the arithmetic); the score is unstable run-to-run and downstream selection logic flip-flops. Root: the probe's `max_tokens` is too small, so a verbose-but-correct model gets clipped (`finish_reason="length"`) before emitting the graded token. The metric silently measures terseness-under-cap, not the property it claims to.
+*Fix:* Size each probe's token cap to the property under test — generous for reasoning/derivation (correctness), tight only where brevity IS the property (json-only, exact-word-count). When a score looks wrong for a capable model, check `finish_reason` before blaming the model. Re-baseline after the fix. (BCJ 2026-06-15 W4 "Probe token-cap manufactured a false reason=0"; repo 4 `scripts/probe_fleet.py::probe_reasoning`)
+
 ---
 
 ## How this catalog grows
