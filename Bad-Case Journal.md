@@ -391,9 +391,11 @@ If probe 2 returns rows but the script returns `edges_used: 0`, the bug is in th
 
 ## 2026-06-15 — Week 4 — Reasoning-distilled model passes `tool` but collapses on every format probe
 
-**Symptom:** `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled` and `Qwen3.5-27B-Claude-Distilled` both scored `tool=1.00` (clean structured calls) yet `json=0.00`, `instr=0.00`, `reason=0.00–0.33` on the same probe run. "Return only JSON" came back truncated (`'{"status":"ok'`); "exactly 3 words" came back empty (`''`); the correct integer was present but buried in prose. A model that tool-calls perfectly looked broken at every constrained-format task.
+**Symptom:** `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled` and `Qwen3.5-27B-Claude-Distilled` both scored `tool=1.00` (clean structured calls) yet `json=0.00` and `instr=0.00` on the same probe run. "Return only JSON" came back truncated (`'{"status":"ok'`); "exactly 3 words" came back empty (`''`). A model that tool-calls perfectly looked broken at every constrained-format task.
 
-**Root cause:** Same mechanism as the 2026-04-30 W2.5 reasoning-budget entry above — the model emits a `<think>…</think>` block that consumes the (deliberately tight) `max_tokens` cap before or around the real answer. `tool_calls` survives because it is a **structured field**, populated by the server regardless of the reasoning preamble; free-form format probes do not survive, because the visible text is all reasoning or gets clipped. The model is not broken, it is *misapplied*: reasoning-distilled ≠ format-tuned.
+> **Correction (2026-06-15 re-baseline):** the original write-up also reported `reason=0.00–0.33` and blamed think-blocks. That was **partly a probe artifact** — the reason probe capped generation at 64 tokens, which clipped correct-but-verbose derivations. Raising the cap to 512 recovered `reason` to **0.83** for these same models. So the real, surviving collapse is **terse-format only** (json/instr), where the caps are deliberately tight and the `<think>` block genuinely eats the budget. Reasoning itself is fine given room. See the companion entry below ("Probe token-cap manufactured a false reason=0").
+
+**Root cause:** Same mechanism as the 2026-04-30 W2.5 reasoning-budget entry above — the model emits a `<think>…</think>` block that consumes the `max_tokens` cap before or around the real answer. `tool_calls` survives because it is a **structured field**, populated by the server regardless of the reasoning preamble; *terse-format* probes (json-only, exact-word-count) do not, because their tight caps leave no room after the reasoning preamble. The model is not broken, it is *misapplied* on format-constrained, low-token tasks: reasoning-distilled ≠ format-tuned.
 
 **Fix:** Route format-sensitive roles (`json_extractor`, `compose`, strict-instruction) to a non-reasoning model — `gemma-4-26B-A4B-it-heretic-4bit` scored 1.00 on all of them. If you must use the reasoning model for format work, suppress thinking via oMLX's chat-template kwargs (`enable_thinking=false` / `reasoning_effort=low`) and re-probe. Otherwise reserve reasoning-distilled models for raw `tool_calls` emission, where the think-block is harmless. In `src/models.py` every reliable role routes to the Gemma-26B workhorse for exactly this reason.
 
@@ -401,6 +403,23 @@ If probe 2 returns rows but the script returns `edges_used: 0`, the bug is in th
 
 **Captured in curriculum at:** [[Week 4 - ReAct From Scratch#1.4 Empirical findings — fleet probe (2026-06-15, oMLX migration)]] (Scenario 14)
 **Related:** the 2026-04-30 W2.5 reasoning-budget entry above — same root mechanism, different surface (entity extraction vs format probes).
+
+---
+
+## 2026-06-15 — Week 4 — Probe token-cap manufactured a false `reason=0`
+
+**Symptom:** In the fleet probe (`scripts/probe_fleet.py`), three reasoning-capable models (`Qwen3.5-4B`, `Qwen3.5-35B-A3B`, `Qwen3.5-27B`) scored `reason=0.00–0.33` despite clearly being able to do the arithmetic. The cheap-role auto-recommendation then swung between models as if reasoning ability were unstable, and a genuinely good fast model (Qwen3.5-4B) was wrongly judged weak at reasoning.
+
+**Root cause:** `probe_reasoning` capped generation at `max_tokens=64`. Models that *show their work* ("To find the distance traveled, we use d = r × t …") spent the budget on the derivation and got clipped before emitting the bare integer the scorer greps for (`finish_reason="length"`). The probe was measuring **terseness under a tight cap**, not reasoning correctness. Re-running the identical cases at 512 tokens scored 3/3 — the answers were always right, just truncated. Second-order effect: `recommend()`'s cheap-role floor (then `reason ≥ 0.5`) flipped its pick based on this artifact.
+
+**Fix:** (1) Raise the reason probe cap to **512** (reasoning is about correctness, not brevity); keep json/instr caps tight — those tasks *should* be terse. (2) Harden `recommend()`: cheap roles now floor on **`reason ≥ 0.5` AND `instr ≥ 0.5`**, so a model that reasons-but-can't-format is excluded regardless of the cap. (3) Re-baseline and pin the run in `data/fleet_probe_20260615_omlx.json`.
+
+**The diagnostic muscle:** When a benchmark score looks implausibly bad for a known-capable model, suspect the **harness** before the model — print `finish_reason`. `finish_reason="length"` on a "wrong" answer means the *cap* failed the test, not the model. A metric must measure the property it claims to; a stingy token cap silently converts a correctness test into a brevity test.
+
+**Tags:** #probe-methodology #measurement-bug #reasoning-model #harness #lab-4 #ops-pattern
+
+**Captured in curriculum at:** [[Week 4 - ReAct From Scratch#1.4 Empirical findings — fleet probe (2026-06-15, oMLX migration)]] (Methodology note + `recommend()` note)
+**Lab artifact:** `lab-04-react-from-scratch/scripts/probe_fleet.py` — `probe_reasoning()` (cap 512), `recommend()` (dual floor)
 
 ---
 
