@@ -2661,9 +2661,9 @@ Review each failure and apply the patches described in the docstrings. Each patc
 
 ## Phase 6 — RESULTS.md Template
 
-Copy this template and fill it in as you complete each phase. The 15-row failure-mode table is the most important artifact — this becomes your behavioral-question fuel in interviews.
+Copy this template and fill it in as you complete each phase. The 15-row failure-mode table is the most important artifact — this becomes your behavioral-question fuel in interviews. (Outer fence is 4 backticks so the nested `diff`/`sql` code blocks inside the template survive copy-paste.)
 
-```markdown
+````markdown
 # Lab 04 — ReAct From Scratch
 
 **Date:** ____-__-__
@@ -2751,7 +2751,7 @@ I can query, aggregate, and alert on.
 (1–2 paragraphs on the most interesting failure you observed. This feeds your
 behavioral question bank: "Tell me about a time a system failed in an unexpected
 way and what you did about it.")
-```
+````
 
 ---
 
