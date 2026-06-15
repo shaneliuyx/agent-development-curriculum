@@ -1,7 +1,7 @@
 ---
 title: "Week 3.7 — Agentic RAG (LangGraph-Canonical Architecture)"
 created: 2026-04-27
-updated: 2026-05-07
+updated: 2026-06-15
 tags: [agent, curriculum, week-3.7, rag, agentic-rag, langgraph, runbook, expansion-week]
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-03.7-agentic-rag"
@@ -1398,11 +1398,11 @@ The fix: after the fallback, re-run `selfrag_checks` + `grade_hallucination` + `
 
 **The "stable but wrong" trap.** The reproducibility cache (below) made the answer *deterministic* — but a deterministic answer can be reproducibly *wrong*. The fan-out had unioned both entities' web docs and reranked that union against the *whole* comparison query; the cross-encoder scored BHE's docs higher, so the top-k came back BHE-heavy → 3 BHE bullets, **BNSF's `$23.876B` silently dropped**. Stability was hiding an accuracy regression.
 
-**The accuracy fix — rerank scope.** Rerank **each sub-query's docs against its OWN sub-query** (not the comparison) and keep the top few, then interleave — so each entity's figure-passage surfaces in its own lane and neither dominates. Same cross-encoder, different *scope*; that scope was the whole bug. The BNSF-vs-BHE answer now carries one grounded, cited figure **per entity**. (`rerank_results` in `shared/web_search.py`.)
+**The accuracy fix — rerank scope.** Rerank **each sub-query's docs against its OWN sub-query** (not the comparison) and keep the top few, then interleave — so each entity's figure-passage surfaces in its own lane and neither dominates. Same cross-encoder, different *scope*; that scope was the whole bug. The BNSF-vs-BHE answer now carries one grounded, cited figure **per entity**. (`rerank_results` in `shared/web_toolkit`.)
 
 **Reproducibility — an original-query-level cache.** A metasearch is non-deterministic: the same query returns a different pool run-to-run (engines bot-block / time out / rotate; language is header-inferred — pinning `SEARXNG_LANGUAGE` + `SEARXNG_ENGINES` shrinks but can't remove it, and pinning a *small* engine set backfires when Google's scraper is blocked → empty pool). So web results are cached on disk, at the **original-query** level: the LLM decomposer's sub-query phrasing varies run-to-run, so per-sub-query keys miss — the stable key is the original question. First run hits the live web; every repeat replays the same pool → the same answer. `WEB_CACHE=0` forces live.
 
-**Promotion to shared.** `web_search` (backend + cache) and `rerank_results` were duplicated across `baseline_handrolled.py` and `crag_variant.py`, so they moved to **`shared/web_search.py`** (one source of truth — `crag_variant` is upgraded from Tavily/DDG-only to the SearXNG-first chain for free), with the SearXNG docker setup alongside in **`shared/searxng/`**. A `--trace` CLI flag prints the step-by-step process trace; default prints just the answer.
+**Promotion to shared.** `web_search` (backend + cache) and `rerank_results` were duplicated across `baseline_handrolled.py` and `crag_variant.py`, so they moved into **`shared/web_toolkit/`** (one source of truth — `crag_variant` is upgraded from Tavily/DDG-only to the SearXNG-first chain for free; the string-returning fallback is exported as `web_search_text` and imported here as `web_search`), with the SearXNG docker setup alongside in **`shared/searxng/`**. A `--trace` CLI flag prints the step-by-step process trace; default prints just the answer. *(The module later absorbed `web_fetch`/`web_browse` to become the canonical `web_toolkit` web-research package — see `shared/web_toolkit/README.md` — but the W3.7 labs use only the `web_search_text` + `rerank_results` + cache primitives shown here.)*
 
 #### Outcome
 
@@ -1420,7 +1420,8 @@ The measured before→after across all three backends is the **§3.3 table above
 
 #### Files changed
 
-- `src/baseline_handrolled.py` — `_searxng_search`, 3-tier `web_search`, `web_search_planned` (decompose + interleave), rewired `answer()` web fallback, re-grade-after-web-fallback (Fix 5), `WEB_FANOUT_K` (default 8).
+- `src/baseline_handrolled.py` — `web_search_planned` (decompose + interleave), rewired `answer()` web fallback, re-grade-after-web-fallback (Fix 5), `WEB_FANOUT_K` (default 8). (The 3-tier backend + `_searxng_legacy` were promoted in Fix 6 to `shared/web_toolkit` as `web_search_text`, imported here as `web_search`.)
+- `shared/web_toolkit/` — the merged web infra: `web_search_text` (3-tier `SEARXNG_URL → TAVILY_API_KEY → DDG` backend + cache) + `rerank_results`, imported by both `baseline_handrolled.py` and `crag_variant.py`.
 - `src/mcp_server.py` — `rag_query` returns `source` + `web_docs_found`.
 - `searxng/` — `docker-compose.yml`, `settings.yml`, `README.md` (free local backend).
 - `.env.example`, `mcp-config.json` — `SEARXNG_URL` documented in the precedence chain.
@@ -1547,7 +1548,7 @@ flowchart TD
 
 **Code (`src/baseline_handrolled.py` — the pipeline, top-to-bottom).** The web-search *backend*
 (SearXNG → Tavily → DuckDuckGo) + on-disk reproducibility cache + cross-encoder `rerank_results`
-were **promoted to `shared/web_search.py`** (imported at the top), since `crag_variant.py` needs the
+were **merged into the `shared/web_toolkit/` package** (imported at the top as `web_search_text as web_search`), since `crag_variant.py` needs the
 same backend — one source of truth. What stays in this file is the lab-specific orchestration
 (`web_search_planned`, `execute_plan`, `answer`). The shared module is shown right after:
 
@@ -1594,8 +1595,8 @@ from rag_hybrid import (  # noqa: E402
     BGE_M3, BGE_RERANKER_V2_M3,
     CrossEncoderReranker, DenseEncoder, autoconfig,
 )
-from web_search import (  # noqa: E402  — promoted infra (shared/web_search.py); see shared/README
-    cache_lookup, cache_store, rerank_results, web_search,
+from web_toolkit import (  # noqa: E402  — merged infra (shared/web_toolkit); see shared/README
+    cache_lookup, cache_store, rerank_results, web_search_text as web_search,
 )
 
 load_dotenv()
@@ -1873,8 +1874,8 @@ def corrective_loop(query: str, top_k: int = 6,
 # ---------- Pipeline orchestration -----------------------------------------
 
 # web_search backend (SearXNG → Tavily → DuckDuckGo) + on-disk reproducibility cache now live in
-# shared/web_search.py (promoted infra — both this file and crag_variant.py import it; see
-# shared/README). Imported at the top: `web_search`, `cache_lookup`, `cache_store`. What stays below
+# shared/web_toolkit (merged infra — both this file and crag_variant.py import it; see
+# shared/README). Imported at the top: `web_search_text as web_search`, `cache_lookup`, `cache_store`. What stays below
 # is the LAB-SPECIFIC orchestration — web_search_planned (decompose → per-sub-query rerank →
 # interleave) and execute_plan — the pieces that couple to decompose_query + rerank, not infra.
 
@@ -1914,7 +1915,7 @@ def web_search_planned(query: str, decision: dict[str, Any],
     """
     # Cache at the ORIGINAL-query level (not per-sub-query): the LLM decomposer's sub-query phrasing
     # varies run-to-run, so per-sub-query keys miss; the original question is the stable key. Cache
-    # API lives in shared/web_search.py (cache_lookup / cache_store honor WEB_CACHE).
+    # API lives in shared/web_toolkit (cache_lookup / cache_store honor WEB_CACHE).
     pkey = f"planned|{decision.get('label')}|k={per_query_k}|{query}"
     hit = cache_lookup(pkey)
     if hit is not None:
@@ -2250,17 +2251,17 @@ if __name__ == "__main__":
             print(out["answer"])
 ```
 
-**Promoted infra — `shared/web_search.py`** (the web backend + reproducibility cache + cross-encoder `rerank_results` that BOTH `baseline_handrolled.py` and `crag_variant.py` import — one source of truth; `shared/searxng/` ships a `docker-compose.yml` for the free local backend):
+**Merged infra — `shared/web_toolkit/` (the legacy RAG web-fallback primitives)** (the web backend + reproducibility cache + cross-encoder `rerank_results` that BOTH `baseline_handrolled.py` and `crag_variant.py` import — one source of truth; `shared/searxng/` ships a `docker-compose.yml` for the free local backend). Shown below is the legacy path as it now lives in `web_toolkit/search.py` (imported as `web_search_text`); in the package the cache helpers physically sit in `web_toolkit/_cache.py` (re-exported) and the structured `web_search`/`web_fetch`/`web_browse` tools live alongside — unused by these labs:
 
 ```python
-"""Cached web-search backend (SearXNG → Tavily → DuckDuckGo) — shared infra.
+"""Legacy RAG web-fallback path (SEARXNG → Tavily → DuckDuckGo) — part of shared/web_toolkit.
 
-Promoted from lab-03.7-agentic-rag (W3.7 Agentic RAG §3.3) where the CRAG web fallback first
-needed it. Both `baseline_handrolled.py` (hand-rolled CRAG) and `crag_variant.py` (LangGraph CRAG)
-import it, so the backend + cache live in exactly one place.
+Merged from the original lab-03.7-agentic-rag (W3.7 Agentic RAG §3.3) web_search.py, where the CRAG
+web fallback first needed it. Both `baseline_handrolled.py` (hand-rolled CRAG) and `crag_variant.py`
+(LangGraph CRAG) import it as `web_search_text`, so the backend + cache live in exactly one place.
 
 Public API:
-  web_search(query, k=4)        — cached backend call; precedence SEARXNG_URL → TAVILY_API_KEY → DDG.
+  web_search_text(query, k=4)   — cached backend call; precedence SEARXNG_URL → TAVILY_API_KEY → DDG.
   cache_lookup(key) / cache_store(key, docs)
                                 — generic disk-cache access for callers that cache at a HIGHER level
                                   than one query (e.g. a fanned-out planned query whose whole doc
@@ -2330,7 +2331,7 @@ def web_cache_key(query: str, k: int) -> str:
     return f"{backend}|k={k}|{query}"
 
 
-def _searxng_search(base_url: str, query: str, k: int) -> list[str]:
+def _searxng_legacy(base_url: str, query: str, k: int) -> list[str]:
     """Query a SearXNG instance's JSON API (free, self-hosted, no key). Aggregates many engines
     (Google, Startpage, ...) and ranks free encyclopedic / press sources ABOVE the Statista paywall
     snippet that Tavily and DuckDuckGo surface first. stdlib urllib only (no curl / no dep).
@@ -2354,7 +2355,7 @@ def _searxng_search(base_url: str, query: str, k: int) -> list[str]:
     return [r["content"] for r in results[:k] if r.get("content")]
 
 
-def _web_search_live(query: str, k: int) -> list[str]:
+def _live_legacy(query: str, k: int) -> list[str]:
     """The actual network call, backend precedence:
       1. SEARXNG_URL  — free self-hosted metasearch, best free-source ranking
       2. TAVILY_API_KEY — managed API (good, but ranks paywalled aggregators high)
@@ -2362,7 +2363,7 @@ def _web_search_live(query: str, k: int) -> list[str]:
     ImportError (missing tavily/ddgs) propagates — the caller's config-bug handler turns it into a
     loud, actionable error rather than a silent abstain."""
     if os.getenv("SEARXNG_URL"):
-        return _searxng_search(os.environ["SEARXNG_URL"], query, k)
+        return _searxng_legacy(os.environ["SEARXNG_URL"], query, k)
     if os.getenv("TAVILY_API_KEY"):
         # Official Tavily SDK (tavily-python) — replaces the sunset
         # langchain_community.TavilySearchResults wrapper (deprecated in LC 0.3.25).
@@ -2377,14 +2378,15 @@ def _web_search_live(query: str, k: int) -> list[str]:
         return [r["body"] for r in ddg.text(query, max_results=k) if r.get("body")]
 
 
-def web_search(query: str, k: int = 4) -> list[str]:
-    """Cached wrapper over _web_search_live for reproducible runs. Cache hit → replay; miss → fetch
-    live + persist. WEB_CACHE=0 disables (always live)."""
+def web_search_text(query: str, k: int = 4) -> list[str]:
+    """Cached wrapper over _live_legacy for reproducible runs. Cache hit → replay; miss → fetch
+    live + persist. WEB_CACHE=0 disables (always live). (Imported by the W3.7 labs as
+    `web_search_text as web_search`; the package's bare `web_search` is the NEW structured tool.)"""
     key = web_cache_key(query, k)
     hit = cache_lookup(key)
     if hit is not None:
         return hit
-    docs = _web_search_live(query, k)
+    docs = _live_legacy(query, k)
     cache_store(key, docs)
     return docs
 
@@ -2413,8 +2415,8 @@ def rerank_results(query: str, docs: list[str], top_k: int, reranker: Any) -> li
 - **Block 2 — `multi_retrieve` (original + keyword-only RRF).** Issues two Qdrant queries: original query text + keyword-only variant (stripped of stopwords / function words). Cormack-style RRF (`1/(60+rank)`) fuses the rankings. Variant generation is the cheap recall-augmentation that doesn't need decomposition; covers the case where the original query has too much syntactic noise to dense-match well.
 - **Block 3 — `synthesize` with `[#i]` citation binding + drift filter.** The W2.7-discovered explained-refusal pattern transferred — the prompt forces inline `[#N]` citations on every bullet. The drift filter post-pass drops any bullet whose keywords don't overlap its cited passage; cheap pre-faithfulness guardrail before RAGAS-style judge runs.
 - **Block 4 — `selfrag_checks` (citation_rate + faithfulness_rate + coverage).** All three are keyword-overlap heuristics — fast (no LLM), cheap (no API call), good-enough for the gating decision. Production faithfulness uses RAGAS LLM-judge (W3 Phase 4); SelfRAG-lite is the build-time approximation. Confidence = mean of the three rates.
-- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. Three refinements from §3.3.1 carry in here: (1) the web backend is a **precedence chain** (`SEARXNG_URL` → Tavily SDK → DuckDuckGo), now living in `shared/web_search.py` (promoted infra, imported by both CRAGs); (2) a **Complex** query **fans out** (`web_search_planned`: decompose → web-search each atomic sub-query → **rerank each against its OWN sub-query** + interleave) so "compare X and Y" grounds *both* figures — each entity's figure-passage surfaces and neither dominates — instead of issuing one doomed comparison search; (3) results are **cached at the original-query level** for reproducible runs. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
-- **Block 6 — `shared/web_search.py` (promoted infra).** `web_search(query, k)` is the cached backend: `web_cache_key` builds a backend+config-aware key, `cache_lookup` replays a hit, else `_web_search_live` runs the `SEARXNG_URL → TAVILY_API_KEY → DuckDuckGo` precedence and `cache_store` persists. `rerank_results(query, docs, top_k, reranker)` is the **accuracy** half — a cross-encoder rerank of result *strings*, with the reranker passed IN so the module stays torch-free. `cache_lookup` / `cache_store` are also exposed for higher-level callers: `web_search_planned` caches the *whole fanned-out pool* under the ORIGINAL query (the decomposer's sub-query wording is unstable run-to-run, so the original question is the only reproducible key). Both `baseline_handrolled.py` and `crag_variant.py` import this one module — `crag_variant` thereby gains the SearXNG-first chain + cache it didn't have.
+- **Block 5 — `corrective_loop` (CRAG: rewrite + retry) → executed web fallback.** When `grade_relevance` fails, fire `rewrite_query` (LLM with synonym-injection prompt) → re-run multi_retrieve → rerank → synthesize. Bounded by `max_rewrite` (default 2). If it *still* fails, the pipeline now **executes a real web search** and re-synthesizes the answer from the web docs (same `[#N]` cites + drift filter) — so it *answers* out-of-corpus, not just hands off. Three refinements from §3.3.1 carry in here: (1) the web backend is a **precedence chain** (`SEARXNG_URL` → Tavily SDK → DuckDuckGo), now living in `shared/web_toolkit` (merged infra, imported by both CRAGs as `web_search_text`); (2) a **Complex** query **fans out** (`web_search_planned`: decompose → web-search each atomic sub-query → **rerank each against its OWN sub-query** + interleave) so "compare X and Y" grounds *both* figures — each entity's figure-passage surfaces and neither dominates — instead of issuing one doomed comparison search; (3) results are **cached at the original-query level** for reproducible runs. It records `next_action={web_search, executed: True}` for traceability. (Note `grade_relevance` itself is now the LLM-judge + canonical-`"I don't know"` short-circuit from §3.3's v1→v3 arc, not the old keyword overlap.)
+- **Block 6 — `shared/web_toolkit` (merged infra).** `web_search_text(query, k)` is the cached backend: `web_cache_key` builds a backend+config-aware key, `cache_lookup` replays a hit, else `_live_legacy` runs the `SEARXNG_URL → TAVILY_API_KEY → DuckDuckGo` precedence and `cache_store` persists. `rerank_results(query, docs, top_k, reranker)` is the **accuracy** half — a cross-encoder rerank of result *strings*, with the reranker passed IN so the module stays torch-free. `cache_lookup` / `cache_store` are also exposed for higher-level callers: `web_search_planned` caches the *whole fanned-out pool* under the ORIGINAL query (the decomposer's sub-query wording is unstable run-to-run, so the original question is the only reproducible key). Both `baseline_handrolled.py` and `crag_variant.py` import this one module — `crag_variant` thereby gains the SearXNG-first chain + cache it didn't have.
 - **CLI — `--trace`.** `uv run python src/baseline_handrolled.py --trace "<q>"` prints the per-stage `out["steps"]` trace (decide → decompose → retrieve/plan → synth → grades → corrective → web → regrade → final) plus the answer; without the flag it prints just the answer.
 
 **Result (measured — out-of-corpus run, 10 questions; full numbers in `RESULTS.md`):**
@@ -2431,7 +2433,7 @@ Per-stage: `decide_complexity` / `selfrag` / grades are <0.01 s (no LLM); `multi
 `★ Insight ─────────────────────────────────────`
 - **The grade-and-loop pattern IS the production agentic-RAG architecture.** What LangGraph calls "ConditionalEdge from grade node" is literally an `if not gr["pass"]: corrective_loop(...)` in the hand-rolled version. Seeing it without the framework first is the pedagogical point: when you later wire LangGraph in Phase 1-4, you know exactly which Python lines correspond to which graph nodes.
 - **`shared/tree_index.split_large_nodes` and this lab's `decompose.py` solve different problems but pair well.** Tree-split fragments a long document into navigable units (build-time); decompose fragments a complex query into atomic sub-queries (query-time). Together: the agent sees a fine-grained tree AND can plan multi-step queries against it.
-- **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search` from `shared/web_search.py`: `SEARXNG_URL` → Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3.1). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
+- **Web fallback: execute inline *or* delegate to the host — two valid CRAG postures.** This lab now **executes** the web search in-process (`web_search_text` from `shared/web_toolkit`, imported as `web_search`: `SEARXNG_URL` → Tavily SDK → DuckDuckGo) and answers from it — matching `crag_variant.py`, 10/10 out-of-corpus (§3.3.1). The *alternative* (what earlier versions did) is to emit a structured `next_action={web_search}` and let the MCP host (Claude Desktop / Cursor via the mcp_server) route to its own web tool. Inline = autonomous + self-contained; delegated = decoupled, host-composable, testable. The `next_action.executed` flag records which path ran — and switching between them is one function call (§3.3).
 - **The backend is part of the retriever, not a detail.** The same fan-out grounds a comparison query on SearXNG but half-abstains on Tavily/DuckDuckGo — because those two rank a paywalled snippet above the free figure (§3.3 table). When you wire a web fallback, the *engine's ranking* is a first-class quality lever; a free metasearch that reranks across engines can beat a managed API on free-source recall. Full arc: §3.3.1.
 `─────────────────────────────────────────────────`
 
