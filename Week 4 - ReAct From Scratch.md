@@ -206,7 +206,7 @@ flowchart TD
 
     subgraph TOOLS["Tool Layer — src/tools.py"]
         direction LR
-        T1["web_search<br/>DDGS · max_calls=4"]
+        T1["web_search<br/>shared/web_toolkit · max_calls=4"]
         T2["python_repl<br/>subprocess + timeout<br/>max_calls=6"]
         T3["read_file<br/>path-contained<br/>max_calls=8"]
         T4["write_file<br/>path-contained<br/>max_calls=4"]
@@ -263,7 +263,7 @@ This diagram is the agent's full anatomy on a single page. Three subgraphs (LOOP
    - Are the arguments identical to a previous successful call (circular-args detector)?
    If either trips, the loop synthesizes an error string for the scratchpad and skips dispatch (circuit breaker behavior). Defends against bad-case Scenario 1 ("infinite tool ping-pong") and Scenario 7 ("repeated identical call").
 5. **`BUDGET → DISPATCH`** (OK branch) — `run_tool()` resolves the tool name, calls the function, catches *all* exceptions (broad except is intentional — the LLM must see the error), and truncates results > 4000 chars to keep scratchpad bounded.
-6. **`DISPATCH → T1..T4`** — fans out to one of four registered tools: `web_search` (DDGS), `python_repl` (subprocess + timeout), `read_file`, `write_file` (both path-contained).
+6. **`DISPATCH → T1..T4`** — fans out to one of four registered tools: `web_search` (delegates to `shared/web_toolkit`), `python_repl` (subprocess + timeout), `read_file`, `write_file` (both path-contained).
 7. **`T1..T4 → TOOL_RESULT`** — append the tool result (or error string) to the scratchpad as an append-only event. Errors go through the same path as successes — that is how the model self-corrects on the next iteration.
 8. **`TOOL_RESULT → CTX_GUARD`** — third decision diamond: did appending push us past `CONTEXT_TOKEN_LIMIT`? If yes, drop the oldest tool result (FIFO eviction). Tiered eviction defends against bad-case Scenario 10 ("context overflow without graceful degradation").
 9. **`CTX_GUARD → ITER_GUARD`** — fourth decision diamond: have we hit `MAX_ITER`? If yes, return the DLQ terminal ("AGENT STOPPED"). If no, loop back to `ASSEMBLE`.
@@ -306,14 +306,14 @@ git init && git add .gitignore && git commit -m "chore: init lab-04"
 
 ### 1.2 Install week-specific dependencies
 
-The shared venv from the curriculum setup already has `openai` and `pydantic`. Add the three packages that the new tools require.
+The shared venv from the curriculum setup already has `openai` and `pydantic`. Add the two packages the new tools require — web search is **not** a new dep here, it is reused from `shared/web_toolkit` (see §1.4 / Phase 3).
 
 ```bash
 source ../.venv/bin/activate
-uv pip install duckduckgo-search sqlite-utils pytest
+uv pip install sqlite-utils pytest
 ```
 
-> **What this means:** `duckduckgo-search` provides the `DDGS` class — a zero-cost, no-API-key search interface used for `web_search`. `sqlite-utils` is a thin wrapper over the standard `sqlite3` module that makes schema creation and row insertion one-liners. `pytest` is the test runner for Phase 5.
+> **What this means:** `web_search` is **not** a pip dependency in this lab — it imports `shared/web_toolkit` (first taught in W3.7). The backend is chosen by **config, not runtime failover**: `web_toolkit.web_search` uses SearXNG when `SEARXNG_URL` is set (it defaults to `http://localhost:8080`), else `TAVILY_API_KEY` if present, else DuckDuckGo (`uv pip install ddgs`). So if you set up W3.7's SearXNG, you get it for free here; if you did **not**, set `SEARXNG_URL=` (empty) so it falls through to DuckDuckGo — a configured-but-down SearXNG does *not* auto-fall-back, it raises (and the tool turns that into an error string). `sqlite-utils` wraps `sqlite3` for one-line schema/row ops; `pytest` runs Phase 5.
 
 ### 1.3 Verify the `.env` file
 
@@ -1241,14 +1241,20 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-from duckduckgo_search import DDGS
+import sys
+sys.path.insert(0, "/Users/yuxinliu/code/agent-prep/shared")
+from web_toolkit import web_search as _web_search_backend  # introduced W3.7; reused here
 
 from src.react import register_tool
 
 # ---------------------------------------------------------------------------
 # Tool 1: web_search
-#    Uses the DuckDuckGo Search Python library (DDGS). No API key required.
-#    Returns the top-5 result snippets concatenated as a string.
+#    Delegates to shared/web_toolkit (first taught in W3.7) instead of calling
+#    DuckDuckGo directly. Backend precedence SearXNG -> Tavily -> DuckDuckGo,
+#    disk-cached for reproducibility. The tool's contract (query -> formatted
+#    string) is unchanged, so the ReAct loop is unaffected. Per the repo's
+#    "introduce inline, reuse via import" rule, W4 consumes web search rather
+#    than re-implementing it.
 # ---------------------------------------------------------------------------
 _WEB_SEARCH_SCHEMA = {
     "type": "function",
@@ -1275,18 +1281,21 @@ _WEB_SEARCH_SCHEMA = {
 
 
 def web_search(query: str) -> str:
-    """Run a DuckDuckGo search; return top-5 result snippets as a numbered list."""
+    """Search the web; return top-5 result snippets as a numbered list.
+
+    The actual search is delegated to shared/web_toolkit's structured
+    `web_search` (returns typed SearchResult objects); we format them into the
+    same numbered string the loop already expects. Swapping the backend (e.g.
+    pointing SEARXNG_URL elsewhere) needs no change here.
+    """
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
+        results = _web_search_backend(query, results=5)
         if not results:
             return "web_search: no results found for that query."
-        lines = []
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "")
-            body = r.get("body", "")
-            href = r.get("href", "")
-            lines.append(f"[{i}] {title}\n    {body}\n    URL: {href}")
+        lines = [
+            f"[{i}] {r.title}\n    {r.snippet}\n    URL: {r.url}"
+            for i, r in enumerate(results, 1)
+        ]
         return "\n\n".join(lines)
     except Exception as e:
         return f"web_search error: {type(e).__name__}: {e}"
@@ -1541,17 +1550,19 @@ Common modifications: add `"examples"` fields to `properties` entries for models
 
 ---
 
-**Chunk 2 — `web_search`: DDGS wrapper and result formatting**
+**Chunk 2 — `web_search`: delegate to `shared/web_toolkit`, format the result**
 
-What it does: calls `DDGS().text()` with `max_results=5`, formats each result as a numbered block with title, body snippet, and URL, returns a single string.
+What it does: calls `shared/web_toolkit`'s structured `web_search(query, results=5)` (introduced in W3.7), then formats the returned `SearchResult` objects (`.title`/`.snippet`/`.url`) into the same numbered string the loop expects. The tool function is a thin adapter; the search logic — backend precedence (SearXNG → Tavily → DuckDuckGo), caching, ranking — lives in the shared package.
 
-> **Why `max_results=5` and not more:** More results = more tokens consumed by the tool result = less context headroom for subsequent iterations. Five snippets is enough for the model to triangulate an answer or decide to refine the query. If you need deeper research, call `web_search` again with a more specific query — that is the intended interaction pattern.
+> **Why reuse instead of re-implement:** web search was first taught in W3.7, so per the repo's "introduce inline, reuse via import" rule W4 imports it rather than re-deriving a DuckDuckGo wrapper. The lab keeps one canonical search implementation (`shared/web_toolkit`); a fix there (e.g. a new backend) propagates to every chapter that consumes it, instead of drifting across copy-pasted `DDGS()` wrappers.
 
-> **Why the `except Exception as e` catch returns a string:** DuckDuckGo's API is unofficial and has no SLA. It can rate-limit, time out, or change its response structure without notice. Any of these should produce an informative error string the model can read, not an unhandled exception that crashes the loop.
+> **Why `results=5` and not more:** More results = more tokens in the tool result = less context headroom for subsequent iterations. Five snippets is enough for the model to triangulate or refine. For deeper research, call `web_search` again with a more specific query — that is the intended interaction pattern.
+
+> **Why the `except Exception as e` catch returns a string:** the shared backend can rate-limit, time out, or hit a down SearXNG instance. Any of these should produce an informative error string the model can read on the next iteration (error-as-observation, Concept 5), not an unhandled exception that crashes the loop. The adapter keeps the tool's `(query) -> str` contract regardless of which backend served the request.
 
 > **Analogy (Infra):** `web_search` is your HTTP source connector. The broad exception catch is your connector's dead-letter handler — emit a structured error record, never crash the pipeline.
 
-Common modifications: add `region="wt-wt"` to `ddgs.text()` for region-neutral results; add a `time=` parameter to filter by recency; swap `DDGS` for the Brave Search API if you need higher rate limits.
+Common modifications: point `SEARXNG_URL` at a different SearXNG instance, or set `TAVILY_API_KEY`, to change the backend without touching this file; pass `language=` through to `web_toolkit.web_search` for locale-specific results; bump `results=` if the model needs more snippets. All of these are backend concerns the shared package owns — the tool adapter stays the same.
 
 ---
 
@@ -1629,7 +1640,7 @@ EOF
 
 Expected output: four lines of non-error output. If `web_search` fails with a network error, that is acceptable for an offline environment — the tool will return an error string and the loop will handle it.
 
-> **Gotcha:** `duckduckgo-search` makes outbound HTTP requests. If you are on a restricted network, `web_search` will consistently return errors. This is fine for bad-case testing — scenario 8 (tool timeout / tool error ignored) is actually easier to test in an offline environment because you can provoke real network failures.
+> **Gotcha:** `shared/web_toolkit` makes outbound requests via the **configured** backend (SearXNG by default). The backend is selected by config, not runtime failover — so if `SEARXNG_URL` points at a SearXNG that is down, `web_search` raises `SearchError` every call (it does **not** silently fall back to DuckDuckGo; for DDG you must set `SEARXNG_URL=` empty). On a restricted network the chosen backend fails the same way. This is fine for bad-case testing — scenario 8 (tool timeout / tool error ignored) is actually easier to test offline because you can provoke real failures.
 
 ---
 
@@ -2739,7 +2750,7 @@ Outline your answer:
 | Symptom | Likely cause | Fix | Prevention tip |
 |---------|-------------|-----|----------------|
 | `call_llm()` returns 400 with "context too long" | Scratchpad has grown past the model's context window before the eviction guard fires | Lower `REACT_CTX_LIMIT` env var to trigger eviction sooner; or increase `RESULT_TRUNCATION_CHARS` to truncate tool results more aggressively | Set `REACT_CTX_LIMIT` to 70% of the model's advertised context window, not 100%; reserve headroom for the system prompt and user message |
-| `agent_run()` hangs indefinitely | A tool is blocking (usually `python_repl` or `web_search`) | Set `timeout=` in `python_repl`; confirm `DDGS()` has a request timeout; add `signal.alarm()` as a last-resort watchdog around `run_tool()` | Always pass `timeout=` to any subprocess call; never trust external network calls to self-terminate |
+| `agent_run()` hangs indefinitely | A tool is blocking (usually `python_repl` or `web_search`) | Set `timeout=` in `python_repl`; confirm the `web_toolkit` backend responds (SearXNG up, or DDG reachable) — its CLIs carry their own timeouts; add `signal.alarm()` as a last-resort watchdog around `run_tool()` | Always pass `timeout=` to any subprocess call; never trust external network calls to self-terminate |
 | `pytest tests/test_bad_cases.py` fails with `ImportError: src.react` | Python path not set correctly | Run `pytest` from the lab root directory (not from inside `tests/`); confirm `sys.path.insert(0, ...)` in the test file points to the correct parent | Use `pyproject.toml` with `[tool.pytest.ini_options] pythonpath = ["."]` to avoid manual path manipulation |
 | Model emits empty `content` and empty `tool_calls` on every iteration | Model is confused by the tool schema or system prompt; the model refuses; OR oMLX has no tool-call parser for this model family and the call leaked into `content` as `<tools>`/`<function>` text | Add `print(messages)` before `call_llm()` to inspect what the model sees; print the raw `content` — if it holds a `<tool_call>`/`<tools>`/`<function>` JSON blob, the server didn't parse it (Qwen2.5-Coder fails this on both surfaces). Confirm `MODEL` is a bare served id from `GET /v1/models` (wrong/prefixed id → `404`) | Log the raw `LLMResponse` to SQLite every iteration for offline replay; for an unparsed family, apply `extract_text_tool_calls()` (see `scripts/probe_fleet.py`) as a client-side fallback before reading `tool_calls` |
 
