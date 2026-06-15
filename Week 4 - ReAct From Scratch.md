@@ -1,10 +1,10 @@
 ---
 title: "Week 4 — The ReAct Loop, Built From Scratch"
 created: 2026-04-23
-updated: 2026-05-04
+updated: 2026-06-15
 tags: [agent, curriculum, week-4, react, agents, runbook]
 audience: "Cloud infrastructure engineer (3 yrs), building agentic systems from first principles"
-stack: "MacBook M5 Pro, local vMLX fleet (Qwen3.6-35B-A3B on :8002 / Gemma-4-26B-A4B on :8003 / Qwen3.5-9B-GLM5.1-Distill on :8004, no API key), Python 3.11+, no frameworks"
+stack: "MacBook M5 Pro (48 GB), local oMLX engine on :8000 (one OpenAI- + Anthropic-compatible endpoint, model-routed by the `model:` field, no API key), Python 3.11+, no frameworks"
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-04-react-from-scratch"
 estimated_time: "12–15 hours over 5–7 days"
@@ -17,7 +17,7 @@ prerequisites: "Week 3 RESULTS.md committed"
 
 **Exit criteria.**
 
-- [ ] `src/react.py` runs end-to-end against your local vMLX endpoint (default `:8004`, `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` — smallest model in the fleet, optimized for fast lab iteration) with zero import errors
+- [ ] `src/react.py` runs end-to-end against your local oMLX endpoint (`:8000`, default model `gemma-4-26B-A4B-it-heretic-4bit` — the measured workhorse: the only fleet model scoring 1.00 on tool + json + reason + instr) with zero import errors
 - [ ] All 4 tools (`web_search`, `python_repl`, `read_file`, `write_file`) respond correctly to at least one live agent task
 - [ ] SQLite observability table is populated after every agent run; `SELECT * FROM agent_events` returns rows
 - [ ] `tests/test_bad_cases.py` contains at least 15 named test scenarios; each has a docstring explaining the failure mode and the patch that fixed it
@@ -93,7 +93,7 @@ Harness Engineering Book 1, Chapter 2, opens with an observation worth memorizin
 > 把 prompt 当成人设，是一种常见误会。
 > *("Treating a prompt as a character persona is a common misunderstanding.")*
 
-The misunderstanding runs like this: engineers think of a system prompt as the thing that makes the model sound like a helpful assistant. Chapter 2 argues that production prompts are something structurally different — they are a **stratified control plane**, not a monologue.
+	The misunderstanding runs like this: engineers think of a system prompt as the thing that makes the model sound like a helpful assistant. Chapter 2 argues that production prompts are something structurally different — they are a **stratified control plane**, not a monologue.
 
 Claude Code's `buildEffectiveSystemPrompt()` in `src/utils/systemPrompt.ts` assembles the effective prompt from at least five sources in priority order: (1) override system prompt, (2) coordinator system prompt, (3) agent system prompt, (4) custom system prompt, (5) default system prompt. The last slot always wins only when nothing higher-priority is present. This is the same logic as CSS specificity or `.gitignore` precedence — specificity overrides generality. The Harness text calls this arrangement a "constitution": it defines power boundaries and exception handling, not a speaking style.
 
@@ -178,7 +178,7 @@ flowchart TD
         direction TB
         ASSEMBLE["context_for_llm()<br/>Assemble: system + tools schema<br/>+ user msg + scratchpad"] --> LLM
 
-        LLM["call_llm()<br/>vMLX :8004<br/>MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit"] --> PARSE
+        LLM["call_llm()<br/>oMLX :8000<br/>gemma-4-26B-A4B-it-heretic-4bit"] --> PARSE
 
         PARSE{"tool_calls<br/>present?"}
 
@@ -227,9 +227,9 @@ flowchart TD
 
     LOOP -- "log_event() on<br/>every iteration" --> LOG
 
-    style LOOP fill:#1a1a2e,stroke:#4a9eff,color:#e0e0e0
-    style TOOLS fill:#0f3460,stroke:#4a9eff,color:#e0e0e0
-    style OBS fill:#16213e,stroke:#e94560,color:#e0e0e0
+    style LOOP fill:transparent,stroke:#4a9eff
+    style TOOLS fill:#cce5ff,stroke:#4a9eff,color:#1a1a2e
+    style OBS fill:transparent,stroke:#e94560
     style DLQ fill:#e94560,color:#fff
     style ANSWER fill:#4caf50,color:#fff
 ```
@@ -256,7 +256,7 @@ This diagram is the agent's full anatomy on a single page. Three subgraphs (LOOP
 **Walkthrough — one user message through the loop.**
 
 1. **`User message → ASSEMBLE`** — the only entry point. `context_for_llm()` builds the prompt fresh on every iteration: system prompt + JSON tool schemas + user message + full scratchpad replay (no truncation at this step — truncation happens later via `CTX_GUARD`).
-2. **`ASSEMBLE → LLM`** — `call_llm()` makes a single OpenAI-compatible chat completion call against the local vMLX server (default: `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` on `:8004` — smallest model in the fleet, chosen for fast lab iteration; swap to `MODEL_OPUS` Qwen3.6-35B-A3B-nvfp4 on `:8002` for production-strength tool calling). Returns `(content, tool_calls, usage)`.
+2. **`ASSEMBLE → LLM`** — `call_llm()` makes a single OpenAI-compatible chat completion call against the local oMLX endpoint (default: `gemma-4-26B-A4B-it-heretic-4bit` on `:8000`, routed by the `model:` field — the measured workhorse, the only fleet model at 1.00 on every quality probe; swap to `MODEL_OPUS` Qwen3.5-27B-Claude-Distilled for a larger reasoning attempt via the `hard_loop` role). Returns `(content, tool_calls, usage)`.
 3. **`LLM → PARSE`** — first decision diamond: did the model emit `tool_calls`? If no, the response is the final answer; jump to `Return final answer` (green terminal).
 4. **`PARSE → BUDGET`** (yes branch) — second decision diamond: budget guard. Two checks:
    - Has this tool's `max_calls` been hit?
@@ -320,28 +320,21 @@ uv pip install duckduckgo-search sqlite-utils pytest
 Your `.env` should contain the following. Confirm each line exists before moving to Phase 2.
 
 ```bash
-# .env — values from the vMLX settings panel.
-# vMLX serves each model on its own port; no API key is required, but the
-# OpenAI SDK still rejects an empty api_key at construction time, so we pass
-# a non-empty placeholder string ("not-needed") that vMLX ignores.
-VMLX_API_KEY=not-needed
+# .env — oMLX exposes ONE OpenAI-compatible endpoint on :8000/v1 and routes
+# internally by the `model:` field (no per-model ports). No API key is
+# required, but the OpenAI SDK rejects an empty api_key at construction time,
+# so we pass a non-empty placeholder ("not-needed") that oMLX ignores.
+OMLX_API_KEY=not-needed
+OMLX_URL=http://127.0.0.1:8000/v1
 
-# Default endpoint = smallest model on the fleet (fast lab iteration).
-# agent_run() reads VMLX_BASE_URL + VMLX_MODEL — change both together.
-VMLX_BASE_URL=http://127.0.0.1:8004/v1
-VMLX_MODEL=MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit
-
-# Per-tier model fleet (Opus / Sonnet / Haiku — used in §5 tier-comparison
-# experiments and Week 5's pattern zoo). Each model has its own port; flip
-# both VMLX_BASE_URL and VMLX_MODEL together when switching tiers.
-MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4                       # port 8002 — strongest tool-caller (MoE)
-MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit           # port 8003 — mid tier
-MODEL_HAIKU=MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit      # port 8004 — smallest, fastest (default)
-
-# Per-tier base URLs (use when running tier-comparison experiments).
-VMLX_URL_OPUS=http://127.0.0.1:8002/v1
-VMLX_URL_SONNET=http://127.0.0.1:8003/v1
-VMLX_URL_HAIKU=http://127.0.0.1:8004/v1
+# Default model = the measured workhorse (Gemma-26B), the only fleet model
+# scoring 1.00 on tool + json + reason + instr (see §1.4). agent_run() reads
+# OMLX_URL + MODEL_SONNET; swap MODEL_* to retier — the URL never changes.
+# Model ids are the BARE served names from GET /v1/models (no `models/` prefix).
+MODEL_SONNET=gemma-4-26B-A4B-it-heretic-4bit                          # workhorse / default (most roles)
+MODEL_FAST=Qwen2.5-Coder-7B-Instruct-MLX-4bit                        # classify — fast 4 GB, reason=1.00; tools need client parser
+MODEL_OPUS=Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit            # hard_loop — larger reasoning, tool=1.00 (format poor)
+MODEL_HAIKU=MLX-Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-4bit  # fast tool-only (ping ~149 ms); think-blocks fail format
 ```
 
 Quick sanity check — this should return the model name with no error:
@@ -351,9 +344,9 @@ set -a; source .env; set +a
 python -c "
 import os
 from openai import OpenAI
-c = OpenAI(base_url=os.getenv('VMLX_BASE_URL'), api_key=os.getenv('VMLX_API_KEY', 'not-needed'))
+c = OpenAI(base_url=os.getenv('OMLX_URL'), api_key=os.getenv('OMLX_API_KEY', 'not-needed'))
 r = c.chat.completions.create(
-    model=os.getenv('VMLX_MODEL'),
+    model=os.getenv('MODEL_SONNET'),
     messages=[{'role':'user','content':'Reply with exactly: ready'}],
     max_tokens=10,
 )
@@ -361,122 +354,138 @@ print(r.choices[0].message.content)
 "
 ```
 
-Verify the other two tiers are also reachable (each on its own port):
+Confirm every model you plan to route to is actually served (one endpoint lists them all):
 
 ```bash
-for url in "$VMLX_URL_OPUS" "$VMLX_URL_SONNET" "$VMLX_URL_HAIKU"; do
-  echo "Probing $url"
-  curl -fsS "${url}/models" >/dev/null && echo "  OK" || echo "  DOWN"
-done
+python -c "
+import os
+from openai import OpenAI
+c = OpenAI(base_url=os.getenv('OMLX_URL','http://127.0.0.1:8000/v1'), api_key='not-needed')
+served = {m.id for m in c.models.list().data}
+for tier in ('MODEL_SONNET','MODEL_FAST','MODEL_OPUS','MODEL_HAIKU'):
+    mid = os.getenv(tier)
+    print(f'  {tier:13s} {mid!s:60s} {\"OK\" if mid in served else \"NOT SERVED\"}')
+"
 ```
 
-> **Gotcha:** If vMLX is not running on the expected port, this returns a `ConnectionRefusedError`. Start the vMLX server for that model from the menu bar, wait for the green indicator, then re-run. Do not proceed to Phase 2 with a failing sanity check — every subsequent step depends on this connection. A common mistake: `VMLX_MODEL` env var still names `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` but `VMLX_BASE_URL` points at `:8003` (Gemma) — the request silently routes to whichever model that port is serving, producing confusing output. Always flip URL and MODEL together.
+> **Gotcha:** With one endpoint there is no per-port silent-routing trap, but two oMLX-specific failures replace it. (1) **Wrong model id → `404 model not found`**: oMLX uses bare ids (`gemma-4-26B-A4B-it-heretic-4bit`), not the `models/`-prefixed or `lmstudio-community/`-prefixed forms other servers use — copy the id verbatim from `GET /v1/models`. (2) **Heavy model → `507` memory-ceiling error**, not a hang: oMLX's memory_guard refuses to load a model whose projected footprint exceeds the ceiling (on a 48 GB box, ~37.44 GB usable) while another model is hot — e.g. the 31B heretic at 47.6 GB projected. Only one heavy model is hot at a time; expect a cold-load (~10–30 s) when you switch to a non-resident model. Do not proceed to Phase 2 with a failing sanity check — every subsequent step depends on it.
 
 > **Analogy (Infra):** This is identical to running `SELECT 1` against a new database connection before wiring it into a pipeline. The thirty seconds spent verifying connectivity saves hours of debugging later.
 
-### 1.4 Empirical findings — fleet probe (2026-05-04)
+### 1.4 Empirical findings — fleet probe (2026-06-15, oMLX migration)
 
-The lab ships a probe harness at `scripts/probe_fleet.py` that scores every model in the fleet across five dimensions: ping latency, structured tool calling, JSON-only output, multi-step reasoning, and strict instruction-following. Run it once after starting vMLX and before writing any loop code; the scores anchor every per-role model assignment in `src/models.py` and every tier-comparison in §5 + Week 5.
+The lab ships a probe harness at `scripts/probe_fleet.py` that scores every model in the fleet across five dimensions: ping latency, structured tool calling, JSON-only output, multi-step reasoning, and strict instruction-following. Run it once after starting oMLX and before writing any loop code; the scores anchor every per-role model assignment in `src/models.py` and every tier-comparison in §5 + Week 5.
 
-**Five-run aggregate on M5 Pro 48 GB, vMLX engine post-2026-05-04 upgrade:**
+> **History.** This lab originally ran on a multi-port vMLX fleet whose headline model (`MLX-Qwen3.5-9B-GLM5.1-Distill`) is no longer in the catalog. The 2026-06-15 migration moved to the **oMLX** engine — one OpenAI- and Anthropic-compatible endpoint on `:8000`, model-routed by the `model:` field. Every number below is re-measured on oMLX; the old vMLX scores are retired. Raw scores: `data/fleet_probe_20260615_omlx.json`.
 
-| Tier | Model | Port | Ping (median ms) | Tool | JSON | Reason | Instr |
-|---|---|---|---|---|---|---|---|
-| haiku | `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` | `:8004` | 525–1208 | **1.00** | **1.00** | **1.00** | **1.00** |
-| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | `:8003` | 301 (warm) / cold-timeout | 0.33–0.67 | 1.00 | 1.00 | 1.00 |
-| opus_lazy (selected) | `Gemma-4-31B-JANG_4M-CRACK` | `:8001` | 2135 (cold) | **1.00** | **1.00** | **1.00** | **1.00** |
-| opus_lazy (rejected) | `gemma-4-31B-uncensored-heretic-mlx-4bit` | `:8000` | ~1700 (cold) | **0.00** | 1.00 | 1.00 | 1.00 |
+**Single run (3 trials per probe) on M5 Pro 48 GB, oMLX `:8000`, 2026-06-15:**
 
-**Two uncensored Gemma-4-31B variants compared at the same parameter scale and quant tier:**
+| Tier | Model | Ping (median ms) | Tool | JSON | Reason | Instr |
+|---|---|---|---|---|---|---|
+| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | 353 | **1.00** | **1.00** | **1.00** | **1.00** |
+| haiku | `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled-4bit` | **149** | **1.00** | 0.00 | 0.00 | 0.00 |
+| fast | `Qwen2.5-Coder-7B-Instruct-MLX-4bit` (4 GB) | 241 | 1.00 † | 0.67 | **1.00** | 0.33 |
+| opus_qwen | `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` | 713 | **1.00** | 0.00 | 0.33 | 0.00 |
+| opus_lazy | `gemma-4-31B-uncensored-heretic` (`Gemma4-31`) | — | — | — | — | — |
 
-| Probe | JANG_4M-CRACK (selected) | heretic-mlx-4bit (rejected) |
+† `fast` tool calls are **text-parsed**, not server-structured: oMLX ships no tool-call parser for the Qwen2.5 family, so the call arrives as `<tools>`/`<function>` text and is recovered client-side by `extract_text_tool_calls()` (Scenario 15). Without that parser the raw score is 0.00.
+
+`opus_lazy` returns no scores because it **cannot load**: oMLX's memory_guard rejects it with a `507` — *"projected memory 47.60 GB would exceed the memory ceiling 37.44 GB"* — once the other models are warm. On a 48 GB box, one heavy model is hot at a time.
+
+**Why `fast` is the 7B and not the 14B.** The same probe on `Qwen2.5-Coder-14B` measured **448 ms** — *slower* than the 353 ms Gemma-26B workhorse, with the same loose format scores (json 0.67, instr 0.33) and the same parser dependency. It is strictly dominated, so it earns no tier. The **7B** is the keeper: at 241 ms and 4 GB it is the fastest model that still emits *usable text answers* (reason=1.00), which the faster 35B-A3B cannot (reason=0.00 — its think-blocks eat the answer). The 7B's niche is cheap, high-frequency, simple-case triage where loose formatting is acceptable.
+
+**The reasoning-distilled trap — tool passes, format collapses:**
+
+| Probe | Gemma-26B (workhorse) | 35B-A3B / 27B (reasoning-distilled) |
 |---|---|---|
-| Tool calling (3 trials) | 3/3 perfect structured `tool_calls` | 0/3 — emitted plain text where tools required |
-| Reasoning | 1.00 | 1.00 |
-| JSON-only output | 1.00 | 1.00 |
-| Instruction following | 1.00 | 1.00 |
-| Context window | 4M tokens (4,000,000) | 32K (typical Gemma-4 default) |
-| Verdict | **Selected** for `finisher` and `hard_loop` roles | **Rejected** — tool=0.00 makes it strictly inferior at the same scale |
+| Tool calling (3 trials) | 3/3 structured `tool_calls` | 3/3 structured `tool_calls` |
+| JSON-only output | 1.00 | **0.00** — `<think>` preamble + clipped JSON |
+| Strict word-count (instr) | 1.00 | **0.00** — reasoning consumes the token budget |
+| Reasoning (integer answer) | 1.00 | 0.00–0.33 — correct answer buried in `<think>` |
+| Verdict | **Workhorse** — every reliable role | Tool-call emission ONLY; never format-sensitive roles |
 
-JANG strictly dominates heretic on the only axis that matters for agent loops. Both fine-tunes are uncensored long-form variants of Gemma-4-31B-4bit, but heretic destroyed the function-call alignment during fine-tuning while JANG preserved it. JANG also carries a 4M context window — 30× larger than the typical 128K — making it the natural target for Week 8 long-context retrieval experiments.
+The reasoning-distilled models are not broken — they are *misapplied* under tight token caps. They emit a `<think>…</think>` block before answering, so "return only JSON" gets prose and "exactly 3 words" gets an essay. Suppressing thinking (oMLX's `enable_thinking` / `reasoning_effort` chat-template kwargs) is the lever that would recover their format scores; until then they are safe only for raw `tool_calls`, where the structured field is unaffected by the reasoning preamble.
 
 `★ Insight ─────────────────────────────────────`
-- **Smallest model is the most stable.** Distill 9B is the only model that scored 1.00 across every quality probe in five consecutive runs — through engine upgrades, fleet shuffling, and OOM cycles. The "Haiku" name in the tier ladder is a transport-layer label, not a quality ranking. On this fleet the lab's default `MODEL` is the smallest, the most reliable, and the one that survives operational chaos.
-- **Tool-calling is a learned format, not a function of size.** Gemma-26B (Sonnet) scores reason=1.00, instr=1.00, but tool=0.33–0.67. Gemma-31B-uncensored-heretic scores reason=instr=1.00 but tool=**0.00** — the uncensored fine-tune dropped the function-call grammar entirely. Tool calling capability is orthogonal to general capability and must be probed separately. Do not assume it from model size or benchmark scores.
-- **48 GB unified memory cannot hold all three hot.** Loading dense Gemma-31B on `:8000` alongside Gemma-26B and Distill-9B triggered cascading `APIConnectionError` across the fleet — total weight memory ≈ 38 GB, plus KV cache and activations exceeded the headroom. The architecturally correct fix is the same as in any memory-pressured infra system: lazy-load the heavy node and accept cold-start tax. This is the difference between "deploy three models" and "deploy three models you can actually use."
+- **The role map collapses onto one workhorse.** Gemma-26B is the *only* model at 1.00 on tool **and** json **and** reason **and** instr. The 31B heretic can't load (memory ceiling); both reasoning-distilled models pass `tool` but score ~0 on every format dimension. The measured fleet supports one reliable generalist, not a stable of specialists — the honest opposite of the aspirational tier ladder.
+- **Tool calling is a model × server-parser pairing, not a model property.** This lab's previous write-up recorded `gemma-4-31B-uncensored-heretic` at tool=0.00 and concluded "the uncensored fine-tune destroyed function-call alignment." That conclusion was a **vMLX artifact**: on oMLX the same heretic weights tool-call correctly (when they fit). What changed was the server's tool-call *parser*, not the model. oMLX parses Gemma / Qwen3 / gpt-oss families into structured `tool_calls`; it does **not** parse Qwen2.5-Coder, which leaks `<tools>`/`<function>` text on *both* the OpenAI and Anthropic surfaces. Probe the pairing, never the model alone.
+- **Memory ceiling fails loud, which is better.** The old multi-port fleet OOMed as cascading `APIConnectionError` — silent thrash. oMLX returns a clean `507` with the exact GB arithmetic (`47.60 GB > 37.44 GB`). An explicit ceiling you can reason about beats a fleet that quietly degrades; design the role map around "one heavy model hot at a time," not around wishful co-residency.
 `─────────────────────────────────────────────────`
 
 **Role-to-model mapping — driven by the table above (see `src/models.py::ROLE_MAP`):**
 
-| Role | Model | Port | Why |
-|---|---|---|---|
-| `loop` (default ReAct driver) | Distill 9B | `:8004` | Only model with 1.00 across every quality probe in 5 runs |
-| `tool_arg` (synthesize tool arguments) | Distill 9B | `:8004` | tool=1.00 vs Sonnet 0.67 vs Opus-lazy 0.00 |
-| `classify` (cheap pre-loop / obs sidecar) | Distill 9B | `:8004` | Smallest, fastest reliable; reuses loop's hot KV cache |
-| `reason` (math / multi-step) | Gemma-26B | `:8003` | reason=1.00 + warm-state 301 ms median |
-| `compose` (post-tool answer drafting) | Gemma-26B | `:8003` | instr=1.00; no `tool_calls` emission needed |
-| `finisher` (post-loop polish, lazy) | JANG_4M-CRACK | `:8001` | reason+instr+json+tool 1.00; uncensored long-form; 4M context. Spin up only after `agent_run()` returns. |
-| `hard_loop` (in-loop fallback when 9B reasoning is insufficient, lazy) | JANG_4M-CRACK | `:8001` | tool=1.00 at 31B scale — heretic could not serve this role (tool=0.00). |
+| Role | Model | Why |
+|---|---|---|
+| `loop` (default ReAct driver) | Gemma-26B | Only model at 1.00 across tool + json + reason + instr |
+| `tool_arg` (synthesize tool arguments) | Gemma-26B | tool=1.00 structured, reliable arguments |
+| `classify` (cheap pre-loop / obs sidecar) | Qwen2.5-Coder-7B (`fast`) | 241 ms + 4 GB + reason=1.00 → fastest model that still answers correctly; non-tool triage, so the 7B's parser/format limits don't bite. (The 149 ms 35B-A3B is faster but reason=0 — useless for real triage.) |
+| `reason` (math / multi-step) | Gemma-26B | reason=1.00, 353 ms warm |
+| `compose` (post-tool answer drafting) | Gemma-26B | instr/json=1.00; clean prose, no think-block noise |
+| `finisher` (post-loop polish) | Gemma-26B | Reliable formatting; no loadable heavy alternative (31B OOMs) |
+| `hard_loop` (larger reasoning attempt, still needs tools) | Qwen3.5-27B-Distilled | Only *other* loadable tool-capable model (tool=1.00); format caveat — use for tool-driven reasoning, not formatted output |
 
-**Three new bad-case scenarios discovered via the probe harness (used in Phase 5):**
+> **How `recommend()` picks the cheap roles — "fastest" is not enough.** The probe's auto-recommendation (`scripts/probe_fleet.py::recommend`) assigns the content roles by argmax over the relevant axis (`tool`, `json`, `reason`, `instr`), but the *cheap* roles (`cheap_classifier`, `obs_summarizer_sidecar`) need a guard: pure argmax over `ping` recommends the 149 ms 35B-A3B, which scores `reason=0` and therefore cannot actually produce a classification. So `recommend()` floors on capability first — **fastest model with `reason ≥ 0.5`**, falling back to the full pool only if none qualify. That excludes the reasoning-distilled MoE and lands on the 4 GB Qwen2.5-Coder-7B (241 ms, `reason=1.00`), matching `src/models.py`'s `classify → fast` routing. The lesson is general: a cheap role's selector must be "fastest model that can still do the job," never "fastest model." A 149 ms model that returns empty output is infinitely slow at producing a usable answer.
 
-- **Scenario 13 — cold-start latency exceeds tool budget.** Sonnet's first call after a memory-pressure event consistently times out at 200+ s. *Fix:* warm-up ping at agent boot; treat first-call latency as a separate per-tool budget axis.
-- **Scenario 14 — model post-OOM corruption.** Symptom: `{"x":33333333333333…` runaway digit decoding, instruction violations (8 words emitted for "EXACTLY 3"). Stale KV cache after a fleet-wide OOM cycle is the root cause, not model corruption on disk. *Fix:* `kill -HUP` the contaminated vMLX server on its port; re-run the probe to confirm scores recover.
-- **Scenario 15 — uncensored fine-tune drops `tool_calls`.** Symptom: `tool_choice="auto"` is sent, schema is valid, but the response has `content="..."` and `tool_calls=[]`. The model emitted plain text where structured calls were required. Root cause: function-call alignment is fragile and is often lost during uncensored / heretic fine-tunes — `gemma-4-31B-uncensored-heretic-mlx-4bit` scored tool=0.00 (0/3 perfect calls) in isolated probing, while `Gemma-4-31B-JANG_4M-CRACK` (same parameter scale, same 4-bit quant, different fine-tune) scored tool=1.00. *Fix:* probe every uncensored variant on tool calling specifically before adopting it; never assume tool capability survives a fine-tune. *Mitigation when only a non-tool-capable model is available:* relegate it to the `finisher` role (post-loop, plain text input/output) and never put it on the loop's `tool_arg` path. `src/models.py` selects JANG over heretic for exactly this reason.
+**Three bad-case scenarios discovered via the probe harness (used in Phase 5):**
+
+- **Scenario 13 — cold-start latency exceeds tool budget.** Switching to a non-resident model incurs a one-time ~10–30 s load while oMLX evicts the prior heavy model and pages in the new one. *Fix:* warm-up ping at agent boot; treat first-call latency as a separate per-tool budget axis.
+- **Scenario 14 — reasoning-distilled format collapse.** Symptom: a model with `tool=1.00` returns empty/garbled output for "JSON only" or "exactly N words" (instr=0.00, json=0.00). Root cause: the model emits a `<think>` block that consumes the token cap or wraps the answer; it is reasoning-distilled, not format-tuned. *Fix:* route format-sensitive roles to a non-reasoning model (Gemma-26B), or suppress thinking via oMLX chat-template kwargs (`enable_thinking=false` / `reasoning_effort=low`) and re-probe.
+- **Scenario 15 — server has no tool-call parser for the model family.** Symptom: `tool_choice="auto"` sent, schema valid, but `tool_calls=[]` and `content` holds the call as text (`<tools>…` on the OpenAI surface, `<function>…` on the Anthropic surface). Root cause: the model formed a correct call but oMLX ships no parser for that family — `Qwen2.5-Coder-{7B,14B}` fail on **both** API surfaces, while Gemma / Qwen3 / gpt-oss succeed. *Fix:* prefer a parsed family; or, to keep an unparsed model, apply a client-side text fallback (`scripts/probe_fleet.py::extract_text_tool_calls`) that recovers `{name, arguments}` from `<tool_call>`/`<tools>`/`<function>` blocks before reading `tool_calls`. This is the modern echo of the 2022 ReAct paper's text-parsing path — the model forces you back onto it.
 
 **Run the probe yourself:**
 
 ```bash
 cd ~/code/agent-prep/lab-04-react-from-scratch
-source ../.venv/bin/activate
-python scripts/probe_fleet.py                           # default = sonnet+haiku (Option C)
-python scripts/probe_fleet.py --only opus_jang          # isolated probe of JANG :8001
-python scripts/probe_fleet.py --only opus_lazy          # isolated probe of heretic :8000 (rejected variant)
-python scripts/probe_fleet.py --json > data/run_$(date +%s).json   # snapshot for replay
+uv run python scripts/probe_fleet.py                                       # default = always-hot tiers: sonnet, haiku, fast
+uv run python scripts/probe_fleet.py --only sonnet,haiku,fast,opus_qwen   # full working fleet
+uv run python scripts/probe_fleet.py --json > data/run_$(date +%Y%m%d).json   # snapshot for replay
 ```
 
-> **Re-run the probe after any vMLX engine upgrade.** A v?→v? bump in this lab changed Sonnet from "request timeout" to "301 ms median" with no model change. Engine version is a load-bearing variable in the role map; pin it in `RESULTS.md`.
+> **Re-run the probe after any oMLX engine upgrade or model swap.** Tool-call parsing, the memory ceiling, and per-model latency are all engine-version-dependent; an upgrade can flip a tool score from 0.00 to 1.00 with no model change (that is exactly how the old heretic tool=0.00 finding inverted). Pin the engine version in `RESULTS.md`.
 
-### 1.5 Refactor — MLX Studio gateway + role map (`src/models.py`, lab commit 2026-05-05)
+### 1.5 Role map behind one endpoint (`src/models.py`)
 
-The §1.3 `.env` block and §1.4 probe results describe the **launch baseline**: each model on its own vMLX port (`:8002` / `:8003` / `:8004` / `:8001`), with one `OpenAI` client per port. As the role count grew (loop + tool_arg + classify + reason + compose + finisher + hard_loop), client construction + connection management became a per-loop tax. The 2026-05-05 lab refactor consolidates ALL models behind a single **MLX Studio API gateway** on `:8080/v1` and routes per-request via the `model:` field. Measured gateway overhead: zero (Sonnet 207→203 ms, Haiku 448→430 ms; within noise). Code lands in `src/models.py` (~150 LOC) as a single source of truth for role → endpoint mapping.
+`src/react.py` is the loop; it should not know *which* model is best at reasoning or tool calling — that is a fleet-tuning concern. `src/models.py` (~150 LOC) isolates the role → `(url, model, timeout)` mapping so retiering is a one-file edit that never touches loop logic. The engine makes this clean: **oMLX exposes one endpoint on `:8000/v1` and routes internally by the `model:` field** — it already *is* the gateway, so there are no per-model ports to thread through the loop. (The lab originally ran a multi-port vMLX fleet, then a separate `:8080` gateway; oMLX collapses both into the single-endpoint model below.)
 
 ```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
 flowchart TD
-  subgraph BEFORE["Before 2026-05-05 — multi-port (BASELINE)"]
-    L1["react.py loop"] --> P1[":8002 vMLX<br/>Opus / 35B"]
-    L1 --> P2[":8003 vMLX<br/>Sonnet / 26B"]
-    L1 --> P3[":8004 vMLX<br/>Haiku / 9B"]
-    L1 --> P4[":8001 vMLX<br/>JANG_4M lazy"]
+  subgraph BEFORE["vMLX multi-port (old)"]
+    L1["react.py loop"] --> P1[":8002 vMLX<br/>per-model port"]
+    L1 --> P2[":8003 vMLX<br/>per-model port"]
+    L1 --> P3[":8004 vMLX<br/>per-model port"]
   end
-  subgraph AFTER["After 2026-05-05 — gateway (SHIPPED)"]
-    L2["react.py loop"] --> G[":8080/v1 MLX Studio gateway"]
-    G --> M1["models/Qwen3.6-35B-A3B-nvfp4"]
-    G --> M2["models/gemma-4-26B-A4B-it-heretic-4bit"]
-    G --> M3["models/MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit"]
-    G --> M4["models/Gemma-4-31B-JANG_4M-CRACK"]
+  subgraph AFTER["oMLX one endpoint"]
+    L2["react.py loop"] --> R["role -> model<br/>ROLE_MAP"]
+    R --> G[":8000/v1 oMLX<br/>model-routed"]
+    G --> M1["gemma-4-26B<br/>heretic-4bit<br/>(workhorse)"]
+    G --> M2["Qwen2.5-Coder-7B<br/>(classify, fast)"]
+    G --> M3["Qwen3.5-27B<br/>Distilled<br/>(hard_loop)"]
   end
 ```
 
 **Code:**
 
 ```python
-# src/models.py — role → endpoint mapping behind one gateway (~151 LOC)
-"""All requests route through the MLX Studio API gateway on :8080/v1, with
-the specific model selected by the `model:` field. Gateway-vs-direct-port
-adds zero measurable overhead (Sonnet 207->203 ms, Haiku 448->430 ms —
-within noise; see data/fleet_probe_*v9_gateway.json).
+# src/models.py — role → endpoint mapping behind one oMLX endpoint (~150 LOC, abridged)
+"""Engine: oMLX exposes one OpenAI-compatible endpoint on :8000/v1 and routes
+internally by the `model:` field — it IS the gateway (no per-model ports).
+Models are addressed by bare served id (GET /v1/models), no `models/` prefix.
 
-Probe-driven mapping as of 2026-05-05 (vMLX gateway, M5 Pro 48 GB):
-  loop, tool_arg, classify  -> Distill 9B (1.00 across 5 runs, only stable)
-  reason, compose           -> Gemma-26B  (reason+instr 1.00 when warm)
-  finisher, hard_loop       -> JANG_4M-CRACK (lazy; tool=1.00 + 4M context)
+Probe-driven mapping as of 2026-06-15 (oMLX :8000, M5 Pro 48 GB) — see
+data/fleet_probe_20260615_omlx.json:
+  loop, tool_arg, reason, compose, finisher -> Gemma-26B
+      (the ONLY model at 1.00 across tool+json+reason+instr)
+  classify -> Qwen2.5-Coder-7B (fast 4 GB, ~241 ms, reason=1.00) — cheap
+      non-tool triage; loose format + parser-only tools don't bite here
+  hard_loop -> Qwen3.5-27B-Claude-Distilled
+      (only OTHER loadable tool-capable model; larger reasoning attempt)
 
-Why JANG_4M-CRACK over gemma-31B-uncensored-heretic-mlx-4bit:
-  Both 31B Gemma-4 4-bit dense fine-tunes. heretic scored tool=0.00 —
-  uncensored fine-tune destroyed function-call alignment. JANG scored
-  tool=1.00, json=1.00, reason=1.00, instr=1.00 with 2135 ms median ping.
-  Same parameter scale, same quant, opposite agent-usability.
+One workhorse, not a fleet of specialists (measured, not aspired):
+  - reasoning-distilled models (35B-A3B, 27B) pass tool=1.00 but score ~0 on
+    json/reason/instr — <think> blocks break strict-format output.
+  - gemma-4-31B-uncensored-heretic cannot load: oMLX memory_guard rejects it
+    (47.6 GB projected > 37.44 GB ceiling) once another model is hot.
 """
 from __future__ import annotations
 import os
@@ -484,14 +493,14 @@ from dataclasses import dataclass
 from typing import Literal
 from openai import OpenAI
 
-_GATEWAY_URL = os.getenv("VMLX_GATEWAY_URL", "http://localhost:8080/v1")
+_OMLX_URL = os.getenv("OMLX_URL", "http://127.0.0.1:8000/v1")
 
-# Model identifiers carry the `models/` prefix expected by the gateway router.
-_HAIKU_MODEL   = os.getenv("MODEL_HAIKU",     "models/MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit")
-_SONNET_MODEL  = os.getenv("MODEL_SONNET",    "models/gemma-4-26B-A4B-it-heretic-4bit")
-_OPUS_LAZY_MODEL = os.getenv("MODEL_OPUS_LAZY", "models/Gemma-4-31B-JANG_4M-CRACK")
+# Bare served ids (GET /v1/models) — no `models/` prefix on oMLX.
+_SONNET_MODEL = os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
+_OPUS_MODEL   = os.getenv("MODEL_OPUS",   "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit")
+_FAST_MODEL   = os.getenv("MODEL_FAST",   "Qwen2.5-Coder-7B-Instruct-MLX-4bit")
 
-API_KEY = os.getenv("VMLX_API_KEY", "not-needed")  # vMLX ignores; SDK requires non-empty
+API_KEY = os.getenv("OMLX_API_KEY", "not-needed")  # oMLX ignores; SDK requires non-empty
 
 Role = Literal["loop", "tool_arg", "classify", "reason", "compose",
                "finisher", "hard_loop"]
@@ -505,13 +514,19 @@ class Endpoint:
 
 
 ROLE_MAP: dict[str, Endpoint] = {
-    "loop":      Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=30),
-    "tool_arg":  Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=30),
-    "classify":  Endpoint(_GATEWAY_URL, _HAIKU_MODEL,     timeout_s=10),
-    "reason":    Endpoint(_GATEWAY_URL, _SONNET_MODEL,    timeout_s=45),
-    "compose":   Endpoint(_GATEWAY_URL, _SONNET_MODEL,    timeout_s=45),
-    "finisher":  Endpoint(_GATEWAY_URL, _OPUS_LAZY_MODEL, timeout_s=90),
-    "hard_loop": Endpoint(_GATEWAY_URL, _OPUS_LAZY_MODEL, timeout_s=60),
+    # Gemma-26B is the measured workhorse (only all-1.00 model). Reliable
+    # roles route here; reasoning-distilled models fail strict format.
+    "loop":      Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=30),
+    "tool_arg":  Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=30),
+    # classify = cheap, high-frequency, NON-tool triage → fast 7B. (Route a
+    # tool role to _FAST_MODEL only with the client text parser; see §1.4.)
+    "classify":  Endpoint(_OMLX_URL, _FAST_MODEL, timeout_s=15),
+    "reason":    Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=45),
+    "compose":   Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=45),
+    "finisher":  Endpoint(_OMLX_URL, _SONNET_MODEL, timeout_s=60),
+    # Larger reasoning attempt that still needs tools. The 31B heretic that
+    # would have served this role OOMs on the 37.44 GB ceiling.
+    "hard_loop": Endpoint(_OMLX_URL, _OPUS_MODEL, timeout_s=90),
 }
 
 
@@ -524,77 +539,43 @@ def get_client(role: Role) -> tuple[OpenAI, str]:
     key = (ep.url, ep.timeout_s)
     client = _CLIENT_CACHE.get(key)
     if client is None:
-        client = OpenAI(
-            base_url=ep.url, api_key=API_KEY,
-            timeout=ep.timeout_s, max_retries=0,
-        )
+        client = OpenAI(base_url=ep.url, api_key=API_KEY,
+                        timeout=ep.timeout_s, max_retries=0)
         _CLIENT_CACHE[key] = client
     return client, ep.model
 
-
-def compose_final_answer(raw_answer: str, user_query: str,
-                         system: str | None = None) -> str:
-    """Lazy-spin the `finisher` model for high-quality post-loop polishing.
-
-    Cold-start tax ~5-15s; subsequent calls ~1.7-2s median. Tool calling
-    intentionally NOT requested — plain-text-in, plain-text-out. Returns
-    raw_answer on ANY error (broad except is deliberate: optional polish
-    must never block agent return path).
-    """
-    client, model = get_client("finisher")
-    sys_prompt = system or (
-        "Polish the agent's draft answer for a human reader. Keep all factual "
-        "content. Improve clarity, fix grammar, drop scratchpad noise."
-    )
-    try:
-        r = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": f"Query: {user_query}\nDraft: {raw_answer}"},
-            ],
-            temperature=0.3, max_tokens=2048,
-        )
-        return r.choices[0].message.content or raw_answer
-    except Exception:  # broad: lazy polish must never block return
-        return raw_answer
-
-
-__all__ = ["Role", "Endpoint", "ROLE_MAP", "get_client",
-           "compose_final_answer", "API_KEY"]
+# compose_final_answer(...) routes ROLE_MAP["finisher"] for opt-in post-loop
+# polish; returns raw_answer on ANY error (broad except — polish must never
+# block the agent's return path). Full body in the repo.
 ```
 
 **Walkthrough:**
 
-**Block 1 — Single `_GATEWAY_URL` constant.** Lab launch had 4 separate `OpenAI(base_url=...)` instances, one per port. Refactor unifies on one URL. Why this matters: client construction is non-trivial (TCP pool init + httpx setup + auth header marshalling); with 7 roles bouncing across 4 ports, that's ~28 client constructions in a fresh `react.py` import. Gateway gives 1 URL + 1 client = constant-time setup. The `VMLX_GATEWAY_URL` env override is the production hook for swapping LAN / remote gateway URLs.
+**Block 1 — Single `_OMLX_URL` constant.** One endpoint for the whole fleet. The loop never constructs a client per model; it asks `get_client(role)` and oMLX routes by the `model:` field. The `OMLX_URL` env override is the production hook for pointing at a LAN/remote oMLX host. (Historical note: the retired vMLX baseline used one `OpenAI(base_url=...)` per port — ~7 roles × several ports = many client constructions per import. Single-endpoint routing makes setup constant-time.)
 
-**Block 2 — `models/` prefix on model IDs.** MLX Studio gateway dispatches by the `model:` field in the OpenAI request body. The literal prefix `models/` is the gateway's route table convention. Compare to launch-baseline where the model name was implicit (whatever the per-port server was loaded with). Trade-off: explicit naming = portable + multi-model-per-port, but every model identifier must carry the prefix or the gateway returns 404.
+**Block 2 — Bare model ids, no prefix.** oMLX dispatches on the `model:` field using the **exact** id from `GET /v1/models` — `gemma-4-26B-A4B-it-heretic-4bit`, not the `models/`- or `lmstudio-community/`-prefixed forms other servers expect. Wrong prefix → `404 model not found`. Copy ids verbatim from the served list; the `MODEL_*` env vars let you retier without code edits.
 
-**Block 3 — `@dataclass(frozen=True) Endpoint`.** Immutable per-role config. Why frozen: `ROLE_MAP` is module-level state; if any caller mutated an `Endpoint` (`map["loop"].timeout_s = 60`), the change would persist for all subsequent callers. Freezing forbids the mutation at construction time. CLAUDE.md immutability rule applied to runtime-shared state.
+**Block 3 — `@dataclass(frozen=True) Endpoint`.** Immutable per-role config. `ROLE_MAP` is module-level shared state; if a caller mutated an `Endpoint` (`map["loop"].timeout_s = 60`) the change would leak to every subsequent caller. Freezing forbids the mutation at construction. CLAUDE.md immutability rule applied to runtime-shared state.
 
-**Block 4 — `ROLE_MAP` dict-of-Endpoints with 7 roles.** All 4 model choices map to one URL; the variation is in `model` field + `timeout_s`. Why per-role timeouts: classify is hot path (10s) → tight ceiling; reason/compose are content-bearing (45s) → wider; finisher is lazy + 31B (90s) → widest. Production rule: timeouts should encode task-shape expectations, not be uniform.
+**Block 4 — `ROLE_MAP` with 7 roles, one URL.** All roles share `_OMLX_URL`; the variation is `model` + `timeout_s`. Five reliable roles point at the Gemma-26B workhorse (the only all-1.00 model); `classify` — cheap, high-frequency, non-tool triage — points at the fast 4 GB Qwen2.5-Coder-7B (241 ms, reason=1.00); `hard_loop` points at Qwen3.5-27B for a larger tool-capable reasoning attempt. Per-role timeouts encode task shape: classify is the cheapest (15 s), reason/compose are content-bearing (45 s), hard_loop may cold-load a non-resident 27B (90 s). Note: the 7B only tool-calls via the client parser, so it is safe on `classify` precisely because triage needs no tools — never route a tool-bearing role to it without `extract_text_tool_calls`.
 
-**Block 5 — `_CLIENT_CACHE` keyed by `(url, timeout)`.** All 7 roles share `_GATEWAY_URL`, but timeouts vary (10/30/45/60/90). So the cache holds 5 distinct `OpenAI` instances even though there's 1 gateway URL. Why not key by URL alone: different timeout configs require distinct httpx clients (timeout is bound at client construction, not at request time). Caching at the (url, timeout) tuple gives correctness + reuse.
+**Block 5 — `_CLIENT_CACHE` keyed by `(url, timeout)`.** All roles share one URL, but timeouts vary (15/30/45/60/90). Timeout is bound at client construction, not per request, so distinct timeouts need distinct httpx clients. Keying the cache on `(url, timeout)` yields ~5 clients covering all 7 roles — correctness plus reuse.
 
-**Block 6 — `compose_final_answer` lazy-loader bailout.** Returns `raw_answer` on ANY exception — deliberate broad `except`. Reason: this is OPT-IN polish. The agent's hot-path return already produces a working answer. If the lazy 31B model has a cold-start failure or OOM, the user still gets the unpolished draft. CLAUDE.md "fail open, not closed" pattern applied: the lazy polish must NEVER block the agent's primary return path.
+**Block 6 — `compose_final_answer` fails open.** The (elided) finisher helper returns `raw_answer` on ANY exception — deliberate broad `except`. It is OPT-IN polish: the hot-path return already produced a working answer, so a cold-start or OOM in the finisher must never block the agent. Contrast Concept 5's loop `try`/`except`, which puts tool errors *on* the main path; this is the inverse failure-budget intent — optional work fails silently.
 
-**Block 7 — JANG_4M-CRACK vs heretic — empirical tie-break.** Same parameter scale (31B), same quant (4-bit), same Gemma-4 family. Probe scores diverged: heretic `tool=0.00` (uncensored fine-tune destroyed function-call alignment); JANG `tool=1.00, json=1.00, reason=1.00, instr=1.00`. Pedagogical lesson: model selection is NOT a free choice within a family — fine-tune lineage matters for agent-usability. The chapter's earlier §1.4 fleet probe is the discovery mechanism; §1.5 ROLE_MAP is where the discovery becomes durable config.
+**Result** (measured 2026-06-15, `data/fleet_probe_20260615_omlx.json`):
 
-**Result** (measured 2026-05-05 lab commit, recorded in `data/fleet_probe_*v9_gateway.json`):
-
-- Gateway-vs-direct-port overhead: Sonnet 207→203 ms (-2%, within noise); Haiku 448→430 ms (-4%, within noise). **Effectively zero.**
-- Client cache hit rate after warm-up: 100% (5 distinct clients cover all 7 roles).
-- Cold-start: first call to a model on the gateway triggers ~5-15s lazy load (MLX Studio loads model weights on demand). Subsequent calls 1.7-2s median for compose_final_answer / ~200-450ms for hot-path roles.
-- Probe-driven verdicts that landed in ROLE_MAP: 5/5 stability runs at temp=0 across all 7 roles on M5 Pro 48 GB.
+- Workhorse Gemma-26B warm latency: **353 ms** median; tool/json/reason/instr all **1.00** — one model covers five roles with no quality compromise.
+- `hard_loop` Qwen3.5-27B: tool=1.00, ping 713 ms, but reason 0.33 / instr 0.00 — usable for tool-driven reasoning, not formatted output (documented caveat in ROLE_MAP).
+- Memory ceiling: only one heavy model hot at a time (37.44 GB guard). Switching to a non-resident model costs a ~10–30 s cold load; the 31B heretic never loads at all (`507`).
+- Client cache: ~5 distinct clients cover all 7 roles after warm-up (one URL, five timeout tiers).
 
 `★ Insight ─────────────────────────────────────`
-- **Gateway refactor is an ARCHITECTURAL move masquerading as ops cleanup.** Pre-refactor, the loop had to know about ports. Post-refactor, the loop only knows about roles. Adding an 8th role costs one ROLE_MAP entry; pre-refactor it would have cost a new vMLX server + port + .env entry. The cost-of-change difference is what makes role-routing a first-class lab artifact instead of a config detail.
-- **Probe-driven ROLE_MAP is the load-bearing pedagogy of this lab.** Without measured probe results, "Distill 9B for loop, Gemma-26B for reason" is arbitrary. With probe results (Distill `tool=1.00`, Gemma `reason=1.00`, JANG `tool=1.00`, heretic `tool=0.00`), the mapping has empirical justification. Production teams should re-run the probe whenever a model swap is considered — exactly the pattern §1.4 established.
-- **`compose_final_answer`'s broad `except` is the chapter's first formal "fail open" pattern.** Phase 2's loop has `try`/`except` AROUND tool calls (errors-on-main-path per Concept 5); this is the same principle applied to OPTIONAL post-loop polish. Two different `try`/`except` shapes, two different failure-budget intents.
-- **W4.5 Model Routing chapter consumes this directly.** The role-tier framework — loop/tool/classify/reason/compose/finisher/hard_loop — is the same axis W4.5 extends with cost-latency Pareto + vote-on-disagreement. Reader who completes §1.5 has the role vocabulary before hitting W4.5's optimization questions.
+- **Role-routing is an ARCHITECTURAL move, not ops cleanup.** The loop knows roles, never models or ports. Adding an 8th role costs one `ROLE_MAP` entry; re-pointing a tier costs one `MODEL_*` env var. The engine migration (vMLX multi-port → vMLX gateway → oMLX single endpoint) touched *zero* loop code precisely because the indirection was there — that is the payoff of the abstraction.
+- **Probe-driven ROLE_MAP is the load-bearing pedagogy.** Without measured scores, "Gemma-26B for loop, Qwen-27B for hard_loop" is arbitrary. With §1.4's table (Gemma all-1.00; reasoning-distilled tool-only; heretic OOM), the mapping is *justified*. Re-run the probe on every model or engine swap — that is how this very section's old "9B-Distill / JANG" map was overturned.
+- **The map collapsing to one workhorse is itself the lesson.** A measured fleet can refuse to be a fleet. The honest output of probe-driven selection here is "one generalist does every reliable role; the specialists either don't fit in memory or can't hold output format." Naming that beats pretending seven tiers are live.
+- **W4.5 Model Routing consumes this directly.** The role vocabulary — loop/tool/classify/reason/compose/finisher/hard_loop — is the axis W4.5 extends with cost-latency Pareto and vote-on-disagreement.
 `─────────────────────────────────────────────────`
-
-> **Backward compat note:** §1.3's `.env` block (`VMLX_*` per-port) describes the launch-baseline config. The shipped lab uses `VMLX_GATEWAY_URL=http://localhost:8080/v1` + `MODEL_*` env vars to select model IDs. Both styles are illustrated for pedagogical contrast; use the gateway style for new work.
 
 ---
 
@@ -731,21 +712,21 @@ from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 1. Client setup
-#    VMLX_MODEL defaults to MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit — the
-#    smallest model on the local fleet (vMLX, port 8004), chosen as default
-#    for fast lab iteration (cheap tokens, snappy turn-around). For tier
-#    experiments swap both VMLX_BASE_URL and VMLX_MODEL: MODEL_OPUS
-#    Qwen3.6-35B-A3B-nvfp4 on :8002 is the strongest tool-caller in the fleet.
+#    MODEL_SONNET defaults to gemma-4-26B-A4B-it-heretic-4bit — the measured
+#    workhorse (the only fleet model scoring 1.00 on tool+json+reason+instr;
+#    see §1.4). oMLX serves all models on ONE endpoint (:8000/v1), routed by
+#    the `model:` field, so retiering swaps MODEL only — the URL is constant.
+#    For a larger reasoning attempt use the `hard_loop` role (Qwen3.5-27B).
 #    The fallback strings let the file run without a .env if needed (e.g., in
 #    CI against a stub server).
-#    vMLX requires no auth, but the OpenAI SDK rejects an empty api_key at
+#    oMLX requires no auth, but the OpenAI SDK rejects an empty api_key at
 #    construction time, so we pass a non-empty placeholder ("not-needed").
 # ---------------------------------------------------------------------------
 _client = OpenAI(
-    base_url=os.getenv("VMLX_BASE_URL", "http://127.0.0.1:8004/v1"),
-    api_key=os.getenv("VMLX_API_KEY", "not-needed"),
+    base_url=os.getenv("OMLX_URL", "http://127.0.0.1:8000/v1"),
+    api_key=os.getenv("OMLX_API_KEY", "not-needed"),
 )
-MODEL = os.getenv("VMLX_MODEL", "MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit")
+MODEL = os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
 
 # ---------------------------------------------------------------------------
 # 2. Loop constants
@@ -1111,15 +1092,15 @@ def agent_run(
 
 What it does: instantiates the `OpenAI` client once at module load and binds the model name from the environment.
 
-> **Why:** A module-level client is the Python equivalent of a connection pool — created once, reused for every `call_llm()` call in the process. Reading `MODEL` from `VMLX_MODEL` means you can swap the default `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` for `MODEL_OPUS=Qwen3.6-35B-A3B-nvfp4` mid-experiment with a single `export` statement (paired with `VMLX_BASE_URL=http://127.0.0.1:8002/v1`), no code edit required.
+> **Why:** A module-level client is the Python equivalent of a connection pool — created once, reused for every `call_llm()` call in the process. Reading `MODEL` from `MODEL_SONNET` means you can swap the default `gemma-4-26B-A4B-it-heretic-4bit` for another served id with a single `export` statement, no code edit required. Because oMLX routes by the `model:` field on one endpoint, you change `MODEL` alone — the `base_url` never moves.
 
-> **Why:** The `or` fallback on `base_url` (defaulting to `http://127.0.0.1:8004/v1`) allows the file to import cleanly in test environments where `.env` is not loaded. Without it, a missing env var produces a confusing `None`-type URL error inside the OpenAI SDK.
+> **Why:** The fallback on `base_url` (defaulting to `http://127.0.0.1:8000/v1`) allows the file to import cleanly in test environments where `.env` is not loaded. Without it, a missing env var produces a confusing `None`-type URL error inside the OpenAI SDK.
 
-> **Why a placeholder `api_key`:** vMLX does not validate auth, but the OpenAI SDK refuses to construct a client with an empty `api_key` (raises `OpenAIError` before any request goes out). The dummy string `"not-needed"` is a no-op that satisfies the SDK and is ignored by the local server.
+> **Why a placeholder `api_key`:** oMLX does not validate auth, but the OpenAI SDK refuses to construct a client with an empty `api_key` (raises `OpenAIError` before any request goes out). The dummy string `"not-needed"` is a no-op that satisfies the SDK and is ignored by the local server.
 
 > **Analogy (Infra):** This is your SQLAlchemy engine — constructed once at startup, never recreated per request.
 
-Common modifications: to promote from the default Haiku-tier `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` (`:8004`) up to the Opus-tier `Qwen3.6-35B-A3B-nvfp4` (`:8002`) without restarting the process, override both URL and MODEL together at call site, e.g. `os.environ["VMLX_BASE_URL"] = "http://127.0.0.1:8002/v1"; os.environ["VMLX_MODEL"] = "Qwen3.6-35B-A3B-nvfp4"` before importing `src.react`. Flipping URL alone routes requests to whatever model that port is serving and produces confusing output.
+Common modifications: to switch the loop's model without restarting the process, override `MODEL` at the call site, e.g. `os.environ["MODEL_SONNET"] = "Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit"` before importing `src.react`. The id must be a bare served name from `GET /v1/models` (no `models/` prefix) or oMLX returns `404`; switching to a non-resident model triggers a one-time ~10–30 s cold load.
 
 ---
 
@@ -1131,7 +1112,7 @@ What it does: sets the two numeric guards that bound the loop's worst-case behav
 
 > **Why env-var tunable:** Hard-coding constants means changing them requires a code edit and a commit. Env-var tuning lets you run `REACT_MAX_ITER=3 pytest tests/test_bad_cases.py::TestScenario01` to reproduce a specific failure without touching source.
 
-> **Why `CONTEXT_TOKEN_LIMIT = 28000`:** the default model `MLX-Qwen3.5-9B-GLM5.1-Distill-v1-8bit` and the Opus-tier `Qwen3.6-35B-A3B-nvfp4` both support a 32K context window. 28K leaves ~4K headroom for the system prompt and user message. Set this to ~70% of the model's advertised window, not 100% — both vMLX and the model itself degrade quality near the upper bound. When you swap to a model with a different window (Gemma-4-26B-A4B-it-heretic-4bit is 128K), retune via `REACT_CTX_LIMIT`.
+> **Why `CONTEXT_TOKEN_LIMIT = 28000`:** the default workhorse `gemma-4-26B-A4B-it-heretic-4bit` advertises a large window (128K), but the limit is set conservatively for portability — 28K leaves comfortable headroom on the smallest window any tier might use and keeps KV-cache memory bounded on a 48 GB box where only one heavy model is hot at a time. Set this to ~70% of the target model's advertised window, not 100% — both the engine and the model degrade quality near the upper bound. Retune via `REACT_CTX_LIMIT` when you pin a specific model.
 
 Common modifications: `REACT_CTX_LIMIT=16000` for memory-constrained experiments; `REACT_MAX_ITER=20` for long research agent tasks.
 
@@ -2760,7 +2741,7 @@ Outline your answer:
 | `call_llm()` returns 400 with "context too long" | Scratchpad has grown past the model's context window before the eviction guard fires | Lower `REACT_CTX_LIMIT` env var to trigger eviction sooner; or increase `RESULT_TRUNCATION_CHARS` to truncate tool results more aggressively | Set `REACT_CTX_LIMIT` to 70% of the model's advertised context window, not 100%; reserve headroom for the system prompt and user message |
 | `agent_run()` hangs indefinitely | A tool is blocking (usually `python_repl` or `web_search`) | Set `timeout=` in `python_repl`; confirm `DDGS()` has a request timeout; add `signal.alarm()` as a last-resort watchdog around `run_tool()` | Always pass `timeout=` to any subprocess call; never trust external network calls to self-terminate |
 | `pytest tests/test_bad_cases.py` fails with `ImportError: src.react` | Python path not set correctly | Run `pytest` from the lab root directory (not from inside `tests/`); confirm `sys.path.insert(0, ...)` in the test file points to the correct parent | Use `pyproject.toml` with `[tool.pytest.ini_options] pythonpath = ["."]` to avoid manual path manipulation |
-| Model emits empty `content` and empty `tool_calls` on every iteration | Model is confused by the tool schema or system prompt; or the model is being asked to do something it refuses | Add `print(messages)` before `call_llm()` to inspect what the model is seeing; try a simpler task first; verify vMLX is serving the correct model on the port `VMLX_BASE_URL` points at (check the vMLX menu bar; mismatched port↔MODEL is a common silent-routing bug) | Log the raw `LLMResponse` to the SQLite table on every iteration so you can replay the conversation offline |
+| Model emits empty `content` and empty `tool_calls` on every iteration | Model is confused by the tool schema or system prompt; the model refuses; OR oMLX has no tool-call parser for this model family and the call leaked into `content` as `<tools>`/`<function>` text | Add `print(messages)` before `call_llm()` to inspect what the model sees; print the raw `content` — if it holds a `<tool_call>`/`<tools>`/`<function>` JSON blob, the server didn't parse it (Qwen2.5-Coder fails this on both surfaces). Confirm `MODEL` is a bare served id from `GET /v1/models` (wrong/prefixed id → `404`) | Log the raw `LLMResponse` to SQLite every iteration for offline replay; for an unparsed family, apply `extract_text_tool_calls()` (see `scripts/probe_fleet.py`) as a client-side fallback before reading `tool_calls` |
 
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: Anti-Patterns to Avoid — Agent Development
 created: 2026-05-27
-updated: 2026-05-27
+updated: 2026-06-15
 tags:
   - anti-patterns
   - cross-cutting
@@ -124,6 +124,16 @@ Entries derived from observed BCJ entries are marked `(BCJ)` with cross-link; en
 
 *Symptom:* `subprocess.run(f"git commit -m '{message}'", shell=True)`. LLM-controlled message contains `'`, `$`, `;` → shell injection. Or hangs forever on credential prompt.
 *Fix:* `execFileSync` / `subprocess.run([list, of, args], shell=False)`. Set `GIT_TERMINAL_PROMPT=0` to prevent credential hangs. (gnhf `src/core/git.ts`, lifted to W4.6 §8 references)
+
+### AP-305 — Assuming tool calling works without probing the model × server-parser pairing (HIGH)
+
+*Symptom:* Valid `tools=` + `tool_choice="auto"` sent, schema correct, but `message.tool_calls` is empty and the call sits in `content` as `<tools>`/`<function>`/`<tool_call>` text. The same model "supports tools" on a different server. On oMLX, `Qwen2.5-Coder-{7B,14B}` fail on **both** the OpenAI and Anthropic surfaces; Gemma / Qwen3 / gpt-oss pass.
+*Fix:* Tool calling is a model × server-*parser* pairing, not a model property — probe the pairing, never the model alone, and re-probe on every engine upgrade (an upgrade can flip a tool score with no model change). Prefer a parsed family; or recover client-side with `extract_text_tool_calls()` before reading `tool_calls`. (BCJ 2026-06-15 W4, repo 4 `scripts/probe_fleet.py`)
+
+### AP-306 — Routing a reasoning-distilled model to a format-sensitive role (HIGH)
+
+*Symptom:* A reasoning-distilled model scores `tool=1.00` but `json=0.00` / `instr=0.00` — "return only JSON" comes back as prose or clipped, "exactly N words" comes back empty. The `<think>` block consumes the `max_tokens` budget before the answer.
+*Fix:* Route format-sensitive roles (json_extractor / compose / strict-instruction) to a non-reasoning model; or suppress thinking (`enable_thinking=false` / `reasoning_effort=low`) and re-probe. Reserve reasoning-distilled models for raw `tool_calls` emission, where the structured field is unaffected. (BCJ 2026-06-15 W4 + 2026-04-30 W2.5, repo 4 `src/models.py`)
 
 ---
 

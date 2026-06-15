@@ -1,7 +1,7 @@
 ---
 tags: [agent-curriculum, debugging, bad-cases, ops-pattern-library]
 created: 2026-04-27
-updated: 2026-06-04
+updated: 2026-06-15
 ---
 
 > **Read order:** Diagnostic Heuristics → Entry Template → Entries → Cross-cutting patterns. The heuristics are pre-debugging discipline (how to think); the template is post-debugging discipline (how to log).
@@ -369,6 +369,38 @@ If probe 2 returns rows but the script returns `edges_used: 0`, the bug is in th
 
 **Captured in curriculum at:** [[Week 2.5 - GraphRAG#Bad-Case Journal]] Entry 6
 **Lab artifact:** `lab-02-5-graphrag/src/query_graph.py` — `extract_seed_entities()`, `_regex_seed_fallback()`
+
+---
+
+## 2026-06-15 — Week 4 — oMLX returns no `tool_calls`; the call leaks into `content` as text
+
+**Symptom:** Fleet probe scored `tool=0.00` for `Qwen2.5-Coder-14B` and `Qwen2.5-Coder-7B` while `gemma-4-26B`, the Qwen3 family, and `gpt-oss-20b` all scored `tool=1.00` on the *same* harness. On the failing models `finish_reason` was `stop`/`end_turn`, `message.tool_calls` was `None`, and `message.content` held the correct call as text — `<tools>\n{"name":"get_weather",...}` on the OpenAI surface, `<function>\n{...}` on the Anthropic surface. The model picked the right function with the right arguments; the structured field was just empty.
+
+**Root cause:** Tool calling is a **model × server-parser pairing, not a model property.** oMLX ships back-parsers that transcode some families' tool syntax into structured `tool_calls` (Gemma / Qwen3 / gpt-oss) but **not** Qwen2.5-Coder. The model emits a valid call in its native text format; with no registered parser the server passes it through verbatim as `content`. Confirmed on *both* the OpenAI (`:8000/v1`) and Anthropic (`:8000`) surfaces — the wire format is irrelevant; only the leak tag differs (`<tools>` vs `<function>`). This also **overturns this lab's earlier vMLX finding** that `gemma-4-31B-uncensored-heretic` "destroyed function-call alignment" (`tool=0.00`): on oMLX the same heretic weights tool-call correctly. The old 0.00 was a missing server parser, not a broken model.
+
+**Fix:** Prefer a parsed family for any tool-driven role. To keep an unparsed model, apply a client-side fallback that recovers `{name, arguments}` from the text before reading `tool_calls`: `scripts/probe_fleet.py::extract_text_tool_calls` (string-aware brace scan; handles `<tool_call>`/`<tools>`/`<function>` tags, missing close tags, args-as-object and args-as-JSON-string). With the fallback wired into `probe_tool_calling`, `Qwen2.5-Coder-14B` went `tool=0.00 → 1.00` (flagged "text-parsed", not "structured"). This is the modern echo of the 2022 ReAct paper's text-parsing path — an unparsed model forces you back onto it.
+
+**The diagnostic muscle:** When `tool_calls` is empty, print the raw `content` *before* blaming the prompt or schema. A `<tool_call>`/`<tools>`/`<function>` JSON blob in `content` means the model succeeded and the *server* dropped the ball. Probe the pairing on every model **and** engine swap — an engine upgrade can flip a tool score with no model change.
+
+**Tags:** #tool-calling #server-parser #model-pairing #react #lab-4 #oMLX #ops-pattern
+
+**Captured in curriculum at:** [[Week 4 - ReAct From Scratch#1.4 Empirical findings — fleet probe (2026-06-15, oMLX migration)]] (Scenario 15)
+**Lab artifact:** `lab-04-react-from-scratch/scripts/probe_fleet.py` — `extract_text_tool_calls()`
+
+---
+
+## 2026-06-15 — Week 4 — Reasoning-distilled model passes `tool` but collapses on every format probe
+
+**Symptom:** `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled` and `Qwen3.5-27B-Claude-Distilled` both scored `tool=1.00` (clean structured calls) yet `json=0.00`, `instr=0.00`, `reason=0.00–0.33` on the same probe run. "Return only JSON" came back truncated (`'{"status":"ok'`); "exactly 3 words" came back empty (`''`); the correct integer was present but buried in prose. A model that tool-calls perfectly looked broken at every constrained-format task.
+
+**Root cause:** Same mechanism as the 2026-04-30 W2.5 reasoning-budget entry above — the model emits a `<think>…</think>` block that consumes the (deliberately tight) `max_tokens` cap before or around the real answer. `tool_calls` survives because it is a **structured field**, populated by the server regardless of the reasoning preamble; free-form format probes do not survive, because the visible text is all reasoning or gets clipped. The model is not broken, it is *misapplied*: reasoning-distilled ≠ format-tuned.
+
+**Fix:** Route format-sensitive roles (`json_extractor`, `compose`, strict-instruction) to a non-reasoning model — `gemma-4-26B-A4B-it-heretic-4bit` scored 1.00 on all of them. If you must use the reasoning model for format work, suppress thinking via oMLX's chat-template kwargs (`enable_thinking=false` / `reasoning_effort=low`) and re-probe. Otherwise reserve reasoning-distilled models for raw `tool_calls` emission, where the think-block is harmless. In `src/models.py` every reliable role routes to the Gemma-26B workhorse for exactly this reason.
+
+**Tags:** #reasoning-model #structured-output #budget-exhaustion #react #lab-4 #model-routing #ops-pattern
+
+**Captured in curriculum at:** [[Week 4 - ReAct From Scratch#1.4 Empirical findings — fleet probe (2026-06-15, oMLX migration)]] (Scenario 14)
+**Related:** the 2026-04-30 W2.5 reasoning-budget entry above — same root mechanism, different surface (entity extraction vs format probes).
 
 ---
 
