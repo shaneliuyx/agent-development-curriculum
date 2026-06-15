@@ -407,10 +407,10 @@ The lab ships a probe harness at `scripts/probe_fleet.py` that scores every mode
 
 | Tier | Model | Ping (median ms) | Tool | JSON | Reason | Instr |
 |---|---|---|---|---|---|---|
-| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | 316 | **1.00** | **1.00** | **1.00** | **1.00** |
-| haiku | `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled-4bit` | **149** | **1.00** | 0.00 | 0.83 | 0.00 |
-| fast | `Qwen3.5-4B-MLX-4bit` (4 GB) | 235 | **1.00** | **1.00** | 0.83 | **1.00** |
-| opus_qwen | `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` | 724 | **1.00** | 0.00 | 0.83 | 0.00 |
+| sonnet | `gemma-4-26B-A4B-it-heretic-4bit` | 317 | **1.00** | **1.00** | **1.00** | **1.00** |
+| haiku | `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled-4bit` | **152** | **1.00** | 0.00 | 0.83 | 0.00 |
+| fast | `Qwen3.5-4B-MLX-4bit` (4 GB) | 236 | **1.00** | **1.00** | 0.83 | **1.00** |
+| opus_qwen | `Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit` | 726 | **1.00** | 0.00 | 0.83 | 0.00 |
 | opus_lazy | `gemma-4-31B-uncensored-heretic` (`Gemma4-31`) | — | — | — | — | — |
 
 > **Methodology note (2026-06-15 re-baseline).** The reason probe's generation cap was raised 64→512 tokens after the original run reported false `reason=0` for verbose-but-correct models. With room to finish, the reasoning-distilled models recover to `reason=0.83` (they *can* reason; they just show their work) — the original `reason=0` was largely a probe artifact, not a capability gap. The surviving real weakness is **terse-format** output: json/instr stay `0.00` for the reasoning models (those caps are deliberately tight). The `fast` tier (Qwen3.5-4B) tool-calls **structured** — Qwen3.5 is server-parsed, so unlike the previous Qwen2.5-Coder-7B fast tier it needs no client parser.
@@ -1684,7 +1684,7 @@ The following script imports the tools and calls each one directly. Run it befor
 
 ```bash
 set -a; source .env; set +a
-python - <<'EOF'
+uv run python - <<'EOF'
 import src.tools   # triggers registration
 
 from src.react import _TOOLS
@@ -1927,7 +1927,7 @@ print(run_summary(RUN_ID))
 
 ```bash
 set -a; source .env; set +a
-python src/run.py
+uv run python src/run.py
 ```
 
 After this runs, verify the database directly:
