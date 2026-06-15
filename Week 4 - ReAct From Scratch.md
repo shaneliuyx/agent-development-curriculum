@@ -2838,37 +2838,35 @@ The Infra bridge for Week 5: multi-agent = distributed compute. The orchestrator
 
 ## Bad-Case Journal
 
-**Entry 1 — Malformed JSON response from model; `json.loads()` fails silently.**
-*Symptom:* Model returns ```json ... ``` wrapped JSON or embeds explanation before JSON. `json.loads()` throws `JSONDecodeError`. Try-except catches it and defaults to `{"thoughts": "", "action": "..."}`. Agent produces wrong output silently.
-*Root cause:* Model doesn't consistently respect "Return JSON only" in prompt. API doesn't enforce `response_format={"type": "json_object"}` or model ignores it.
-*Fix:* Use `response_format={"type": "json_object"}` in OpenAI SDK. Add regex extraction: `re.search(r'\{.*\}', resp, re.DOTALL)` before `json.loads()`. Log JSON parse failures loudly with full response context.
+> These are real incidents observed while building and running this lab on oMLX
+> (2026-06-15), not invented failure modes. Measured anchors:
+> `data/fleet_probe_20260615_omlx.json`, the tool smoke test, and the Phase 5 run.
+> Cross-listed in the vault's global `Bad-Case Journal.md`.
 
-**Entry 2 — Tool function hangs; agent loop blocks forever.**
-*Symptom:* Agent calls `python_repl` to compute something. Tool process hangs (network call, infinite loop in user code). Main loop waits forever. No timeout.
-*Root cause:* No timeout on tool calls. Tool execution is synchronous. One blocking tool blocks entire agent.
-*Fix:* Wrap tool calls with `timeout` (e.g., `subprocess.run(..., timeout=30)`). Catch `TimeoutError`, return error message to model: "Tool timed out after 30 seconds. Simplify the query." Async tool execution with `concurrent.futures` if performance critical.
+**Entry 1 — oMLX returns no `tool_calls`; the call leaks into `content` as text.**
+*Symptom:* Probe `tool=0.00` for `Qwen2.5-Coder-{7B,14B}` while Gemma / Qwen3 / gpt-oss score 1.00 on the same harness. `finish_reason=stop`, `message.tool_calls is None`, and `message.content` holds the correct call as text — `<tools>…` on the OpenAI surface, `<function>…` on the Anthropic surface.
+*Root cause:* Tool calling is a **model × server-parser pairing**, not a model property. oMLX ships back-parsers that transcode some families' tool syntax into structured `tool_calls` (Gemma/Qwen3/gpt-oss) but not Qwen2.5 — the model forms a valid call, the server passes it through as text. Same model, both API surfaces, both fail.
+*Fix:* Prefer a parsed family; or recover client-side with `scripts/probe_fleet.py::extract_text_tool_calls`, which parses `<tool_call>`/`<tools>`/`<function>` JSON into `{name, arguments}` before the loop reads `tool_calls`. Probe the pairing (and re-probe on every engine upgrade) — this also overturned the lab's earlier "heretic destroyed tool calling" claim, which was a vMLX parser artifact, not the model.
 
-**Entry 3 — Tool returns error; agent hallucinates it succeeded.**
-*Symptom:* `python_repl` executes user code, returns `stderr: "SyntaxError: invalid syntax"`. Agent reads error, produces reasoning step that ignores the error and moves forward as if code ran.
-*Root cause:* Agent prompt doesn't emphasize "if tool returns error, the error is the ground truth. Do not continue."  Prompt mixing success + error in the same JSON output field confuses attention.
-*Fix:* Separate error and success: `{"action_type": "tool", "tool": "...", "success": true/false, "result_or_error": "..."}`. In prompt, emphasize: "If success=false, the error is the ground truth. Do not assume the tool succeeded."
+**Entry 2 — Reasoning-distilled model: `tool=1.00`, but strict-format probes collapse.**
+*Symptom:* `MLX-Qwen3.5-35B-A3B-…-Reasoning-Distilled` and `Qwen3.5-27B-Distilled` emit clean structured tool calls yet score `json=0.00`, `instr=0.00` — "return only JSON" comes back truncated, "exactly 3 words" comes back empty.
+*Root cause:* The model emits a `<think>…</think>` block that consumes the (tight) `max_tokens` cap before/around the answer. `tool_calls` survives because it is a structured field the server fills regardless; free-form terse-format output does not. Reasoning-distilled ≠ format-tuned.
+*Fix:* Route format-sensitive roles (`json_extractor`, `compose`, strict-instruction) to the non-reasoning Gemma-26B workhorse; or suppress thinking via oMLX chat-template kwargs (`enable_thinking=false` / `reasoning_effort=low`) and re-probe. Reserve reasoning-distilled models for raw `tool_calls` emission.
 
-**Entry 4 — Infinite loop: agent calls same tool with same args repeatedly.**
-*Symptom:* Agent enters loop calling `web_search("python list comprehension")` 10 times in a row, producing identical results each iteration. Loop never converges.
-*Root cause:* No check for repeated (tool, args) pairs. No early exit when agent repeats. Prompt doesn't discourage repetition.
-*Fix:* Track last N (tool, args) pairs. If current pair matches recent history, interrupt: "You just called this tool with the same arguments. The result won't change. Either refine your query or conclude." Limit total loop steps (e.g., max 20 iterations).
+**Entry 3 — A probe token-cap manufactured a false `reason=0`.**
+*Symptom:* Three reasoning-capable models scored `reason=0.00–0.33` despite clearly doing the arithmetic; the cheap-role auto-recommendation flip-flopped run to run.
+*Root cause:* `probe_reasoning` capped generation at `max_tokens=64`. A model that shows its work ("d = r × t …") spends the budget on the derivation and gets clipped (`finish_reason="length"`) before printing the bare integer the scorer greps for. The probe measured terseness-under-cap, not reasoning correctness.
+*Fix:* Raise the reason cap to 512 (scores recovered to 0.83); keep json/instr caps tight (those *should* be terse); `recommend()`'s cheap-role floor now requires `reason ≥ 0.5` AND `instr ≥ 0.5`. Diagnostic muscle: when a known-capable model scores implausibly low, suspect the harness — check `finish_reason` before blaming the model.
 
-**Entry 5 — Tool returns large result; exceeds context window.**
-*Symptom:* `read_file("large_csv.txt")` returns 10MB of text. Full result appended to scratchpad. Scratchpad now 15K tokens. Next model call fails due to context overflow.
-*Root cause:* Tool returns unbounded result. No truncation. No summarization.
-*Fix:* Truncate results: if tool response > 2K tokens, truncate with "...[X more tokens]." Implement summari
+**Entry 4 — oMLX load failures: `507` memory ceiling and a broken-quant `500`.**
+*Symptom:* `Gemma4-31` (heretic 31B) returns `507 — projected memory 47.60 GB would exceed the memory ceiling 37.44 GB` once another model is warm; `Qwen3.5-9B-OptiQ-4bit` returns `500` on every call.
+*Root cause:* (a) a 48 GB box holds one heavy model at a time — oMLX's memory_guard refuses a co-resident load with an explicit `507` (better than the old silent fleet-wide `APIConnectionError` thrash); (b) the `OptiQ` quant build is incompatible with this oMLX/mlx-lm version.
+*Fix:* Keep one heavy model resident; lazy-load the rest and accept ~10–30 s cold-start; pin the workhorse under the ceiling (Gemma-26B ≈ 14.6 GB). Drop incompatible quants — re-download a standard MLX 4-/8-bit build.
 
-zation for large results: `summarize_text(result)` for read_file if file is large. Add `max_result_tokens` config per tool.
-
-**Entry 6 — Agent gets stuck in error-retry loop: same error, repeated fix attempts.**
-*Symptom:* Agent calls tool, gets error, produces new reasoning, calls tool with different args but same logical error repeats. Loops through 5 retries, each failing with same root cause.
-*Root cause:* Model doesn't analyze the error cause, just tries variations. Prompt doesn't ask "why did this fail?" before retrying.
-*Fix:* After 2 consecutive errors, force reflection: "Two consecutive errors. Analyze the root cause. Do not retry without explaining why your previous attempt failed." Include error patterns in scratchpad for learning across retries.
+**Entry 5 — SearXNG container won't start: "mount a directory onto a file?"**
+*Symptom:* `searxng-lab` exits 127 with `error mounting "/tmp/searxng-cfg/settings.yml" … not a directory: Are you trying to mount a directory onto a file (or vice-versa)?` So `web_search` returns `SearchError` every call.
+*Root cause:* A bind-mount source `/tmp/searxng-cfg/settings.yml` did not exist as a file. Docker auto-creates a missing bind source as a **directory**, then cannot mount that directory onto the container's `settings.yml` *file*.
+*Fix:* Don't use the ad-hoc `/tmp` path — start SearXNG via the repo's `shared/searxng/docker-compose.yml`, which mounts the real `./settings.yml:/etc/searxng/settings.yml:ro`. Remove the bogus dir (`rm -rf /tmp/searxng-cfg`) and `docker compose up -d`. General rule: a bind-mount needs the host source to already exist with the correct *type* (file vs dir).
 
 ---
 
