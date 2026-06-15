@@ -1236,12 +1236,13 @@ from __future__ import annotations
 
 import ast
 import os
+import resource
 import subprocess
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
 
-import sys
 sys.path.insert(0, "/Users/yuxinliu/code/agent-prep/shared")
 from web_toolkit import web_search as _web_search_backend  # introduced W3.7; reused here
 
@@ -1304,10 +1305,20 @@ def web_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool 2: python_repl
 #    Executes arbitrary Python code in a subprocess with a hard timeout.
-#    Sandboxing via subprocess prevents the agent from modifying the host
-#    process's state (imports, globals, open file handles).
-#    This is not a production sandbox — for that, use a container or gVisor.
-#    For this lab it is sufficient to catch runaway computation and imports.
+#
+#    SECURITY BOUNDARY — read before reusing this anywhere real:
+#    What this DOES enforce: a wall-clock timeout; process-LOCAL isolation
+#    (imports/globals/handles don't leak back into the agent process); a
+#    stripped child env (no inherited secrets, see _REPL_ENV); and CPU+memory
+#    rlimits (see _repl_rlimits). That bounds accidents and resource abuse.
+#    What it does NOT do: the code still runs with your full user privileges
+#    and full filesystem access (open() works; _static_check's import blocklist
+#    is trivially bypassable via open()/__import__/attribute gadgets). This is
+#    NOT a sandbox. It is acceptable HERE only because a ReAct teaching-lab
+#    agent is non-adversarial. NEVER expose this REPL to untrusted input.
+#    Still-missing pieces for a real boundary (built in W11.5 Agent Security):
+#    drop privileges, filesystem containment, container / bubblewrap / nsjail,
+#    no network namespace.
 # ---------------------------------------------------------------------------
 _PYTHON_REPL_SCHEMA = {
     "type": "function",
@@ -1317,8 +1328,8 @@ _PYTHON_REPL_SCHEMA = {
             "Execute Python code and return stdout + stderr. "
             "Use for calculations, data transformations, or verifying logic. "
             "Do not use for file I/O — use read_file / write_file instead. "
-            "Code runs in an isolated subprocess; imports are allowed but "
-            "network access may be blocked by the system firewall."
+            "Code runs in a short-lived subprocess with a timeout; a few "
+            "imports (os, sys, subprocess, ...) are blocked."
         ),
         "parameters": {
             "type": "object",
@@ -1340,8 +1351,10 @@ _PYTHON_REPL_SCHEMA = {
 }
 
 _ALLOWED_BUILTINS = {
-    # Whitelist of names we are comfortable allowing in the REPL.
-    # The subprocess boundary is the real guard; this is a secondary lint.
+    # Aspirational whitelist — NOT currently enforced. The subprocess runs with
+    # the full builtins; nothing applies this set yet (it documents intent and
+    # is a TODO: pass as a restricted globals dict). Do not mistake it for a
+    # guard — neither this set nor _static_check makes the REPL safe.
     "abs", "all", "any", "bin", "bool", "chr", "dict", "dir", "divmod",
     "enumerate", "filter", "float", "format", "frozenset", "getattr",
     "hasattr", "hash", "hex", "int", "isinstance", "issubclass", "iter",
@@ -1378,8 +1391,38 @@ def _static_check(code: str) -> str | None:
     return None
 
 
+# Minimal env for the child: keep PATH/locale, DROP everything the parent
+# inherited (API keys, tokens, secrets). Defense-in-depth so a bypass of the
+# import blocklist (open('/proc/self/environ'), __import__) reads nothing useful.
+_REPL_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+_REPL_MEM_BYTES = 512 * 1024 * 1024   # 512 MB address-space cap
+
+
+def _repl_rlimits(cpu_seconds: int):
+    """Return a preexec_fn that caps CPU time and address space in the child
+    before exec. POSIX-only; each limit is best-effort — some platforms don't
+    enforce RLIMIT_AS (notably macOS), so we swallow failures rather than crash
+    the child. This bounds resource abuse; it is NOT isolation."""
+    def _apply() -> None:
+        for res, limit in (
+            (resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds)),
+            (resource.RLIMIT_AS, (_REPL_MEM_BYTES, _REPL_MEM_BYTES)),
+        ):
+            try:
+                resource.setrlimit(res, limit)
+            except (ValueError, OSError):
+                pass  # limit unsupported on this platform (e.g. RLIMIT_AS on macOS)
+    return _apply
+
+
 def python_repl(code: str, timeout: int = 10) -> str:
-    """Execute Python code in a subprocess; return combined stdout + stderr."""
+    """Execute Python code in a subprocess; return combined stdout + stderr.
+
+    Hardening (defense-in-depth, NOT a sandbox — see the SECURITY BOUNDARY note
+    above): runs `sys.executable` with a stripped env (no inherited secrets) and
+    CPU/memory rlimits. Still runs as your user with filesystem access; for real
+    isolation see W11.5.
+    """
     timeout = min(max(1, timeout), 30)   # clamp to [1, 30] seconds
 
     err = _static_check(code)
@@ -1393,10 +1436,12 @@ def python_repl(code: str, timeout: int = 10) -> str:
 
     try:
         result = subprocess.run(
-            ["python3", tmpfile],
+            [sys.executable, tmpfile],   # absolute interpreter — no PATH dependence
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_REPL_ENV,               # strip inherited secrets from the child
+            preexec_fn=_repl_rlimits(timeout),  # CPU + memory caps (POSIX)
         )
         out = result.stdout
         err_out = result.stderr
@@ -1574,9 +1619,9 @@ What it does: runs Python code in a child process with a hard timeout; a lightwe
 
 > **Why a temp file instead of `-c "code"`:** Shell-escaping arbitrary Python code passed via `-c` is brittle. A temp file sidesteps all quoting and newline issues. The `finally` block ensures cleanup even on timeout.
 
-> **Why `_BLOCKED_IMPORTS` is a whitelist of blocked names, not a whitelist of allowed names:** A blocklist is easier to maintain incrementally as new dangerous modules are discovered. A full allowlist would require pre-approving every import the agent might legitimately need (e.g., `math`, `json`, `itertools`). For a development sandbox, blocklist is the right tradeoff.
+> **Why `_BLOCKED_IMPORTS` is a whitelist of blocked names, not a whitelist of allowed names:** A blocklist is easier to maintain incrementally as new dangerous modules are discovered. A full allowlist would require pre-approving every import the agent might legitimately need (e.g., `math`, `json`, `itertools`). For a non-adversarial dev REPL (not a security boundary — see the SECURITY BOUNDARY note above), a blocklist is the pragmatic tradeoff.
 
-> **Gotcha:** `_static_check` only examines the AST of the top-level code. It does not catch `importlib.import_module("os")` or `__import__("subprocess")` — dynamic imports bypass the check. The subprocess boundary is the real guard; treat `_static_check` as a lint, not a security boundary.
+> **Gotcha:** `_static_check` only examines the AST of the top-level code. It does not catch `importlib.import_module("os")` or `__import__("subprocess")` — dynamic imports bypass the check, and `open()` needs no import at all. Treat `_static_check` as a lint, not a security boundary — and note the subprocess is **not** a security boundary either (it bounds runtime, not privileges; the code runs as you, with your env). Both together stop accidents, not an adversary.
 
 > **Why `timeout = min(max(1, timeout), 30)`:** Clamps the caller-supplied timeout to `[1, 30]` seconds. A timeout of 0 would cause `subprocess.run` to raise immediately. A timeout > 30 is too long for an agent iteration — the model will likely time out its own thinking budget before the subprocess finishes.
 
@@ -2831,7 +2876,7 @@ zation for large results: `summarize_text(result)` for read_file if file is larg
 
 - **Builds on:** W1-W3 (retrieval primitives become `web_search` and `read_file` tools).
 - **Distinguish from:** Chain-of-Thought (synthetic reasoning, no external calls; ReAct makes tool results load-bearing); one-shot tool calls (single dispatch when tool + args fully determined; ReAct only when intermediate results change what to call).
-- **Connects to:** W5 Pattern Zoo (ReAct is one of 8 patterns); W5.5 Metacognition (Reflexion = ReAct + episodic scratchpad + self-critique); W7 Tool Harness (`run_tool()` and per-tool budget registry seed the production harness); W11.5 Agent Security (path-containment guards on `read_file`/`write_file`, subprocess sandbox on `python_repl`).
+- **Connects to:** W5 Pattern Zoo (ReAct is one of 8 patterns); W5.5 Metacognition (Reflexion = ReAct + episodic scratchpad + self-critique); W7 Tool Harness (`run_tool()` and per-tool budget registry seed the production harness); W11.5 Agent Security (path-containment guards on `read_file`/`write_file`, and turning `python_repl`'s non-sandbox into a real one — env strip, setrlimit, container/bubblewrap).
 - **Foreshadows:** W6 Context Governance (FIFO eviction → proper autocompact with reserved 20K-token summary); W11 System Design (production ReAct deployment — observability, escalation ladders, stop conditions); W12 Capstone (the loop in `src/react.py` is the runtime substrate).
 - **Cited by:** chapters across the curriculum reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
   - **W0.5**: LLM internals primer — ReAct's per-call cost is the runtime-relevant view of the same forward-pass internals
