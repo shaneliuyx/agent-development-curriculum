@@ -1980,6 +1980,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import src.tools   # register the four real tools
+from src.tools import python_repl
 from src.react import (
     MAX_ITER,
     _TOOLS,
@@ -2305,12 +2306,6 @@ class TestScenario08ToolTimeout:
         assert "timed out" in result, f"Expected timeout message, got: {result!r}"
         assert elapsed < 5, f"Took {elapsed:.1f}s; expected < 5s"
 
-    @pytest.fixture(autouse=False)
-    def _import_repl(self):
-        from src.tools import python_repl as _repl
-        global python_repl
-        python_repl = _repl
-
 
 # ---------------------------------------------------------------------------
 # Scenario 9: Tool error ignored by model
@@ -2384,11 +2379,12 @@ class TestScenario10ContextWindowLimit:
         from src.react import Scratchpad, CONTEXT_TOKEN_LIMIT
 
         sp = Scratchpad()
-        # Stuff the scratchpad with large fake entries
+        # Stuff the scratchpad PAST the limit: 30 x 4000 chars ~= 30k tokens
+        # (estimated_tokens ~= chars/4) vs CONTEXT_TOKEN_LIMIT 28k.
         for i in range(30):
-            sp.append_tool_result(f"tc_{i:03d}", "web_search", "x" * 500)
+            sp.append_tool_result(f"tc_{i:03d}", "web_search", "x" * 4000)
 
-        assert sp.estimated_tokens() > CONTEXT_TOKEN_LIMIT // 4
+        assert sp.estimated_tokens() > CONTEXT_TOKEN_LIMIT
 
         # Now run agent_run() with a mock LLM that immediately returns final answer.
         # The point is that the loop should not raise a 400 error.
@@ -2398,6 +2394,32 @@ class TestScenario10ContextWindowLimit:
         )
         result = agent_run("A long task.", obs=False)
         assert isinstance(result, str)
+
+    def test_evict_drops_oldest_tool_result_first(self):
+        """Eviction is FIFO over tool results: the OLDEST is dropped, order is
+        preserved, and repeated calls converge under the limit. Tests the
+        extracted `_evict_if_over_limit` helper directly — asserts oldest-drop,
+        not merely 'the loop didn't crash'."""
+        from src.react import Scratchpad, _evict_if_over_limit, CONTEXT_TOKEN_LIMIT
+
+        sp = Scratchpad()
+        for i in range(30):
+            sp.append_tool_result(f"tc_{i:03d}", "web_search", "x" * 4000)
+        assert sp.estimated_tokens() > CONTEXT_TOKEN_LIMIT
+        ids_before = [e.tool_call_id for e in sp.entries if e.role == "tool"]
+
+        evicted = _evict_if_over_limit(sp)
+        assert evicted is not None and evicted.tool_call_id == "tc_000"  # oldest
+        ids_after = [e.tool_call_id for e in sp.entries if e.role == "tool"]
+        assert "tc_000" not in ids_after
+        assert ids_after == ids_before[1:]      # only the oldest removed, order kept
+
+        guard = 0
+        while sp.estimated_tokens() > CONTEXT_TOKEN_LIMIT and guard < 60:
+            _evict_if_over_limit(sp)
+            guard += 1
+        assert sp.estimated_tokens() <= CONTEXT_TOKEN_LIMIT
+        assert _evict_if_over_limit(sp) is None  # under limit → no-op
 
 
 # ---------------------------------------------------------------------------
