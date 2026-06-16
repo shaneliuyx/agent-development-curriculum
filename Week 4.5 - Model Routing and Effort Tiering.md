@@ -1208,25 +1208,22 @@ Goal: run the eval split of the probe set under four routing configurations and 
 
 ```mermaid
 flowchart TB
-    Probes["Eval split<br/>20 rows from probe set"]
-    OAlways["(a) opus-always<br/>opus model, minimal"]
-    Cls["(b) classifier-routed<br/>Qwen3.5-4B verdict"]
-    Vote["(c) classifier+vote<br/>Qwen + BART"]
-    Rand["(d) random-baseline<br/>uniform (tier, mode)"]
-    Bench["bench_row()<br/>measure wall + tokens"]
-    Results["RESULTS.md<br/>+ pareto.json"]
+    Probes["Eval split<br/>23 rows from probe set"]
+    HAlways["(a) heavy_always<br/>gemma-26B, all rows"]
+    R2["(b) router2 (2-tier)<br/>classify2 → haiku/heavy"]
+    Rand["(c) random-baseline<br/>uniform {haiku, heavy}"]
+    Cell["_run_cell()<br/>1 capped call, real usage"]
+    Results["RESULTS_phase5.json"]
 
-    Probes --> OAlways
-    Probes --> Cls
-    Probes --> Vote
+    Probes --> HAlways
+    Probes --> R2
     Probes --> Rand
-    OAlways --> Bench
-    Cls --> Bench
-    Vote --> Bench
-    Rand --> Bench
-    Bench --> Results
+    HAlways --> Cell
+    R2 --> Cell
+    Rand --> Cell
+    Cell --> Results
 
-    style Vote fill:#27ae60,color:#fff
+    style R2 fill:#27ae60,color:#fff
     style Rand fill:#7f8c8d,color:#fff
 ```
 
@@ -1235,168 +1232,165 @@ flowchart TB
 `tests/test_four_way_bench.py`:
 
 ```python
-"""Phase 5 four-way cost-latency benchmark.
+"""Phase 5 cost-latency benchmark — 2-tier architecture.
 
-Runs the eval split through each of 4 routing configs, measures wall +
-tokens + success per row, aggregates to the Pareto-front input.
+Runs the eval split through 3 routing configs (heavy_always, router2, random),
+measures wall + REAL token usage + soft success per row, aggregates to the
+Pareto-front input, writes RESULTS_phase5.json.
 
-Success here is a soft metric — pytest can't grade open-ended LLM output.
-We use a 4-point rubric: did the response (1) actually answer the prompt
-(non-empty, on-topic), (2) include the key terms from the expected domain,
-(3) finish within the expected latency band, (4) avoid the classic failure
-modes (empty, refusal, hallucination of nonexistent APIs). Hand-grade if
-you want a tighter number — chapter ships the soft auto-grader.
+PERF (why the old version took >1h): on one-hot oMLX, swapping the executor model
+cold-loads a heavy model (~10-30s). The old `for row: for config:` loop swapped
+models ~90 times. This version loops `for config:` and SORTS each config's rows by
+executor model so the heavy model loads once per config — a handful of cold-loads
+total. It also caps max_tokens and uses single-call cells (the cost bench measures
+the TIER decision, not mode control-flow), and sets a per-call timeout.
+
+Integration + slow: hits the live oMLX fleet. Run: RUN_INTEGRATION=1 uv run pytest -m slow.
 """
-import asyncio
 import json
+import os
 import random
 import time
 from pathlib import Path
 
 import pytest
+from openai import OpenAI
 
 from src.fleet_config import FLEET
 from src.probes import load_probes, train_eval_split
-from src.router import RouterVerdict, classify
-from src.router_vote import router_vote
-from src.tier_dispatch import dispatch
+from src.router2 import classify2
+
+# 2-tier executor map: haiku-class -> cheap fast model; heavy-class -> gemma-26B workhorse
+# (the local model that scored best on tier). One key per distinct hot model.
+HEAVY_EXEC = "sonnet"  # FLEET["sonnet"] = gemma-4-26B (the 'heavy' executor)
 
 
-# Public per-token cost ($/M tokens) — Claude Sonnet 4.6 / Haiku 4.5 / Opus 4.5 (2026 published rates).
-# Used as cloud-equivalent baseline so the local-MLX cost is in production language.
+def exec_tier(tier2: str) -> str:
+    return "haiku" if tier2 == "haiku" else HEAVY_EXEC
+
+
+# Public cloud-equivalent rates ($/M tokens) so local cost is in production language.
 COST_PER_M_TOKENS = {
     "haiku":  {"input": 1.00, "output": 5.00},
     "sonnet": {"input": 3.00, "output": 15.00},
-    "opus":   {"input": 15.00, "output": 75.00},
 }
 
 
-def _estimated_cost_usd(tier: str, in_tokens: int, out_tokens: int) -> float:
-    rate = COST_PER_M_TOKENS[tier]
-    return (in_tokens * rate["input"] + out_tokens * rate["output"]) / 1_000_000
+def _cost_usd(exec_t: str, in_tok: int, out_tok: int) -> float:
+    rate = COST_PER_M_TOKENS[exec_t]
+    return (in_tok * rate["input"] + out_tok * rate["output"]) / 1_000_000
 
 
-def _opus_always_verdict(_prompt: str) -> RouterVerdict:
-    return RouterVerdict(tier="opus", mode="minimal", confidence=1.0)
+_RNG = random.Random(42)  # seeded ONCE (old code re-seeded per call -> not random)
 
 
-def _random_verdict(_prompt: str) -> RouterVerdict:
-    rng = random.Random(42)
-    return RouterVerdict(
-        tier=rng.choice(["haiku", "sonnet", "opus"]),
-        mode=rng.choice(["minimal", "react", "deliberate"]),
-        confidence=0.5,
+def _verdict_tier(cfg: str, prompt: str) -> str:
+    """Return the 2-tier {haiku, heavy} decision for a config."""
+    if cfg == "heavy_always":
+        return "heavy"
+    if cfg == "router2":
+        return classify2(prompt).tier
+    return _RNG.choice(["haiku", "heavy"])  # random baseline
+
+
+def _run_cell(exec_t: str, prompt: str) -> tuple[str, int, int]:
+    """One executor completion at the routed tier. Capped + timed out. Real usage."""
+    ep = FLEET[exec_t]
+    cli = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"), timeout=120.0)
+    r = cli.chat.completions.create(
+        model=ep.model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=512,
     )
+    resp = (r.choices[0].message.content or "").strip()
+    u = r.usage
+    return resp, (u.prompt_tokens if u else 0), (u.completion_tokens if u else 0)
 
 
-def _classifier_verdict(prompt: str) -> RouterVerdict:
-    return classify(prompt)
-
-
-def _vote_verdict(prompt: str) -> RouterVerdict:
-    return asyncio.run(router_vote(prompt))
-
-
-def _soft_success(response: str, expected_domain: str) -> bool:
-    """Cheap pass/fail. Hand-grade in RESULTS.md for the rigorous version."""
+def _soft_success(response: str) -> bool:
     if not response or len(response) < 20:
         return False
-    if "i cannot" in response.lower() or "i don't know" in response.lower():
-        return False
-    return True
+    low = response.lower()
+    return not ("i cannot" in low or "i don't know" in low)
 
 
-def bench_row(prompt: str, expected_domain: str, verdict_fn) -> dict:
-    """Run one (prompt, config) cell. Return measurement dict."""
-    t0 = time.perf_counter()
-    verdict = verdict_fn(prompt)
-    t1 = time.perf_counter()
-    response = dispatch(verdict, prompt)
-    t2 = time.perf_counter()
-
-    # Token counts: use len(response.split()) as a cheap proxy. Real impl
-    # should read usage from the OpenAI response — left as an exercise so
-    # this test stays small. Update RESULTS.md with real counts post-run.
-    in_tokens = len(prompt.split()) * 4   # rough char-to-token ratio for English
-    out_tokens = len(response.split()) * 4
-
-    return {
-        "tier": verdict.tier,
-        "mode": verdict.mode,
-        "router_wall_ms": (t1 - t0) * 1000,
-        "exec_wall_ms": (t2 - t1) * 1000,
-        "total_wall_ms": (t2 - t0) * 1000,
-        "in_tokens": in_tokens,
-        "out_tokens": out_tokens,
-        "cost_usd": _estimated_cost_usd(verdict.tier, in_tokens, out_tokens),
-        "success": _soft_success(response, expected_domain),
-    }
+CONFIGS = ("heavy_always", "router2", "random")
 
 
-CONFIGS = {
-    "opus_always": _opus_always_verdict,
-    "classifier": _classifier_verdict,
-    "vote": _vote_verdict,
-    "random": _random_verdict,
-}
-
-
+@pytest.mark.integration
 @pytest.mark.slow
 def test_four_way_bench_runs_and_writes_results():
-    rows = load_probes()
-    _, eval_ = train_eval_split(rows)
+    _, eval_ = train_eval_split(load_probes())
 
-    results: dict = {cfg: [] for cfg in CONFIGS}
-    for r in eval_:
-        for cfg, fn in CONFIGS.items():
-            results[cfg].append(bench_row(r["prompt"], r["domain"], fn))
-
-    # Aggregate
     agg: dict = {}
-    for cfg, rows_ in results.items():
-        walls = sorted([r["total_wall_ms"] for r in rows_])
+    for cfg in CONFIGS:
+        # Decide tier for every row first, then SORT by executor model so the heavy
+        # model cold-loads once (not once per row) — the key perf fix.
+        planned = [(r, exec_tier(_verdict_tier(cfg, r["prompt"]))) for r in eval_]
+        planned.sort(key=lambda x: x[1])  # group haiku rows, then heavy rows
+
+        rows_ = []
+        for r, exec_t in planned:
+            t0 = time.perf_counter()
+            resp, in_tok, out_tok = _run_cell(exec_t, r["prompt"])
+            wall_ms = (time.perf_counter() - t0) * 1000
+            rows_.append({
+                "exec_tier": exec_t,
+                "wall_ms": wall_ms,
+                "in_tokens": in_tok,
+                "out_tokens": out_tok,
+                "cost_usd": _cost_usd(exec_t, in_tok, out_tok),
+                "success": _soft_success(resp),
+            })
+
+        walls = sorted(r["wall_ms"] for r in rows_)
+        n = len(rows_)
         agg[cfg] = {
-            "n": len(rows_),
-            "success_rate": sum(r["success"] for r in rows_) / len(rows_),
-            "mean_total_wall_ms": sum(walls) / len(walls),
-            "p50_total_wall_ms": walls[len(walls) // 2],
-            "p95_total_wall_ms": walls[int(len(walls) * 0.95)],
-            "mean_cost_usd": sum(r["cost_usd"] for r in rows_) / len(rows_),
-            "total_cost_usd": sum(r["cost_usd"] for r in rows_),
+            "n": n,
+            "success_rate": sum(r["success"] for r in rows_) / n,
+            "p50_wall_ms": walls[n // 2],
+            "p95_wall_ms": walls[min(int(n * 0.95), n - 1)],
+            "mean_cost_usd": sum(r["cost_usd"] for r in rows_) / n,
+            "pct_routed_haiku": sum(r["exec_tier"] == "haiku" for r in rows_) / n,
         }
 
     Path("RESULTS_phase5.json").write_text(json.dumps(agg, indent=2))
-    # Soft assertions — actual Pareto-dominance check is read by hand
-    assert agg["classifier"]["mean_cost_usd"] < agg["opus_always"]["mean_cost_usd"], (
-        "classifier-routed didn't beat opus-always on cost — routing isn't winning"
+
+    # Routing must beat heavy-always on cost (it routes the easy class to haiku)...
+    assert agg["router2"]["mean_cost_usd"] < agg["heavy_always"]["mean_cost_usd"], (
+        "router2 didn't beat heavy_always on cost — routing isn't winning"
     )
-    assert agg["random"]["success_rate"] <= agg["classifier"]["success_rate"], (
-        "classifier didn't beat random — taxonomy is broken"
+    # ...and beat random on success (the taxonomy carries signal).
+    assert agg["router2"]["success_rate"] >= agg["random"]["success_rate"], (
+        "router2 didn't beat random on success — taxonomy is broken"
     )
 ```
 
 **Walkthrough:**
 
-- **Block 1 — `COST_PER_M_TOKENS` is the cloud-equivalent rate card.** Local MLX has no $-cost per token; the rate card lets you report "if I were on Claude, this routing layer would have cost $X vs $Y on opus-always" — which is the language production cost dashboards speak. Sub-claim: a local-first lab can still produce a $-cost number that interviewers will recognize, as long as the rates are real public numbers.
-- **Block 2 — Soft-success rubric is intentional.** Open-ended LLM grading is its own research field; the test ships a cheap binary success-or-not check (non-empty, on-topic-ish, no refusal pattern). For the chapter's RESULTS.md, hand-grade the 20 rows for a tighter number — but ship the auto-grader so the test is repeatable.
-- **Block 3 — `_random_verdict` uses a seeded RNG.** Sanity-floor baselines need to be REPRODUCIBLE across runs; otherwise you can't compare "did my router get better between runs?" against "did the random baseline happen to land well this time?" Seed 42 keeps the dice the same.
-- **Block 4 — Token counts use a 4× char-to-token proxy.** Real tokenization requires the model's tokenizer; that's a separate dependency per backend. The proxy is good to ~15% relative accuracy on English — enough for cost-latency Pareto comparison, not enough for a published paper. Update with real `usage` field readings post-run.
-- **Block 5 — Two soft assertions: classifier beats opus-always on cost; classifier beats random on success.** Both are LOAD-BEARING checks. If classifier-routed doesn't beat opus-always on cost, routing isn't winning at all. If classifier doesn't beat random on success, the taxonomy is fundamentally broken. The test fails fast on either; you don't waste time reading detailed metrics on a broken setup.
-- **Block 6 — Results land in `RESULTS_phase5.json`.** Single JSON file makes diff-tracking across runs trivial. Each commit's results live alongside the code; cost-latency improvement (or regression) is a git diff.
+- **Block 1 — `COST_PER_M_TOKENS` is the cloud-equivalent rate card** (haiku + sonnet only, since the 2-tier executor map is `{haiku, heavy=gemma-26B}`). Local MLX has no $-cost per token; the rate card lets you report "if I were on Claude, this router would cost $X vs $Y on heavy-always" — the language production cost dashboards speak.
+- **Block 2 — `_run_cell` reads REAL token usage (`r.usage`), caps `max_tokens=512`, sets a 120 s timeout.** The old proxy (`len(split)*4`) is gone — real `usage.prompt_tokens`/`completion_tokens` make the cost number honest. The cap + timeout are why this finishes: the bench measures the *tier decision's* cost, not long-form answer quality, so a single capped completion per cell is enough.
+- **Block 3 — Sort each config's rows by executor model BEFORE running — the load-bearing perf fix.** On one-hot oMLX, swapping the hot heavy model cold-loads it (~10-30 s). Looping `for config:` and sorting rows by `exec_tier` groups all-haiku then all-heavy, so each model loads *once per config* (~a handful total) instead of ~once per row (~90). This is the difference between 7m49s and >1h (§5 BCJ). On hardware that keeps one model resident, batch by model.
+- **Block 4 — `_RNG = random.Random(42)` is seeded ONCE at module scope.** The earlier per-call re-seed made the "random" baseline deterministic-but-identical every call (not random). Seed once → a reproducible *spread* across rows, which is what a sanity-floor baseline needs.
+- **Block 5 — Two assertions: `router2` beats `heavy_always` on cost; `router2` ≥ `random` on success.** Cost: routing the easy class to haiku must undercut routing everything heavy. Success: the taxonomy must carry signal over random. Caveat (measured): the soft grader saturates at 1.00, so the success assertion is weak — it gates "not broken," not "better"; use hand/LLM grading for a discriminating success number.
+- **Block 6 — Results land in `RESULTS_phase5.json`.** Single JSON file makes diff-tracking across runs trivial — cost-latency improvement (or regression) is a git diff.
 
-**Result (2-tier architecture; routing accuracy MEASURED in Phase 4b, cost/latency = placeholders pending a Phase 5 run):**
+**Result (MEASURED — 2026-06-16, 23-row eval, `RESULTS_phase5.json`; bench wall = 7m49s):**
 
-After Phase 4b the routed config is the **2-tier router** (`router2.py`): haiku-class tasks → the cheap fast model, heavy-class tasks → the heavy model. The **vote config is dropped** (Phase 4 measured it regressing, not helping). Baselines become `heavy_always` (route everything to the heavy model — the old "opus_always" under the merged taxonomy) and `random`.
+The routed config is the **2-tier router** (`router2.py`): haiku-class → cheap fast model, heavy-class → gemma-26B. The vote config is dropped (Phase 4 measured it regressing). Baselines: `heavy_always` and `random`.
 
-| Config | success_rate | p50 wall (ms) | mean cost (¢/query, cloud-equiv) |
-|---|---|---|---|
-| heavy_always | high, expensive | ~high | ~high |
-| **router2 (2-tier)** | **~heavy on hard, cheap on easy** | **~low** | **~fraction of heavy** |
-| random | sanity floor | mid | mid |
+| Config | success_rate | p50 wall (ms) | mean cost (¢/query, cloud-equiv) | % routed → haiku |
+|---|---:|---:|---:|---:|
+| heavy_always | 1.00 | 8377 | 0.616 | 0% |
+| **router2 (2-tier)** | **1.00** | **8396** | **0.591** | **30%** |
+| random | 1.00 | 5923 | 0.311 | 74% |
 
-**Pareto-front interpretation.** The biggest cost lever is the easy/hard split — and the 2-tier classifier nails it at **95.65%** (measured, Phase 4b). A 2-tier router sends the easy majority to the cheap model and reserves the heavy model for the hard class, so against `heavy_always` it trades a small accuracy cost on the ~4% misrouted-easy tasks for a large cost/latency saving across the easy majority. The SHAPE is the result: **router2 sits below-and-left of `heavy_always` on the cost×error plane** (cheaper at a small success delta), and well left of `random`. Run the bench, write `RESULTS_phase5.json`, fill in your cost/latency numbers — the success-rate driver (the 95.65% split) is already measured.
+**Honest interpretation — a modest, partly-instrument-limited win.** Two real findings, neither dressed up:
+1. **router2 beats `heavy_always` on cost (0.591 vs 0.616 ¢, −4%)** by routing 30% of tasks to the cheap haiku model — the assertion passes, but the margin is small *because this probe set is hard-skewed*: the merged taxonomy labels ~70% of prompts `heavy`, so only 30% are routable to cheap. On an easy-heavy workload the gap widens; the cost lever scales with the easy fraction.
+2. **The soft success metric is saturated (1.00 for all three configs) → it cannot show router2's quality advantage.** `random` looks "cheapest" (0.311 ¢, 74% → haiku) only because the all-pass grader never penalizes a wrong-tier (under-powered) answer. The real router2 vs random quality gap needs hand-grading or an LLM-judge — the cheap auto-grader is the limitation, and reporting `random` as "cheapest" without that caveat would be misleading.
 
-> **Bench harness note.** Wire the routed config to `router2.classify2` and collapse the executor map to two tiers (`haiku` model + one `heavy` model). The old `_opus_always_verdict` / 3-tier `BENCHMARKS` scaffold below predates Phase 4b — swap `opus_always` → `heavy_always` and drop the `vote` config before running.
+**Takeaway:** the *accuracy* of the 2-tier split is the strong, measured result (95.65%, Phase 4b); the *cost-latency* win is real but modest on this hard-skewed set, and the success axis needs a discriminating grader before the Pareto chart means anything. Honest > tidy.
 
 `★ Insight ─────────────────────────────────────`
 - **The Pareto front is the right chart, not the bar chart.** A 2-D plot with cost on x-axis and 1-success_rate on y-axis: `heavy_always` is one point (high cost, low error), `router2` is one point lower-left of it (cheaper + slightly more error on misrouted-easy tasks), random is upper-left (similar cost, much more error). The visual proof of routing's value: the `router2` point sits BELOW AND LEFT of the `heavy_always`↔`random` line — domination.
