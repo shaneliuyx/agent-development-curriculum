@@ -80,6 +80,47 @@ Self-Refine (Madaan et al. 2023) keeps everything in one model: generate, critiq
 
 ---
 
+### Concept 1.5 — The Pattern Space Is Four Orthogonal Axes (place ANY pattern, even ones not invented yet)
+
+The decision tree above is a *lookup table* — fast in an interview, but it teaches the patterns as a flat list of named boxes. The deeper model, and the one that survives a follow-up question like *"okay, what about CodeAct?"* or *"how would you combine two of these?"*, is this: **the named patterns are not siblings. They are coordinates in a space with four (mostly) independent axes.** Pick a value on each axis and you have *a* pattern — usually one with a paper and a marketing name, sometimes one nobody has named yet.
+
+| Axis | Question it answers | One end | Other end |
+|---|---|---|---|
+| **A1 — Plan placement** | *When* is the plan formed relative to execution? | **Interleaved** — plan emerges step-by-step from the scratchpad (ReAct) | **Upfront** — full plan emitted before any tool runs (Plan-and-Solve, ReWOO) |
+| **A2 — Action space** | *What* is one unit of action? | **Structured tool-call** — JSON function-calling, one tool per step (ReAct, most patterns) | **Executable code** — the action *is* a code block that composes tools, loops, does arithmetic in one shot (CodeAct) |
+| **A3 — Search shape** | *How many* paths through the solution are explored? | **Greedy single path** — commit to each step, no backtrack (ReAct, Plan-and-Solve, ReWOO) | **Tree + value + backtrack** — expand candidates, score, retreat from dead ends (Tree-of-Thoughts, LATS) |
+| **A4 — Division of labor** | *Who* does the work? | **Single agent** — one reasoner owns the whole task (ReAct, CodeAct, ReWOO, Reflexion) | **Multi-agent** — typed roles + a coordinator (Orchestrator-Worker, Swarm, State-Machine, Writer–Reviewer) |
+
+**Read the named patterns as coordinates:**
+
+| Pattern | A1 Plan | A2 Action | A3 Search | A4 Agents |
+|---|---|---|---|---|
+| ReAct | interleaved | tool-call | greedy | single |
+| Plan-and-Solve | upfront (re-plans on observations) | tool-call | greedy | single |
+| **ReWOO** | upfront (**observation-free** — never re-feeds results to the planner) | tool-call | greedy | single |
+| **CodeAct** | interleaved | **code** | greedy | single |
+| Orchestrator-Worker | upfront-ish | tool-call | greedy (parallel) | **multi** |
+| Tree-of-Thoughts | interleaved | tool-call | **tree** | single |
+| **LATS** | interleaved | tool-call | **tree + value + reflection** | single |
+
+Three payoffs from carrying the axes instead of the boxes:
+
+1. **You can place a pattern you've never seen.** Interviewer says *"we use CodeAct"* → you answer *"so your action space is executable code instead of JSON tool-calls — that buys tool composition in one step and kills the N-round-trip tax, at the cost of needing a sandbox."* You didn't memorise CodeAct; you read its coordinate.
+2. **You can compose.** The axes are independent, so the products are real architectures: CodeAct **×** multi-agent (code-emitting workers), ReWOO **×** tree-search (plan variants scored before execution), Orchestrator-Worker **×** CodeAct. Most "new" 2025–26 architectures are a fresh point in this space, not a fresh idea.
+3. **Vendor aliases collapse.** "Plan-and-Execute" (LangChain), "Plan-and-Solve" (Wang et al. 2023), "planner/executor" are the **same A1=upfront coordinate** — Pattern B in this chapter. When a recruiter's JD and a paper use different names, map both to the axis and the confusion evaporates.
+
+**One thing the four axes deliberately leave out: the quality-iteration loop.** Reflexion and Self-Refine are *not* a fifth sibling — they are a **wrapper** you can layer on any coordinate. Reflexion = `(any pattern) + critic + episodic memory`, run again. That is why Concept 2's failure mode (the critic amplifies confident errors) applies regardless of which base coordinate you wrapped — the loop is orthogonal to the base architecture, which is exactly why it composes with all of them and inherits the weaknesses of none specifically.
+
+> **Interview soundbite:** "I don't think of agent patterns as a list — I think of four axes: when the plan is formed (interleaved vs upfront), what the action space is (JSON tool-call vs executable code), how much search happens (greedy vs tree-with-value), and how many agents (single vs typed multi). Every named pattern is a coordinate. ReAct is interleaved/tool-call/greedy/single. CodeAct moves one axis — the action space — to code. ReWOO moves another — it plans upfront and never re-feeds observations, which is where its token savings come from. Reflexion isn't on the axes at all; it's a critic loop you wrap on any of them. Naming the axes lets me place an architecture I've never seen and compose two I have."
+
+`★ Insight ─────────────────────────────────────`
+- A flat list of N patterns scales O(N) in memorisation and breaks on pattern N+1. Four binary-ish axes cover 2⁴≈16 base coordinates with **four facts**, and place unseen patterns by construction.
+- The axes are *mostly* orthogonal, not perfectly: A1=upfront pairs naturally with A4=multi (a plan is easy to fan out), and A3=tree is expensive enough that it rarely combines with A4=multi in production. The correlations are themselves interview content — they're *why* certain coordinates have papers and others don't.
+- Engineering discipline (Concept 1's rule of thumb) still governs: each axis you move *away from the cheap end* — upfront planning, code execution, tree search, extra agents — must be paid for by a property the task actually has. The axes tell you what's *possible*; the task tells you what's *justified*.
+`─────────────────────────────────────────────────`
+
+---
+
 ### Concept 2 — Reflexion's Failure Mode: Amplifying Confident Errors
 
 Reflexion's promise is appealing: run a critic, inject the critique, iterate toward a better answer. The failure mode is less discussed but more important for production readiness.
@@ -468,6 +509,8 @@ Keep this table in your head. When an interviewer asks "how does multi-agent par
 **Time estimate: ~1 hour**
 
 Every pattern will run against the exact same task definition. Lock this down before writing any implementation so comparisons are fair.
+
+> **Canonical lab vs teaching view (read this first).** Phases 1–7 below build each pattern **by hand, inline**, so every line is visible — that is the *teaching* artifact. The **runnable, measured** version of this lab lives in `lab-05-pattern-zoo/` and is the source of every measured number in this chapter (see **Patterns I & J** for the full shared harness, the comparison matrix, and reproduce commands). Where the two differ, the lab-05 harness is canonical — it is the one actually built, tested (8/8), and run on local oMLX. **ReAct, Plan-and-Solve, CodeAct, and ReWOO are built and measured there today;** Reflexion (Phase 4), Orchestrator-Worker (Phase 5), and Writer–Reviewer Adversarial (Phase 5B) are shown here as reference implementations with **measurement pending** — their matrix rows stay blank until built on the same harness (measured-only rule: no invented numbers).
 
 ### 1.1 Lab scaffold
 
@@ -1074,6 +1117,8 @@ def run(company: dict) -> CompanyReport:
 
 ## Phase 4 — Implementation C: Reflexion
 
+> **Status — reference implementation, measurement pending.** Built + measured today are ReAct, Plan-and-Solve, CodeAct, and ReWOO (see *Measured Results*). This Reflexion impl is shown in full for learning; its comparison-matrix row stays blank until it is built on the `lab-05-pattern-zoo/` harness — per the measured-only rule, no number is invented.
+
 **Time estimate: ~2 hours**
 
 Reflexion adds a critic LLM on top of the ReAct inner loop. After each complete iteration, the critic reads the current output and produces written self-critique. That critique is injected into the actor's context for the next outer iteration.
@@ -1295,6 +1340,8 @@ def run(company: dict) -> CompanyReport:
 ---
 
 ## Phase 5 — Implementation D: Orchestrator-Worker
+
+> **Status — reference implementation, measurement pending.** Shown in full for learning; not yet built on the canonical `lab-05-pattern-zoo/` harness, so its row in *Measured Results* is intentionally blank (measured-only rule — no invented numbers).
 
 **Time estimate: ~2.5 hours**
 
@@ -1551,6 +1598,8 @@ def run(company: dict) -> CompanyReport:
 ---
 
 ## Phase 5B — Implementation E: Writer–Reviewer Adversarial Loop
+
+> **Status — reference implementation, measurement pending.** Shown in full for learning; not yet built on the canonical `lab-05-pattern-zoo/` harness, so its row in *Measured Results* is intentionally blank (measured-only rule — no invented numbers).
 
 **Time estimate: ~2.5 hours**
 
@@ -1811,7 +1860,7 @@ def run(company: dict) -> CompanyReport:
 
 **Chunk 5 — `deterministic_gate()` before the reviewer.** Binary, regex-level checks: word count, citation count, URL scheme, non-empty snippet. These are impossible for the writer to game and impossible for the reviewer to incorrectly rubber-stamp. The reviewer LLM is **not** called at all when the gate fails.
 
-> **Why:** This is the single most important design choice in the whole pattern. In production, the deterministic gate catches ~60% of rejections on typical RAG-style tasks. Running the reviewer (opus, ~$0 here but $$$ in prod) on drafts that don't even have the minimum citation count is pure waste. More importantly: the gate cannot be gamed by improved prose style, so the writer's optimisation pressure lands on substance, not rhetoric.
+> **Why:** This is the single most important design choice in the whole pattern. In production, the deterministic gate catches ~60% of rejections on typical RAG-style tasks. Running the reviewer (opus, ~\$0 here but \$\$\$ in prod) on drafts that don't even have the minimum citation count is pure waste. More importantly: the gate cannot be gamed by improved prose style, so the writer's optimisation pressure lands on substance, not rhetoric.
 
 **Chunk 6 — `reviewer_call()` uses `response_format=json_object` and fail-closed fallback.** If the reviewer's own JSON parse fails, the verdict defaults to `REJECT`. This is fail-closed: a broken reviewer never produces a false-positive PASS.
 
@@ -2048,6 +2097,24 @@ stop
 | Plan-and-Solve | Good when the plan is sound | Multi-step infra pipeline construction (ingest → transform → validate → load) |
 | Reflexion | Marginal — critic may amplify hallucinations | Creative writing refinement, code style improvement, where errors are structural |
 | Orchestrator-Worker | Best wall time — 3 parallel searches | Translate a document into 5 languages simultaneously; crawl 10 URLs in parallel |
+
+---
+
+## Measured Results — built patterns (oMLX, 2026-06-16)
+
+These are the **real** numbers from `lab-05-pattern-zoo/` (canonical runnable harness — see *Patterns I & J* for the source and reproduce commands). Four patterns are built and measured today; the other three are reference implementations whose rows are left blank until built on the same harness (measured-only rule — nothing invented). Same canonical task `(30000 + 12000) × 3 = 126000`, same model `gemma-4-26B-A4B-it-heretic-4bit`, exact-match + LLM-as-judge.
+
+| Pattern | Correct | LLM calls | Total tokens | Latency (ms) | Status |
+|---|---|---|---|---|---|
+| ReAct | PASS | 6 | 3048 | 4028 | **measured** |
+| Plan-and-Solve | PASS | 7 | 3808 | 4931 | **measured** |
+| CodeAct (Pattern I) | PASS | 1 | 409 | 1258 | **measured** |
+| ReWOO (Pattern J) | PASS | 2 | 800 | 3496 | **measured** |
+| Reflexion (Phase 4) | — | — | — | — | reference impl, pending |
+| Orchestrator-Worker (Phase 5) | — | — | — | — | reference impl, pending |
+| Writer–Reviewer Adversarial (Phase 5B) | — | — | — | — | reference impl, pending |
+
+> **What the four measured rows already teach:** CodeAct (1 call / 409 tok) is **7.5× fewer tokens** than ReAct by moving the action space to code; ReWOO (2 calls / 800 tok) is **4.8× fewer** than Plan-and-Solve by never re-feeding observations; and Plan-and-Solve costing *more* than ReAct on this short linear task is the honest counter-result (Concept 1: every layer must be justified). To complete the matrix, build the three pending patterns onto the lab-05 harness (same `run(task) -> AgentResult` contract) and fill their rows from a real run.
 
 ---
 
@@ -2618,6 +2685,906 @@ Each agent runs `agent_loop` as a long-lived process (or serverless trigger on m
 - Ray Actors (modern actor implementation in Python)
 - `shareAI-lab/learn-claude-code` — s07 task system + team coordination patterns
 
+---
+
+## Patterns I & J — The Two Single-Agent Axes Patterns A–H Leave Unexplored (built + measured on oMLX)
+
+Patterns A–H above vary mostly on **A4 (division of labor)** — single vs multi-agent topology. Two of the four axes from Concept 1.5 are still uncovered by a *single-agent* pattern in this chapter:
+
+- **A2 — action space.** Every pattern above acts via structured JSON tool-calls. **CodeAct** moves this axis: the action *is* executable code.
+- **A1 — plan placement, the extreme end.** Plan-and-Solve (Pattern B) plans upfront but *re-feeds observations* and replans. **ReWOO** goes further: it plans upfront and **never** re-feeds an observation into the model — observations live only in a worker's evidence table.
+
+These two were built as a **minimal standalone harness** in `lab-05-pattern-zoo/` and **measured live on local oMLX** (`gemma-4-26B-A4B-it-heretic-4bit`, no cloud) on 2026-06-16. The harness is deliberately separate from the by-hand Phase 1–7 scaffold above — full source is below so the two patterns reproduce on their own. All four patterns (ReAct, Plan-and-Solve, CodeAct, ReWOO) run the **same canonical task on the same harness**, so the matrix is apples-to-apples.
+
+### Shared lab harness (copy these three files first)
+
+All four impls share one tiny contract: each exposes `run(task) -> AgentResult`, and every number in `AgentResult` is real (`response.usage`), never estimated.
+
+`src/schema.py` — the measured envelope + the one canonical task:
+
+```python
+"""
+src/schema.py — shared input/output schema for every pattern in the zoo.
+
+Every pattern impl (ReAct, Plan-and-Solve, CodeAct, ReWOO, ...) exposes the same
+entry point:
+
+    run(task: str) -> AgentResult
+
+so 05_compare.py can drive them identically and slot their numbers into one
+matrix. AgentResult is the *measured* envelope: the final answer plus the four
+columns the comparison matrix tracks (LLM calls, total tokens, wall-clock).
+
+Immutable by construction (frozen dataclass): a result is a record of a run, not
+a mutable accumulator. Patterns build their own counters internally and emit one
+AgentResult at the end.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    """The measured outcome of one pattern running one task.
+
+    Fields map 1:1 to the comparison-matrix columns:
+      answer            : the agent's final text answer (judged for correctness)
+      llm_calls         : number of round-trips to the model
+      prompt_tokens     : summed real response.usage.prompt_tokens
+      completion_tokens : summed real response.usage.completion_tokens
+      latency_ms        : wall-clock for the whole run
+      pattern           : pattern name (for the matrix row label)
+      trace             : optional human-readable step log (debugging only)
+    """
+
+    pattern: str
+    answer: str
+    llm_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    latency_ms: int
+    trace: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+# The single canonical task every pattern runs, so the matrix is apples-to-apples.
+#
+# It is deliberately multi-step AND tool-composable:
+#   - look up two numeric facts from the knowledge_base (population of two cities)
+#   - SUM them, then MULTIPLY by a looked-up growth factor
+# ReAct/Plan-Solve must round-trip the LLM once per tool call (observation fed
+# back each time). CodeAct can do the whole arithmetic chain in ONE code action.
+# ReWOO plans all the tool calls up front and never re-feeds observations.
+CANONICAL_TASK: str = (
+    "Using the tools, find the population of 'Springfield' and the population of "
+    "'Shelbyville' from the knowledge base, add them together, then multiply that "
+    "sum by the 'growth_factor' value from the knowledge base. Report the final "
+    "number."
+)
+
+# Ground truth, computed from the fixed knowledge_base in src/tools.py:
+#   Springfield = 30000, Shelbyville = 12000, growth_factor = 3
+#   (30000 + 12000) * 3 = 126000
+CANONICAL_EXPECTED_ANSWER: str = "126000"
+```
+
+`src/tools.py` — the same three tools exposed **two ways** (callables for CodeAct; JSON schema + `dispatch` for the structured-call patterns):
+
+```python
+"""
+src/tools.py — the shared tool set for the pattern zoo.
+
+Three deterministic, offline tools so every pattern runs reproducibly with zero
+network dependency (the point of this lab is to compare AGENT PATTERNS, not tool
+backends). Each tool is exposed TWO ways, on purpose:
+
+  1. As a plain Python callable (kb_lookup / add / multiply) — CodeAct executes
+     model-emitted code in a namespace where these are in scope, so it can
+     compose them (loop, arithmetic, chaining) in ONE action.
+  2. As an OpenAI function-calling schema (TOOL_SCHEMAS) + a name->callable
+     registry (TOOLS) — ReAct / Plan-and-Solve / ReWOO emit structured tool
+     calls and the harness dispatches by name.
+
+Same functions, same results, two surfaces — so the only thing that differs
+across patterns is the *control flow*, which is exactly what the matrix measures.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# Fixed knowledge base. Deterministic so the canonical task has one ground
+# truth: (Springfield 30000 + Shelbyville 12000) * growth_factor 3 = 126000.
+# ---------------------------------------------------------------------------
+_KNOWLEDGE_BASE: dict[str, float] = {
+    "springfield": 30000,
+    "shelbyville": 12000,
+    "growth_factor": 3,
+    "capital_city": 95000,
+    "ogdenville": 8000,
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool 1: kb_lookup — fetch a numeric value by key from the knowledge base.
+# ---------------------------------------------------------------------------
+def kb_lookup(key: str) -> float:
+    """Return the numeric value stored under `key` in the knowledge base.
+
+    Raises KeyError on an unknown key so callers (and CodeAct tracebacks) see a
+    real failure rather than a silent default.
+    """
+    norm = str(key).strip().lower()
+    if norm not in _KNOWLEDGE_BASE:
+        raise KeyError(
+            f"kb_lookup: unknown key {key!r}. "
+            f"Known keys: {sorted(_KNOWLEDGE_BASE)}"
+        )
+    return _KNOWLEDGE_BASE[norm]
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: add — sum two numbers.
+# ---------------------------------------------------------------------------
+def add(a: float, b: float) -> float:
+    """Return a + b."""
+    return float(a) + float(b)
+
+
+# ---------------------------------------------------------------------------
+# Tool 3: multiply — product of two numbers.
+# ---------------------------------------------------------------------------
+def multiply(a: float, b: float) -> float:
+    """Return a * b."""
+    return float(a) * float(b)
+
+
+# ---------------------------------------------------------------------------
+# Surface A — plain-callable registry (CodeAct injects these into its namespace).
+# ---------------------------------------------------------------------------
+TOOLS: dict[str, Callable[..., Any]] = {
+    "kb_lookup": kb_lookup,
+    "add": add,
+    "multiply": multiply,
+}
+
+
+# ---------------------------------------------------------------------------
+# Surface B — OpenAI function-calling schemas (ReAct / Plan-Solve / ReWOO).
+# Same shape as lab-04-react-from-scratch/src/tools.py (type/function/parameters,
+# additionalProperties:False).
+# ---------------------------------------------------------------------------
+_KB_LOOKUP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "kb_lookup",
+        "description": (
+            "Look up a numeric value by key in the knowledge base. "
+            "Use this to fetch facts like a city's population or a named factor. "
+            "Returns the number stored under that key."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "The lookup key, e.g. 'Springfield' or 'growth_factor'.",
+                }
+            },
+            "required": ["key"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_ADD_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "add",
+        "description": "Add two numbers and return the sum.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "number", "description": "First addend."},
+                "b": {"type": "number", "description": "Second addend."},
+            },
+            "required": ["a", "b"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_MULTIPLY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "multiply",
+        "description": "Multiply two numbers and return the product.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "number", "description": "First factor."},
+                "b": {"type": "number", "description": "Second factor."},
+            },
+            "required": ["a", "b"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+TOOL_SCHEMAS: list[dict] = [_KB_LOOKUP_SCHEMA, _ADD_SCHEMA, _MULTIPLY_SCHEMA]
+
+
+def dispatch(name: str, args: dict) -> str:
+    """Execute a tool by name with kwargs; return a string result (errors too).
+
+    Shared by the structured-tool-call patterns (ReAct, Plan-Solve, ReWOO).
+    Never raises — a failed call becomes an observation the model can read.
+    """
+    fn = TOOLS.get(name)
+    if fn is None:
+        return f"ERROR: unknown tool {name!r}. Available: {list(TOOLS)}"
+    try:
+        return str(fn(**args))
+    except TypeError as e:
+        return f"ERROR: bad arguments for tool {name!r}: {e}"
+    except Exception as e:  # KeyError from kb_lookup, etc. — surface as observation
+        return f"ERROR: tool {name!r} raised {type(e).__name__}: {e}"
+
+
+def tools_doc() -> str:
+    """One-line-per-tool signature doc, injected into CodeAct/ReWOO prompts so the
+    model knows the exact callable names and arity without re-deriving them."""
+    return (
+        "kb_lookup(key: str) -> float   # numeric value for a key in the knowledge base\n"
+        "add(a: float, b: float) -> float   # a + b\n"
+        "multiply(a: float, b: float) -> float   # a * b"
+    )
+```
+
+`src/llm_client.py` — the one oMLX client every pattern shares (local-only, real `usage`):
+
+```python
+"""
+src/llm_client.py — the ONE oMLX client every pattern shares.
+
+Copied verbatim in spirit from lab-04-react-from-scratch/src/react.py §1:
+  - local oMLX OpenAI-compatible endpoint (http://127.0.0.1:8000/v1)
+  - workhorse model gemma-4-26B-A4B-it-heretic-4bit via MODEL_SONNET
+  - api_key placeholder "not-needed" (SDK rejects empty; oMLX ignores auth)
+
+NO cloud / VibeProxy profiles. Zero cloud spend. If you point OMLX_URL elsewhere
+the whole zoo follows — the model is selected by the `model:` field, one endpoint.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, cast
+
+from openai import OpenAI
+
+CLIENT = OpenAI(
+    base_url=os.getenv("OMLX_URL", "http://127.0.0.1:8000/v1"),
+    api_key=os.getenv("OMLX_API_KEY", "not-needed"),
+    timeout=120,
+    max_retries=0,
+)
+MODEL = os.getenv("MODEL_SONNET", "gemma-4-26B-A4B-it-heretic-4bit")
+
+
+@dataclass
+class LLMResponse:
+    """Structured return so callers don't navigate nested SDK attributes."""
+
+    content: str
+    tool_calls: list
+    prompt_tokens: int
+    completion_tokens: int
+
+
+def call_llm(
+    messages: list[dict],
+    *,
+    tools: list[dict] | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 1024,
+) -> LLMResponse:
+    """Single chat-completions round-trip against oMLX.
+
+    `tools=None` sends no tool schema (used by CodeAct / ReWOO planner+solver,
+    which want plain text out, not structured tool calls). Real usage numbers
+    come straight from response.usage — never estimated.
+    """
+    resp = CLIENT.chat.completions.create(
+        model=MODEL,
+        messages=cast(Any, messages),
+        tools=cast(Any, tools) if tools else None,
+        tool_choice="auto" if tools else cast(Any, None),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    choice = resp.choices[0]
+    usage = resp.usage  # may be None on some local backends
+    return LLMResponse(
+        content=choice.message.content or "",
+        tool_calls=choice.message.tool_calls or [],
+        prompt_tokens=usage.prompt_tokens if usage else 0,
+        completion_tokens=usage.completion_tokens if usage else 0,
+    )
+```
+
+---
+
+## Pattern I — CodeAct (Action Space = Executable Code)
+
+### Mechanism
+
+In every pattern above, one *action* is a structured JSON tool-call: the model names a tool and supplies arguments, the harness runs exactly one tool, feeds back one observation, and loops. **CodeAct** (Wang et al., 2024 — *Executable Code Actions Elicit Better LLM Agents*) moves the **A2 action-space axis**: an action is a **block of Python code**. The harness executes that code in a namespace where the tools are in scope as plain callables, captures `stdout` as the observation, and loops. The model signals completion by printing `FINAL: <answer>`.
+
+The consequence is the whole point: because the action is code, the model can **compose tools, branch, loop, and do arithmetic in a single action** — `kb_lookup` three times, `add`, `multiply`, print the result — instead of paying one LLM round-trip per tool call. On a 5-tool-step task that is the difference between ~6 LLM calls and **1**.
+
+> **Security note (a designed-against caveat, not an observed bug).** `exec()` of model output is **not** a real sandbox. The impl restricts the namespace (no `__import__`, `open`, or I/O builtins), which bounds the *non-adversarial* teaching agent, but a determined adversary can still escape via attribute gadgets. Real isolation is subprocess + rlimits, then containers — the W11.5 story, out of scope for a pattern demo. This is called out here, not logged in the Bad-Case Journal, precisely because it was *designed against*, not *observed* (§5 measured-only discipline).
+
+### Diagram
+
+```mermaid
+sequenceDiagram
+    participant M as Model
+    participant H as Harness
+    participant S as Restricted namespace (tools in scope)
+    M->>H: emit one fenced python code block
+    H->>S: exec(code) with kb_lookup / add / multiply
+    S-->>H: stdout = observation (or traceback on error)
+    H->>M: Observation
+    Note over M,H: loop, bounded by MAX_ITER
+    M->>H: code prints FINAL: 126000
+    H-->>M: done — answer parsed from FINAL line
+```
+
+#### Pattern I (CodeAct) — diagram walkthrough
+
+The loop is structurally identical to ReAct (think → act → observe), but the **act** edge carries code, and the **observe** edge carries `stdout`. The harness is doing two jobs ReAct's harness never does: it *executes* the action (in a restricted namespace) and it *captures a traceback as an observation* when the code raises — so a runtime error becomes feedback the model can repair, not a crash.
+
+`★ Insight ─────────────────────────────────────`
+- **One action can be a whole program.** The measured run did `kb_lookup×3 → add → multiply → print(FINAL)` in a *single* code block — so the entire task cost **1 LLM call**. JSON tool-calling cannot express "do these five things and combine them" in one action; code can.
+- **The traceback IS the observation.** `_execute` catches every exception and returns the formatted traceback as the observation string. This is the CodeAct analogue of a failed tool-call result — the model reads its own stack trace and retries, bounded by `MAX_ITER`.
+- **The harness now runs untrusted code — that's the tax.** CodeAct trades the N-round-trip cost for an *execution-safety* cost. On this axis the cheap end (JSON tool-calls) needs no sandbox; the expensive end (code) does. Concept 1's rule of thumb applies to the axis itself: move to code only when tool composition actually buys you something.
+`─────────────────────────────────────────────────`
+
+### Code — `src/impl_codeact.py` (verbatim, runs as-is on the harness above)
+
+> Rendered with a four-backtick fence because the source itself contains triple-backtick `` ```python `` markers (the agent instructs the model to emit fenced code blocks). Copy the lines between the fences.
+
+````python
+"""
+src/impl_codeact.py — CodeAct for the pattern zoo.
+
+CodeAct (Wang et al., 2024, "Executable Code Actions Elicit Better LLM Agents"):
+the agent's ACTION SPACE is *Python code*, not a structured JSON tool call. Each
+turn the model emits a fenced ```python block; the harness executes it in a
+restricted namespace where the tools (src/tools.py) are in scope as plain
+callables, captures stdout as the OBSERVATION, and loops. The model signals it is
+done by printing a line  FINAL: <answer>.
+
+Teaching point vs ReAct: because the action is code, the model can COMPOSE tools,
+loop, and do arithmetic in ONE action instead of one LLM round-trip per tool call.
+On the canonical task ReAct needs ~5 round-trips (kb_lookup x3, add, multiply,
+then answer); CodeAct can do the whole chain in a single code block -> far fewer
+LLM calls.
+
+Failure modes guarded (the assignment's "obvious failures"):
+  - model emits prose, no code block      -> observation nudges it to emit code
+  - model code raises                     -> traceback is fed back as observation
+  - bounded retries via MAX_ITER          -> no infinite loop
+  - restricted namespace                  -> only the tool callables + a small
+                                             allow-list of builtins are exposed;
+                                             no import / open / __import__.
+
+Entry point: run(task: str) -> AgentResult
+
+SECURITY NOTE: exec() of model output is NOT a real sandbox. The namespace is
+restricted (no __import__, no open, no file/network builtins) which bounds the
+non-adversarial teaching agent here, but a determined adversary can still escape
+via attribute gadgets. Real isolation (subprocess + rlimits, then containers) is
+the lab-04 python_repl story and W11.5 — out of scope for this pattern demo.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import time
+import traceback
+from contextlib import redirect_stdout
+from typing import Any
+
+from src.llm_client import call_llm
+from src.schema import CANONICAL_TASK, AgentResult
+from src.tools import TOOLS, tools_doc
+
+PATTERN = "CodeAct"
+MAX_ITER = 6
+
+# A code block fence:  ```python ... ```   (also tolerate a bare ``` ... ```).
+_CODE_BLOCK = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# The done sentinel the model prints when finished.
+_FINAL = re.compile(r"^\s*FINAL:\s*(.+?)\s*$", re.MULTILINE)
+
+# Builtins the executed code is allowed to touch. Deliberately tiny: enough for
+# arithmetic / printing / iteration, nothing for I/O, import, or reflection.
+_SAFE_BUILTINS: dict[str, Any] = {
+    "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
+    "len": len, "range": range, "enumerate": enumerate, "zip": zip,
+    "float": float, "int": int, "str": str, "bool": bool,
+    "list": list, "dict": dict, "tuple": tuple, "set": set,
+    "print": print, "sorted": sorted, "map": map, "filter": filter,
+}
+
+SYSTEM_PROMPT = f"""You are a CodeAct agent. Your ONLY way to act is to emit a
+single fenced Python code block. The harness will execute it and return its stdout
+as the observation. The following tool functions are already in scope — call them
+directly, do NOT import anything:
+
+{tools_doc()}
+
+Protocol:
+- Each turn, emit exactly one ```python ... ``` block.
+- print(...) any intermediate values you want to observe.
+- You may call several tools and do arithmetic IN ONE block — you do not need a
+  separate turn per tool.
+- When you have the final number, print a line exactly of the form:
+      print("FINAL:", <the_number>)
+  and the loop will end.
+- Do NOT import modules, open files, or use builtins other than basic ones
+  (print, int, float, sum, range, ...). Only the tool functions above plus
+  arithmetic are available.
+"""
+
+
+def _make_namespace() -> dict[str, Any]:
+    """Build the restricted exec namespace: tool callables + safe builtins only."""
+    ns: dict[str, Any] = dict(TOOLS)            # kb_lookup / add / multiply
+    ns["__builtins__"] = _SAFE_BUILTINS          # block import/open/etc.
+    return ns
+
+
+def _extract_code(text: str) -> str | None:
+    """Pull the first fenced code block out of the model's message, or None."""
+    m = _CODE_BLOCK.search(text)
+    return m.group(1) if m else None
+
+
+def _execute(code: str, ns: dict[str, Any]) -> str:
+    """Exec `code` in `ns`, capturing stdout. Returns stdout, or a traceback
+    string prefixed with ERROR: if it raises. Never propagates the exception."""
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            exec(compile(code, "<codeact>", "exec"), ns)  # noqa: S102 (restricted ns)
+    except Exception:
+        tb = traceback.format_exc(limit=3)
+        captured = buf.getvalue()
+        return f"ERROR: code raised:\n{tb}" + (f"\n[stdout before error]\n{captured}" if captured else "")
+    out = buf.getvalue().strip()
+    return out or "(no output — remember to print() what you want to observe)"
+
+
+def run(task: str = CANONICAL_TASK) -> AgentResult:
+    """Run the CodeAct loop on `task`; return the measured AgentResult."""
+    t0 = time.perf_counter()
+    ns = _make_namespace()
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
+    llm_calls = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    trace: list[str] = []
+
+    for _ in range(MAX_ITER):
+        resp = call_llm(messages, tools=None)   # plain text out; action is code
+        llm_calls += 1
+        prompt_tokens += resp.prompt_tokens
+        completion_tokens += resp.completion_tokens
+        assistant_msg = resp.content
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+        # A FINAL: sentinel in the assistant text itself ends the loop, even if
+        # it came from describing the printed result.
+        fin = _FINAL.search(assistant_msg)
+
+        code = _extract_code(assistant_msg)
+        if code is None:
+            # Failure mode: prose, no code. Nudge and retry (bounded by MAX_ITER).
+            if fin:  # model answered in prose with FINAL: — accept it
+                trace.append(f"final(prose): {fin.group(1)!r}")
+                return _result(PATTERN, fin.group(1).strip(), llm_calls,
+                               prompt_tokens, completion_tokens, t0, trace)
+            obs = ("ERROR: no ```python``` code block found in your reply. "
+                   "Emit exactly one fenced Python block to act.")
+            trace.append("no-code -> nudge")
+            messages.append({"role": "user", "content": f"Observation:\n{obs}"})
+            continue
+
+        # Execute the code; stdout becomes the observation.
+        obs = _execute(code, ns)
+        trace.append(f"exec -> {obs!r}")
+
+        # Did the executed code print a FINAL: line?
+        fin_obs = _FINAL.search(obs)
+        if fin_obs:
+            return _result(PATTERN, fin_obs.group(1).strip(), llm_calls,
+                           prompt_tokens, completion_tokens, t0, trace)
+
+        messages.append({"role": "user", "content": f"Observation:\n{obs}"})
+
+    # MAX_ITER exhausted.
+    return _result(
+        PATTERN,
+        f"[CodeAct stopped: reached MAX_ITER={MAX_ITER} without a FINAL: line]",
+        llm_calls, prompt_tokens, completion_tokens, t0, trace,
+    )
+
+
+def _result(pattern, answer, calls, ptok, ctok, t0, trace) -> AgentResult:
+    return AgentResult(
+        pattern=pattern,
+        answer=answer,
+        llm_calls=calls,
+        prompt_tokens=ptok,
+        completion_tokens=ctok,
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+        trace=tuple(trace),
+    )
+
+
+if __name__ == "__main__":
+    print(run())
+````
+
+### Result — measured 4-pattern matrix (oMLX, 2026-06-16)
+
+All four patterns ran the **same** canonical task `(30000 + 12000) × 3 = 126000` on the **same** harness. Correctness is exact-match against ground truth *and* an LLM-as-judge on the same local model; token columns were byte-identical across two runs.
+
+| Pattern | Correct (exact) | Correct (judge) | LLM calls | Prompt tok | Completion tok | **Total tok** | Latency (ms) |
+|---|---|---|---|---|---|---|---|
+| ReAct | PASS | PASS | 6 | 2941 | 107 | 3048 | 4028 |
+| Plan-and-Solve | PASS | PASS | 7 | 3596 | 212 | 3808 | 4931 |
+| **CodeAct** | PASS | PASS | **1** | 321 | 88 | **409** | **1258** |
+| **ReWOO** | PASS | PASS | **2** | 522 | 278 | **800** | 3496 |
+
+**CodeAct read:** 1 LLM call, 409 tokens — it composed `kb_lookup×3 → add → multiply → FINAL` in one code action. That is **6× fewer LLM calls** and **~7.5× fewer tokens** than ReAct on the identical task, and the lowest latency in the matrix. The A2 action-space move is not a story — it is a measured 7.5× token cut here. *(Source: `src/05_compare.py` matrix + `impl_codeact` `.trace`; `RESULTS.md`.)*
+
+### When To Use
+
+**Use when:** the task needs **tool composition** (chain/loop/arithmetic over several tool results), the model is competent at code, and you can afford an execution sandbox. Data-processing and multi-step computation are the sweet spot — exactly where the N-round-trip tax of JSON tool-calling hurts most.
+
+**Avoid when:** you cannot safely execute model output (no sandbox, adversarial inputs), the task is a single tool call (code is pure overhead), or the model is weak at code (it will emit prose or buggy blocks and burn `MAX_ITER`).
+
+### Bad-Case Journal
+
+**I-1 (harness, real/observed): `05_compare.py` is not importable.** Building the comparison driver, `import src.05_compare` raised `SyntaxError` — a leading-digit filename is not a valid Python module identifier, so the `NN_name.py` lab convention collides with import grammar. *Fix:* drive it via `runpy.run_module('src.05_compare', run_name='__main__')`; documented at the top of the file. No impl change. *(This is the only failure actually observed during the build/run — CodeAct itself passed on the first live run.)*
+
+### Interview Soundbite
+
+"CodeAct moves the action-space axis: instead of emitting one JSON tool-call per step, the agent emits a Python code block that the harness executes with the tools in scope, and stdout is the observation. The payoff is composition — it did three lookups, an add, and a multiply in *one* action, which on my measured run was 1 LLM call and 409 tokens versus ReAct's 6 calls and 3048 tokens, a 7.5× token cut on the same task. The cost moves too: the harness now runs untrusted code, so you need a real sandbox in production. I'd reach for it when the task is tool-composition-heavy and I can isolate execution."
+
+---
+
+## Pattern J — ReWOO (Reasoning WithOut Observation)
+
+### Mechanism
+
+Plan-and-Solve (Pattern B) plans upfront but **re-feeds every observation** to the model and replans — so it still pays one LLM round-trip per tool step, and the prompt grows with the trajectory. **ReWOO** (Xu et al., 2023 — *Reasoning WithOut Observation*) takes the **A1 plan-placement axis to its extreme**: three roles, and the planner **never sees a tool observation**.
+
+1. **Planner** — *one* LLM call. Emits the **entire** plan of tool calls up front, using `#E1, #E2, …` placeholders where a later step references an earlier result. It reasons purely from the task; it does not call tools and never sees their output.
+2. **Worker** — pure execution, **no LLM**. Walks the plan, substitutes already-computed `#E` values into each step's args, runs the tool, stores the result as that step's `#E`. Observations live only in this evidence table.
+3. **Solver** — *one* LLM call. Given the task + the filled evidence table, writes the final answer.
+
+**Total LLM calls = 2, independent of the number of tool steps.** The trajectory cost is paid in the Worker, which spends zero tokens — so the token savings are *structural*, not incidental.
+
+### Diagram
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as Planner (LLM call 1)
+    participant W as Worker (0 LLM calls)
+    participant S as Solver (LLM call 2)
+    U->>P: task
+    P->>W: full plan (#E1..#En with placeholders)
+    Note over W: run every tool call,<br/>substitute #E refs, no model
+    W->>S: evidence table (#E = value)
+    S-->>U: final answer
+```
+
+#### Pattern J (ReWOO) — diagram walkthrough
+
+The model touches the problem exactly **twice** — once to plan, once to solve — no matter how long the tool trajectory is. Everything between is deterministic string substitution and tool dispatch with **no tokens spent**. Contrast Plan-and-Solve, where the solver re-enters the loop after each observation: there, a 5-step plan costs ~7 LLM calls; here it costs 2.
+
+`★ Insight ─────────────────────────────────────`
+- **Decouple LLM calls from tool steps.** ReAct/Plan-Solve tie #LLM-calls to #tool-steps (observation re-fed each time). ReWOO breaks that coupling — calls are constant (2) while tool steps are free. The measured ReWOO row (2 calls, 800 tokens) vs Plan-and-Solve (7 calls, 3808 tokens) is a **~4.8× token cut** from this single structural change.
+- **The cost is brittleness to a bad plan.** Because the planner never sees observations, it cannot recover if its upfront plan is wrong — there is no replanning loop. ReWOO trades adaptability for tokens; it shines when the task structure is *predictable enough to plan blind*.
+- **`#E` substitution is the whole trick.** The Worker resolves `{"a": "#E1", "b": "#E2"}` into real numbers before `json.loads`, so the plan is a tiny dataflow DAG executed with no model in the loop. This is the same upfront-DAG idea as Plan-and-Solve (A1=upfront) — ReWOO just refuses to re-consult the model afterward.
+`─────────────────────────────────────────────────`
+
+### Code — `src/impl_rewoo.py` (verbatim)
+
+```python
+"""
+src/impl_rewoo.py — ReWOO (Reasoning WithOut Observation) for the pattern zoo.
+
+ReWOO (Xu et al., 2023) splits the agent into three roles, and crucially the
+PLANNER never sees a tool observation:
+
+  1. PLANNER  — ONE LLM call. Emits the ENTIRE plan of tool calls up front, using
+                #E1, #E2 ... variable placeholders where a later step references
+                an earlier step's result. The planner reasons purely from the
+                task — it does NOT call tools and never sees their output.
+  2. WORKER   — pure execution, NO LLM. Walks the plan top to bottom, substitutes
+                already-computed #E values into each step's arguments, runs the
+                tool, and stores the result as that step's #E. Observations live
+                only in this evidence table; they are never sent back to a model.
+  3. SOLVER   — ONE LLM call. Given the task + the filled evidence table, writes
+                the final answer.
+
+Total LLM calls = 2 (planner + solver), INDEPENDENT of the number of tool steps.
+Contrast: ReAct / Plan-and-Solve re-feed every observation into the model, so each
+tool step costs an LLM round-trip and the prompt grows with the trajectory. ReWOO
+pays the trajectory cost in the Worker (free, no tokens), so the token-savings
+claim is structural — and measured here via real response.usage.
+
+Difference from src/impl_plan_solve.py: Plan-Solve REPLANS with observations (the
+solver re-feeds each tool result and adapts step by step). ReWOO does not — the
+plan is fixed before any tool runs, and no observation ever re-enters the LLM.
+
+Entry point: run(task: str) -> AgentResult
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any
+
+from src.llm_client import call_llm
+from src.schema import CANONICAL_TASK, AgentResult
+from src.tools import TOOLS, dispatch, tools_doc
+
+PATTERN = "ReWOO"
+
+# A plan line:  #E1 = tool_name[json-args]
+#   e.g.  #E1 = kb_lookup[{"key": "Springfield"}]
+#         #E3 = add[{"a": "#E1", "b": "#E2"}]
+_PLAN_LINE = re.compile(r"#E(\d+)\s*=\s*(\w+)\s*\[(.*?)\]\s*$", re.MULTILINE)
+_EVIDENCE_REF = re.compile(r"#E\d+")
+
+_PLANNER_SYSTEM = f"""You are the ReWOO Planner. Produce a COMPLETE plan of tool
+calls to solve the task, all at once, WITHOUT calling any tools and WITHOUT seeing
+any results. Use variable placeholders #E1, #E2, ... for each step's result, and
+reference earlier results by their placeholder in later steps.
+
+Tools available:
+{tools_doc()}
+
+Output format — one step per line, nothing else, no prose:
+#E1 = tool_name[{{"arg": value}}]
+#E2 = tool_name[{{"arg": "#E1"}}]
+...
+
+Rules:
+- Arguments are a JSON object inside the [ ].
+- To pass a previous step's result as an argument, use its placeholder string,
+  e.g. {{"a": "#E1", "b": "#E2"}} — the worker substitutes the real value.
+- Plan EVERY step needed to reach the final number. Do not stop early.
+- Emit ONLY the #E lines."""
+
+_SOLVER_SYSTEM = """You are the ReWOO Solver. You are given the original task and an
+evidence table mapping each plan variable (#E1, #E2, ...) to the value the worker
+computed. Using ONLY this evidence, state the final answer. Give the final number
+clearly."""
+
+
+def _parse_plan(plan_text: str) -> list[tuple[str, str, str]]:
+    """Parse plan text into ordered (var, tool, raw_args) tuples."""
+    steps = []
+    for m in _PLAN_LINE.finditer(plan_text):
+        var = f"#E{m.group(1)}"
+        tool = m.group(2)
+        raw_args = m.group(3).strip()
+        steps.append((var, tool, raw_args))
+    return steps
+
+
+def _substitute(raw_args: str, evidence: dict[str, str]) -> dict[str, Any]:
+    """Resolve #E refs in a step's JSON args from the evidence table.
+
+    Replaces every "#En" token (whether it appears as a bare value or inside a
+    string) with the computed value before json.loads. Numeric evidence is
+    substituted unquoted so JSON stays valid (e.g. {"a": "#E1"} -> {"a": 30000.0}).
+    """
+    def repl(match: re.Match) -> str:
+        ref = match.group(0)
+        val = evidence.get(ref, ref)
+        return str(val)
+
+    # Replace "#En" (quoted placeholder) with the raw value, then bare #En too.
+    s = re.sub(r'"(#E\d+)"', lambda m: repl(re.match(r"#E\d+", m.group(1))), raw_args)
+    s = _EVIDENCE_REF.sub(repl, s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        # Fall back: best-effort single-key parse so the worker can still surface
+        # a real error observation rather than crashing.
+        return {"__raw__": s}
+
+
+def run(task: str = CANONICAL_TASK) -> AgentResult:
+    """Planner (1 LLM) -> Worker (0 LLM) -> Solver (1 LLM)."""
+    t0 = time.perf_counter()
+    llm_calls = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    trace: list[str] = []
+
+    # --- Phase 1: PLANNER (one LLM call, no tools) ---
+    plan_resp = call_llm(
+        [
+            {"role": "system", "content": _PLANNER_SYSTEM},
+            {"role": "user", "content": task},
+        ],
+        tools=None,
+        max_tokens=512,
+    )
+    llm_calls += 1
+    prompt_tokens += plan_resp.prompt_tokens
+    completion_tokens += plan_resp.completion_tokens
+    plan_text = plan_resp.content
+    trace.append(f"plan:\n{plan_text}")
+
+    steps = _parse_plan(plan_text)
+    trace.append(f"parsed {len(steps)} steps")
+
+    # --- Phase 2: WORKER (NO LLM — pure execution) ---
+    evidence: dict[str, str] = {}
+    for var, tool, raw_args in steps:
+        args = _substitute(raw_args, evidence)
+        if "__raw__" in args:
+            result = f"ERROR: could not parse args for {tool!r}: {args['__raw__']!r}"
+        else:
+            result = dispatch(tool, args)
+        evidence[var] = result
+        trace.append(f"worker {var} = {tool}({args}) -> {result}")
+
+    evidence_table = "\n".join(f"{v} = {val}" for v, val in evidence.items()) or "(empty)"
+
+    # --- Phase 3: SOLVER (one LLM call, no tools) ---
+    solve_resp = call_llm(
+        [
+            {"role": "system", "content": _SOLVER_SYSTEM},
+            {"role": "user", "content": f"Task: {task}\n\nEvidence:\n{evidence_table}"},
+        ],
+        tools=None,
+    )
+    llm_calls += 1
+    prompt_tokens += solve_resp.prompt_tokens
+    completion_tokens += solve_resp.completion_tokens
+    trace.append(f"final: {solve_resp.content!r}")
+
+    return AgentResult(
+        pattern=PATTERN,
+        answer=solve_resp.content,
+        llm_calls=llm_calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+        trace=tuple(trace),
+    )
+
+
+if __name__ == "__main__":
+    print(run())
+```
+
+### Result — see the matrix under Pattern I
+
+ReWOO: **2 LLM calls, 800 tokens** — the Planner emitted 5 `#E` steps, the Worker ran all five tool calls with **zero** LLM calls, the Solver answered. That is **~4.8× fewer tokens** than Plan-and-Solve (7 calls, 3808 tokens) on the identical task, because observations never re-enter the loop. Note the matrix's honest counter-result: **Plan-and-Solve cost *more* than ReAct here** — its extra plan round-trip bought nothing on a short linear task. The matrix makes that visible instead of assumed (Concept 1's "every layer must be justified").
+
+### When To Use
+
+**Use when:** the task structure is **predictable enough to plan blind** (the plan won't need to change based on what a tool returns), and **token/latency budget is tight**. Long deterministic tool pipelines are ideal — the 2-call cost is constant no matter how many steps.
+
+**Avoid when:** the plan depends on intermediate results you cannot know upfront (you need replanning — use Plan-and-Solve or ReAct), or a wrong early step would poison everything downstream (no observation means no recovery).
+
+### Bad-Case Journal
+
+*No pattern-specific failure observed* — ReWOO passed exact + judge on the first live run (2 calls, PASS). One **designed-against** fragility worth naming (not logged as measured because it was not triggered): the `#E`-substitution worker assumes the planner emits exactly the `#En = tool[json]` grammar; a planner that free-forms its plan falls to the `_substitute` `__raw__` error path. It did not happen on this task at temperature 0, so it stays a note here, not a §5 entry.
+
+### Interview Soundbite
+
+"ReWOO pushes the plan-placement axis to the limit: the planner emits the entire tool plan up front with `#E` placeholders and never sees an observation, a worker executes every step with no model in the loop, and a solver reads the evidence table once. So it's exactly 2 LLM calls regardless of how many tool steps there are — on my measured run, 2 calls and 800 tokens versus Plan-and-Solve's 7 calls and 3808, a 4.8× token cut. The trade is adaptability: with no observation feedback it can't recover from a bad plan, so I'd use it when the task is predictable enough to plan blind and the token budget is tight."
+
+---
+
+### Reproduce Patterns I & J
+
+Both patterns reproduce from the four files above (`schema.py`, `tools.py`, `llm_client.py` + the impl). The ReAct/Plan-and-Solve matrix rows come from the same lab-05 harness (`src/impl_react.py`, `src/impl_plan_solve.py` — same `call_llm` / `AgentResult` contract) driven by `src/05_compare.py`.
+
+```bash
+cd /Users/yuxinliu/code/agent-prep/lab-05-pattern-zoo
+set -a; source .env; set +a              # OMLX_URL, MODEL_SONNET — local oMLX only
+
+# Each new pattern runs standalone (every impl has a __main__):
+PYTHONPATH=. python -m src.impl_codeact
+PYTHONPATH=. python -m src.impl_rewoo
+
+# Full 4-pattern matrix + LLM-as-judge. NOTE: 05_compare.py starts with a digit,
+# so it is not importable as a module — drive it via runpy (Bad-Case I-1):
+PYTHONPATH=. python -c "import runpy; runpy.run_module('src.05_compare', run_name='__main__')"
+
+# Offline unit tests (no server needed): 8 passed
+PYTHONPATH=. python -m pytest tests/ -q
+```
+
+A minimal self-contained driver for just the calls/tokens columns (no judge needed — the task has one ground truth, 126000):
+
+```python
+# minimal_compare.py — run all four impls, print the measured matrix rows
+from src.impl_react import run as react
+from src.impl_plan_solve import run as plan_solve
+from src.impl_codeact import run as codeact
+from src.impl_rewoo import run as rewoo
+
+for fn in (react, plan_solve, codeact, rewoo):
+    r = fn()
+    ok = "PASS" if "126000" in r.answer else "FAIL"
+    print(f"{r.pattern:16} {ok}  calls={r.llm_calls}  tokens={r.total_tokens}  "
+          f"latency_ms={r.latency_ms}")
+```
+
+Environment of record: Python 3.13, `openai` 2.41.0, oMLX `http://127.0.0.1:8000/v1`, model `gemma-4-26B-A4B-it-heretic-4bit` (also the judge). No cloud / VibeProxy.
+
+---
+
+## Pattern K — LATS (Language Agent Tree Search) — reference only, no lab
+
+**This pattern is deliberately *not* built in this lab.** It is here so you can place it on the axes and defend the decision *not* to reach for it — which is itself the interview point.
+
+### Mechanism
+
+LATS (Zhou et al., 2024 — *Language Agent Tree Search*) is the **A3 search-shape axis at its expensive extreme**: it wraps a ReAct-style agent in **Monte-Carlo Tree Search**. Each node is a state; the agent **expands** candidate actions, **simulates/evaluates** them with a value function (often an LLM self-evaluation), **backpropagates** the reward up the tree, and **backtracks** out of dead ends — combining tree search (A3) with a reflection signal. Where ReAct commits to one greedy path, LATS explores many and retreats from bad ones.
+
+### Why no lab here (the cost-benefit call)
+
+Tree search multiplies LLM calls by the branching factor × depth × rollouts — it is the most expensive coordinate in the space, and it only pays off when the **solution space is deeply branching and a wrong path is cheap to abandon but expensive to commit** (hard coding/proof search, strategic planning). For the chapter's short, linear canonical task it would burn 10–100× the tokens of ReAct for the same answer — building it would be the exact gold-plating Concept 1 warns against. The honest engineering output is the *decision not to build it*, with the axis placement to justify that.
+
+### Measured evidence it is task-sensitive (external)
+
+The public `FareedKhan-dev/all-agentic-architectures` benchmark (35 patterns, real runs, MIT) reports LATS as a **pattern-fit failure on arithmetic** — *"LATS on arithmetic (wrong shape)"* — i.e. tree search applied to a task whose structure doesn't reward search underperforms simpler patterns. That is external corroboration of Concept 1's thesis: the pattern must match the task's structural properties, and LATS's structure (deep search) is wasted — or worse — on shallow deterministic tasks.
+
+### When To Use
+
+**Use when:** deeply branching solution space, a usable value/reward signal exists, and exploration cost is justified by the payoff (competitive coding, theorem-proving, long-horizon strategy). **Avoid when:** the task is linear or shallow (LATS is pure overhead — measured above), or you have no reliable value function (the search wanders without a gradient).
+
+### Interview Soundbite
+
+"LATS is ReAct wrapped in MCTS — it expands candidate actions, scores them with a value function, backpropagates reward, and backtracks from dead ends. It's the expensive end of the search axis, so I only reach for it when the solution space is deeply branching and a value signal exists — competitive coding, proof search. I'd *not* use it for a linear tool task; a public 35-pattern benchmark actually shows LATS underperforming on arithmetic because the task has no search structure to exploit. Knowing when *not* to spend the search budget is the point."
+
+### References
+
+- Zhou et al. (2024), *Language Agent Tree Search Unifies Reasoning, Acting, and Planning in Language Models* — the LATS paper.
+- Wang et al. (2024), *Executable Code Actions Elicit Better LLM Agents* — CodeAct (Pattern I).
+- Xu et al. (2023), *ReWOO: Decoupling Reasoning from Observations for Efficient Augmented Language Models* — ReWOO (Pattern J).
+- `FareedKhan-dev/all-agentic-architectures` (MIT) — 35 patterns, real runs, a benchmark leaderboard, and a notebook-per-pattern. The most complete public cross-check of this chapter's taxonomy; cited above for the LATS-on-arithmetic measured result. Reference for *breadth*; our labs stay from-scratch/local-first by design.
 
 ---
 
@@ -2631,11 +3598,12 @@ Each agent runs `agent_loop` as a long-lived process (or serverless trigger on m
   - Pattern D (Orchestrator-Worker) vs Pattern A used hierarchically: Orchestrator-Worker dispatches fungible workers whose boundaries are emergent; hierarchical multi-agent assigns typed roles whose boundaries are part of the design. Confusing the two leads to fan-out architectures that silently degrade because workers over-reach scope.
   - Pattern F (Swarm) vs Pattern G (State-Machine): Swarm agents negotiate turn order at runtime — no pre-specified graph, high observability cost, emergent critique quality. State-machine enumerates branches as typed edges in advance — fully testable, replayable, interruptible. Swarm's apparent collaboration costs 3-5× the latency and context.
   - Pattern G (State-Machine, synchronous) vs Pattern H (Async Mailbox): state-machine and swarm both block each step on the previous step's output. Async mailbox abandons that — each agent runs on own cadence, communicating via durable per-agent queues. Pattern H is the only topology that survives heterogeneous infrastructure (LLM + non-LLM, GPU + serverless) and individual agent crashes.
+  - Patterns I/J/K (single-agent axis moves) vs Patterns A–H (mostly A4 topology moves): A–H vary *who / how many* agents act; the late patterns instead move a *single-agent* axis — CodeAct (I) moves the **action space** to executable code, ReWOO (J) moves **plan placement** to observation-free-upfront, LATS (K) moves **search shape** to tree+value. Lesson: don't reach for a multi-agent topology when the cheaper lever is a single-agent axis move — CodeAct's measured 7.5× token cut came from changing the action space, not from adding agents. See Concept 1.5 for the full axis map.
 
-- **Connects to:** [[Week 3.7 - Agentic RAG]] — canonical 5-node Agentic RAG graph (decide → retrieve → grade → rewrite → answer) is Pattern G applied to retrieval, with Pattern D's fan-out on retrieve node; [[Week 5.5 - Metacognition]] — Reflexion (Pattern C) is the episodic critic loop W5.5 extends; [[Week 7 - Tool Harness]] — every pattern dispatches tools; W7's harness is the execution layer all 8 patterns share.
+- **Connects to:** [[Week 3.7 - Agentic RAG]] — canonical 5-node Agentic RAG graph (decide → retrieve → grade → rewrite → answer) is Pattern G applied to retrieval, with Pattern D's fan-out on retrieve node; [[Week 5.5 - Metacognition]] — Reflexion (Pattern C) is the episodic critic loop W5.5 extends; [[Week 7 - Tool Harness]] — every pattern dispatches tools; W7's harness is the execution layer all 11 patterns share.
 
-- **Foreshadows:** [[Week 10 - Framework Shootout]] — CrewAI bakes in Pattern F, LangGraph bakes in Pattern G, AutoGen exposes Pattern H — framework choice IS pattern choice; [[Week 11 - System Design]] — production system design requires selecting + justifying patterns from A-H against task structural properties (linear → A, long-horizon decomposition → B, quality iteration → C/E, parallelism → D, typed specialists → A-hierarchical, emergent critique → F, enumerable branches → G, heterogeneous infra → H); [[Week 12 - Capstone]] — capstone requires composing at least three patterns into a working system with written justification.
+- **Foreshadows:** [[Week 10 - Framework Shootout]] — CrewAI bakes in Pattern F, LangGraph bakes in Pattern G, AutoGen exposes Pattern H — framework choice IS pattern choice; [[Week 11 - System Design]] — production system design requires selecting + justifying patterns from A–K against task structural properties (linear → A, long-horizon decomposition → B, quality iteration → C/E, parallelism → D, typed specialists → A-hierarchical, emergent critique → F, enumerable branches → G, heterogeneous infra → H, tool-composition → I, observation-free planning → J, deep branching search → K); [[Week 12 - Capstone]] — capstone requires composing at least three patterns into a working system with written justification.
 - **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
-  - **W10**: Framework Shootout — frameworks are evaluated against the 8-pattern coverage matrix from W5
+  - **W10**: Framework Shootout — frameworks are evaluated against the 11-pattern coverage matrix (A–K) from W5
   - **W11**: System Design — pattern choice is a system-design decision with cost / latency / reliability trade-offs
-  - **W3.7**: Agentic RAG — typed-state-graph IS one of the 8 patterns adapted for retrieval-heavy workloads
+  - **W3.7**: Agentic RAG — typed-state-graph IS one of the 11 patterns adapted for retrieval-heavy workloads
