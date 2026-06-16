@@ -155,6 +155,11 @@ touch conftest.py                # repo-root marker: pytest adds this dir to sys
 
 uv pip install "openai>=1.40" pytest   # openai: oMLX wire client. pytest: Phase 3 router-accuracy tests
 
+# Phase 4 only — the second classifier is HuggingFace BART-MNLI, which needs
+# transformers + a torch backend (~2 GB of weights + the torch wheel). Heavy:
+# install now if you'll do Phase 4, or defer to keep the Phase 1-3 env lean.
+uv pip install transformers torch     # BART-MNLI zero-shot second classifier (Phase 4 vote)
+
 # oMLX requires a non-empty key even though it ignores the value.
 export OMLX_API_KEY=sk-local-omlx
 
@@ -782,12 +787,12 @@ tests/test_router_accuracy.py::test_router_per_mode_accuracy_meets_target XFAIL
 
 The single-classifier accuracy sweep across four configurations (full table in the lab's `RESULTS.md`):
 
-| classifier | per-tier | per-mode | latency / 23 rows |
-|------------|---------:|---------:|------------------:|
-| zero-shot (rubric prompt only) | 60.87% | 69.57% | 32 s |
-| **+ few-shot (9 exemplars, 1 per cell)** | **82.61%** | **86.96%** | 32 s |
-| + naïve 3-voter (same 4B) | 78.26% ↓ | 86.96% | 93 s |
-| + confidence-gated vote (same 4B) | 82.61% | 86.96% | 34 s |
+| classifier                               |   per-tier |   per-mode | latency / 23 rows |
+| ---------------------------------------- | ---------: | ---------: | ----------------: |
+| zero-shot (rubric prompt only)           |     60.87% |     69.57% |              32 s |
+| **+ few-shot (9 exemplars, 1 per cell)** | **82.61%** | **86.96%** |              32 s |
+| + naïve 3-voter (same 4B)                |   78.26% ↓ |     86.96% |              93 s |
+| + confidence-gated vote (same 4B)        |     82.61% |     86.96% |              34 s |
 
 Few-shot is the entire lift (+21.7 pts tier from 9 exemplars); everything after is diminishing returns. The load-bearing lesson: a **same-model** vote cannot beat the 4B's own ceiling — every voter shares its blind spots, so an ensemble only reshuffles the errors (naïve vote, −4 pts) or preserves them (gated vote, +0), never cancels them. That is precisely why **Phase 4 uses an *independent* model (BART-MNLI), not a second 4B prompt** — independent errors are what make a vote pay. The few-shot classifier lands just under the 0.85 / 0.90 production bar, so `test_router_accuracy.py` is `xfail` + `integration` (skipped unless `RUN_INTEGRATION=1`): the suite stays honest-green by default and the gap is **documented, not hidden**. If your own run misses by more, start with §5 BCJ Entry 1 (domain-shift): inspect the misclassified rows and either retag or add a few-shot example for that domain.
 
@@ -800,6 +805,27 @@ Few-shot is the entire lift (+21.7 pts tier from 9 exemplars); everything after 
 ### Phase 4 — Add classifier-2 + vote (~1.5 hours)
 
 Goal: introduce a second classifier (zero-shot BART-MNLI from HuggingFace transformers) emitting the same `(tier, mode)` taxonomy. Implement `router_vote()` with the rule: agree → emit; disagree → escalate one tier (safety bias) + log row to SQLite. Measure voted-classifier accuracy vs single-classifier; disagreement rate; latency cost of running the second classifier in parallel via `asyncio.gather`.
+
+**Measured outcome (2026-06-16) — the vote does NOT pay, and that is the lesson.** Build the vote as below, but the empirical result (full numbers in the lab's `RESULTS.md`) is a *negative*: an independent second classifier never beat the few-shot single classifier, and the real ceiling is the labels, not the model. Lead with this when you present the chapter — a measured negative + a localized root cause is a stronger interview signal than a vote that "works."
+
+| classifier (single, few-shot) | per-tier | per-mode | note |
+|---|---:|---:|---|
+| Qwen3.5-4B | 82.61% | 86.96% | shipped, 0 fails, ~236ms |
+| gemma-4-26B | 86.96% | 86.96% | clears tier; sonnet-tier latency + one-hot slot |
+| claude-sonnet-4-6 | 82.61% | 91.30% | clears mode; cloud |
+| claude-opus-4-8 | 82.61% | 91.30% | = Sonnet; bigger buys nothing |
+
+Second-classifier *votes* (paired with the 4B): BART-MNLI zero-shot **regressed** tier to 60.87% (83% disagreement — a topic model judging meta-routing labels is noise); an `AdaptiveClassifier` few-shot head cut disagreement to 30% but adaptive-alone tier stuck at 60.87% (a 37-row head can't learn difficulty), so the vote merely *matched* the single classifier. A vote cannot beat its best voter.
+
+**Why tier plateaus at 82.61% across a 4B, Sonnet, AND Opus:** the ceiling is **inter-annotator disagreement**, not capacity. A blind Opus re-label of the eval set agreed with the original tiers only **78% (18/23)**; the 4B already hits **89%** on the rows where both labellers agree. A classifier can't exceed the self-agreement of its ground truth — so 83% *is* the label-noise ceiling, with a small capacity residual (2 consensus misses). Principled relabelling of the 5 disputed rows moved accuracy *down* (83%→78%), not up — confirming irreducible boundary subjectivity. **Fix: a coarser taxonomy (merge sonnet/opus) or a calibrated rubric with anchor examples — not a bigger model.** (Two frontier-API traps surfaced en route — §5 BCJ: VibeProxy persona-cloak on a `system` role; `temperature` deprecated on Opus.)
+
+**Setup note — BART weights + the mirror trap.** The second classifier pulls `facebook/bart-large-mnli` (~1.6 GB) from HuggingFace on first run. If your shell sets `HF_ENDPOINT` to a mirror (e.g. `hf-mirror.com`), the fetch dies with a confusing `OSError: We couldn't connect to '<mirror>'` deep inside `hf_hub_download` — the mirror 308-redirects to HF's Xet CDN, which the downloader can't follow. Pull direct on the first run:
+
+```bash
+HF_ENDPOINT=https://huggingface.co RUN_INTEGRATION=1 uv run pytest tests/test_router_vote.py -v
+```
+
+Once the weights cache under `~/.cache/huggingface/hub/`, the mirror env no longer matters — later runs are offline cache hits. On a China-network box, prefer a ModelScope pre-download instead (it re-hosts the repo as plain LFS over a China CDN).
 
 **Architecture mermaid:**
 
@@ -1008,20 +1034,171 @@ def test_disagreement_rate_observable_and_bounded():
 - **Block 4 — Safety-bias tie-break.** Both axes (tier, mode) escalate independently to the heavier verdict on disagreement. Why: over-spending compute is recoverable (slow but correct); under-spending produces a bad answer (fast but wrong). The §2.1 thesis #3 made concrete in code.
 - **Block 5 — Disagreement log is the calibration signal.** When the two classifiers disagree, it's because the taxonomy has a fuzzy boundary at that prompt. The SQLite log is your offline review queue: read the disagreements weekly, decide if you need to retag a probe-set row or add a new few-shot example to `ROUTER_PROMPT`.
 
-**Result (expected):**
 
-| Metric | Single classifier (Phase 3) | Vote layer (Phase 4) | Delta |
-|---|---|---|---|
-| Per-tier accuracy on eval split | 0.85 (target) | 0.90+ (predicted; safety-escalation catches edge cases) | +5pp |
-| Disagreement rate on eval | n/a | 0.20-0.35 (typical) | — |
-| Latency overhead vs single | n/a | +100-200ms (BART CPU) — parallelised, so adds ~max(0, bart - qwen) | minimal |
-| Disagreement log rows | 0 | 4-7 (for 20-row eval) | calibration material |
+**Result (measured — 2026-06-16, 23-row eval):**
+
+| Metric | Single classifier (Phase 3) | Vote layer (Phase 4, BART-MNLI) | Delta |
+| --- | --- | --- | --- |
+| Per-tier accuracy | 82.61% (19/23) | 60.87% (14/23) | **−21.7pp — regressed** |
+| Per-mode accuracy | 86.96% (20/23) | 86.96% (20/23) | 0 |
+| Disagreement rate vs Qwen | n/a | 83% (BART) / 30% (AdaptiveClassifier) | — |
+| Latency / 23 rows | 32 s | 93 s (BART load + per-row) | +61 s (≈3×) |
+
+The vote **regressed** — it did not catch edge cases, it amplified noise. BART-MNLI is an *independent but incompetent* second voter (83% disagreement = a topic model can't judge routing-meta labels), and the "disagree → escalate" rule fired on 83% of rows, over-routing everything. Swapping BART for a few-shot `AdaptiveClassifier` cut disagreement to 30% but it still couldn't learn difficulty from 37 rows, so that vote merely *matched* the single classifier (no gain). A vote cannot beat its best voter — see the Phase 4 *Measured outcome* table above and the lab `RESULTS.md`.
 
 `★ Insight ─────────────────────────────────────`
-- **Disagreement rate is the under-appreciated metric.** A 0% rate means BART is redundant — drop the second classifier. A >50% rate means the taxonomy is too fuzzy — narrow the categories before scaling. The healthy range is 15-35%; outside that, action required.
-- **BART-MNLI is the cheapest second classifier you can deploy.** No fine-tuning, no separate serving infra, runs on CPU in ~150-300ms. The agenticSeek `router_vote` pattern uses this exact combination. The alternative (training a second Qwen3.5-4B head) costs orders of magnitude more dev-time for marginal accuracy gains.
-- **The vote-layer's disagreement log is the next iteration's training data.** Every disagreement is an annotated boundary case for free. Production routers improve by sampling disagreements weekly and adding them as few-shot examples — the calibration loop §2.2.4 made concrete.
+- **Disagreement rate is the diagnostic that caught the broken voter — before we trusted it.** It measured 83% for BART (>50% = "taxonomy too fuzzy / voter is noise" → don't ship it) and 30% for the AdaptiveClassifier (in the healthy 15-35% band, yet still no accuracy gain). Lesson: a healthy disagreement rate is necessary but NOT sufficient — a competent-looking voter can still fail to add signal. Read disagreement rate first; it's the cheapest "is this vote even worth scoring?" gate.
+- **Cheap ≠ useful: BART-MNLI is the cheapest second classifier AND the wrong one here.** No fine-tuning, CPU ~150-300ms — but it's a *topic* model, and tier is *difficulty*, so it judged the wrong thing and regressed the router −21.7pp. agenticSeek's `router_vote` actually pairs BART with a *learned* `AdaptiveClassifier` (`add_examples`), not raw BART alone — the independent voter has to be **competent**, not just independent. An independent-but-incompetent voter is worse than no voter.
+- **The vote didn't pay, but the disagreement log still earns its keep — as a review queue, not a win.** Every disagreement is an annotated boundary case; sampling them weekly is how you'd *sharpen the labels* (the real bottleneck — tier is label-bound, not capacity-bound) or decide to merge the sonnet/opus tiers. The calibration loop (§2.2.4) survives the negative result; the accuracy vote does not.
 `─────────────────────────────────────────────────`
+
+### Phase 4b — Resolution: the 2-tier router (the workable fix)
+
+The vote failed and the label audit localized the wall to the sonnet↔opus boundary (78% inter-annotator agreement). The fix is to **stop drawing the boundary nobody agrees on** — collapse `{haiku, sonnet, opus}` → `{haiku, heavy}`. Same cheap 4B, same few-shot mechanism, one fewer difficulty class.
+
+**Architecture mermaid:**
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+    P["prompt"] --> C["classify2()<br/>4B few-shot, 2-tier"]
+    C --> H["tier=haiku<br/>(trivial)"]
+    C --> V["tier=heavy<br/>(sonnet+opus merged)"]
+    C --> M["mode: minimal /<br/>react / deliberate"]
+    style V fill:#27ae60,color:#fff
+```
+
+**Result (measured — 2026-06-16, 23-row eval):**
+
+| metric | 3-tier | 2-tier `{haiku, heavy}` |
+|---|---:|---:|
+| tier accuracy | 82.61% (19/23) | **95.65% (22/23)** |
+| residual cross-line errors | — | 1/23 |
+| per-mode | 86.96% | 86.96% |
+
+`src/router2.py` clears tier by +10pp with **no vote, no frontier, no cloud**; `tests/test_router2_accuracy.py` passes (tier ≥ 0.85, mode ≥ 0.85 — a real pass, not xfail). `residual = 1/23` confirms ~3 of the 4 three-way tier misses were purely the contested boundary.
+
+**Code:** `src/router2.py`:
+
+```python
+"""2-tier difficulty router — the workable Phase 4 solution.
+
+3-way tier plateaus at ~83% because the sonnet<->opus boundary has only 78%
+inter-annotator agreement. Collapsing to {haiku, heavy} removes the contested
+boundary -> 95.65% tier (measured). Same cheap 4B, same few-shot mechanism.
+Mode (minimal/react/deliberate) is unchanged — the merge is on difficulty only.
+"""
+import json
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Literal
+
+from openai import OpenAI
+from src.fleet_config import FLEET
+
+Tier2 = Literal["haiku", "heavy"]
+Mode = Literal["minimal", "react", "deliberate"]
+
+
+@dataclass(frozen=True)
+class Verdict2:
+    tier: Tier2
+    mode: Mode
+    confidence: float
+
+
+def merge_tier(t: str) -> Tier2:
+    return "haiku" if t == "haiku" else "heavy"  # sonnet, opus -> heavy
+
+
+ROUTER2_PROMPT = """You route LLM queries on two axes: difficulty TIER and control-flow MODE.
+
+Output ONE JSON object on a single line:
+  {"tier": "haiku" | "heavy", "mode": "minimal" | "react" | "deliberate", "confidence": 0.0-1.0}
+
+TIER (difficulty):
+  haiku — trivial: arithmetic, factual recall, single-fact lookup, short summary/rewrite.
+  heavy — anything needing real reasoning: code, concept explanation, architecture,
+          multi-step planning, deep debugging, synthesis.
+
+MODE (control flow):
+  minimal    — one LLM call, no tools (factual, arithmetic, one-shot).
+  react      — Think-Act-Observe loop with tools (code debug, multi-step compute).
+  deliberate — plan-then-execute split (architecture, multi-component planning).
+
+Return ONLY the JSON object."""
+
+
+@lru_cache(maxsize=1)
+def _fewshot2() -> tuple[dict, ...]:
+    """One exemplar per (tier2, mode) cell from the TRAIN split, tiers merged to 2-way."""
+    from src.probes import load_probes, train_eval_split
+
+    train, _ = train_eval_split(load_probes())
+    seen, msgs = set(), []
+    for r in train:
+        key = (merge_tier(r["expected_tier"]), r["expected_mode"])
+        if key in seen:
+            continue
+        seen.add(key)
+        msgs.append({"role": "user", "content": r["prompt"]})
+        msgs.append({"role": "assistant", "content": json.dumps(
+            {"tier": key[0], "mode": key[1], "confidence": 0.9})})
+    return tuple(msgs)
+
+
+def classify2(prompt: str, scratchpad: str = "") -> Verdict2:
+    """Route to one (tier2, mode) cell. Degrades to (heavy, react, 0.5) — bias to the
+    safe heavier tier rather than crash dispatch."""
+    ep = FLEET["classifier"]
+    client = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"))
+    user_msg = prompt if not scratchpad else f"{prompt}\n\nRecent scratchpad context:\n{scratchpad[-2000:]}"
+    try:
+        resp = client.chat.completions.create(
+            model=ep.model,
+            messages=[{"role": "system", "content": ROUTER2_PROMPT}, *_fewshot2(),
+                      {"role": "user", "content": user_msg}],
+            temperature=0.0, max_tokens=120)
+        raw = (resp.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw[4:] if raw.startswith("json") else raw
+            raw = raw.strip()
+        p = json.loads(raw)
+        if p.get("tier") in ("haiku", "heavy") and p.get("mode") in ("minimal", "react", "deliberate"):
+            return Verdict2(tier=p["tier"], mode=p["mode"], confidence=float(p.get("confidence", 0.5)))
+    except Exception:  # noqa: BLE001
+        pass
+    return Verdict2(tier="heavy", mode="react", confidence=0.5)
+```
+
+**Walkthrough:**
+- **Block 1 — `merge_tier()` is the entire fix.** One function collapses the two tiers humans can't tell apart. Everything else is the same router; the lesson is that the highest-leverage change was a taxonomy decision, not a model or prompt change.
+- **Block 2 — `_fewshot2()` merges in the loader, not in the data.** The 60-row probe set keeps its 3-tier labels (preserving history); the 2-tier view is derived at few-shot build time. Re-tiering is a one-line `merge_tier` edit, no data migration.
+- **Block 3 — `classify2()` keeps the `system` role.** Unlike the cloud Sonnet/Opus probes (which needed user-only roles to dodge VibeProxy's persona-cloak, §5 BCJ), the local oMLX 4B honours a `system` role — so the proven 3-tier structure carries over unchanged.
+- **Block 4 — the fallback biases to `heavy`.** A misroute *up* (heavy when haiku would do) wastes compute; a misroute *down* fails the task. On a classifier hiccup, over-provision.
+
+`★ Insight ─────────────────────────────────────`
+- **Reframing the problem beat engineering the solution.** Four models and two voting schemes couldn't move 3-way tier past 83%; deleting one contested boundary hit 95.65% with the model already shipped. When the metric won't move, question the metric's ground truth before scaling the model.
+- **2-tier is the production-honest shape.** Real routers route *easy-vs-hard* first (the decision with the highest agreement and the biggest cost delta) and only sub-split when a downstream SLA demands it. A 9-cell taxonomy was precision the labels couldn't support.
+`─────────────────────────────────────────────────`
+
+### Design best practices & constraints (Phase 4 distilled)
+
+**Best practices:**
+1. **Pick the classifier for FORMAT reliability, not raw capability.** The 4B emitted clean JSON (0 fails); Sonnet/Opus needed prompt surgery (user-only roles, dropped `temperature`) to even parse.
+2. **Few-shot is the lever (+21.7pp tier); a vote cannot beat its best voter.** Spend effort on exemplars before classifier cleverness.
+3. **A second voter must be independent AND competent.** BART-MNLI (independent, incompetent) *regressed* the router −21.7pp; an AdaptiveClassifier (competent-ish) merely matched it.
+4. **Read disagreement rate first** — the cheap "is this vote even worth scoring?" gate (83% = broken voter; healthy 15–35% is necessary but not sufficient).
+5. **A flat accuracy wall across model sizes ⇒ suspect the labels/taxonomy, not the model.** Verify with an independent blind re-label; never relabel-to-predictions (gaming).
+6. **Reframe the problem before scaling the solution** — a coarser taxonomy (drop the boundary nobody agrees on) beat every model upgrade.
+
+**Constraints (this lab's hardware / cost):**
+- **One-hot oMLX** — one heavy model resident at a time; a two-*model* vote cold-load-thrashes (10–30 s/swap) and risks a 507. Prefer one hot model + a 2-tier single classifier.
+- **VibeProxy = cloud Claude** — persona-cloak on a caller `system` role, `temperature` deprecated on reasoning models, and real spend against the ~$10 program cap. Local-first by default.
+- **60-row probe set** — too small for a learned second head to acquire *difficulty* (the 37-row AdaptiveClassifier plateaued at 60.87% tier). Scale the set or coarsen the taxonomy.
+- **Label noise sets the ceiling** — tier ground truth has ~78% self-agreement, so 3-way accuracy is noise-capped near 83%; the achievable target *is* the inter-annotator agreement.
 
 ### Phase 5 — Four-way cost-latency benchmark (~2 hours)
 
