@@ -461,20 +461,22 @@ def train_eval_split(rows: list[dict], seed: int = 42, train_frac: float = 0.67)
 
 **Result:**
 
-After running `python -c "from src.probes import load_probes, train_eval_split; r = load_probes(); t, e = train_eval_split(r); print(len(t), len(e))"` you should see `40 20` (roughly — exact split varies by stratification).
+After running `python -c "from src.probes import load_probes, train_eval_split; r = load_probes(); t, e = train_eval_split(r); print(len(t), len(e))"` you should see `37 23` (stratified 60-row split; exact counts depend on per-cell `int(n*0.67)` rounding).
 
-| Domain | Train rows | Eval rows |
+| (tier, mode) cell | Train | Eval |
 |---|---|---|
-| factual-recall | ~4 | ~2 |
-| arithmetic + math-multistep | ~5 | ~3 |
-| summarization | ~3 | ~2 |
-| code-debug + code-refactor | ~7 | ~4 |
-| concept-explanation | ~3 | ~2 |
-| architecture + deep-explanation | ~6 | ~3 |
-| planning | ~3 | ~2 |
-| (others) | ~9 | ~2 |
+| haiku / minimal | 6 | 3 |
+| haiku / react | 4 | 2 |
+| haiku / deliberate | 1 | 1 |
+| sonnet / minimal | 5 | 3 |
+| sonnet / react | 5 | 3 |
+| sonnet / deliberate | 4 | 2 |
+| opus / minimal | 2 | 2 |
+| opus / react | 4 | 3 |
+| opus / deliberate | 6 | 4 |
+| **total** | **37** | **23** |
 
-Numbers vary by your specific labelling — the table is illustrative.
+Measured on the shipped 60-row set (2026-06-16). The split stratifies by `(tier, mode)` cell — not by domain — so each cell keeps roughly its 2:1 train:eval ratio. Watch the sparse cells: `haiku/deliberate` has only 2 rows total, so `int(2*0.67)=1` leaves it with 1 train / 1 eval — the rounding floor that makes small cells fragile (and the reason the 12-row preview split lopsidedly to 5/7).
 
 `★ Insight ─────────────────────────────────────`
 - **Hand-labelling 60 rows takes ~1 hour and is non-negotiable.** Without your own probe set you can't measure routing accuracy in your domain; public benchmarks (RouterBench) tell you how the router does on someone else's domain. The 1-hour cost is paid once, amortized across every Phase 3-5 measurement.
