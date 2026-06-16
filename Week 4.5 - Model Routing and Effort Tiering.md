@@ -1370,27 +1370,44 @@ def test_four_way_bench_runs_and_writes_results():
 **Walkthrough:**
 
 - **Block 1 — `COST_PER_M_TOKENS` is the cloud-equivalent rate card** (haiku + sonnet only, since the 2-tier executor map is `{haiku, heavy=gemma-26B}`). Local MLX has no $-cost per token; the rate card lets you report "if I were on Claude, this router would cost $X vs $Y on heavy-always" — the language production cost dashboards speak.
-- **Block 2 — `_run_cell` reads REAL token usage (`r.usage`), caps `max_tokens=512`, sets a 120 s timeout.** The old proxy (`len(split)*4`) is gone — real `usage.prompt_tokens`/`completion_tokens` make the cost number honest. The cap + timeout are why this finishes: the bench measures the *tier decision's* cost, not long-form answer quality, so a single capped completion per cell is enough.
+- **Block 2 — `_run_cell` is mode-aware: a per-mode system prompt + token budget (512 minimal / 2048 react+deliberate), real `usage` tokens, 180 s timeout.** A flat 512-cap was the confound that made every config fail the strict judge (hard answers truncated mid-reasoning → graded "shallow"). Scaling the budget by mode lets a *correct* model actually finish a hard task, so the bench measures the tier decision — not truncation. Real `usage.prompt_tokens`/`completion_tokens` keep the cost honest.
 - **Block 3 — Sort each config's rows by executor model BEFORE running — the load-bearing perf fix.** On one-hot oMLX, swapping the hot heavy model cold-loads it (~10-30 s). Looping `for config:` and sorting rows by `exec_tier` groups all-haiku then all-heavy, so each model loads *once per config* (~a handful total) instead of ~once per row (~90). This is the difference between 7m49s and >1h (§5 BCJ). On hardware that keeps one model resident, batch by model.
 - **Block 4 — `_RNG = random.Random(42)` is seeded ONCE at module scope.** The earlier per-call re-seed made the "random" baseline deterministic-but-identical every call (not random). Seed once → a reproducible *spread* across rows, which is what a sanity-floor baseline needs.
-- **Block 5 — Two assertions: `router2` beats `heavy_always` on cost; `router2` ≥ `random` on success.** Cost: routing the easy class to haiku must undercut routing everything heavy. Success: the taxonomy must carry signal over random. Caveat (measured): the soft grader saturates at 1.00, so the success assertion is weak — it gates "not broken," not "better"; use hand/LLM grading for a discriminating success number.
+- **Block 5 — Two assertions: `router2` beats `heavy_always` on cost; `router2` ≥ `random` on success.** Cost: routing the easy class to haiku must undercut routing everything heavy. Success: the taxonomy must carry signal over random. Success is graded by a strict CoT LLM-judge (`_llm_judge_success`: difficulty → correctness → adequacy → failure-mode, then a parsed `VERDICT:` line, fail-closed). It replaced a soft grader that saturated at 1.00 for every config — the judge is what makes the success axis (and the Pareto chart) discriminate `router2` from `random` at all.
 - **Block 6 — Results land in `RESULTS_phase5.json`.** Single JSON file makes diff-tracking across runs trivial — cost-latency improvement (or regression) is a git diff.
 
-**Result (MEASURED — 2026-06-16, 23-row eval, `RESULTS_phase5.json`; bench wall = 7m49s):**
+**Result (MEASURED — 2026-06-16, 23-row eval; mode-aware executor + CoT LLM-judge, `RESULTS_phase5.json`):**
 
-The routed config is the **2-tier router** (`router2.py`): haiku-class → cheap fast model, heavy-class → gemma-26B. The vote config is dropped (Phase 4 measured it regressing). Baselines: `heavy_always` and `random`.
+The routed config is the **2-tier router** (`router2.py`): haiku-class → cheap fast model, heavy-class → gemma-26B; mode held constant across configs so only the tier choice varies. Success is graded by a strict CoT LLM-judge (a shallow answer to a hard prompt = FAIL), replacing the earlier saturated soft grader.
 
 | Config | success_rate | p50 wall (ms) | mean cost (¢/query, cloud-equiv) | % routed → haiku |
 |---|---:|---:|---:|---:|
-| heavy_always | 1.00 | 8377 | 0.616 | 0% |
-| **router2 (2-tier)** | **1.00** | **8396** | **0.591** | **30%** |
-| random | 1.00 | 5923 | 0.311 | 74% |
+| heavy_always | **0.78** (18/23) | 11297 | 0.963 | 0% |
+| **router2 (2-tier)** | 0.57 (13/23) | 11275 | 0.959 | 30% |
+| random | 0.43 (10/23) | 5929 | **0.592** | 74% |
 
-**Honest interpretation — a modest, partly-instrument-limited win.** Two real findings, neither dressed up:
-1. **router2 beats `heavy_always` on cost (0.591 vs 0.616 ¢, −4%)** by routing 30% of tasks to the cheap haiku model — the assertion passes, but the margin is small *because this probe set is hard-skewed*: the merged taxonomy labels ~70% of prompts `heavy`, so only 30% are routable to cheap. On an easy-heavy workload the gap widens; the cost lever scales with the easy fraction.
-2. **The soft success metric is saturated (1.00 for all three configs) → it cannot show router2's quality advantage.** `random` looks "cheapest" (0.311 ¢, 74% → haiku) only because the all-pass grader never penalizes a wrong-tier (under-powered) answer. The real router2 vs random quality gap needs hand-grading or an LLM-judge — the cheap auto-grader is the limitation, and reporting `random` as "cheapest" without that caveat would be misleading.
+**Pareto front (cost × success):**
 
-**Takeaway:** the *accuracy* of the 2-tier split is the strong, measured result (95.65%, Phase 4b); the *cost-latency* win is real but modest on this hard-skewed set, and the success axis needs a discriminating grader before the Pareto chart means anything. Honest > tidy.
+```mermaid
+quadrantChart
+    title Phase 5 — cost vs success (fair executor, LLM-judge, n=23)
+    x-axis "Low cost" --> "High cost"
+    y-axis "Low success" --> "High success"
+    quadrant-1 "costly + strong"
+    quadrant-2 "cheap + strong (ideal)"
+    quadrant-3 "cheap + weak"
+    quadrant-4 "costly + weak (avoid)"
+    "heavy_always": [0.96, 0.78]
+    "router2": [0.93, 0.57]
+    "random": [0.08, 0.43]
+```
+
+**Honest interpretation — the classifier works, but routing is Pareto-dominated here.**
+1. **Routing carries real signal:** router2 success (0.57) beats random (0.43) by +13pp — the tier decision is not noise.
+2. **But router2 is dominated by `heavy_always`:** ~identical cost (0.959 vs 0.963 ¢, −0.4%) at **22pp lower success**. On the chart router2 sits in the "costly + weak" quadrant, below heavy_always at the same x.
+3. **Why routing doesn't pay on THIS workload:** the merged taxonomy labels ~70% of prompts `heavy`, so only 30% route to cheap → the cost lever is tiny (−0.4%); cost is output-token-dominated; and the 30% sent to haiku include hard tasks that then fail → −22pp success for −0.4% cost. A bad trade.
+
+**Takeaway (the senior-engineer line):** *"Routing pays as a function of the easy-task fraction. My classifier is accurate (95.65% 2-tier split) and beats random by 13pp, but on a 70%-hard workload the cost lever is too small to justify the misroute success loss — route-everything-heavy dominated my router on the cost×success front. Routing wins when most traffic is easy (FrugalGPT); pick it by the workload, not by default."* Caveats: n=23, local tiers, single-call executor — directional, not definitive.
 
 `★ Insight ─────────────────────────────────────`
 - **The Pareto front is the right chart, not the bar chart.** A 2-D plot with cost on x-axis and 1-success_rate on y-axis: `heavy_always` is one point (high cost, low error), `router2` is one point lower-left of it (cheaper + slightly more error on misrouted-easy tasks), random is upper-left (similar cost, much more error). The visual proof of routing's value: the `router2` point sits BELOW AND LEFT of the `heavy_always`↔`random` line — domination.
