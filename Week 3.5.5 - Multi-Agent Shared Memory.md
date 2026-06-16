@@ -1340,7 +1340,7 @@ Or use unique `quest_id` per test via `uuid.uuid4()` (the lab's `make_quest_id` 
 
 - **Builds on:** [[Week 3.5 - Cross-Session Memory]] (single-agent memory; this week adds concurrency)
 - **Distinguish from:** [[Week 2.5 - GraphRAG]] (multi-entity graph for RETRIEVAL, not coordination), [[Week 3.7 - Agentic RAG]] (5-node state graph for agentic retrieval, single agent)
-- **Connects to:** [[Week 3.5.8 - Two-Tier Memory Architecture]] (uses guild as the operational tier in a two-tier production architecture; this week is its prerequisite), [[Week 4 - ReAct From Scratch]] (the agent loop that consumes this coordination layer)
+- **Connects to:** [[Week 3.5.8 - Two-Tier Memory Architecture]] (uses guild as the operational tier in a two-tier production architecture; this week is its prerequisite), [[Week 4 - ReAct From Scratch]] (the W4 agent loop that consumes this coordination layer)
 - **Foreshadows:** [[Week 7 - Tool Harness]] (MCP-protocol-native tool calling as a production pattern), [[Week 11 - System Design]] (defend the build-vs-adopt decision to a hostile-reviewer panel)
 
 ---

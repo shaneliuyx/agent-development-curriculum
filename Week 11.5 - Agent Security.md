@@ -821,6 +821,9 @@ Production rule: NEVER trust one layer alone. Each layer has its own failure mod
   - **W6**: Claude Code Source Dive — Claude Code's `useCanUseTool` predicate is the enforcement primitive W11.5 stress-tests
   - **W6.85**: Prompt Templates — system-prompt-injection-resistance is a template design concern
   - **W7.8**: Code-Agent Patterns — code-execution agents have the highest blast radius; W11.5's containment guards are their primary defense
+  - **W11.55**: Content Provenance + AI Regulatory — builds on this threat model as its security axis, then adds the regulatory + provenance axis at the deployment layer
+  - **W6.65**: MCP Production Transports — tool-poisoning attacks land here as a specific catalog; Origin-validation defense maps to this chapter's web-security-style threat model
+  - **W7.6**: Small-Model Agent Stacks — the Quicksand VM sandbox connects to this chapter's sandbox-defense layer
 
 ---
 

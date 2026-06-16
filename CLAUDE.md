@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A 12-week, project-driven Agent / LLM Engineer interview-prep curriculum, authored as an Obsidian vault. **No code, no build, no tests.** Markdown only. Each chapter is a long-form pedagogical document combining theory primer, hands-on lab, bad-case journal, and interview soundbites. Labs themselves live in a separate repo (`~/code/agent-prep/lab-*`); this vault is the *narrative* + *interview-prep* layer over those labs.
+A 12-week, project-driven Agent / LLM Engineer interview-prep curriculum, authored as an Obsidian vault. **Prose-first: no application build, no test suite.** The chapters are Markdown. The one exception is `scripts/` — Python audit scripts that act as the vault's lint/CI layer, enforcing structural invariants across chapters (see [Audit commands](#audit-commands--the-vaults-lint-layer)). Each chapter is a long-form pedagogical document combining theory primer, hands-on lab, bad-case journal, and interview soundbites. The labs' own code lives in a separate repo (`~/code/agent-prep/lab-*`); selected lab/reference repos are also vendored under `code/` here. This vault is the *narrative* + *interview-prep* layer over those labs.
 
 Reader profile in the frontmatter of `Agent Development 3-Month Curriculum.md`: cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$10 cloud spend cap across 12 weeks.
 
@@ -13,11 +13,44 @@ Reader profile in the frontmatter of `Agent Development 3-Month Curriculum.md`: 
 - `Agent Development 3-Month Curriculum.md` — top-level overview + discipline rules. Read first.
 - `Week N - <Title>.md` — main weekly chapters (W0–W12).
 - `Week N.M - <Title>.md` — supplementary chapters inserted between main weeks (W2.5 GraphRAG, W3.5 Cross-Session Memory, W3.7 Agentic RAG, W5.5 Metacognition, W6.5 Hermes, W6.7 Agent Skills, W7.5 Computer Use, W8.5 Voice AI, W11.5 Agent Security). Decimal numbering = "elective; cuts in between sequentially-prerequisite weeks."
-- `Bad-Case Journal.md` — cross-cutting ops-pattern library. Every chapter's bad-case entries also live (or should live) here. Read order in its preamble.
-- `Engineering Decision Patterns.md` — cross-cutting design-decision library, indexed by pattern, not by week.
+- `README.md` — public-facing entry point ("How to read"). The reading-order map lives here.
+
+Cross-cutting libraries (indexed by theme/pattern, not by week — keep in sync when chapters change):
+- `Bad-Case Journal.md` — ops-pattern library. Every chapter's bad-case entries also live (or should live) here. Read order in its preamble. Documents WHAT broke + WHY + FIX, *after the fact*.
+- `ANTI-PATTERNS.md` — companion to the Bad-Case Journal. Documents patterns to avoid *before* writing code. Read both before starting a new chapter or lab.
+- `Engineering Decision Patterns.md` — design-decision library, indexed by pattern number. The audit scripts enforce the mechanically-checkable patterns here (e.g. Pattern 19, Pattern 21).
+- `Interview Question Index.md` — pre-interview entry point; maps interview-question patterns → chapter + measured anchor. Open 24–48h before an interview.
+- `FDE Track - Forward Deployed Engineer Path.md` — alternate chapter ordering for Forward Deployed Engineer interview prep.
+- `Trend-Monitoring Discipline.md` — process doc for keeping the curriculum current with the field.
+
+Supporting directories:
+- `scripts/` — Python audit scripts (the vault's lint layer). See [Audit commands](#audit-commands--the-vaults-lint-layer).
+- `code/` — vendored lab/reference repos (`agent-prep`, `EverOS`, `LongMemEval`, `self-improving-agents-curriculum`). Source for measured numbers; not part of the prose.
+- `proposals/` — draft chapter proposals before they become full `Week N.M` chapters.
+- `research/` — research notes backing specific chapters (e.g. structure-aware RAG tree construction).
 - `tasks/`, `assets/diagrams/` — supporting non-prose.
 
-## Required chapter structure (normative — every chapter MUST contain these 10 sections)
+## Audit commands — the vault's lint layer
+
+There is no build or test suite. The closest equivalent is `scripts/`, which mechanically enforces the checkable invariants in `Engineering Decision Patterns.md`. Run from the vault root any time the chapter set changes substantially:
+
+```bash
+# Cross-reference audit (Pattern 21 — bidirectional cross-ref invariant):
+# every "Builds on:/Connects to:/Distinguish from:/Foreshadows:/Cited by: B" on
+# chapter A must have a reciprocal mention on chapter B.
+python3 scripts/audit_cross_refs.py
+python3 scripts/audit_cross_refs.py --verbose          # show every missing edge
+
+# Status-marker audit (Pattern 19 — Spec → IMPLEMENTED transition markers):
+# flags implicit-state headings (TBD / OUTLINED / "FULL TEXT IN ROUND N").
+python3 scripts/audit_status_markers.py
+python3 scripts/audit_status_markers.py --list-explicit # also show compliant headings
+python3 scripts/audit_status_markers.py --fix           # rewrite implicit → (SPEC)
+```
+
+Exit code `0` = clean, `1` = violations found (CI-hook-friendly). Both scripts walk `Week*.md` in the vault root. Taste-based patterns (★ Insight callouts, trade-off transparency) stay human-review-only — do not try to automate them. When you codify a new mechanically-checkable pattern in `Engineering Decision Patterns.md`, add a matching script here (`scripts/README.md` documents the shared shape).
+
+## Required chapter structure (normative — every chapter MUST contain these 9 sections)
 
 The reference chapter is `Week 2 - Rerank and Context Compression.md`. Every other chapter — main week, decimal supplement, future addition — MUST match this structure. A chapter that skips a required section is incomplete and SHOULD be flagged before commit.
 
@@ -62,11 +95,13 @@ The bundle is one continuous reading unit — do not split mermaid into one sect
 
 **The non-negotiable bar:** the walkthrough portion must answer "why is this code shaped this way?" — a reader who copy-pastes the script must come away understanding the design choices, not just having a working script. If you cannot answer "why" for a block, you do not understand it well enough; spike the code first, then write.
 
-### Section 5 — (deprecated)
+### Walkthroughs are inline — no separate walkthrough section
 
-The previous `## Phase 5 — Code Walkthroughs` separate section is no longer used. Walkthroughs live inline next to their code per the §4 per-block-bundle rule above. Existing chapters with a standalone §5 should be migrated when next touched: move each walkthrough back into the Phase that contains its code, then delete §5.
+There is **no separate code-walkthrough section** (the old `## Phase 5 — Code Walkthroughs` pattern is gone). Walkthroughs live inline next to their code per the §4 per-block-bundle rule above. **Do not emit a `## 5. (deprecated)` stub or any deprecated placeholder.**
 
-### Section 6 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
+Section numbering is **continuous, 1–9** (no gap). After §4 Lab Phases the next section is **§5 Bad-Case Journal** — the sections below renumbered down by one when the old deprecated §5 slot was removed (2026-06-16). When you touch a chapter that still carries a leftover `## 5. (deprecated)` stub or a §4→§6 gap, delete the stub and renumber the remaining sections so they run 1–9 continuously (move any walkthrough text back into its Phase first, then renumber §6→§5 … §10→§9, and fix that chapter's internal `§N` references — taking care NOT to touch cited-paper section numbers like "RouteLLM §5").
+
+### Section 5 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
 
 Each entry uses **exactly** this 3-field format:
 
@@ -79,18 +114,18 @@ Each entry uses **exactly** this 3-field format:
 
 Entries also belong in the global `Bad-Case Journal.md` cross-cutting library. Other chapters' interview soundbites cite specific entries — do not delete or rewrite entries without checking incoming references.
 
-### Section 7 — Interview Soundbites (REQUIRED — 2–3 entries, user-voice, ~70 words each)
+### Section 6 — Interview Soundbites (REQUIRED — 2–3 entries, user-voice, ~70 words each)
 
-Written in first-person, anchored to a measured outcome from §4 or §6. Each soundbite is a speak-aloud answer to an interview question, ~70 words. Avoid hedging language. Avoid generic advice. Reference specific numbers and specific findings from this chapter.
+Written in first-person, anchored to a measured outcome from §4 or §5. Each soundbite is a speak-aloud answer to an interview question, ~70 words. Avoid hedging language. Avoid generic advice. Reference specific numbers and specific findings from this chapter.
 
-### Section 8 — References (REQUIRED)
+### Section 7 — References (REQUIRED)
 
 Peer-reviewed papers + canonical docs + production blog posts. Format:
 - **Author et al. (Year).** *Title.* Venue. arXiv:NNNN.NNNNN. One-line description of why this reference matters.
 
 Link to arXiv where applicable. Include at least one production blog post or canonical implementation repo so the reader can see how the concept ships in practice, not just how it is described in papers.
 
-### Section 9 — Cross-References (REQUIRED)
+### Section 8 — Cross-References (REQUIRED)
 
 Use these four labels in this order:
 
@@ -101,7 +136,7 @@ Use these four labels in this order:
 
 Cross-references must be bidirectional — if W7 says "Builds on: W4 ReAct", then W4 should say "Connects to: W7 Tool Harness". When you add a forward link, add the reverse link in the target chapter in the same edit.
 
-### Section 10 — Frontmatter (REQUIRED on new chapters)
+### Section 9 — Frontmatter (REQUIRED on new chapters)
 
 YAML frontmatter at the top of the file:
 
@@ -124,7 +159,7 @@ Update `updated:` on every substantive edit. Tags should overlap with sibling ch
 
 - **Empirical findings subsection (§N.X.Y).** When you run experiments and produce measured results that contradict or refine the theory primer, add a numbered subsection (e.g., `### 2.2.1 Actual results — fp32 vs fp16 reranker on M5 Pro (2026-04-28 runs)`). W2 uses this pattern extensively for its rerank experiments. Date-tag the subsection.
 - **Mini-lab.** A 30-minute hands-on exercise that doesn't warrant a full Phase. Use `### Mini-Lab — <name>`.
-- **Production considerations.** When the chapter has a clear production deployment story, add a `## Production Considerations` section before §6 Bad-Case Journal. Cover sandboxing, cost ceilings, multi-tenancy, observability.
+- **Production considerations.** When the chapter has a clear production deployment story, add a `## Production Considerations` section before §5 Bad-Case Journal. Cover sandboxing, cost ceilings, multi-tenancy, observability.
 
 ## Pre-commit checklist (run mentally before every chapter commit)
 
@@ -136,13 +171,13 @@ Update `updated:` on every substantive edit. Tags should overlap with sibling ch
 [ ] §4  Expected metrics table present
 [ ] §4  Per-Python-block bundle present (Architecture mermaid → Code → Walkthrough → Result → Insight) for every Python script
 [ ] §4  Mermaid hygiene: default `flowchart TD` (LR only for side-by-side subgraph clusters); edge-label parens quote-wrapped (`-->|"text<br/>(parens)"|`); subgraph titles ≤22 chars (no wrap/clip); horizontal multi-cluster layouts use `~~~` invisible-link chaining; node labels use `<br/>` not `\n`; TD blocks open with `%%{init: ... 'fontSize':'20px' ...}%%`, LR cluster blocks open with `%%{init: ... 'fontSize':'28px', ... 'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50 ...}%%` for article-body-sized text + no title-vs-first-node overlap
-[ ] §6  Bad-Case Journal — 3–5 entries in exact 3-field format
-[ ] §6  New entries copied to global Bad-Case Journal.md
-[ ] §7  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
-[ ] §8  References — papers + docs + production examples
-[ ] §9  Cross-References — Builds on / Distinguish from / Connects to / Foreshadows
-[ ] §9  Reverse links added in linked chapters
-[ ] §10 Frontmatter updated
+[ ] §5  Bad-Case Journal — 3–5 entries in exact 3-field format
+[ ] §5  New entries copied to global Bad-Case Journal.md
+[ ] §6  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
+[ ] §7  References — papers + docs + production examples
+[ ] §8  Cross-References — Builds on / Distinguish from / Connects to / Foreshadows
+[ ] §8  Reverse links added in linked chapters
+[ ] §9  Frontmatter updated
 ```
 
 ## Hard rules from `Agent Development 3-Month Curriculum.md`

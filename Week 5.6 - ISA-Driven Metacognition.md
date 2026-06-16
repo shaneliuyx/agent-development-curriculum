@@ -166,13 +166,7 @@ Goal: handle the user-changes-their-mind case. Mid-run user input triggers `reco
 
 ---
 
-## 5. (deprecated)
-
-Walkthroughs live inline per the per-Python-block bundle in §4.
-
----
-
-## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
+## 5. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in PAI v5.0.0 release notes + Reflexion paper §6 + Anthropic agents blog post §evaluation. Final entries populated post-implementation.
 
@@ -193,7 +187,7 @@ Pre-flight entries scoped from convergent failure modes in PAI v5.0.0 release no
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
+## 6. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics, anchored on the "termination criteria" interview question:
 
@@ -203,7 +197,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References (SPEC)
+## 7. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.
@@ -217,7 +211,7 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 4 - ReAct From Scratch]] (the loop being wrapped; `run_agent()` is reused as the per-turn action); [[Week 5.5 - Metacognition]] (confidence-threshold gating is demoted from terminator to early-warn signal — ISA replaces it as the terminator).
 - **Distinguish from:** confidence-threshold termination (W5.5) — same circuit judging itself; LLM-as-judge evaluation harnesses (the primary pattern is mechanical verification, LLM-judge is the last-10% fallback); planner output (W4 plan-then-execute) — planner decomposes the goal into STEPS, ISA decomposes the goal into END STATES.

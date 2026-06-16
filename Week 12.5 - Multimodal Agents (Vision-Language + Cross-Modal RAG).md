@@ -180,11 +180,7 @@ Verification: latency comparison clear; identify which deployment shape needs th
 
 ---
 
-## 5. (deprecated)
-
----
-
-## 6. Bad-Case Journal (3-5 entries — SPEC)
+## 5. Bad-Case Journal (3-5 entries — SPEC)
 
 Candidate failure surfaces:
 
@@ -196,7 +192,7 @@ Candidate failure surfaces:
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC)
+## 6. Interview Soundbites (2-3 entries — SPEC)
 
 - **Planned Soundbite 1 — "When would you use ColPali vs OCR-then-text RAG?"** Anchors: §2.2 thesis + Phase 3 measurement. 70 words: ColPali for visual-content-heavy docs (charts, tables, diagrams); text RAG for prose-dominant. ColPali preserves visual structure that OCR loses; cost is larger index + more expensive query-time scoring. Production rule: switch to ColPali when >30% of your retrieval target is in non-text content.
 - **Planned Soundbite 2 — "How would you architect multimodal RAG for [domain]?"** Anchors: §2.3 four-stage pipeline + Phase 5 deployment shapes. 70 words naming retrieval heads per modality + fusion choice + generation grounding shape, anchored to one production-deployment example.
@@ -204,7 +200,7 @@ Candidate failure surfaces:
 
 ---
 
-## 8. References
+## 7. References
 
 ### Papers + canonical writing
 
@@ -231,7 +227,7 @@ Candidate failure surfaces:
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 2 - Rerank and Context Compression]] (RAG fundamentals — multimodal extends); [[Week 2.7 - Structure-Aware RAG]] (document structure — ColPali is the vision-native extension); [[Week 3 - Embeddings and Vector Search]] (single-modality embeddings — multimodal extends to shared spaces).
 - **Distinguish from:** [[Week 7.5 - Computer Use and Browser Agents]] (computer use ACTS in visual environment; multimodal RAG RETRIEVES + grounds — different consumption patterns); [[Week 8.5 - Voice AI]] (voice as input/output channel; this chapter as cross-modal retrieval + generation).

@@ -155,13 +155,7 @@ Goal: extend `@mcp_tool` to detect `AsyncGenerator[T, None]` in the return annot
 
 ---
 
-## 5. (deprecated)
-
-Walkthroughs live inline per the per-Python-block bundle in §4.
-
----
-
-## 6. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
+## 5. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in MCP / FastMCP / PraisonAI / AutoGPT issue trackers; final entries populated post-implementation.
 
@@ -182,17 +176,17 @@ Pre-flight entries scoped from convergent failure modes in MCP / FastMCP / Prais
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
+## 6. Interview Soundbites (2-3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
 - (a) "How would you ship a Python function as a tool an LLM can call?" — anchor on the `@mcp_tool` decorator's measured LOC-savings vs hand-written MCP YAML; the senior beat is "the schema is derived, not hand-written, so there is no drift".
-- (b) "What's the difference between an Optional parameter and a Union with null in JSON Schema?" — anchor on Entry 1 in §6, the MCP convention, and why getting it wrong silently breaks rendering.
+- (b) "What's the difference between an Optional parameter and a Union with null in JSON Schema?" — anchor on Entry 1 in §5, the MCP convention, and why getting it wrong silently breaks rendering.
 - (c) "How does streaming work for an MCP tool?" — anchor on the Phase 5 result: `AsyncGenerator` → frame protocol → terminator, the consumer-buffering deadlock failure mode in Entry 4.
 
 ---
 
-## 8. References (SPEC)
+## 7. References (SPEC)
 
 Same set as §2.3 once expanded. Format per vault conventions:
 - **Author et al. (Year).** *Title.* Venue. arXiv link. One-line description.
@@ -207,7 +201,7 @@ Must include at least one production blog post or canonical implementation repo.
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 3.5.5 - Multi-Agent Shared Memory]] (the reader has CONSUMED MCP via `GuildClient`; this chapter teaches the producer side); [[Week 6.5 - Hermes]] (structured-output discipline on the LLM side — the consumer of this chapter's schemas); [[Week 4 - ReAct From Scratch]] (fleet endpoint reuse for the Phase 4 consumer-dispatch test).
 - **Distinguish from:** free-text tool descriptions (pre-MCP LangChain pattern); OpenAI function-calling format (subset of MCP, different envelope); Pydantic-everywhere (the decorator handles plain types too, do not force BaseModel); async tools (streaming is a subset).

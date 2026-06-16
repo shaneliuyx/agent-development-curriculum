@@ -49,11 +49,14 @@ LABEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SUB_BULLET_PATTERN = re.compile(
-    r"^\s+-\s+\*\*(W\d+(?:\.\d+(?:\.\d+)?)?)\*\*",
+    r"^\s+-\s+\*\*(W\d+(?:\.\d+(?:\.\d+(?:\.\d+)?)?)?)\*\*",
     re.MULTILINE,
 )
-CHAPTER_ID_PATTERN = re.compile(r"W(\d+(?:\.\d+(?:\.\d+)?)?)")
-CHAPTER_FILE_PATTERN = re.compile(r"Week (\d+(?:\.\d+(?:\.\d+)?)?)\b")
+# Patterns capture up to 4 numeric levels (e.g. W3.5.5.5). Capping at 3
+# collapsed 4-level chapters onto their 3-level prefix (Week 3.5.5.5 ≡ W3.5.5),
+# producing phantom missing-reverse pairs.
+CHAPTER_ID_PATTERN = re.compile(r"W(\d+(?:\.\d+(?:\.\d+(?:\.\d+)?)?)?)")
+CHAPTER_FILE_PATTERN = re.compile(r"Week (\d+(?:\.\d+(?:\.\d+(?:\.\d+)?)?)?)\b")
 
 
 def chapter_id_from_filename(filename: str) -> str | None:

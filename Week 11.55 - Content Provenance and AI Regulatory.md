@@ -206,11 +206,7 @@ Goal: design a layered provenance defense for an enterprise content-generation s
 
 ---
 
-## 5. (deprecated)
-
----
-
-## 6. Bad-Case Journal (3-5 entries — SPEC)
+## 5. Bad-Case Journal (3-5 entries — SPEC)
 
 Candidate failure surfaces:
 
@@ -222,7 +218,7 @@ Candidate failure surfaces:
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC)
+## 6. Interview Soundbites (2-3 entries — SPEC)
 
 - **Planned Soundbite 1 — "How does SynthID work and why isn't it enough on its own?"** Anchors: §2.2 mechanism + §2.1 layering thesis. 70 words naming green/red partition + z-score detection + paraphrase weakness + the meaning-preserving attack (arXiv:2508.20228) + the C2PA layering complement.
 - **Planned Soundbite 2 — "What does EU AI Act compliance require for an agent system?"** Anchors: §2.4 + §2.5. 70 words: risk-tier classification (chatbot → limited risk, transparency obligation; medical-triage → high risk, full Model Card + Quality Management System + post-market monitoring) + penalties (€35M or 7% revenue) + August 2026 full-applicability date.
@@ -230,7 +226,7 @@ Candidate failure surfaces:
 
 ---
 
-## 8. References
+## 7. References
 
 ### Papers + canonical writing
 
@@ -264,11 +260,11 @@ Candidate failure surfaces:
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 11.5 - Agent Security]] (security threat model — this chapter is the provenance + regulatory axis); [[Week 6.95 - A2A Protocol]] (AP2 signed Agent Cards — content provenance at the protocol layer).
 - **Distinguish from:** [[Week 11.5 - Agent Security]] (W11.5 covers adversarial robustness / prompt injection at the technical layer; this chapter covers REGULATORY + PROVENANCE obligations at the deployment layer); [[Week 11.6 - Production Tracing and Cost Telemetry]] (W11.6 is internal observability; this chapter is external provenance signal).
-- **Connects to:** [[Week 11.8 - Continuous Training and MLOps Pipelines]] (training data provenance + model card discipline — CT pipelines need to produce data provenance records); [[Week 12 - Capstone]] (capstone systems shipping to enterprise / regulated industries need a Model Card + C2PA manifest + jurisdiction-aware compliance posture).
+- **Connects to:** [[Week 11.8 - Continuous Training and MLOps Pipelines]] (training data provenance + model card discipline — CT pipelines need to produce data provenance records); [[Week 6.65 - MCP Production Transports]] (W6.65's MCP auth audit trail is the regulatory-compliance primitive at the transport layer — every agent-issued token is auditable per user, which is the provenance record this chapter requires); [[Week 12 - Capstone]] (capstone systems shipping to enterprise / regulated industries need a Model Card + C2PA manifest + jurisdiction-aware compliance posture).
 - **Foreshadows:** future regulatory updates (EU AI Act amendments, US federal AI law if passed, China + India AI regulation evolution).
 
 ---

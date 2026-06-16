@@ -552,6 +552,7 @@ Fix: monthly reconciliation — compare DuckDB rollup against actual invoice; in
   - *Logging*: free-form text events; not structured trace tree. Logs go in spans as events.
   - *Metrics-only*: aggregates without correlation. Loses the per-request story.
   - *APM (Application Performance Monitoring)*: includes traces + metrics + logs but is built for web apps; LLM-specific UIs (Langfuse, Phoenix) are better fit.
+  - **W11.55**: Content Provenance + AI Regulatory — this chapter is *internal* observability (spans + cost telemetry for your own debugging); W11.55 is the *external* provenance signal (C2PA manifests, regulatory disclosure). Same trace data, opposite audience.
 - **Connects to:** W4.5 (cost-latency Pareto front uses these measurements), W11.5 agent security (audit log lives in spans), W12 capstone (demo's production-readiness story leans on observability)
 - **Foreshadows:** continuous training (W11.8) uses traces as the data source for retraining triggers; drift detection runs on aggregated span attributes
 - **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):

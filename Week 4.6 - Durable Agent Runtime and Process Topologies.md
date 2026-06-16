@@ -11,7 +11,7 @@ tags:
   - cost-metering
   - process-topology
 audience: "cloud infrastructure engineer (3 yrs) targeting Agent / LLM Engineer roles, local-first MLX stack on Apple Silicon, ~$13 cloud spend cap across the program (12 main weeks + decimal supplements; see curriculum overview §How to Use This Guide for the three time-paths)"
-stack: "macOS Apple Silicon M5 Pro 48 GB, vMLX fleet from W4 (Qwen3.6-35B-A3B :8002 / Gemma-4-26B-A4B :8003 / Qwen3.5-9B-GLM5.1-Distill :8004), Python 3.11+, asyncio, SQLite (stdlib), optional Redis fallback for distributed lock (default: file lock; Redis is heavy and elective), no agent framework"
+stack: "macOS Apple Silicon M5 Pro 48 GB, oMLX engine from W4 on :8000 (one endpoint, model-routed by the `model:` field — haiku→MLX-Qwen3.5-35B-A3B-Reasoning-Distilled, sonnet→gemma-4-26B-A4B-it-heretic-4bit, opus→Qwen3.5-27B), Python 3.11+, asyncio, SQLite (stdlib), optional Redis fallback for distributed lock (default: file lock; Redis is heavy and elective), no agent framework"
 ---
 
 > **Status: SPEC DRAFT (2026-05-14).** This chapter is a planning skeleton produced from cross-repo convergence research (AutoGPT Platform executor/scheduler/cluster_lock/cost_tracking architecture + PraisonAI four Process modes + Trigger-based scheduling rebuke of classic-AutoGPT self-prompting loops). Phase Python blocks marked `TBD` are scoped but not yet written. Reviewer-pass before implementation. Spec source: research dossier on AutoGPT-classic→Platform postmortem + PraisonAI `process.py` (2026-05-14). Target: a 200–300 LOC minimal runtime, NOT a re-implementation of AutoGPT Platform.
@@ -50,7 +50,7 @@ The bug at the heart of classic AutoGPT was not "the agent is dumb." It was an a
 
 ### 2.3 Papers + references — pointer list
 
-In-chapter pointer list. Full formal citations live in §8 References. This list is the reader's at-a-glance "where do the ideas in §2 come from?" map.
+In-chapter pointer list. Full formal citations live in §7 References. This list is the reader's at-a-glance "where do the ideas in §2 come from?" map.
 
 - **Vogels (2007).** *Eventually Consistent.* CACM. Foundational paper on durable distributed state; the read-side semantics LLM-agent durable runtimes inherit.
 - **Fowler, Martin.** *Event Sourcing.* martinfowler.com. Canonical pattern reference for append-only execution logs — the architectural primitive every durable workflow engine builds on.
@@ -184,10 +184,10 @@ flowchart TB
     NCTab["node_cost table"]
   end
 
-  subgraph F["vMLX fleet (from W4)"]
-    H["haiku-tier :8004"]
-    Sm["sonnet-tier :8003"]
-    O["opus-tier :8002"]
+  subgraph F["oMLX :8000 (from W4)"]
+    H["haiku-tier<br/>35B-A3B"]
+    Sm["sonnet-tier<br/>Gemma-26B"]
+    O["opus-tier<br/>Qwen3.5-27B"]
   end
 
   Cron --> Sch
@@ -218,7 +218,7 @@ flowchart TB
   W3 -->|update status| NTab
 ```
 
-**Reading the diagram.** A trigger (cron / webhook / manual) fires the Scheduler, which creates a `runs` row and seeds the READY queue with the graph's root nodes. Workers pull ready nodes, acquire the file lock (preventing two workers from claiming the same node), call the right vMLX endpoint, write a cost row, append an event, update node status, and enqueue dependent nodes whose preconditions are now satisfied. Process death anywhere in that loop is safe because the graph + executions tables hold ground truth; restart re-derives the READY queue from `nodes WHERE status='ready'`.
+**Reading the diagram.** A trigger (cron / webhook / manual) fires the Scheduler, which creates a `runs` row and seeds the READY queue with the graph's root nodes. Workers pull ready nodes, acquire the file lock (preventing two workers from claiming the same node), call the right oMLX model (one `:8000` endpoint, model-routed by the `model:` field), write a cost row, append an event, update node status, and enqueue dependent nodes whose preconditions are now satisfied. Process death anywhere in that loop is safe because the graph + executions tables hold ground truth; restart re-derives the READY queue from `nodes WHERE status='ready'`.
 
 ---
 
@@ -234,7 +234,7 @@ Goal: design the durable schema. Four tables: `graphs` (DAG definition), `nodes`
 
 ### Phase 2 — Asyncio worker pool (~1 hour)
 
-Goal: implement `src/worker_pool.py` with a configurable-N asyncio worker coroutine. Each worker pulls from the READY queue, dispatches to a node-type-specific handler (LLM call → vMLX endpoint; tool call → local function; branch → expression eval), writes cost + event rows, and enqueues unblocked downstream nodes. Graceful drain on SIGTERM: workers finish current node, do NOT pick up new work, the scheduler flushes pending events.
+Goal: implement `src/worker_pool.py` with a configurable-N asyncio worker coroutine. Each worker pulls from the READY queue, dispatches to a node-type-specific handler (LLM call → oMLX `:8000`, model-routed; tool call → local function; branch → expression eval), writes cost + event rows, and enqueues unblocked downstream nodes. Graceful drain on SIGTERM: workers finish current node, do NOT pick up new work, the scheduler flushes pending events.
 
 - **TBD code** — `src/worker_pool.py` (worker coroutine + supervisor + drain logic).
 - **TBD verification** — `tests/test_worker_pool.py`: queue 10 nodes, observe N=3 workers run them with bounded concurrency; SIGTERM mid-flight, observe clean drain.
@@ -266,13 +266,7 @@ Goal: implement `src/scheduler.py` with three trigger types: `register_cron(grap
 
 ---
 
-## 5. (deprecated)
-
-Walkthroughs live inline per the per-Python-block bundle in §4.
-
----
-
-## 6. Bad-Case Journal (3–5 entries — (SPEC — to be filled after lab run))
+## 5. Bad-Case Journal (3–5 entries — (SPEC — to be filled after lab run))
 
 Pre-flight entries scoped from convergent failure modes in AutoGPT Platform issue tracker + PraisonAI process-mode bug reports + durable-workflow literature; final entries populated post-implementation.
 
@@ -293,7 +287,7 @@ Pre-flight entries scoped from convergent failure modes in AutoGPT Platform issu
 
 ---
 
-## 7. Interview Soundbites (2–3 entries — (SPEC — to be filled after lab run))
+## 6. Interview Soundbites (2–3 entries — (SPEC — to be filled after lab run))
 
 Soundbites are written post-measurement so the numbers cited are real. Scoped topics:
 
@@ -303,7 +297,7 @@ Soundbites are written post-measurement so the numbers cited are real. Scoped to
 
 ---
 
-## 8. References
+## 7. References
 
 Full formal citations for the works cited in §2 + the canonical production implementations the lab draws from. Per vault conventions: peer-reviewed papers + canonical docs + production blog posts + reference repositories.
 
@@ -329,11 +323,11 @@ Full formal citations for the works cited in §2 + the canonical production impl
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
-- **Builds on:** [[Week 4 - ReAct From Scratch]] (vMLX fleet, ReAct loop — the thing we are now putting under a durable runtime); [[Week 4.5 - Model Routing and Effort Tiering]] (per-call routing; this chapter's cost meter is what makes routing wins measurable).
-- **Distinguish from:** state machine vs agent loop (a state machine is a degenerate workflow with one path; an agent loop is the LLM control flow inside a node, not the runtime around it); durable workflow vs cascade (durable workflow persists a DAG; cascade chains attempts at the same node — different abstractions); agent framework vs runtime (LangGraph / CrewAI are frameworks; durability is an orthogonal property).
-- **Connects to:** [[Week 11.5 - Agent Security]] (trigger surface is the auth boundary — webhook trigger is an unauthenticated entry point until you secure it; cron triggers run as the system identity); [[Week 12 - Capstone]] (the capstone agent runs on this runtime, not a one-shot script).
+- **Builds on:** [[Week 4 - ReAct From Scratch]] (oMLX :8000 model-routed fleet, ReAct loop — the thing we are now putting under a durable runtime); [[Week 4.5 - Model Routing and Effort Tiering]] (per-call routing; this chapter's cost meter is what makes routing wins measurable).
+- **Distinguish from:** state machine vs agent loop (a state machine is a degenerate workflow with one path; an agent loop is the LLM control flow inside a node, not the runtime around it); durable workflow vs cascade (durable workflow persists a DAG; cascade chains attempts at the same node — different abstractions); agent framework vs runtime (LangGraph / CrewAI are frameworks; durability is an orthogonal property); topology vs runtime ([[Week 3.5.5.5 - Multi-Agent Topology Patterns]] — W3.5.5.5 is the communication-topology axis, which agents talk to whom; this chapter is the execution-trigger + durability axis, how a run persists and recovers — orthogonal concerns).
+- **Connects to:** [[Week 11.5 - Agent Security]] (trigger surface is the auth boundary — webhook trigger is an unauthenticated entry point until you secure it; cron triggers run as the system identity); [[Week 6.65 - MCP Production Transports]] (W6.65's Streamable HTTP session-id + last-event-id are the durability primitive at the transport layer; this chapter's per-iteration commit is the same durability shape at the runtime layer — different scale); [[Week 12 - Capstone]] (the capstone agent runs on this runtime, not a one-shot script).
 - **Foreshadows:** production deployment topology (multi-host worker pool, Redis-backed lock, cron-leader election); cost-attribution dashboards; multi-tenant agent platforms.
 
 - **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):

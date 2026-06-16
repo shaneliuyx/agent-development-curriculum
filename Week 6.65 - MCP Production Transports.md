@@ -158,13 +158,7 @@ Verification: write 4 detector functions matching the attacks (schema hash pin, 
 
 ---
 
-## 5. (deprecated)
-
-The previous `## Phase 5 — Code Walkthroughs` separate section is no longer used. Walkthroughs live inline next to their code per the §4 per-block-bundle rule above.
-
----
-
-## 6. Bad-Case Journal (3-5 entries — SPEC — to be filled after lab run)
+## 5. Bad-Case Journal (3-5 entries — SPEC — to be filled after lab run)
 
 Candidate failure surfaces — entries will be populated with concrete symptom/root-cause/fix after Phase 1-6 actual runs.
 
@@ -176,7 +170,7 @@ Candidate failure surfaces — entries will be populated with concrete symptom/r
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC — to be filled after lab run)
+## 6. Interview Soundbites (2-3 entries — SPEC — to be filled after lab run)
 
 Soundbites will be populated with concrete numbers after Phase 1-6 actual runs.
 
@@ -186,7 +180,7 @@ Soundbites will be populated with concrete numbers after Phase 1-6 actual runs.
 
 ---
 
-## 8. References
+## 7. References
 
 ### Specs + canonical writing
 
@@ -212,7 +206,7 @@ Soundbites will be populated with concrete numbers after Phase 1-6 actual runs.
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 6.5 - Hermes Agent Hands-On]] (MCP fundamentals + Hermes client); [[Week 6.6 - MCP Schema Bridge]] (stdio server + @mcp_tool decorator — this chapter's Phase 1 reuses the dispatch logic). [[Week 4.6 - Durable Agent Runtime and Process Topologies]] (Streamable HTTP session-id + last-event-id are the durability primitives at the transport layer; W4.6's per-iteration commit is the durability primitive at the runtime layer — same shape, different scale).
 - **Distinguish from:** [[Week 6.95 - A2A Protocol]] (sibling chapter — A2A is agent-to-agent over HTTP; this chapter is agent-to-tool over MCP-Streamable-HTTP; the two protocols are complementary, not competing); [[Week 7.3 - Production LLM Infrastructure]] (W7.3 covers the LLM-call transport — gateway, caching, routing — at a different layer than MCP transport).
@@ -221,7 +215,7 @@ Soundbites will be populated with concrete numbers after Phase 1-6 actual runs.
 
 ---
 
-## 10. Companion — WorkOS `auth.md` Agent Registration Protocol (TRENDS-LIFT 2026-05-28)
+## 9. Companion — WorkOS `auth.md` Agent Registration Protocol (TRENDS-LIFT 2026-05-28)
 
 W6.65 teaches MCP transport security: Origin allowlist + DNS-rebinding defense + signed sessions. The next layer up is AGENT IDENTITY: how does a service know which agent is calling, on behalf of which user? **WorkOS auth.md** (May 2026) standardizes this.
 

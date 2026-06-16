@@ -175,11 +175,7 @@ Deliverable: a half-page design note in `outputs/a2a_over_mcp.md` answering: whe
 
 ---
 
-## 5. (deprecated)
-
----
-
-## 6. Bad-Case Journal (3-5 entries — SPEC — to be filled after lab run)
+## 5. Bad-Case Journal (3-5 entries — SPEC — to be filled after lab run)
 
 Candidate failure surfaces:
 
@@ -191,7 +187,7 @@ Candidate failure surfaces:
 
 ---
 
-## 7. Interview Soundbites (2-3 entries — SPEC — to be filled after lab run)
+## 6. Interview Soundbites (2-3 entries — SPEC — to be filled after lab run)
 
 Candidates with anchors:
 
@@ -201,7 +197,7 @@ Candidates with anchors:
 
 ---
 
-## 8. References
+## 7. References
 
 ### Specs + canonical writing
 
@@ -231,7 +227,7 @@ Candidates with anchors:
 
 ---
 
-## 9. Cross-References
+## 8. Cross-References
 
 - **Builds on:** [[Week 6.5 - Hermes Agent Hands-On]] (MCP fundamentals — the sibling protocol; A2A reuses the JSON-RPC + SSE transport idioms); [[Week 6.6 - MCP Schema Bridge]] (tool schema patterns — Agent Card skills are the A2A analogue of MCP tool schemas); [[Week 3.5.5 - Multi-Agent Shared Knowledge]] (multi-agent intro at the queue/state axis; A2A is the protocol axis).
 - **Distinguish from:** [[Week 6.65 - MCP Production Transports]] (sibling — MCP transport spec; A2A and MCP are complementary protocols, not competing); [[Week 3.5.5.5 - Multi-Agent Topology Patterns]] (topology patterns are SINGLE-PROCESS multi-agent shapes; A2A is the CROSS-PROCESS / CROSS-ORGANIZATION shape).

@@ -19,3 +19,7 @@
 
 # OMC sessions (session-local tooling state)
 .omc/sessions/
+
+# Agent/tool local state
+.serena/
+.omc/
