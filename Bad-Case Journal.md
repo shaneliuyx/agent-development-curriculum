@@ -1490,4 +1490,24 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 
 ---
 
+## 2026-06-16 — Week 4.6 — One shared `FileLock` instance corrupts under the async worker pool: `flock` raises `TypeError: argument must be an int`
+
+**Symptom:** `claim_ready_node` raised `TypeError: argument must be an int, or have a fileno() method` from inside `fcntl.flock` — but ONLY under the async worker pool. The single-threaded durability test ran the identical claim path with zero errors. Async-only, never single-threaded: the tell that this is a concurrency bug, not a logic bug.
+
+**Why it's a bad case:** the single-threaded path is green, so the primitive *looks* correct. The error only surfaces under genuine thread overlap, which the unit test never produced — "passes single-threaded" is not "thread-safe."
+
+**Root cause:** `GraphStore` exposes ONE shared `FileLock` instance (`store.lock`) whose fd is single-use — `release()` sets `self._fd = None`. Workers run the claim via `asyncio.to_thread`, so two sibling threads entered that same `FileLock` context manager concurrently: worker A's `release()` nulled the fd, then worker B called `flock(None)`, which is not an int. The lock object was designed for one owner per instance and silently breaks when two threads share the instance.
+
+**Fix:** gate the claim with an in-process `asyncio.Lock` (`claim_lock`) in `run_graph`, so only one sibling thread is inside the shared instance at a time. The claim is already a serialization point by design (the store does `ORDER BY name LIMIT 1`), so gating it costs nothing. Cross-PROCESS safety still comes from the `FileLock`; the in-process lock only stops sibling THREADS in this process from entering the one shared instance. `mark_done`/`mark_failed` open their own connections and never touch the shared lock, so they stay fully concurrent.
+
+**5-second sanity test:** any lock/handle with single-use teardown (`release()` nulls the fd) must be exercised with ≥2 concurrent threads before you trust it — run the claim path under `asyncio.gather` of N workers, not just one.
+
+**Generalizes to:** any resource whose teardown invalidates shared state (single-use fds, one-shot iterators, connection pools sized 1, "close nulls the handle" objects). A shared instance is safe under serial use and corrupts the instant two threads overlap. Pick one: per-thread instances, or an in-process gate around the shared one. Distinguish the two lock scopes — in-process thread gating ≠ cross-process mutual exclusion.
+
+**Tags:** #concurrency #file-lock #fcntl #async #to_thread #passes-single-threaded #shared-mutable-handle #lab-4.6
+
+**Captured in curriculum at:** [[Week 4.6 - Durable Agent Runtime and Process Topologies#5. Bad-Case Journal]] (Entry 1)
+
+---
+
 — end —

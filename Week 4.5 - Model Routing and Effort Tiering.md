@@ -1703,14 +1703,14 @@ uv run python -c "from src.privacy_router import privacy_route; print(privacy_ro
 
 **Result (measured, 2026-06-16 — `tests/test_privacy_router.py`, rules-only, n=12):**
 
-| Class | Example probe | `rule_detect` verdict | Action | Note |
-|---|---|---|---|---|
-| S3 | "here's my `id_rsa`, debug the ssh config" | S3 (`keyword:id_rsa`) | redirect → local | secret keyword |
-| S3 | "`-----BEGIN OPENSSH PRIVATE KEY-----` …" | S3 (`pattern`) | redirect → local | key-block regex |
-| S3 | "my aws key is `AKIAIOSFODNN7EXAMPLE`" | S3 (`pattern`) | redirect → local | AWS key-id regex |
-| S2 | "prod db is at `postgres://…@10.2.3.4`" | S2 (`pattern`) | desensitize → cloud | private-IP + DSN |
-| S1 | "explain TCP vs UDP for a backend dev" | None → S1 | passthrough → classifier | clean |
-| S1 ⚠ | "how do password managers store credentials safely" | **S2 (`keyword:password`)** | desensitize → cloud | **false positive** |
+| Class | Example probe                                       | `rule_detect` verdict       | Action                   | Note               |
+| ----- | --------------------------------------------------- | --------------------------- | ------------------------ | ------------------ |
+| S3    | "here's my `id_rsa`, debug the ssh config"          | S3 (`keyword:id_rsa`)       | redirect → local         | secret keyword     |
+| S3    | "`-----BEGIN OPENSSH PRIVATE KEY-----` …"           | S3 (`pattern`)              | redirect → local         | key-block regex    |
+| S3    | "my aws key is `AKIAIOSFODNN7EXAMPLE`"              | S3 (`pattern`)              | redirect → local         | AWS key-id regex   |
+| S2    | "prod db is at `postgres://…@10.2.3.4`"             | S2 (`pattern`)              | desensitize → cloud      | private-IP + DSN   |
+| S1    | "explain TCP vs UDP for a backend dev"              | None → S1                   | passthrough → classifier | clean              |
+| S1 ⚠  | "how do password managers store credentials safely" | **S2 (`keyword:password`)** | desensitize → cloud      | **false positive** |
 
 Measured: **leak rate (false negative) = 0/8** — every secret-bearing probe was caught and held local; the critical S3 class was detected exactly. **False-positive rate = 1/4** on the S1 negatives — the keyword `password` over-triggers on the password-manager question (a benign topic carrying no secret), over-restricting it to local. Headline metric is **not** accuracy — it is the **false-negative leak rate**, and rules alone hit the target of 0 on this set. The lone false positive is the *safe* failure direction (it forfeits a cloud-tier capability, it does not leak) and is exactly what the LLM detector is meant to refine — see §5 Entry 7. Caveat: n=12 is smoke-sized; a production leak rate needs a far larger, adversarially-phrased probe set before you trust it.
 
@@ -1799,7 +1799,7 @@ That on one-hot local inference the dominant cost is model cold-loads, not reque
 - **LMSYS — `lmsys/RouteLLM`.** https://github.com/lm-sys/RouteLLM — open-source, production-deployed router; the implementation behind the RouteLLM paper above. The Phase 5 cost-quality targets are RouteLLM-class.
 - **PraisonAI — process modes** (`src/praisonai-agents/praisonaiagents/process/process.py`). The four first-class process topologies (sequential / parallel / hierarchical / workflow) are why MODE is its own routing axis in this chapter rather than collapsed into tier.
 - **OpenBMB — ClawXRouter.** https://github.com/OpenBMB/ClawXRouter — Edge-Cloud Collaborative routing plugin; the source of this chapter's sensitivity axis (§2.2 concept 6, Phase 6). Read `src/router-pipeline.ts` (two-phase weighted pipeline), `src/routers/privacy.ts` (S1/S2/S3), `src/routers/token-saver.ts` (LLM-as-Judge cost router), and `src/rules.ts` (the regex/keyword detector Phase 6 trims). README claim: "beat Sonnet at 40% of the price."
-- **OpenBMB — PilotDeck.** https://github.com/OpenBMB/PilotDeck — WorkSpace agent OS whose role-based "Smart Routing" (orchestrator-Opus / sub-agent-Sonnet) is reported at ≈4.4× cheaper than all-Opus ($2.83 vs $12.58). The canonical production example of routing by agent role rather than per-prompt.
+- **OpenBMB — PilotDeck.** https://github.com/OpenBMB/PilotDeck — WorkSpace agent OS (TypeScript 70% / Python) whose role-based "Smart Routing" (orchestrator-Opus / sub-agent-Sonnet) is reported at ≈4.4× cheaper than all-Opus ($2.83 vs $12.58). The canonical production example of routing by agent role rather than per-prompt; built on OpenBMB's own ClawXRouter (above) + ClawXMemory. **License caveat: AGPL-3.0** — hard copyleft. Reference the architecture in prose and reproduce the *pattern* in your own code, but do NOT vendor or port PilotDeck source into this (permissively-licensed) curriculum repo: AGPL is viral and would relicense the whole vault. This is the licensing-axis lesson — Trinity (Apache-2.0, see [[Week 4.6 - Durable Agent Runtime and Process Topologies#7. References]]) and SkillOpt (MIT) are portable with attribution; PilotDeck is look-don't-touch.
 
 ---
 

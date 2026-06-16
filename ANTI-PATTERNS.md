@@ -1,7 +1,7 @@
 ---
 title: Anti-Patterns to Avoid — Agent Development
 created: 2026-05-27
-updated: 2026-06-15
+updated: 2026-06-16
 tags:
   - anti-patterns
   - cross-cutting
@@ -163,6 +163,26 @@ Entries derived from observed BCJ entries are marked `(BCJ)` with cross-link; en
 
 *Symptom:* A known-capable model scores implausibly low on an eval (e.g. `reason=0` for a model that clearly does the arithmetic); the score is unstable run-to-run and downstream selection logic flip-flops. Root: the probe's `max_tokens` is too small, so a verbose-but-correct model gets clipped (`finish_reason="length"`) before emitting the graded token. The metric silently measures terseness-under-cap, not the property it claims to.
 *Fix:* Size each probe's token cap to the property under test — generous for reasoning/derivation (correctness), tight only where brevity IS the property (json-only, exact-word-count). When a score looks wrong for a capable model, check `finish_reason` before blaming the model. Re-baseline after the fix. (BCJ 2026-06-15 W4 "Probe token-cap manufactured a false reason=0"; repo 4 `scripts/probe_fleet.py::probe_reasoning`)
+
+### AP-406 — Split status + event writes in a durable state machine (HIGH)
+
+*Symptom:* A node is marked `done` in the `nodes` table but its `done` event never lands in the log — a crash (or exception) between the status `UPDATE` and the event `INSERT` leaves live state and audit trail disagreeing, and a downstream forensic count is silently off by one. Nothing errors; the divergence only shows when you cross-check the two.
+*Fix:* Wrap the status update, the event append, and any dependent state promotion (`PENDING→READY`) in ONE transaction (`with self._connect() as conn:`) so they commit together or not at all. Generalizes to any system pairing a live state field with an append-only log of changes (outbox, CDC, workflow engines, double-entry ledgers): split writes drift under crash. (W4.6 `graph_store.py::mark_done` — designed-against; not yet observed, the bench never crashed mid-write.)
+
+### AP-407 — In-memory retry counter in a restartable runtime (HIGH)
+
+*Symptom:* A node that fails validation retries, the process restarts mid-run, and the node's attempt budget is back to zero — the classic AutoGPT infinite-cost retry storm. A `while attempts < N` loop in process locals does not survive `kill -9`, so every restart re-grants the full budget and a permanently-flaky node burns unbounded cost.
+*Fix:* Persist the retry counter in durable state (`nodes.attempts` column), bump it at claim time, and read it in `mark_failed`: terminal `FAILED` at `attempts >= max_attempts`, else requeue `READY`. A counter that was never in memory cannot be reset by a restart. (W4.6 `graph_store.py` durable `attempts` — designed-against; the bench ran zero retries so the storm never fired.)
+
+### AP-408 — Cost-meter row keyed by event, not by unit of work (HIGH)
+
+*Symptom:* A node that failed once and succeeded on retry writes two `node_cost` rows; the run's `cost_report` over-reports tokens and cloud-equivalent USD versus the work actually done. Without an idempotency key tied to the unit of work, every retry inserts a fresh row (the AutoGPT Platform `cost_tracking.py` early-commit failure mode).
+*Fix:* Key the cost row to the unit of work, not the wall-clock event: `node_cost` carries `UNIQUE(run_id, node_name, attempt)` and the meter writes with `INSERT OR IGNORE`, so re-recording the same `(node, attempt)` is a deliberate no-op. The ledger stays correct under retry — the exact failure the runtime is built to survive. (W4.6 `cost_meter.py` — designed-against; not separately observed because the bench ran zero retries.)
+
+### AP-409 — Multi-scheduler cron without a single-scheduler invariant (HIGH, multi-host — deferred to W11.5/W12)
+
+*Symptom:* A cron-registered graph starts two runs per tick after a restart; an operator sees duplicated work and doubled cost with no error. Without leader election or an idempotency key, a restart can leave a zombie timer running alongside the new one (the APScheduler / classic-AutoGPT scheduler-duplication mode).
+*Fix:* Leader election (one scheduler owns the cron lease) or an idempotency key on `(graph_id, tick_bucket)` so a duplicate tick is a no-op `start_run` — the same unit-of-work-keying discipline as AP-408. Out of scope for a single-host lab: W4.6 ships one in-thread `threading.Timer` per graph with an idempotent `stop_cron`, so duplication only arises in the multi-host deployment deferred to W11.5/W12. (W4.6 `scheduler.py` — designed-against; never observed, single-host by construction.)
 
 ---
 

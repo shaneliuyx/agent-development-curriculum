@@ -46,6 +46,13 @@ python3 scripts/audit_cross_refs.py --verbose          # show every missing edge
 python3 scripts/audit_status_markers.py
 python3 scripts/audit_status_markers.py --list-explicit # also show compliant headings
 python3 scripts/audit_status_markers.py --fix           # rewrite implicit → (SPEC)
+
+# Bad-Case Journal measured-only audit (§5 MEASURED-ONLY INVARIANT):
+# flags any §5 / global-journal entry that reads as predicted/scoped/hypothetical
+# rather than a real observed failure ((planned), "predicted", "scoped-not-measured",
+# "to be filled after lab run", TBD, "not yet measured", etc.).
+python3 scripts/audit_bcj_measured.py
+python3 scripts/audit_bcj_measured.py --verbose         # show each flagged entry + reason
 ```
 
 Exit code `0` = clean, `1` = violations found (CI-hook-friendly). Both scripts walk `Week*.md` in the vault root. Taste-based patterns (★ Insight callouts, trade-off transparency) stay human-review-only — do not try to automate them. When you codify a new mechanically-checkable pattern in `Engineering Decision Patterns.md`, add a matching script here (`scripts/README.md` documents the shared shape).
@@ -114,6 +121,8 @@ Each entry uses **exactly** this 3-field format:
 
 Entries also belong in the global `Bad-Case Journal.md` cross-cutting library. Other chapters' interview soundbites cite specific entries — do not delete or rewrite entries without checking incoming references.
 
+**MEASURED-ONLY INVARIANT (normative — non-negotiable).** Every Bad-Case Journal entry — in a chapter §5 AND in the global `Bad-Case Journal.md` — MUST be a *real failure actually observed in a lab run*: reproduced, with its symptom / root-cause / fix traceable to a run, an error message, a failing test, or a `RESULTS.md` row. **No predicted, scoped, hypothetical, anticipated, or `(planned)` entries. Ever.** A failure mode you *expect* but have *not yet observed* is not a bad-case entry — it belongs in `ANTI-PATTERNS.md` (the explicit "before you write code" companion), and only *graduates* to the Bad-Case Journal once you measure it. Why this is non-negotiable: the journal's entire value is that it documents what broke **after the fact**; a predicted entry teaches a failure that may never occur and quietly launders speculation as evidence — the exact judgment-atrophy failure the program exists to prevent. **If a chapter is still a spec draft, leave §5 empty** (or park anticipated modes in `ANTI-PATTERNS.md`); do NOT pre-fill §5 with guesses dressed as findings. The one allowed exception is an entry explicitly and visibly labelled as a *deferred/out-of-scope* mode (e.g. multi-host failures in a single-host lab) — but it must say so in-line and must not invent a symptom or a measured number. Mechanically enforced by `scripts/audit_bcj_measured.py` (exit 1 on any unmeasured-looking entry).
+
 ### Section 6 — Interview Soundbites (REQUIRED — 2–3 entries, user-voice, ~70 words each)
 
 Written in first-person, anchored to a measured outcome from §4 or §5. Each soundbite is a speak-aloud answer to an interview question, ~70 words. Avoid hedging language. Avoid generic advice. Reference specific numbers and specific findings from this chapter.
@@ -172,6 +181,7 @@ Update `updated:` on every substantive edit. Tags should overlap with sibling ch
 [ ] §4  Per-Python-block bundle present (Architecture mermaid → Code → Walkthrough → Result → Insight) for every Python script
 [ ] §4  Mermaid hygiene: default `flowchart TD` (LR only for side-by-side subgraph clusters); edge-label parens quote-wrapped (`-->|"text<br/>(parens)"|`); subgraph titles ≤22 chars (no wrap/clip); horizontal multi-cluster layouts use `~~~` invisible-link chaining; node labels use `<br/>` not `\n`; TD blocks open with `%%{init: ... 'fontSize':'20px' ...}%%`, LR cluster blocks open with `%%{init: ... 'fontSize':'28px', ... 'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50 ...}%%` for article-body-sized text + no title-vs-first-node overlap
 [ ] §5  Bad-Case Journal — 3–5 entries in exact 3-field format
+[ ] §5  Every entry is REAL + MEASURED (no predicted / (planned) / hypothetical) — `python3 scripts/audit_bcj_measured.py` exits 0
 [ ] §5  New entries copied to global Bad-Case Journal.md
 [ ] §6  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
 [ ] §7  References — papers + docs + production examples
