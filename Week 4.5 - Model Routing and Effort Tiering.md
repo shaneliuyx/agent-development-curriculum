@@ -1293,26 +1293,88 @@ def _verdict_tier(cfg: str, prompt: str) -> str:
     return _RNG.choice(["haiku", "heavy"])  # random baseline
 
 
-def _run_cell(exec_t: str, prompt: str) -> tuple[str, int, int]:
-    """One executor completion at the routed tier. Capped + timed out. Real usage."""
+_MODE_SYS = {
+    "minimal": "Answer directly and concisely.",
+    "react": "Reason step by step (Think -> Act -> Observe), then give the final answer.",
+    "deliberate": "First outline a brief numbered plan, then execute it fully in this response.",
+}
+_MODE_MAXTOK = {"minimal": 512, "react": 2048, "deliberate": 2048}
+
+
+def _run_cell(exec_t: str, prompt: str, mode: str) -> tuple[str, int, int]:
+    """Mode-aware single completion at the routed tier. Gives a CORRECT model enough
+    budget + the right prompting to actually succeed on a hard task — fixing the
+    512-token truncation confound that made every config fail the strict judge.
+    Real usage; long timeout for the 2048-token heavy generations."""
     ep = FLEET[exec_t]
-    cli = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"), timeout=120.0)
+    cli = OpenAI(base_url=ep.base_url, api_key=os.getenv("OMLX_API_KEY"), timeout=180.0)
     r = cli.chat.completions.create(
         model=ep.model,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": _MODE_SYS.get(mode, _MODE_SYS["minimal"])},
+            {"role": "user", "content": prompt},
+        ],
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=_MODE_MAXTOK.get(mode, 1024),
     )
     resp = (r.choices[0].message.content or "").strip()
     u = r.usage
     return resp, (u.prompt_tokens if u else 0), (u.completion_tokens if u else 0)
 
 
-def _soft_success(response: str) -> bool:
-    if not response or len(response) < 20:
+JUDGE_BASE = "http://localhost:8317/v1"  # VibeProxy -> cloud Claude
+JUDGE_MODEL = "claude-sonnet-4-6"
+
+
+def _llm_judge_success(prompt: str, response: str) -> bool:
+    """Discriminating success grade via an LLM judge (Sonnet through VibeProxy).
+
+    Replaces the saturating soft grader (which passed any non-empty response). An
+    under-powered / shallow answer to a hard prompt is a FAIL — this is what lets the
+    bench distinguish router2 from random. User-only roles dodge VibeProxy's
+    persona-cloak (BCJ-5). Cheap pre-filter avoids a judge call on empties/refusals.
+    """
+    if not response or len(response) < 20 or "i cannot" in response.lower():
         return False
-    low = response.lower()
-    return not ("i cannot" in low or "i don't know" in low)
+    cli = OpenAI(base_url=JUDGE_BASE, api_key="vibeproxy", timeout=90.0)
+    rubric = (
+        "You are grading an LLM ROUTER's output: does RESPONSE acceptably answer PROMPT? "
+        "Reason through the steps below, THEN give a verdict. Be strict.\n\n"
+        "DEFINITIONS (what each criterion means):\n"
+        "- CORRECT = factually accurate. No fabricated facts, invented APIs/flags, or made-up\n"
+        "  citations. A confident wrong answer is worse than a hedged one.\n"
+        "- ADEQUATE = the answer's DEPTH matches the PROMPT's DIFFICULTY. A hard prompt (system\n"
+        "  design, multi-file/deep debugging, multi-step planning, non-trivial reasoning) needs\n"
+        "  substantive, specific analysis. A trivial prompt (a fact, arithmetic, a one-liner)\n"
+        "  only needs a short correct answer — extra length does NOT make it better.\n"
+        "- UNDER-POWERED = a hard prompt answered shallowly: a generic platitude, a restatement\n"
+        "  of the question, or a surface gloss where real analysis was required. This is a FAIL\n"
+        "  EVEN IF nothing in it is factually wrong — it is the tell that a weak model was\n"
+        "  mis-routed onto a task that needed a stronger one. (This is the whole point of the\n"
+        "  bench: catch when 'route the easy class to the cheap model' sent a HARD task there.)\n"
+        "- FAILURE MODES = auto-FAIL regardless of the above: empty, a refusal, off-topic, or\n"
+        "  hallucinated APIs/facts.\n\n"
+        "REASONING STEPS (write 1-2 short sentences for each, in order):\n"
+        "  1. DIFFICULTY: rate the PROMPT trivial / moderate / hard, and say why.\n"
+        "  2. CORRECTNESS: is RESPONSE factually right? Flag any fabrication.\n"
+        "  3. ADEQUACY: does RESPONSE's depth match the difficulty from step 1?\n"
+        "  4. FAILURE MODES: any empty / refusal / off-topic / hallucination?\n\n"
+        "FINAL LINE — output exactly one of (and nothing after it):\n"
+        "  VERDICT: PASS   -> only if CORRECT and ADEQUATE and NO failure mode\n"
+        "  VERDICT: FAIL   -> otherwise\n\n"
+        f"PROMPT:\n{prompt}\n\nRESPONSE:\n{response}"
+    )
+    out = cli.chat.completions.create(
+        model=JUDGE_MODEL,
+        messages=[{"role": "user", "content": rubric}],
+        max_tokens=600,
+    ).choices[0].message.content or ""
+    # CoT precedes the verdict — parse the LAST line containing "VERDICT". Default FAIL
+    # if the judge produced no parseable verdict (fail-closed: don't credit an ambiguous grade).
+    verdict_line = next(
+        (ln for ln in reversed(out.upper().splitlines()) if "VERDICT" in ln), ""
+    )
+    return "PASS" in verdict_line and "FAIL" not in verdict_line
 
 
 CONFIGS = ("heavy_always", "router2", "random")
@@ -1322,6 +1384,10 @@ CONFIGS = ("heavy_always", "router2", "random")
 @pytest.mark.slow
 def test_four_way_bench_runs_and_writes_results():
     _, eval_ = train_eval_split(load_probes())
+
+    # Mode is held CONSTANT across configs (router2's mode per row), so the bench isolates
+    # the TIER decision — only the executor model varies between configs, not the control-flow.
+    modes = {r["prompt"]: classify2(r["prompt"]).mode for r in eval_}
 
     agg: dict = {}
     for cfg in CONFIGS:
@@ -1333,7 +1399,7 @@ def test_four_way_bench_runs_and_writes_results():
         rows_ = []
         for r, exec_t in planned:
             t0 = time.perf_counter()
-            resp, in_tok, out_tok = _run_cell(exec_t, r["prompt"])
+            resp, in_tok, out_tok = _run_cell(exec_t, r["prompt"], modes[r["prompt"]])
             wall_ms = (time.perf_counter() - t0) * 1000
             rows_.append({
                 "exec_tier": exec_t,
@@ -1341,7 +1407,7 @@ def test_four_way_bench_runs_and_writes_results():
                 "in_tokens": in_tok,
                 "out_tokens": out_tok,
                 "cost_usd": _cost_usd(exec_t, in_tok, out_tok),
-                "success": _soft_success(resp),
+                "success": _llm_judge_success(r["prompt"], resp),
             })
 
         walls = sorted(r["wall_ms"] for r in rows_)
@@ -1571,9 +1637,9 @@ Headline metric is **not** accuracy — it is **false-negative leak rate** (sens
 
 ---
 
-## 5. Bad-Case Journal (6 entries — PRE-FLIGHT)
+## 5. Bad-Case Journal  
 
-Entries 1, 2, 4, 5, 6 are **pre-flight**: symptoms, root causes, and fixes derived from the convergent failure literature (agenticSeek, PAI, RouteLLM, RouterBench) and this chapter's mechanisms — they do not depend on a lab run; their numbers are *targets/placeholders*. **Entry 3 is now MEASURED** (the Phase 4 vote ran and regressed). The remaining measured bad-cases from the Phase 4/4b runs — BART-vote noise, the VibeProxy `system`-role persona-cloak, `temperature` deprecated on reasoning models, and the taxonomy-too-fine ceiling — live in the lab `RESULTS.md` as **BCJ-4..7**; copy them into the global `Bad-Case Journal.md` (Pattern 21) alongside Entry 3.
+Entries 1, 2, 4, 5, 6 are **pre-flight**: symptoms, root causes, and fixes derived from the convergent failure literature (agenticSeek, PAI, RouteLLM, RouterBench) and this chapter's mechanisms — they do not depend on a lab run; their numbers are *targets/placeholders*. **Entry 3 is now MEASURED** (the Phase 4 vote ran and regressed). The remaining measured bad-cases from the Phase 4/4b AND Phase 5 runs — BART-vote noise, the VibeProxy `system`-role persona-cloak, `temperature` deprecated on reasoning models, the taxonomy-too-fine ceiling, the Phase 5 cold-load hang (>1 h → 7m49s via loop-reorder + sort-by-model), and the saturated-grader/starved-executor confound (a "green" bench that measured nothing → fixed with a CoT LLM-judge + mode-aware executor) — live in the lab `RESULTS.md` as **BCJ-4..9**; copy them into the global `Bad-Case Journal.md` (Pattern 21) alongside Entry 3.
 
 **Entry 1 — Classifier silently miscategorizes domain-shift prompts.**
 *Symptom:* per-tier accuracy holds at ~0.87 on the chapter's eval split but falls toward ~0.70 once you feed your own workload's prompts. No error, no crash — the verdicts just name the wrong tier, surfacing only as "easy questions feel slow, hard questions get shallow answers."
@@ -1588,7 +1654,7 @@ Entries 1, 2, 4, 5, 6 are **pre-flight**: symptoms, root causes, and fixes deriv
 **Entry 3 — Vote layer regressed accuracy and erased the latency win (MEASURED 2026-06-16).**
 *Symptom:* adding the BART-MNLI vote dropped per-tier accuracy from 82.61% (single 4B) to **60.87%** and tripled latency (32 s → 93 s on the 23-row eval). The Pareto win vanished; the vote collapsed onto the expensive corner.
 *Root cause:* BART-MNLI is an *independent but incompetent* second voter — a topic classifier judging routing-meta labels disagrees with Qwen on **83%** of rows. The safety-bias "escalate on disagree" rule then fired on 83% of queries, bumping nearly everything to the heavy tier. Escalate-always + high-disagreement is de-facto heavy-always (the RouteLLM cascade-collapse). A confidence-gated vote and a learned `AdaptiveClassifier` second voter both *avoided* the regression but added **no gain** — a vote cannot beat its best voter.
-*Fix:* **drop the vote.** The accuracy problem was never the tie-break rule — it was the taxonomy: the sonnet↔opus boundary has only 78% inter-annotator agreement (a blind Opus re-label). Collapsing to 2 tiers `{haiku, heavy}` (`src/router2.py`) lifted tier to **95.65%** with no vote at all (Phase 4b). Keep the disagreement log only as a label-review queue, not an accuracy mechanism. Full numbers + the two frontier-API traps (VibeProxy `system`-role persona-cloak; `temperature` deprecated on reasoning models) in lab `RESULTS.md` BCJ-4..7.
+*Fix:* **drop the vote.** The accuracy problem was never the tie-break rule — it was the taxonomy: the sonnet↔opus boundary has only 78% inter-annotator agreement (a blind Opus re-label). Collapsing to 2 tiers `{haiku, heavy}` (`src/router2.py`) lifted tier to **95.65%** with no vote at all (Phase 4b). Keep the disagreement log only as a label-review queue, not an accuracy mechanism. Full numbers + the two frontier-API traps (VibeProxy `system`-role persona-cloak; `temperature` deprecated on reasoning models) in lab `RESULTS.md` BCJ-4..9.
 
 **Entry 4 — Executor tier endpoint unavailable → no fallback path, pipeline stalls.**
 *Symptom:* oMLX reassigns a port, or an executor tier OOMs; `dispatch()` to that tier hangs or throws and the whole router pipeline dies on a single endpoint outage — even though the other two tiers are healthy.
