@@ -1390,16 +1390,16 @@ The routed config is the **2-tier router** (`router2.py`): haiku-class → cheap
 
 ```mermaid
 quadrantChart
-    title Phase 5 — cost vs success (fair executor, LLM-judge, n=23)
+    title Phase 5 cost vs success (n=23)
     x-axis "Low cost" --> "High cost"
     y-axis "Low success" --> "High success"
     quadrant-1 "costly + strong"
     quadrant-2 "cheap + strong (ideal)"
     quadrant-3 "cheap + weak"
     quadrant-4 "costly + weak (avoid)"
-    "heavy_always": [0.96, 0.78]
-    "router2": [0.93, 0.57]
-    "random": [0.08, 0.43]
+    "heavy_always": [0.80, 0.80]
+    "router2": [0.78, 0.57]
+    "random": [0.16, 0.43]
 ```
 
 **Honest interpretation — the classifier works, but routing is Pareto-dominated here.**
