@@ -2198,6 +2198,8 @@ if __name__ == "__main__":
 
 **Result:** `$PY examples/example_graph.py` (live oMLX) prints the created graph and its 5 node names, the manual trigger's `run_id`, all five nodes `DONE`, `run status: done`, a `pool result` with `peak_concurrency: 4` (the parallel fan-out), a `cost report` with `tokens_total: 195` and a small `usd_cloud_equivalent`, and the path to the exported `cost.csv`. Requires oMLX serving `Qwen2.5-Coder-7B-Instruct-MLX-4bit` on `:8000`.
 
+**Measured (2026-06-17, live oMLX).** Run `r_bc350dfff2be` (graph `g_b651c363be17`, trigger=manual): 5/5 nodes `DONE`, `run status: done`, `peak_concurrency: 4`, wall-clock **1.366 s**, tokens **185 in + 10 out = 195**, cloud-equivalent **$0.000188**. The per-node `cost.csv` (37 in + 2 out per node, `attempt 1`, no retries) carries the fan-out's **Amdahl signature**: wall-clock 1366 ms ≈ `n1` (649.7 ms — the serial root, runs alone) + the slowest leaf (`n5` 667.3 ms) = **1317 ms**, *not* the 2784.79 ms sum of all five node latencies — direct proof the four leaves (n2–n5) overlapped. Full run summary + per-node ledger in the lab's `RESULTS.md` (§ End-to-end demo).
+
 `★ Insight ─────────────────────────────────────`
 - **A runnable end-to-end example is the cheapest correctness signal a reader gets.** Before any test or bench, `example_graph.py` proves the copied files import, wire, and run — every seam exercised once, every result printed for eyeball verification.
 - **Starting the run only through `trigger_manually` keeps the architecture honest even in the demo.** The example could have called `start_run` directly; routing through the scheduler is a deliberate reminder that runs are externally fired, never self-prompted.
