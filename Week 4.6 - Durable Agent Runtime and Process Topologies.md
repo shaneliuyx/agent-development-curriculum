@@ -1,7 +1,7 @@
 ---
 title: "Week 4.6 — Durable Agent Runtime and Process Topologies"
 created: 2026-05-14
-updated: 2026-06-16
+updated: 2026-06-17
 tags:
   - agent
   - runtime
@@ -857,17 +857,23 @@ core. The durability test (tests/test_durability.py) leans on exactly this: it
 runs the runtime with a deterministic `tool_handler` so a kill-and-recover test
 has zero LLM nondeterminism.
 
-WHY we call the raw OpenAI client and not shared/llm.chat:
-shared/llm.chat returns only the text and DISCARDS `response.usage`. This lab's
-headline number is *real* token counts summed across a topology, so we must read
-`usage.prompt_tokens` / `usage.completion_tokens` off the raw response ourselves.
+WHY token counts are real:
+this lab's headline number is *real* token counts summed across a topology. We
+get them from `shared/llm.chat_usage`, which returns `(text, usage)` in one call
+(usage = prompt/completion/total tokens off `response.usage`) — so the handler
+never has to hand-roll a raw client just to keep the usage the cost story needs.
 """
 from __future__ import annotations
 
+import os
+import sys
 import time
 from typing import Any, Callable
 
-from graph_store import Node
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "shared"))
+
+from graph_store import Node  # noqa: E402
+from llm import chat_usage  # noqa: E402
 
 # Tiny generation budget: this lab measures topology/throughput, not output
 # quality. Short prompts + small max_tokens keep oMLX from thrashing and keep
@@ -893,10 +899,11 @@ def make_llm_handler(
 ) -> Callable[[Node], dict[str, Any]]:
     """Build a handler that calls oMLX for one node and captures REAL usage.
 
-    `client` is a raw `openai.OpenAI` pointed at oMLX :8000 (so we get
-    `response.usage`). If `cost_meter` is passed, the call is wrapped in
-    `cost_meter.meter(...)` keyed by (run_id, node, attempt) so retries don't
-    double-bill. Returns {"tokens": total, "ms": wall, "text": ...}."""
+    `client` is an `openai.OpenAI` pointed at oMLX :8000; the call goes through
+    `shared/llm.chat_usage`, which returns `(text, usage)` so we get real token
+    counts without re-reading `response.usage` by hand. If `cost_meter` is passed,
+    the call is wrapped in `cost_meter.meter(...)` keyed by (run_id, node, attempt)
+    so retries don't double-bill. Returns {"tokens": total, "ms": wall, "text": ...}."""
 
     def handler(node: Node) -> dict[str, Any]:
         prompt = node.payload.get("prompt", "Reply with the single word: ok.")
@@ -904,18 +911,15 @@ def make_llm_handler(
 
         def _call() -> dict[str, Any]:
             start = time.perf_counter()
-            resp = client.chat.completions.create(
-                model=node_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=_MAX_TOKENS,
-            )
+            text, usage = chat_usage(client, prompt, node_model,
+                                     temperature=0.0, max_tokens=_MAX_TOKENS)
             ms = (time.perf_counter() - start) * 1000.0
-            usage = resp.usage
-            t_in = getattr(usage, "prompt_tokens", 0) or 0
-            t_out = getattr(usage, "completion_tokens", 0) or 0
-            text = resp.choices[0].message.content or ""
-            return {"_t_in": t_in, "_t_out": t_out, "ms": ms, "text": text}
+            return {
+                "_t_in": usage["prompt_tokens"],
+                "_t_out": usage["completion_tokens"],
+                "ms": ms,
+                "text": text,
+            }
 
         if cost_meter is not None:
             with cost_meter.meter(node.run_id, node.name, node.attempts,
@@ -938,14 +942,14 @@ def make_llm_handler(
 
 **Block 1 — The handler is the seam that lets the durability core stay model-agnostic.** `graph_store` + `worker_pool` own claim/retry/recover and never know what a node *computes*; a handler turns a claimed `Node` into a result dict. That split is why the kill-and-recover test can run the exact same runtime with a deterministic `tool_handler` (a sleep) and get zero LLM nondeterminism, while the bench swaps in `make_llm_handler` against live oMLX — same scheduler, different payload.
 
-**Block 2 — `make_llm_handler` calls the RAW OpenAI client specifically to keep `response.usage`.** The lab's headline number is *real* summed token counts, and the shared `llm.chat` helper discards `response.usage`. So this handler builds the client call itself and reads `usage.prompt_tokens` / `usage.completion_tokens` off the raw response. `temperature=0.0` plus a tiny `_MAX_TOKENS=64` make usage deterministic and keep each node's wall-clock dominated by structure, not generation — which is what lets the bench attribute time differences to topology.
+**Block 2 — `make_llm_handler` goes through `shared/llm.chat_usage` to keep `response.usage`.** The lab's headline number is *real* summed token counts. Plain `llm.chat` returns only text, so rather than bypass the shared helper, we gave it a sibling: `chat_usage(client, prompt, model, temperature, max_tokens)` returns `(text, usage)` with prompt/completion/total tokens read off `response.usage` once, centrally. The handler calls that and unpacks the usage dict. `temperature=0.0` plus a tiny `_MAX_TOKENS=64` make usage deterministic and keep each node's wall-clock dominated by structure, not generation — which is what lets the bench attribute time differences to topology.
 
 **Block 3 — Metering is opt-in and keyed by `(run_id, node, attempt)`.** When a `cost_meter` is passed, the call is wrapped in `cost_meter.meter(...)` and `m.record(t_in, t_out)` fires after the response returns (usage is unknowable before the call). The `node.attempts` in the key is what makes a retried node idempotent in the ledger (Phase 4). With no meter, the handler degrades to a bare call — the durability test path, which prices nothing.
 
 **Result:** `make_llm_handler` is the handler for all four bench topologies; `tool_handler` is the handler for `tests/test_durability.py` and the bench's recovery probe. Per llm node, real usage is ~33 prompt + ~6 completion tokens → the 195-token per-topology total (5 nodes) reported in Phase 4/5.
 
 `★ Insight ─────────────────────────────────────`
-- **Reading `response.usage` is non-negotiable for a cost story.** A convenience wrapper that returns only text silently destroys the one number this lab exists to measure; the handler reaches past it to the raw client on purpose.
+- **Reading `response.usage` is non-negotiable for a cost story.** A convenience wrapper that returns only text silently destroys the one number this lab exists to measure — so the fix was to give the shared helper a `chat_usage` variant that returns `(text, usage)`, not to bypass it. Read usage once, centrally; don't re-hand-roll a raw client in every lab that needs tokens.
 - **A deterministic `tool_handler` is what makes the durability test trustworthy.** Swapping the LLM for a sleep removes model nondeterminism from the kill-and-recover proof, so a failure is a runtime bug, never a flaky generation.
 - **The handler closure threads the cost meter without the runtime knowing.** `worker_pool` calls `handler(node)` with no idea metering happened — cost stays a handler-local concern, decoupled from scheduling.
 `─────────────────────────────────────────────────`
@@ -1448,6 +1452,39 @@ class Scheduler:
             reg.timer = None
 ```
 
+**Architecture — the four 5-node shapes (node-edge structure is the only variable).** All four graphs hold node count (5), model, and prompt constant; only the *edges* differ. Read each shape's available parallelism off its widest fan-out — that is the `concurrency` each builder returns: **sequential** 1 (linear chain), **parallel** 4 (1→4 fan-out), **hierarchical** 3 (manager→3 workers→gather), **workflow** 1 (linear, plus a *durable* `validate→gen` feedback edge — modeled via `mark_failed`'s persisted retry counter, not an in-memory while-loop).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'28px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50}}}%%
+flowchart LR
+  subgraph SEQ["Sequential"]
+    direction TB
+    s1[n1] --> s2[n2] --> s3[n3] --> s4[n4] --> s5[n5]
+  end
+  subgraph PAR["Parallel"]
+    direction TB
+    p1[n1] --> p2[n2]
+    p1 --> p3[n3]
+    p1 --> p4[n4]
+    p1 --> p5[n5]
+  end
+  subgraph HIER["Hierarchical"]
+    direction TB
+    h1[manager] --> h2[worker1]
+    h1 --> h3[worker2]
+    h1 --> h4[worker3]
+    h2 --> h5[gather]
+    h3 --> h5
+    h4 --> h5
+  end
+  subgraph WF["Workflow"]
+    direction TB
+    w1[precheck] --> w2[gen] --> w3[validate] --> w4[finalize] --> w5[postcheck]
+    w3 -.->|"mark_failed<br/>(durable retry)"| w2
+  end
+  SEQ ~~~ PAR ~~~ HIER ~~~ WF
+```
+
 **Code:** (`src/topologies.py` — the ENTIRE file: docstring, `BENCH_MODEL`, `_node`, and all four builders (`sequential` / `parallel` / `hierarchical` / `workflow`); verbatim)
 
 ```python
@@ -1600,7 +1637,7 @@ from topologies import (  # noqa: E402
 from worker_pool import run_graph  # noqa: E402
 
 OMLX_BASE = "http://localhost:8000/v1"
-REPEATS = 2
+REPEATS = int(os.environ.get("BENCH_REPEATS", "5"))  # wall-clock mean; >=5 for stable seq
 HARDWARE = "Apple M5 Pro, 48GB"
 
 _BUILDERS = {
@@ -1779,21 +1816,45 @@ if __name__ == "__main__":
 
 **Block 4 — `_measure_recovery` is the only place the bench induces a REAL crash.** It drains a deterministic tool-node chain in a spawned child (`_child_drain`), waits until at least one node is `DONE`, then `proc.kill()` (SIGKILL) mid-run — leaving an orphaned `RUNNING` row. A fresh `GraphStore` (simulating a restarted process) calls `recover_run` and finishes the rest, and only the *recovery phase* (fresh-store → run done) is timed. `main` runs the four topologies then the recovery probe, renders the table, and writes `RESULTS.md` from an f-string so the committed numbers are exactly the ones this run produced — nothing is hand-entered.
 
-**Result:** Live four-topology bench (`RESULTS.md`, M5 Pro 48GB, 2026-06-16, repeats=2):
+**Result:** Live four-topology bench (`RESULTS.md`, M5 Pro 48GB, 2026-06-17, repeats=5):
 
-| topology | mean wall-clock (s) | total tokens | peak concurrency | recovery time (s) |
-|---|---|---|---|---|
-| sequential | 1.076 | 195 | 1 | 1.221 |
-| parallel | 0.901 | 195 | 4 | — |
-| hierarchical | 0.915 | 195 | 3 | — |
-| workflow | 0.926 | 195 | 1 | — |
+| topology | mean wall-clock (s) | total tokens | peak concurrency |
+|---|---|---|---|
+| sequential | 0.994 | 195 | 1 |
+| parallel | 0.903 | 195 | 4 |
+| hierarchical | 0.921 | 195 | 3 |
+| workflow | 0.928 | 195 | 1 |
 
-Honest reading: the wall-clocks are close (0.90–1.08s) because at 7B speed with tiny prompts, per-call latency dominates these short critical paths. But the ordering is real and correct — sequential is the slowest, parallel the fastest; peak concurrency (1 / 4 / 3 / 1) cleanly reflects each shape; and identical 195-token totals confirm structure was isolated from work volume. Recovery: a real SIGKILL mid-run, then a fresh-store `recover_run` finished the remaining nodes in 1.221s — the recovery time is dominated by the residual tool-node sleeps (the cost of *finishing* the run), since `recover_run` itself is a single table update.
+**Recovery** (topology-agnostic — one probe on a dedicated linear tool-node chain, *not* tied to any row above): **1.227s** from fresh-store `recover_run` to run done.
+
+Honest reading: the wall-clocks are close (0.90–0.99s) because at 7B speed with tiny prompts, per-call latency dominates these short critical paths. But the ordering is real and correct — sequential is the slowest, parallel the fastest; peak concurrency (1 / 4 / 3 / 1) cleanly reflects each shape; and identical 195-token totals confirm structure was isolated from work volume. (Methodology note: at `repeats=2` one early run clocked sequential at 2.385s — a background-load outlier; the `repeats=5` mean smooths it to 0.994s. Wall-clock needs ≥5 repeats to be stable on a shared box; tokens and peak concurrency are deterministic and never moved across runs. This is itself the lesson — anchor a claim on a stable mean, not a 2-sample fluke.)
+
+**Why recovery is one number, not a per-topology column.** Recovery is a property of the `GraphStore`+scheduler layer that sits *below* topology shape — a topology is only an edge set fed to the same store, so the durability mechanism is identical for all four. Crash any of them and `recover_run` flips the orphaned `RUNNING` node → `READY`, then `_promote_downstream` resumes by `deps_json`. So recovery *capability* is shared and measured once (on a dedicated linear chain); the 1.227s is dominated by the residual tool-node sleeps — the cost of *finishing*, since `recover_run` itself is a single table UPDATE. (Recovery *time* would track the same critical-path logic as the table above — a parallel remainder finishes faster than a sequential one — but the durability guarantee, not its shape-dependent finish cost, is what this lab tests.)
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  SEQ["sequential<br/>edges only"]
+  PAR["parallel<br/>edges only"]
+  HIER["hierarchical<br/>edges only"]
+  WF["workflow<br/>edges only"]
+  SEQ --> GS
+  PAR --> GS
+  HIER --> GS
+  WF --> GS
+  subgraph RUNTIME["shared durable runtime"]
+    GS["GraphStore SQLite<br/>nodes / edges / event log"]
+    GS --> REC["recover_run<br/>orphaned RUNNING to READY"]
+    REC --> PROM["promote_downstream<br/>deps all DONE to READY"]
+    PROM --> POOL["scheduler / worker_pool<br/>claim READY, run, repeat"]
+    POOL --> GS
+  end
+```
 
 `★ Insight ─────────────────────────────────────`
 - **Close wall-clocks are not a null result — the ordering and concurrency ARE the finding.** At 7B speed with tiny prompts, per-call latency swamps a 5-node critical path, so the absolute gaps are small; the correct sequential-slowest / parallel-fastest ordering and the 1/4/3/1 concurrency profile are what prove structure mattered. The honest framing (report the gap AND why it's small) is the senior signal.
 - **Identical 195-token totals are the control that validates the experiment.** Constant tokens across all four shapes prove the bench isolated *structure*, not work volume — without that control, a wall-clock difference could just mean "this graph did more."
-- **Recovery time measures finishing, not recovering.** `recover_run` is one UPDATE; the 1.221s is the residual sleeps of the un-run nodes. Separating "cost to recover" from "cost to finish" is what keeps the recovery number honest.
+- **Recovery time measures finishing, not recovering.** `recover_run` is one UPDATE; the 1.227s is the residual sleeps of the un-run nodes. Separating "cost to recover" from "cost to finish" is what keeps the recovery number honest — and it's a property of the shared runtime layer, so it's measured once, not per topology.
 `─────────────────────────────────────────────────`
 
 ### The durability proof — `tests/test_durability.py`
@@ -2077,7 +2138,7 @@ My execution state lives in four SQLite tables, not in Python locals, so a `kill
 
 **(b) "When would you pick parallel versus sequential topology, and can you prove it matters?"**
 
-I benchmarked four topologies on identical 5-node DAGs, one constant 7B model, holding token count fixed at 195 so structure was the only variable. Parallel came in fastest at 0.901s with peak concurrency 4; sequential was slowest at 1.076s with concurrency 1. The wall-clock gap is small because at 7B speed per-call latency dominates a short critical path — but the ordering is real, and the 1/4/3/1 concurrency profile cleanly tracks each shape. Pick parallel for independent fan-out, sequential when ordering is the requirement.
+I benchmarked four topologies on identical 5-node DAGs, one constant 7B model, holding token count fixed at 195 so structure was the only variable. Parallel came in fastest at 0.903s with peak concurrency 4; sequential was slowest at 0.994s with concurrency 1. The wall-clock gap is small because at 7B speed per-call latency dominates a short critical path — but the ordering is real, and the 1/4/3/1 concurrency profile cleanly tracks each shape. Pick parallel for independent fan-out, sequential when ordering is the requirement.
 
 **(c) "What's a real concurrency bug you hit building it?"**
 

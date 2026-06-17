@@ -168,22 +168,7 @@ Goal: handle the user-changes-their-mind case. Mid-run user input triggers `reco
 
 ## 5. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
-Pre-flight entries scoped from convergent failure modes in PAI v5.0.0 release notes + Reflexion paper §6 + Anthropic agents blog post §evaluation. Final entries populated post-implementation.
-
-**Entry 1 (planned) — LLM-judge bias inflates "all pass" verdicts.**
-*Scoped from:* Reflexion §6 (LLM-judge collusion when judge and actor share weights / family). Symptom: 100% ISC pass on llm_judge ISCs, 50% pass on mechanical ISCs — the gap IS the bias.
-
-**Entry 2 (planned) — ISC under-specification leads to infinite hill-climbing.**
-*Scoped from:* PAI v5.0.0 release notes warning on "ambiguous criteria". Symptom: an ISC's mechanical check passes after one action, but the spirit of the criterion is not met; agent loops forever or terminates prematurely.
-
-**Entry 3 (planned) — Reconciliation race when user updates during a long turn.**
-*Scoped from:* general agent-systems concurrency. Symptom: agent finishes a 90-second action against the OLD ISA; reconciliation event arrived 30 seconds in; verification runs against NEW ISA and silently passes the wrong artifact.
-
-**Entry 4 (planned) — ISC verification cost dominates main work.**
-*Scoped from:* Anthropic agents blog §evaluation cost. Symptom: re-verifying the full ISC set every turn (Phase 4 design) costs more tokens than the action itself; mitigation: incremental verification with cached results invalidated only on actions touching the relevant artifacts.
-
-**Entry 5 (planned) — Ambiguous Vision→Criteria translation by the scaffolder.**
-*Scoped from:* PAI v5.0.0 release notes example failures. Symptom: scaffolder produces ISCs that are vacuously true (e.g., `verification_type: regex, payload: ".*"` — matches anything); mitigation: scaffolder unit test that rejects trivially-passable verification payloads.
+_This chapter is a SPEC draft; its Bad-Case Journal is intentionally empty. Per the MEASURED-ONLY INVARIANT (CLAUDE.md §5), only failures reproduced in a live lab run belong here — and the lab has not been built. Real entries land once it is._
 
 ---
 

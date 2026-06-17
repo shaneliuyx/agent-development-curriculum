@@ -395,22 +395,7 @@ Push to GitHub. Add the repo to your portfolio list in `target_companies.md` (Ap
 
 ## Bad-Case Journal
 
-> _Lab not yet executed by curriculum reader as of 2026-05-07. Per the chapter discipline established this week (entries must come from `RESULTS.md`, not pre-experiment speculation), this section is intentionally empty until the first run lands. Three slots reserved below for the most likely failure-mode shapes; populate with real symptoms + fixes after the timed exercise completes._
-
-**Slot 1 — (TBD: chunker / corpus-prep failure observed during Phase 3)**
-*Symptom:* (populate after run)
-*Root cause:* (populate after run)
-*Fix:* (populate after run)
-
-**Slot 2 — (TBD: eval-gate calibration failure observed during Phase 4)**
-*Symptom:* (populate after run)
-*Root cause:* (populate after run)
-*Fix:* (populate after run)
-
-**Slot 3 — (TBD: screencast over-budget or scope drift observed during Phase 5)**
-*Symptom:* (populate after run)
-*Root cause:* (populate after run)
-*Fix:* (populate after run)
+> _Lab not yet executed by curriculum reader as of 2026-05-07. Per the chapter discipline established this week (entries must come from `RESULTS.md`, not pre-experiment speculation), this section is intentionally empty until the first run lands._
 
 **Cross-cutting candidates** to watch for (NOT entries until observed): (a) reusing `shared/rag_hybrid` introduces a sys.path bootstrap edge case if the repo is cloned without the parent `agent-prep/` repo; (b) `[doc:DOC_ID]` citation-binding fails if doc IDs collide across chunked windows; (c) the 4-hour budget under-allocates Phase 6 because Phase 3 iteration overruns are common.
 

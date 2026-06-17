@@ -160,13 +160,7 @@ Verification: write 4 detector functions matching the attacks (schema hash pin, 
 
 ## 5. Bad-Case Journal (3-5 entries — SPEC — to be filled after lab run)
 
-Candidate failure surfaces — entries will be populated with concrete symptom/root-cause/fix after Phase 1-6 actual runs.
-
-- **Phase 1 — Mcp-Session-Id collision under concurrent first-request races.** Likely surface: two clients send first requests within the same millisecond; both get the same random id (insufficient entropy in test fixtures using `random.random()` instead of `secrets.token_hex(16)`). Server merges sessions silently. Fix: `secrets.token_hex(16)` for cryptographic randomness; collision check on session map insertion.
-- **Phase 2 — Origin allowlist matches as prefix, not suffix.** Likely surface: rule `https://*.example.com` written as `startswith("https://*.example.com")` accepts `https://*.example.com.attacker.net`. Fix: parse the pattern, split host into segments, suffix-match the right side.
-- **Phase 3 — Event ring buffer evicts events while client is mid-reconnect.** Likely surface: 100-event buffer fills + reconnect happens at event 105; events 1-5 already evicted; replay misses them. Fix: parameterize buffer size; emit "buffer too small for last-event-id" error on cap-exceeded replay request.
-- **Phase 5 — Gateway forgets to clean up upstream sessions when external session terminates.** Likely surface: external client DELETEs the session; gateway closes the external session but leaves N upstream sessions running. Memory leak over many connect/disconnect cycles. Fix: gateway tracks upstream-session-id list per external-session; cascades DELETE on cleanup.
-- **Phase 6 — Tool-poisoning detector flags legitimate schema changes as attacks.** Likely surface: legitimate version bump renames a tool; name-similarity check fires on the new name vs old name. False positive blocks rollouts. Fix: name-similarity check operates on UNAUTHORIZED schema changes only (compare against per-server pin list, not against arbitrary historical state).
+_This chapter is a SPEC draft; its Bad-Case Journal is intentionally empty. Per the MEASURED-ONLY INVARIANT (CLAUDE.md §5), only failures reproduced in a live lab run belong here — and the lab has not been built. Real entries land once it is._
 
 ---
 

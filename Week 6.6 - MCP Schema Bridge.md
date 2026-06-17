@@ -157,22 +157,7 @@ Goal: extend `@mcp_tool` to detect `AsyncGenerator[T, None]` in the return annot
 
 ## 5. Bad-Case Journal (3-5 entries — (SPEC — to be filled after lab run))
 
-Pre-flight entries scoped from convergent failure modes in MCP / FastMCP / PraisonAI / AutoGPT issue trackers; final entries populated post-implementation.
-
-**Entry 1 (planned) — `Optional[X]` schema emits `null` in `type` array instead of dropping field from `required`.**
-*Scoped from:* PraisonAI mcp_utils issue thread + MCP spec ambiguity on `Optional` representation. Two conventions exist (`{"type": ["X", "null"]}` vs `{"type": "X"}` + dropped from `required`); MCP convention is the latter; getting it wrong silently breaks Claude Desktop's renderer.
-
-**Entry 2 (planned) — `Union[A, B, C]` schema explodes; LLM picks the wrong branch.**
-*Scoped from:* JSON-Schema `oneOf` discrimination edge cases. Without a `discriminator` field, the LLM can't tell which branch it's emitting and the validator can't either; both A and B may validate the same payload. Fix: add `Literal` discriminator field on each branch, or use Pydantic discriminated unions.
-
-**Entry 3 (planned) — Missing docstring on parameter; LLM hallucinates the meaning.**
-*Scoped from:* MCP spec doesn't require parameter descriptions, but the consumer LLM treats their absence as a hint to guess. The decorator should require docstring-parsed parameter descriptions and fail registration if any parameter lacks one.
-
-**Entry 4 (planned) — Streaming-output tool deadlocks on consumer buffering.**
-*Scoped from:* AutoGPT issue trackers + general async-generator gotchas. The MCP stdio transport is line-buffered; if the consumer doesn't read frames as they arrive, the server's `yield` blocks. Fix: client must consume frames in a dedicated task, not interleave with other LLM calls on the same coroutine.
-
-**Entry 5 (planned) — Schema evolution: adding a required field breaks existing consumers.**
-*Scoped from:* general API-versioning practice + the senior-eng signal in §2.2. Manifested as: prod consumer suddenly fails `inputSchema` validation after a server redeploy because a new required parameter appeared. Fix: never add required fields to an existing tool; version the tool name (`calculator_v2`), keep `calculator_v1` for a deprecation window.
+_This chapter is a SPEC draft; its Bad-Case Journal is intentionally empty. Per the MEASURED-ONLY INVARIANT (CLAUDE.md §5), only failures reproduced in a live lab run belong here — and the lab has not been built. Real entries land once it is._
 
 ---
 
