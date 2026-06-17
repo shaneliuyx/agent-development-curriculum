@@ -1510,4 +1510,98 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 
 ---
 
+## 2026-06-16 — Week 4.5 — An independent-but-incompetent vote (BART-MNLI) regressed tier accuracy 82.61% → 60.87%
+
+*Symptom:* adding a BART-MNLI second-classifier vote dropped per-tier accuracy from 82.61% (single 4B few-shot) to **60.87%** and tripled latency (32 s → 93 s) on the 23-row eval.
+*Root cause:* BART-MNLI (a topic classifier) disagreed with the Qwen router on **83%** of rows; the escalate-on-disagree rule then bumped 83% of queries to the heavy tier — de-facto heavy-always. A vote cannot beat its best voter.
+*Fix:* drop the vote (keep the disagreement log as a label-review queue). A confidence-gated vote and a learned `AdaptiveClassifier` voter both avoided the regression but added no gain.
+
+**Generalizes to:** any ensemble where the added voter is *independent but individually weaker* — disagreement then becomes noise the tie-break amplifies. A second classifier helps only if it is independent AND individually accurate.
+
+**Tags:** #routing #classifier #ensemble #vote-regression #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 1)
+
+---
+
+## 2026-06-16 — Week 4.5 — The tier-accuracy ceiling (82.61%) was label noise, not model size
+
+*Symptom:* 3-way tier accuracy plateaued at exactly **82.61%** across a 4B, gemma-26B, Sonnet, and Opus — no bigger model and no vote beat it.
+*Root cause:* a blind Opus re-label of the eval set agreed with the original tiers only **78%** (5/23 disputed, all on the sonnet↔opus boundary). A classifier cannot exceed the self-agreement of its ground truth, so 82.61% *is* the label-noise ceiling of a too-fine taxonomy.
+*Fix:* collapse the contested boundary — merge sonnet+opus into one `heavy` tier. 2-way tier jumped to **95.65%** with the same 4B (`src/router2.py`).
+
+**5-second sanity test:** when an accuracy wall is flat across model sizes, stop scaling the model and re-label a sample blind — if inter-annotator agreement ≈ the wall, the labels are the ceiling.
+
+**Tags:** #routing #label-noise #taxonomy #accuracy-ceiling #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 2)
+
+---
+
+## 2026-06-16 — Week 4.5 — Frontier model answered the prompt instead of classifying it (VibeProxy persona-cloak)
+
+*Symptom:* Claude Sonnet/Opus via VibeProxy returned prose ("TCP vs UDP: …", "I'm Claude Code…"), not JSON → 6/23 parse failures → a bogus 56% score.
+*Root cause:* VibeProxy (`:8317`) injects its OWN system prompt server-side; a caller-supplied `system` role triggers the Claude-Code persona-cloak (recurrence of the W3.5.9 finding). User-only callers survive; system-role callers do not.
+*Fix:* no caller `system` role — fold the rubric into the first `user` turn. Parse failures 6 → 0; Sonnet/Opus then scored 82.61 tier / 91.30 mode.
+
+**Generalizes to:** any router-style proxy that owns the system prompt — passing your own `system` role can silently swap the persona. Probe with a user-only call first. Cross-ref [[Week 3.5.9]] (same VibeProxy cloak).
+
+**Tags:** #vibeproxy #persona-cloak #system-role #json-parse #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 3)
+
+---
+
+## 2026-06-16 — Week 4.5 — Reasoning model rejected a standard parameter (frontier-API drift)
+
+*Symptom:* `claude-opus-4-8` via VibeProxy → `400 invalid_request_error: temperature is deprecated for this model`.
+*Root cause:* the harness hardcoded `temperature=0.0` (fine for the local oMLX endpoint); reasoning models drop the parameter. A harness tuned to one OpenAI-compatible endpoint breaks on a frontier one — different contract.
+*Fix:* omit `temperature` for reasoning models; gate model-specific params by model id.
+
+**Tags:** #frontier-api #api-drift #temperature #reasoning-model #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 4)
+
+---
+
+## 2026-06-16 — Week 4.5 — Phase 5 bench hung >1 h: cold-load thrash on one-hot oMLX
+
+*Symptom:* the cost-latency bench ran over an hour without finishing.
+*Root cause:* a `for row: for config:` loop swapped the executor model ~90× on one-hot oMLX; each swap cold-loads a heavy model (~10–30 s) → ~30–60 min in pure model loading.
+*Fix:* loop `for config:` and **sort each config's rows by executor model** so each model loads once per config. 1 h+ → **7m49s** (same 69 calls, ~6 cold-loads instead of ~90).
+
+**Generalizes to:** any one-hot / single-resident accelerator (one model in VRAM at a time). The dominant cost is swap count, not request concurrency — batch work by resident model. Cross-ref [[Week 4.6 - Durable Agent Runtime and Process Topologies]] (cold-load thrash lineage).
+
+**Tags:** #benchmark #cold-load #scheduling #one-hot-inference #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 5)
+
+---
+
+## 2026-06-16 — Week 4.5 — A "green" bench that measured nothing (saturated grader + starved executor)
+
+*Symptom:* the first fair run gave `success_rate = 1.00` for **all** configs (router indistinguishable from random); after a strict grader, success cratered to **~0.22** for all — still indistinguishable.
+*Root cause:* two stacked confounds — (1) a soft grader passed any non-empty response (saturated, no discrimination); (2) a single 512-token executor truncated hard tasks. The bench measured "can one short shot answer a hard prompt," not routing quality.
+*Fix:* a strict CoT LLM-judge (difficulty→correctness→adequacy, parsed `VERDICT`, fail-closed) **and** a mode-aware executor (per-mode prompt + 512/2048 budget). Success then discriminated (heavy 0.78 / router2 0.57 / random 0.43) — revealing routing is Pareto-dominated on this hard-skewed workload.
+
+**5-second sanity test:** before trusting a comparative metric, confirm the instrument *discriminates* — if every arm (including random) scores identically, you are measuring the grader/executor, not the thing under test.
+
+**Tags:** #benchmark #saturated-grader #confound #llm-judge #pareto #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 6)
+
+---
+
+## 2026-06-16 — Week 4.5 — A benign prompt was over-restricted to local (privacy keyword over-trigger)
+
+*Symptom:* on the Phase 6 privacy probe, "how do password managers store credentials safely" — a benign how-to with no secret — scored **S2** (`keyword:password`) and was routed `desensitize → local` instead of to the tier classifier. Measured leak rate **0/8**, false-positive **1/4** on S1 negatives (rules-only, n=12).
+*Root cause:* the S2 keyword list matches the bare token `password`/`credential` regardless of context, so a prompt that *discusses* secrets trips the same rule as one that *contains* one.
+*Fix:* ships measured-not-gated — over-restriction is the *safe* direction (forfeits a cloud tier, never leaks). Drive down by requiring secret-shaped *context* around a keyword and wiring an LLM detector as the recall backstop (dual-engine, §Phase 6). Treat every caught false positive as a keyword to tighten.
+
+**Tags:** #privacy #edge-cloud #keyword-overtrigger #false-positive #safe-failure-direction #lab-4.5
+
+**Captured in curriculum at:** [[Week 4.5 - Model Routing and Effort Tiering#5. Bad-Case Journal]] (Entry 7)
+
+---
+
 — end —
