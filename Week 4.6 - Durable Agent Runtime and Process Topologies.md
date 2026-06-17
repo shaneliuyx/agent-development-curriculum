@@ -2272,7 +2272,7 @@ My execution state lives in four SQLite tables, not in Python locals, so a `kill
 
 **(b) "When would you pick parallel versus sequential topology, and can you prove it matters?"**
 
-I benchmarked four topologies on identical 5-node DAGs, one constant 7B model, holding token count fixed at 195 so structure was the only variable. Parallel came in fastest at 0.903s with peak concurrency 4; sequential was slowest at 0.994s with concurrency 1. The wall-clock gap is small because at 7B speed per-call latency dominates a short critical path — but the ordering is real, and the 1/4/3/1 concurrency profile cleanly tracks each shape. Pick parallel for independent fan-out, sequential when ordering is the requirement.
+I can prove topology sets throughput at node granularity, not just assert it. Four topologies, identical 5-node DAGs, one 7B model, token count pinned at 195 — so structure is the only variable. The per-node ledger is the proof: in the parallel fan-out, total wall-clock (1.37s) ≈ the serial root (650ms) plus the *slowest* leaf (667ms), not the 2.78s sum of all five — the four leaves provably overlapped, peak concurrency 4. Sequential serializes to peak 1. Pick parallel for independent fan-out; sequential when order is the requirement.
 
 **(c) "What's a real concurrency bug you hit building it?"**
 
