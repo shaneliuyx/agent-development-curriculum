@@ -123,6 +123,8 @@ Each step is a *design decision*, not an implementation detail:
 - **Merge / reduce**: most demos skip this step. Most production systems fail here. Pre-declare who reduces, with what merge logic, before spawning the workers.
 - **Final output or next task**: in-turn return is RPC-shaped; queue handoff is durable-board-shaped. Choosing wrong is the same category error as [[Bad-Case Journal#2026-05-19 — Cross-cutting — Multi-Agent Anti-Patterns (Russell 2026 synthesis)|BCJ Entry MA-5]] (wrong primitive for lifecycle).
 
+**The same chain, in this lab's five scripts.** The full end-to-end orchestration — the driver entrypoint, both execution phases, the inner cross-script call graph (with per-edge call sites + `file:line`), the DB seam, and the production worker-daemon variant — is drawn as **one diagram** in the end-to-end demo section below (`examples/example_graph.py`). Rather than duplicate it here, this primer stays conceptual; see that single diagram for how `scheduler.py` → `graph_store.py` → `worker_pool.py` → `handlers.py` → `shared/llm.py` actually wire together.
+
 ### 2.7 The 8-question decision order — what to ask BEFORE picking a topology
 
 Russell's most useful contribution is reframing topology choice as a *decision sequence*, not a menu pick. Run through these in order; the answer to question N constrains question N+1. Most engineers reach for "star fan-out" by reflex; the questions below catch the cases where that's wrong.
@@ -2026,6 +2028,89 @@ def test_two_filelock_holders_are_mutually_exclusive() -> None:
 
 The smallest complete run: it wires every seam together once — topology builder → `create_graph` → `Scheduler.trigger_manually` (the external trigger) → `run_graph` (async workers) → `cost_report`. Live oMLX, so you see real token counts: `$PY examples/example_graph.py`.
 
+**The whole process in one diagram — what drives execution, and how every script links.** Read it top-down. The **driver** (`example_graph.py main()`) is the entrypoint and calls *both* phases: phase ① `scheduler.trigger_manually` → `start_run` only writes node **state** to SQLite and returns; phase ② `asyncio.run(run_graph)` spawns the worker pool that drains that state — and only there, deep inside a worker's handler, is the LLM ever called. Every edge carries the verbatim call + `file:line`; dashed edges are *state handoffs / recovery*, not function calls.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  DRV["example_graph.py main()<br/>the driver / entrypoint"]
+  subgraph TP["topologies.py"]
+    PARA["parallel / sequential /<br/>hierarchical / workflow<br/>build (dag, concurrency)"]
+  end
+  subgraph SCH["scheduler.py"]
+    TRG["trigger_manually /<br/>handle_webhook /<br/>cron _tick"]
+  end
+  subgraph GS["graph_store.py"]
+    CG["create_graph<br/>store DAG template"]
+    SR["start_run<br/>root=READY, rest=PENDING"]
+    CRN["claim_ready_node<br/>READY to RUNNING"]
+    MD["mark_done<br/>RUNNING to DONE"]
+    PD["_promote_downstream<br/>deps DONE: PENDING to READY"]
+    RC["recover_run<br/>orphan RUNNING to READY"]
+  end
+  subgraph FLK["file_lock.py"]
+    FL["FileLock<br/>cross-process claim mutex"]
+  end
+  subgraph WP["worker_pool.py"]
+    RG["run_graph<br/>spawn N async workers"]
+    WK["worker loop"]
+  end
+  subgraph HD["handlers.py"]
+    MLH["make_llm_handler closure"]
+    TH["tool_handler<br/>sleep, no LLM"]
+  end
+  subgraph CM["cost_meter.py"]
+    MET["CostMeter.meter + record<br/>(run_id, node, attempt)"]
+  end
+  subgraph LL["shared/llm.py"]
+    CU["chat_usage"]
+  end
+  OMLX(["oMLX :8000"])
+  PROD["production: worker daemon polls store<br/>for READY runs, calls run_graph"]
+
+  DRV -->|"parallel(llm=True)<br/>example_graph.py:48"| PARA
+  PARA -->|"(dag, concurrency)"| CG
+  DRV -->|"store.create_graph(dag)<br/>example_graph.py:49"| CG
+  CG -.->|"graph_id"| TRG
+  DRV -->|"phase ① scheduler.trigger_manually(graph_id)<br/>example_graph.py:53"| TRG
+  DRV -->|"phase ② asyncio.run(run_graph(...))<br/>example_graph.py:58"| RG
+  TRG -->|"store.start_run(graph_id, trigger)<br/>scheduler.py:57 / 73 / 93"| SR
+  SR -.->|"writes node rows; claim reads them"| CRN
+  RG -->|"asyncio.gather(worker(wN))<br/>worker_pool.py:120"| WK
+  WK -->|"asyncio.to_thread(store.claim_ready_node,<br/>run_id, worker_id)<br/>worker_pool.py:95"| CRN
+  CRN -->|"acquires (cross-process mutex)<br/>graph_store.py:63"| FL
+  CRN -->|"returns Node or None<br/>graph_store.py:182"| WK
+  WK -->|"asyncio.to_thread(handler, node)<br/>worker_pool.py:107  [llm nodes]"| MLH
+  WK -->|"asyncio.to_thread(handler, node)<br/>worker_pool.py:107  [tool nodes]"| TH
+  MLH -->|"cost_meter.meter(...); m.record(t_in, t_out)<br/>handlers.py:74 / 77"| MET
+  MLH -->|"chat_usage(client, prompt, node_model,<br/>max_tokens=64)<br/>handlers.py:68"| CU
+  CU -->|"client.chat.completions.create(...)<br/>shared/llm.py:107"| OMLX
+  WK -->|"asyncio.to_thread(store.mark_done,<br/>run_id, node.name, result)<br/>worker_pool.py:108"| MD
+  MD -->|"self._promote_downstream(conn, run_id)<br/>graph_store.py:220"| PD
+  PD -.->|"promoted READY seen by next claim<br/>graph_store.py:278"| WK
+  RC -.->|"store.recover_run(run_id) on restart<br/>graph_store.py:254"| WK
+  DRV -.->|"CostMeter(cost_db):43 ; cm.cost_report:66"| MET
+  SR -.->|"DB seam enables a separate drainer"| PROD
+  PROD -.->|"in prod, replaces the driver"| RG
+```
+
+Reading the flow:
+
+1. **Author + drive (example_graph.py:48 / 49 / 53 / 58).** `main()` builds the DAG from a **`topologies.py`** shape (`parallel(llm=True)` → `(dag, concurrency)`), stores the template (`create_graph`), fires the trigger (`trigger_manually` → `start_run`), then drives execution (`asyncio.run(run_graph)`). Trigger and drain are *separate calls* bridged only by the DB — in production the driver is replaced by a worker daemon polling the store for READY runs (the dashed `prod` edges).
+2. **Trigger (scheduler.py:57 / 73 / 93).** All three triggers funnel into `start_run`; the `Scheduler` holds no run state and never knows LLM-vs-tool.
+3. **Materialize (graph_store.start_run).** Writes node rows — root `READY`, rest `PENDING` — returns `run_id`. Nothing has executed; the "instructions" (model, prompt) ride in each node's `payload_json`.
+4. **Drain (worker_pool.run_graph:120 → worker loop).** N workers loop: `claim_ready_node` (FileLock, `READY→RUNNING`, off-thread) → `handler(node)` → `mark_done` → `_promote_downstream` (`PENDING→READY`), which re-feeds the frontier.
+5. **Execute (handlers.py:68 → shared/llm.py:107).** `make_llm_handler` reads `prompt`/`model` from `node.payload` and calls `chat_usage` → `client.chat.completions.create` → oMLX. A `tool_handler` node just sleeps — same worker, no LLM.
+6. **Recover (graph_store.recover_run:254).** After a `kill -9`, a fresh process resets orphaned `RUNNING→READY` and the workers finish the rest — nothing lost, nothing done twice.
+7. **Meter + lock (cost_meter.py via handlers.py:74/77; file_lock.py via graph_store.py:63).** Inside the LLM handler, `cost_meter.meter((run_id, node, attempt))` brackets the call and `m.record(t_in, t_out)` books real tokens — idempotent per `(node, attempt)`, so a retry never double-bills; the driver reads `cm.cost_report(run_id)` after (line 66). And `claim_ready_node` takes the cross-process `FileLock` (`graph_store.py:63`) so two processes never claim the same node — the mutex that makes a multi-process drainer safe.
+
+`★ Insight ─────────────────────────────────────`
+- **"Declare runnable" and "execute" are fully separated, with DB node-state as the handoff.** The driver fires `start_run` (sets states) and `run_graph` (reads states + acts) as two calls; nothing auto-bridges them but the DB. That seam is the root of durability — if the executor dies, the `READY`/`RUNNING` rows survive in SQLite and a fresh process's `recover_run` resumes. A trigger that synchronously called the LLM would lose everything on a crash.
+- **The trigger layer never touches the LLM.** scheduler → `start_run` → return. Three tiers, each owning one segment: trigger (writes `READY`) → storage (state machine) → worker (executes). Calling the model is strictly the worker+handler's job — which is also why the production drainer can be a separate process.
+- **Instructions are data, not code.** "Which model, what prompt" lives in `node.payload` (JSON in the DB), not hardcoded. The handler is a generic executor acting on the payload — so the same worker pool runs *any* graph; swapping graphs = swapping payload rows, zero code change.
+
+`─────────────────────────────────────────────────`
+
 **Code:** (`examples/example_graph.py` — the ENTIRE file: docstring, the `sys.path` shim, and `main` wiring all seams end-to-end; verbatim)
 
 ```python
@@ -2116,6 +2201,52 @@ if __name__ == "__main__":
 `★ Insight ─────────────────────────────────────`
 - **A runnable end-to-end example is the cheapest correctness signal a reader gets.** Before any test or bench, `example_graph.py` proves the copied files import, wire, and run — every seam exercised once, every result printed for eyeball verification.
 - **Starting the run only through `trigger_manually` keeps the architecture honest even in the demo.** The example could have called `start_run` directly; routing through the scheduler is a deliberate reminder that runs are externally fired, never self-prompted.
+`─────────────────────────────────────────────────`
+
+#### How the demo runs 4-wide — fan-out concurrency, step by step
+
+The demo authors `parallel(llm=True)` — a **fan-out** DAG: 1 root → 4 independent leaves. The edges are all `n1→leaf`; the leaves share no edge, so they have no dependency on each other and can run at once. `parallel()` returns `concurrency=4` precisely because 4 is this shape's maximum parallelism.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  n1["n1 (root)"]
+  n1 --> n2["n2"]
+  n1 --> n3["n3"]
+  n1 --> n4["n4"]
+  n1 --> n5["n5"]
+```
+
+`edges = [[n1,n2],[n1,n3],[n1,n4],[n1,n5]]` — every edge is `n1 → leaf`; no edge *between* leaves = no dependency = runnable together.
+
+**How 4 actually run at once — it emerges from the state machine, you never schedule it.** When `start_run` materializes the run it reverses the edges into per-node deps and sets initial status:
+
+```text
+deps   = {n1: [], n2: [n1], n3: [n1], n4: [n1], n5: [n1]}
+status = n1 READY (0 deps);  n2..n5 PENDING (waiting on n1)
+```
+
+Execution timeline with `concurrency=4` (4 workers):
+
+| t | what happens | READY set | concurrently running | peak |
+|---|---|---|---|---|
+| t0 | run materialized; 4 workers race `claim_ready_node`, but its cross-process FileLock + `ORDER BY name LIMIT 1` lets only **one** take `n1` — the other 3 poll | `{n1}` | n1 | 1 |
+| t1 | `n1` finishes → `mark_done` → `_promote_downstream` flips **all** of n2..n5 `PENDING→READY` | `{n2,n3,n4,n5}` | — | — |
+| t2 | now 4 READY nodes + 4 idle workers → each claims one → n2 n3 n4 n5 run together | `{}` | n2, n3, n4, n5 | **4** |
+| t3 | all `DONE` | `{}` | — | — |
+
+Parallelism happens because **multiple nodes are READY at once *and* there are enough workers** — not because anything schedules it. Three conditions must all hold (drop any one and 4-way collapses to serial):
+
+| condition | where it lives | satisfied here? |
+|---|---|---|
+| leaves have no edges between them | the DAG (`topologies.parallel`) | ✅ n2..n5 unconnected → all READY the instant n1 is DONE |
+| enough workers | `run_graph(store, run_id, handler, concurrency=4)` | ✅ the `4` `parallel()` returns is passed straight in |
+| execution can overlap | `worker_pool` `asyncio.to_thread(handler, node)` | ✅ the sync handler is offloaded to a thread pool, so N handlers genuinely overlap |
+
+`★ Insight ─────────────────────────────────────`
+- **Parallelism = min(simultaneously-READY nodes, worker count).** This shape's ceiling is 4 — give it 8 workers and 4 idle (only 4 leaves); give it `concurrency=1` and it serializes to `peak=1` with ~the chain's wall-clock. `bench_four_topology.py` measures exactly this knob: how topology sets throughput.
+- **`n1` is the Amdahl serial bottleneck.** No worker count helps it — `n1` must finish alone before any leaf is READY. Total ≈ `t(n1) + t(slowest leaf)`, **not** `t(n1) + 4×t(leaf)`. Fan-out's entire win is the overlapped-leaves segment.
+- **Same 5 nodes, different topology, different throughput.** Arranged as a chain `n1→n2→n3→n4→n5`, `peak=1`, wall ≈ 5× a node; as this fan-out, `peak=4`, wall ≈ 2×. Identical node count and model — only the edges differ. That is the lab's headline ("topology changes throughput") made concrete.
 `─────────────────────────────────────────────────`
 
 ---
