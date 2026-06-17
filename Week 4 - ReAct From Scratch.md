@@ -1905,14 +1905,14 @@ Save as `src/run.py`:
 
 ```python
 """src/run.py — smoke-test entrypoint. Run one agent task and print the event log."""
-import os, sys
+import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import src.tools   # must import before agent_run to register tools
 from src.react import agent_run
 from src.obs import query_run, run_summary
 
-RUN_ID = "smoke_run_001"
+RUN_ID = f"smoke_{int(time.time())}"  # unique per run; a constant aliased every run onto one id
 TASK = "What is the square root of 144? Use the python_repl tool to verify."
 
 print(f"Task: {TASK}\n")
@@ -1939,6 +1939,8 @@ sqlite3 data/agent_obs.db "SELECT run_id, iteration, event_type, tool_name, tool
 ```
 
 You should see at least two rows: one `tool_call` (the `python_repl` call) and one `final_answer`.
+
+> **Why a fresh `RUN_ID` each run:** `src/obs.py` is a persistent, append-only SQLite store, so a *constant* run id makes every invocation accumulate under one id and `run_summary` aggregates all past runs together — a reused `smoke_run_001` once doubled the totals (4 events / 2592 prompt tokens for what was really two 2-event runs). A timestamped `smoke_<ts>` isolates each run, matching `agent_run`'s own `run_id or f"run_{ts}"` default. The DB still grows across runs (that's the audit trail); the *summary* is just scoped to one run id.
 
 > **Why this step exists:** The observability table is your audit trail. Without it, debugging a broken agent means reading raw token streams. With it, you can write a SQL query like `SELECT * FROM agent_events WHERE tool_error IS NOT NULL ORDER BY ts DESC LIMIT 10` and immediately see every failure in the last N runs, what tool caused it, and how many tokens were consumed before the failure surfaced.
 
