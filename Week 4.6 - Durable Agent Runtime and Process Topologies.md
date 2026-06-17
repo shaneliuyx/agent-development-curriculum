@@ -78,24 +78,24 @@ Most chapter-zero discussions of multi-agent systems conflate two orthogonal axe
 
 **Trigger axis — when does the system go from 1 agent to N?**
 
-| Trigger | What fires the fan-out | Canonical system |
-|---|---|---|
-| **Explicit** | User says `Use parallel subagents` or `Spawn one agent per category` | Codex (refuses to auto-spawn from "deep investigation") |
-| **Semantic** | Parent agent matches task content against subagent `description` field | Claude Code default subagents |
-| **Routing** | Message entry point (Slack channel, Telegram peer, Discord thread, guild, role) binds to a specific agent | OpenClaw |
-| **Queue** | Task lands in a board / cron / background-job table; dispatcher pulls workers by `assignee` | Hermes Kanban |
+| Trigger      | What fires the fan-out                                                                                    | Canonical system                                        |
+| ------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| **Explicit** | User says `Use parallel subagents` or `Spawn one agent per category`                                      | Codex (refuses to auto-spawn from "deep investigation") |
+| **Semantic** | Parent agent matches task content against subagent `description` field                                    | Claude Code default subagents                           |
+| **Routing**  | Message entry point (Slack channel, Telegram peer, Discord thread, guild, role) binds to a specific agent | OpenClaw                                                |
+| **Queue**    | Task lands in a board / cron / background-job table; dispatcher pulls workers by `assignee`               | Hermes Kanban                                           |
 
 **Topology axis — once the system is multi-agent, how are the agents organized?**
 
-| Topology | Shape | Best for | Worst for |
-|---|---|---|---|
-| **Single** | 1 agent | Small changes, strong-order tasks, fuzzy requirements | Long context that pollutes main agent |
-| **Star fan-out / fan-in** | 1 parent → N workers; workers don't talk; reduce at parent | PR review (security / tests / perf in parallel), code-search exploration | Tasks where workers need to challenge each other |
-| **Pipeline** | A → B → C → D, strictly ordered | Locate-bug → write-fix → add-test → review; ETL-shaped tasks | Anything where worker N's output doesn't feed worker N+1 |
-| **Tree** | Orchestrator subagent spawns leaf workers; bounded depth | Large tasks needing sub-decomposition (Codex `max_depth=2`; OpenClaw default `maxSpawnDepth=1`) | Tasks that don't compose hierarchically — depth-N×breadth-N fan-out explodes ($) |
-| **Mesh** | Teammates communicate peer-to-peer, share task list | Multi-hypothesis debug (login fails → frontend? token? session? cache? deploy?) | Anything where the worker count > 4-5 — coordination overhead dominates |
-| **Gateway routing** | Different entry points → different agents (no fan-out per task) | Multi-channel personal assistant (Slack vs Telegram vs family group) | Single-channel coding tasks (where Codex/Claude Code already dominate) |
-| **Durable board** | Tasks + comments + handoffs in persistent storage; workers attached to states | Cross-turn, cross-day, human-in-loop work (research reports, migrations, audits) | Sub-minute tasks (board overhead dominates wall-clock) |
+| Topology                  | Shape                                                                         | Best for                                                                                        | Worst for                                                                        |
+| ------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| **Single**                | 1 agent                                                                       | Small changes, strong-order tasks, fuzzy requirements                                           | Long context that pollutes main agent                                            |
+| **Star fan-out / fan-in** | 1 parent → N workers; workers don't talk; reduce at parent                    | PR review (security / tests / perf in parallel), code-search exploration                        | Tasks where workers need to challenge each other                                 |
+| **Pipeline**              | A → B → C → D, strictly ordered                                               | Locate-bug → write-fix → add-test → review; ETL-shaped tasks                                    | Anything where worker N's output doesn't feed worker N+1                         |
+| **Tree**                  | Orchestrator subagent spawns leaf workers; bounded depth                      | Large tasks needing sub-decomposition (Codex `max_depth=2`; OpenClaw default `maxSpawnDepth=1`) | Tasks that don't compose hierarchically — depth-N×breadth-N fan-out explodes ($) |
+| **Mesh**                  | Teammates communicate peer-to-peer, share task list                           | Multi-hypothesis debug (login fails → frontend? token? session? cache? deploy?)                 | Anything where the worker count > 4-5 — coordination overhead dominates          |
+| **Gateway routing**       | Different entry points → different agents (no fan-out per task)               | Multi-channel personal assistant (Slack vs Telegram vs family group)                            | Single-channel coding tasks (where Codex/Claude Code already dominate)           |
+| **Durable board**         | Tasks + comments + handoffs in persistent storage; workers attached to states | Cross-turn, cross-day, human-in-loop work (research reports, migrations, audits)                | Sub-minute tasks (board overhead dominates wall-clock)                           |
 
 The 2D grid is roughly 4 × 7 = 28 cells, but only ~10 are well-populated in production. The empty cells are the most useful — they say "this combination has no good system precedent, so think before you ship it."
 
@@ -116,7 +116,7 @@ input event
 
 Each step is a *design decision*, not an implementation detail:
 - **Router / dispatcher**: explicit user-driven (Codex), description-match (Claude Code), channel-binding (OpenClaw), or queue-pull (Hermes Kanban).
-- **Context builder**: the *write-side* of the Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]]). What's in here determines whether the child can succeed or has to guess.
+- **Context builder**: the *write-side* of the Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template (brief subagents like new hires, not like teammates)|Engineering Decision Patterns > Pattern 14 — Delegation Contract Template]]). What's in here determines whether the child can succeed or has to guess.
 - **Worker profile selection**: read-only explorer vs implementation worker vs security reviewer. Role choice cascades into the next two steps.
 - **Execution sandbox**: shell? network? write? spawn child? Hermes leaf restrictions are the canonical reference; OpenClaw's tool-policy isolation is the canonical pattern.
 - **State store**: ephemeral (lives in the turn), session (lives in agent workspace), durable (lives in board / SQLite / postgres). Picking wrong here is the difference between "kill -9 → resume" and "kill -9 → start over."

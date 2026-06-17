@@ -1014,7 +1014,7 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 **Entry MA-2 — Subagents know nothing (under-briefed children guess).**
 *Symptom:* delegated subagent returns plausible-looking but factually wrong output; the wrong output references files that don't exist, uses APIs from old versions, or solves a different problem than the one asked.
 *Root cause:* parent agent had the full project context in working memory; child started fresh. Parent passed in a one-line goal ("fix the bug"); child's only recourse was to guess the missing 95% of context.
-*Fix:* fill the 8-field Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]]): Role / Goal / Context / Allowed / Ownership / Forbidden / Output / Stop. Production rule: child should *never* need to ask the user a clarifying question. If it did, the parent's Context field was incomplete — that's a parent bug, not a child bug.
+*Fix:* fill the 8-field Delegation Contract Template (see [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template (brief subagents like new hires, not like teammates)|Engineering Decision Patterns > Pattern 14 — Delegation Contract Template]]): Role / Goal / Context / Allowed / Ownership / Forbidden / Output / Stop. Production rule: child should *never* need to ask the user a clarifying question. If it did, the parent's Context field was incomplete — that's a parent bug, not a child bug.
 *Tags:* #multi-agent #delegation #context #anti-pattern
 
 **Entry MA-3 — Unbounded parallel writes without ownership.**
@@ -1055,7 +1055,7 @@ Seven recurring multi-agent failure shapes, synthesized from Russell's engineeri
 
 **Source:** Russell (2026), [多智能体协作调查：Agent 到底该怎么分工](https://x.com/Russell3402/status/2056331558223786416). Engineering survey on X, 2026-05. Synthesis paraphrases Russell's "7 anti-patterns" subsection (§"反模式：多 agent 最容易坏在哪里").
 
-**Captured in curriculum at:** [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template]] (write-side), [[Week 3.5.8 - Two-Tier Memory Architecture#3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)|W3.5.8 §3.4]] (read-side audit log = MA-7 remediation), [[Week 4.6 - Durable Agent Runtime and Process Topologies]] §1-2 (topology choice = MA-1 remediation).
+**Captured in curriculum at:** [[Engineering Decision Patterns#Pattern 14 — Delegation Contract Template (brief subagents like new hires, not like teammates)|Engineering Decision Patterns > Pattern 14 — Delegation Contract Template]] (write-side), [[Week 3.5.8 - Two-Tier Memory Architecture#3.4 Audit Log as a First-Class Primitive (cross-ref: `rohitg00/agentmemory`)|W3.5.8 §3.4]] (read-side audit log = MA-7 remediation), [[Week 4.6 - Durable Agent Runtime and Process Topologies]] §1-2 (topology choice = MA-1 remediation).
 
 ---
 
