@@ -24,6 +24,7 @@ Cross-cutting libraries (indexed by theme/pattern, not by week — keep in sync 
 - `Trend-Monitoring Discipline.md` — process doc for keeping the curriculum current with the field.
 
 Supporting directories:
+- `authoring/` — the chapter-authoring spec, split into focused on-demand files (see [Chapter authoring](#chapter-authoring--read-the-relevant-spec-on-demand)).
 - `scripts/` — Python audit scripts (the vault's lint layer). See [Audit commands](#audit-commands--the-vaults-lint-layer).
 - `code/` — vendored lab/reference repos (`agent-prep`, `EverOS`, `LongMemEval`, `self-improving-agents-curriculum`). Source for measured numbers; not part of the prose.
 - `proposals/` — draft chapter proposals before they become full `Week N.M` chapters.
@@ -57,138 +58,23 @@ python3 scripts/audit_bcj_measured.py --verbose         # show each flagged entr
 
 Exit code `0` = clean, `1` = violations found (CI-hook-friendly). Both scripts walk `Week*.md` in the vault root. Taste-based patterns (★ Insight callouts, trade-off transparency) stay human-review-only — do not try to automate them. When you codify a new mechanically-checkable pattern in `Engineering Decision Patterns.md`, add a matching script here (`scripts/README.md` documents the shared shape).
 
-## Required chapter structure (normative — every chapter MUST contain these 9 sections)
+## Chapter authoring — read the relevant spec on demand
 
-The reference chapter is `Week 2 - Rerank and Context Compression.md`. Every other chapter — main week, decimal supplement, future addition — MUST match this structure. A chapter that skips a required section is incomplete and SHOULD be flagged before commit.
+The detailed chapter-authoring rules are split into focused files under `authoring/`. They are **NOT auto-loaded** — read the one your task needs:
 
-### Section 1 — Why This Week Matters (REQUIRED, ~150 words)
+| When you are… | Read |
+|---|---|
+| creating or editing a chapter's structure | [`authoring/chapter-structure.md`](authoring/chapter-structure.md) — the 9 required sections + optional sections + the pre-commit checklist |
+| adding or editing any diagram | [`authoring/diagrams.md`](authoring/diagrams.md) — Mermaid hygiene + font directives + render-validation |
+| writing a §4 lab-phase code block | [`authoring/code-walkthroughs.md`](authoring/code-walkthroughs.md) — the per-Python-block bundle + the two walkthrough modes (per-block vs execution-trace) |
+| writing or editing Bad-Case entries | [`authoring/bad-case-journal.md`](authoring/bad-case-journal.md) — §5 entry format + the MEASURED-ONLY invariant |
 
-Production motivation + interview signal. Why does this matter in real systems? Why will an interviewer ask about it? Do **not** collapse to a one-line TL;DR. The 150-word length is intentional — it is the speak-aloud hook for the topic.
-
-### Section 2 — Theory Primer (REQUIRED, ~1000 words)
-
-Long-form explanatory prose. Cite original papers (arXiv links). Include real numbers, not vague claims ("hybrid recall@10 = 0.998 vs dense 0.993" not "hybrid is better"). Distinguish carefully from adjacent concepts that are commonly conflated.
-
-### Section 3 — Mechanism / Architecture Diagram (REQUIRED)
-
-Mermaid diagrams (Obsidian renders them natively). Every chapter has at least one diagram showing the system shape. Label every node and edge — unlabeled boxes are not diagrams.
-
-### Section 4 — Lab Phases (REQUIRED — numbered phases with runnable code)
-
-Phases are numbered and time-budgeted (`## Phase 1 — <name> (~2 hours)`). Each phase includes:
-- A goal statement
-- Setup commands (real package names, real versions)
-- Step-by-step numbered actions with **runnable Python** (not pseudocode)
-- Verification commands at the end of the phase
-- An expected metrics table (recall@K, latency, cost, etc — measured on M5 Pro hardware)
-
-**Per-Python-block bundle (NORMATIVE).** Each Python script (or substantive Python snippet) inside a Lab Phase MUST be presented as one self-contained bundle, in this exact order, before moving to the next block:
-
-1. **Architecture diagram** — Mermaid (non-ASCII) showing the data flow / call graph for THIS script. Place immediately before the code. Mermaid hygiene rules (NORMATIVE):
-    - **Edge labels with parens** MUST be quote-wrapped (`-->|"text<br/>(parens)"| Node`). Bare parens in unquoted edge labels break the Mermaid parser.
-    - **Subgraph titles** MUST be ≤22 characters AND ≤ the cluster's narrowest sibling cluster width. Two constraints: (a) absolute char count to avoid wrapping at any zoom; (b) Mermaid sizes each cluster to its widest child node, so a title that fits in a wide cluster may wrap in a narrow sibling. Visual symmetry rule: side-by-side comparison subgraphs should have titles of matching word count and length — if one sibling cluster is narrower, shorten ALL titles to fit the narrowest. Move port numbers, version tags, qualifier suffixes into the section's prose paragraph or into child node labels (`Imprint API<br/>:1995`), not the cluster title.
-    - **Horizontal multi-cluster layouts** (`flowchart LR` with multiple `subgraph` blocks) MUST add invisible-link chaining (`C1 ~~~ C2 ~~~ C3`) when the subgraphs share no real edges. Without it, the layout engine stacks subgraphs vertically and wastes horizontal canvas, regardless of the top-level `LR` declaration.
-    - **Node labels** with multiple lines use `<br/>` (HTML break), not literal `\n`. Each line ≤20 chars to avoid box-width drift across siblings.
-    - **Diagram direction** — default to **`flowchart TD`** (vertical). Vertical diagrams stay narrow, fit the article column without downscaling, and render text at declared fontSize. **`flowchart LR`** is reserved for diagrams where horizontal layout is semantically load-bearing — typically side-by-side subgraph clusters used for visual comparison (e.g., Class 1 vs Class 2 vs Class 3 architectures, L1/L2/L3 tier topology). Wide linear pipelines (>5 nodes) MUST be TD; reading a 10-node horizontal scroll is worse than reading a 10-node vertical column.
-    - **Font size directive** — every mermaid block opens with a `%%{init: ...}%%` directive immediately after the ```` ```mermaid ```` fence. Two classes:
-        - **Default (TD/TB diagrams):** `%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%`. Vertical diagrams don't downscale, so 20px declared renders at ~20px display (matches article body text).
-        - **LR subgraph-cluster diagrams:** `%%{init: {'theme':'default', 'themeVariables': {'fontSize':'28px'}, 'flowchart':{'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50}}}%%`. Three load-bearing settings: (a) `useMaxWidth:false` lets wide diagrams overflow horizontally so text stays at native pixel size; (b) `subGraphTitleMargin` adds explicit gap between cluster title and first child node (default margin is too tight at any fontSize ≥ 24px and causes title-vs-first-node text overlap); (c) `nodeSpacing` + `rankSpacing` open up the between-node gaps so dense LR diagrams don't pack arrows tight. Trade-off accepted: horizontal scroll inside the article container.
-2. **Code** — full `\`\`\`python` block. Annotate `**Code:**` header above for visual delineation.
-3. **Walkthrough** — `**Walkthrough:**` header, then bullet-per-block analysis (`**Block 1 — <title>.**` + 2–4 sentences answering *why*, not what). Cover gotchas a copy-paster would miss.
-4. **Result** — `**Result:**` header, then measured numbers from the actual lab run (wall time per stage, output sizes, aggregate scores). Pull from `RESULTS.md` in the lab repo. Mark `~estimated` if not yet measured; update after the run.
-5. **Insight callout** — `\`★ Insight ─────────────────────────────────────\`` / `\`─────────────────────────────────────────────────\`` border around 2–3 bullets calling out non-obvious design choices, model superpowers being exploited, deliberate trade-offs.
-
-The bundle is one continuous reading unit — do not split mermaid into one section, code into another, walkthrough into a separate `## Phase 5 — Code Walkthroughs` section. The old `## Phase 5` separate-section pattern is **deprecated** as of 2026-05-07. Reference: `Week 2.7 - Structure-Aware RAG.md` Phase 2/3/4 — every Python block follows this bundle shape.
-
-**The non-negotiable bar:** the walkthrough portion must answer "why is this code shaped this way?" — a reader who copy-pastes the script must come away understanding the design choices, not just having a working script. If you cannot answer "why" for a block, you do not understand it well enough; spike the code first, then write.
-
-### Walkthroughs are inline — no separate walkthrough section
-
-There is **no separate code-walkthrough section** (the old `## Phase 5 — Code Walkthroughs` pattern is gone). Walkthroughs live inline next to their code per the §4 per-block-bundle rule above. **Do not emit a `## 5. (deprecated)` stub or any deprecated placeholder.**
-
-Section numbering is **continuous, 1–9** (no gap). After §4 Lab Phases the next section is **§5 Bad-Case Journal** — the sections below renumbered down by one when the old deprecated §5 slot was removed (2026-06-16). When you touch a chapter that still carries a leftover `## 5. (deprecated)` stub or a §4→§6 gap, delete the stub and renumber the remaining sections so they run 1–9 continuously (move any walkthrough text back into its Phase first, then renumber §6→§5 … §10→§9, and fix that chapter's internal `§N` references — taking care NOT to touch cited-paper section numbers like "RouteLLM §5").
-
-### Section 5 — Bad-Case Journal (REQUIRED — 3–5 entries, exact format)
-
-Each entry uses **exactly** this 3-field format:
-
-```
-**Entry N — <one-line symptom>.**
-*Symptom:* what the operator observes
-*Root cause:* what is actually broken
-*Fix:* concrete remediation, with code or config when applicable
-```
-
-Entries also belong in the global `Bad-Case Journal.md` cross-cutting library. Other chapters' interview soundbites cite specific entries — do not delete or rewrite entries without checking incoming references.
-
-**MEASURED-ONLY INVARIANT (normative — non-negotiable).** Every Bad-Case Journal entry — in a chapter §5 AND in the global `Bad-Case Journal.md` — MUST be a *real failure actually observed in a lab run*: reproduced, with its symptom / root-cause / fix traceable to a run, an error message, a failing test, or a `RESULTS.md` row. **No predicted, scoped, hypothetical, anticipated, or `(planned)` entries. Ever.** A failure mode you *expect* but have *not yet observed* is not a bad-case entry — it belongs in `ANTI-PATTERNS.md` (the explicit "before you write code" companion), and only *graduates* to the Bad-Case Journal once you measure it. Why this is non-negotiable: the journal's entire value is that it documents what broke **after the fact**; a predicted entry teaches a failure that may never occur and quietly launders speculation as evidence — the exact judgment-atrophy failure the program exists to prevent. **If a chapter is still a spec draft, leave §5 empty** (or park anticipated modes in `ANTI-PATTERNS.md`); do NOT pre-fill §5 with guesses dressed as findings. The one allowed exception is an entry explicitly and visibly labelled as a *deferred/out-of-scope* mode (e.g. multi-host failures in a single-host lab) — but it must say so in-line and must not invent a symptom or a measured number. Mechanically enforced by `scripts/audit_bcj_measured.py` (exit 1 on any unmeasured-looking entry).
-
-### Section 6 — Interview Soundbites (REQUIRED — 2–3 entries, user-voice, ~70 words each)
-
-Written in first-person, anchored to a measured outcome from §4 or §5. Each soundbite is a speak-aloud answer to an interview question, ~70 words. Avoid hedging language. Avoid generic advice. Reference specific numbers and specific findings from this chapter.
-
-### Section 7 — References (REQUIRED)
-
-Peer-reviewed papers + canonical docs + production blog posts. Format:
-- **Author et al. (Year).** *Title.* Venue. arXiv:NNNN.NNNNN. One-line description of why this reference matters.
-
-Link to arXiv where applicable. Include at least one production blog post or canonical implementation repo so the reader can see how the concept ships in practice, not just how it is described in papers.
-
-### Section 8 — Cross-References (REQUIRED)
-
-Use these four labels in this order:
-
-- **Builds on:** explicit prerequisite chapters (the reader should have done these first).
-- **Distinguish from:** adjacent topics that are commonly conflated. **This section is high-leverage; do not skip it.** It is what makes a candidate sound senior in interviews.
-- **Connects to:** later chapters that use this material as a building block.
-- **Foreshadows:** chapters where this material reaches its full production shape (often W11 System Design or W12 Capstone).
-
-Cross-references must be bidirectional — if W7 says "Builds on: W4 ReAct", then W4 should say "Connects to: W7 Tool Harness". When you add a forward link, add the reverse link in the target chapter in the same edit.
-
-### Section 9 — Frontmatter (REQUIRED on new chapters)
-
-YAML frontmatter at the top of the file:
-
-```yaml
----
-title: <chapter title>
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
-tags:
-  - agent
-  - <topic-specific tags>
-audience: <who this chapter is for, copied from curriculum overview>
-stack: <hardware + model assumptions>
----
-```
-
-Update `updated:` on every substantive edit. Tags should overlap with sibling chapters so Obsidian's graph view connects them.
-
-## Optional sections (use when relevant)
-
-- **Empirical findings subsection (§N.X.Y).** When you run experiments and produce measured results that contradict or refine the theory primer, add a numbered subsection (e.g., `### 2.2.1 Actual results — fp32 vs fp16 reranker on M5 Pro (2026-04-28 runs)`). W2 uses this pattern extensively for its rerank experiments. Date-tag the subsection.
-- **Mini-lab.** A 30-minute hands-on exercise that doesn't warrant a full Phase. Use `### Mini-Lab — <name>`.
-- **Production considerations.** When the chapter has a clear production deployment story, add a `## Production Considerations` section before §5 Bad-Case Journal. Cover sandboxing, cost ceilings, multi-tenancy, observability.
-
-## Pre-commit checklist (run mentally before every chapter commit)
-
-```
-[ ] §1  Why This Week Matters — ~150 words present
-[ ] §2  Theory Primer — ~1000 words, papers cited, real numbers
-[ ] §3  Mermaid diagram present and labeled
-[ ] §4  Lab phases numbered, time-budgeted, with runnable code
-[ ] §4  Expected metrics table present
-[ ] §4  Per-Python-block bundle present (Architecture mermaid → Code → Walkthrough → Result → Insight) for every Python script
-[ ] §4  Mermaid hygiene: default `flowchart TD` (LR only for side-by-side subgraph clusters); edge-label parens quote-wrapped (`-->|"text<br/>(parens)"|`); subgraph titles ≤22 chars (no wrap/clip); horizontal multi-cluster layouts use `~~~` invisible-link chaining; node labels use `<br/>` not `\n`; TD blocks open with `%%{init: ... 'fontSize':'20px' ...}%%`, LR cluster blocks open with `%%{init: ... 'fontSize':'28px', ... 'useMaxWidth':false, 'subGraphTitleMargin':{'top':20,'bottom':30}, 'nodeSpacing':40, 'rankSpacing':50 ...}%%` for article-body-sized text + no title-vs-first-node overlap
-[ ] §5  Bad-Case Journal — 3–5 entries in exact 3-field format
-[ ] §5  Every entry is REAL + MEASURED (no predicted / (planned) / hypothetical) — `python3 scripts/audit_bcj_measured.py` exits 0
-[ ] §5  New entries copied to global Bad-Case Journal.md
-[ ] §6  Interview Soundbites — 2–3, user-voice, ~70 words, measured-outcome anchored
-[ ] §7  References — papers + docs + production examples
-[ ] §8  Cross-References — Builds on / Distinguish from / Connects to / Foreshadows
-[ ] §8  Reverse links added in linked chapters
-[ ] §9  Frontmatter updated
-```
+**Hard invariants (always in force — full detail in the files above):**
+- Every chapter has the **9 required sections**, numbered continuously 1–9 (`chapter-structure.md`).
+- Every §4 code block uses the **per-block bundle** (Architecture diagram → Code → Walkthrough → Result → Insight). **Complete runnable scripts** get an **execution-trace** walkthrough (Step 0…N, code + state snapshot per step, real measured output); partial code gets the `Block N` style (`code-walkthroughs.md`).
+- Every diagram is **render-validated** (`mmdc`); no `;` / `#` inside Mermaid text (`diagrams.md`).
+- Every §5 Bad-Case entry is **REAL + MEASURED** (`scripts/audit_bcj_measured.py` exits 0); predicted modes go to `ANTI-PATTERNS.md` (`bad-case-journal.md`).
+- All numbers are **measured + traceable to `RESULTS.md`**; cross-references are **bidirectional**.
 
 ## Hard rules from `Agent Development 3-Month Curriculum.md`
 
