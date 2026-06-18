@@ -2192,9 +2192,197 @@ if __name__ == "__main__":
 
 **Walkthrough:**
 
-**Block 1 — The demo's value is that it makes the four-table durability core observable in one screen.** It authors the `parallel` topology with live llm nodes, fires it through `Scheduler.trigger_manually` (the demo never starts a run any other way — the external-trigger discipline made concrete), drains it with `run_graph`, then prints `node_states` (every node `DONE`), `run_status` (`done`), the pool result (`peak_concurrency`), and `cost_report` (real tokens + cloud-equivalent USD). It is the shortest path from "I copied the files" to "I can see the runtime working."
+The whole demo, end to end — every hop tied to a `file:line` we've already read. Topology = `parallel` (n1 root → n2/n3/n4/n5), live LLM nodes, `concurrency=4`.
 
-**Block 2 — Every seam appears exactly once, in dependency order.** `GraphStore` + `CostMeter` (two SQLite files), then `Scheduler` over the store, then a raw `openai.OpenAI` pointed at oMLX, then builder → `create_graph` → trigger → `run_graph` → report → `export_csv`. A reader can map each printed line back to the module that produced it, which is why this is the right place to *end* the runbook: it is the integration test a human runs by eye.
+**Step 0 — stand up the infrastructure (`example_graph.py:38–45`).**
+
+```python
+tmp       = tempfile.mkdtemp(prefix="durable_demo_")
+store     = GraphStore(db)        # 4 tables (graphs/runs/nodes/executions) + a FileLock
+cm        = CostMeter(cost_db)    # node_cost table (idempotent key)
+scheduler = Scheduler(store)      # stateless trigger layer, holds a store ref
+client    = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")  # → oMLX
+```
+
+`GraphStore.__init__` (`graph_store.py:61`) runs the table-creation `executescript` (lines 77–118) — the four empty tables + indexes + the `FileLock`. The DB exists but is entirely empty.
+
+**Step 1 — author the graph template (`:48–49`).**
+
+```python
+dag, concurrency = parallel(llm=True, model=BENCH_MODEL)   # concurrency = 4
+graph_id = store.create_graph("demo-parallel", dag)
+```
+
+`parallel()` returns the fan-out structure you just analyzed:
+
+```python
+dag = {
+  "nodes": {"n1": {"type": "llm", "payload": {...}}, "n2": {...}, ..., "n5": {...}},
+  "edges": [["n1","n2"], ["n1","n3"], ["n1","n4"], ["n1","n5"]],   # every edge n1 → leaf
+}
+```
+
+`create_graph` (`graph_store.py:134`) mints `graph_id="g_…"` and serializes the whole `dag` to JSON in **one `graphs` row**. This is only a *template* — no run, no node rows yet:
+
+```text
+graphs:  [g_… | "demo-parallel" | dag_json | created_at]
+runs:    (empty)
+nodes:   (empty)
+```
+
+**Step 2 — external trigger → `start_run` (`:53`).**
+
+```python
+run_id = scheduler.trigger_manually(graph_id, {"by": "example"})
+```
+
+`trigger_manually` (`scheduler.py:52`) → `store.start_run(graph_id, "manual:…")` — the **only** entry that creates a run (cron/webhook funnel here too). `start_run` (`graph_store.py:146`) does four things **in one transaction**:
+
+1. **Reverse the edges into per-node deps** (`:158–160`):
+   ```text
+   deps = {n1: [], n2: [n1], n3: [n1], n4: [n1], n5: [n1]}
+   ```
+2. **Insert the run row**: `run_id="r_…"`, `status="running"`.
+3. **Insert one `nodes` row per node** (`:169–176`), initial status by deps:
+   ```text
+   n1 → READY    (no deps)
+   n2 → PENDING  (waits on n1)
+   n3 → PENDING
+   n4 → PENDING
+   n5 → PENDING
+   ```
+4. **Append a `run_started` event** to `executions` (`:177`).
+
+The DB now:
+
+```text
+runs:  [r_… | g_… | "manual:…" | running]
+nodes: n1 READY | n2 PENDING | n3 PENDING | n4 PENDING | n5 PENDING
+       (each row also stores deps_json, payload_json, attempts=0)
+```
+
+**Key: not one LLM has been called.** The trigger just laid out the state machine and returned.
+
+**Step 3 — the worker pool drains it (`:57–58`).**
+
+```python
+handler = make_llm_handler(client, BENCH_MODEL, cost_meter=cm)   # the executor that calls the LLM
+result  = asyncio.run(run_graph(store, run_id, handler, concurrency, cost_meter=cm))
+```
+
+`run_graph` (`worker_pool.py:53`) spawns **4 worker coroutines** (`asyncio.gather`, `:120`); each runs the same loop (`:93`). Tic by tic:
+
+**t0 — claim `n1`.** All 4 workers enter the loop:
+
+```python
+async with claim_lock:                                   # in-process serialize (the shared-fd race fix)
+    node = await asyncio.to_thread(store.claim_ready_node, run_id, worker_id)
+```
+
+`claim_ready_node` (`graph_store.py:182`), inside the cross-process `FileLock`, runs `SELECT … WHERE status=READY ORDER BY name LIMIT 1`. Only `n1` is READY → **exactly one worker wins `n1`** (`READY→RUNNING`, `attempts→1`); the other **3 get `None`** → poll-sleep (`_IDLE_POLL_S`, `worker_pool.py:103`).
+
+**t1 — run `n1` (the only LLM call so far).** The winner (`worker_pool.py:105–110`):
+
+```python
+await peak.enter()                                       # concurrency counter +1
+result = await asyncio.to_thread(handler, node)          # ← the actual LLM call
+await asyncio.to_thread(store.mark_done, run_id, node.name, result)
+```
+
+`handler` (`handlers.py:62`) reads `prompt`/`model` from `node.payload` → `chat_usage` (`handlers.py:68`) → **oMLX `:8000`** → text + real token counts → `cost_meter.meter(run_id, "n1", attempt=1)` records cost on the idempotent key.
+
+**t2 — `n1` DONE wakes the 4 leaves.** `mark_done` sets `n1 DONE` and checks the nodes depending on it; their deps are now all satisfied → `n2,n3,n4,n5` all `PENDING→READY`:
+
+```text
+nodes: n1 DONE | n2 READY | n3 READY | n4 READY | n5 READY
+```
+
+**t3 — 4 workers each claim a leaf (true parallel).** The 3 sleepers wake; 4 READY nodes ↔ 4 workers → **`n2 n3 n4 n5` execute concurrently**, one LLM call each. **`peak.peak` hits 4.**
+
+**t4 — leaves finish → no READY and all DONE.** Each leaf `mark_done` → `DONE`; no downstream (leaves have no out-edges). When a worker sees `claim_ready_node → None` **and** `run_status != "running"` → it `return`s (`:101–102`). `asyncio.gather` joins all 4 → `run_graph` returns:
+
+```python
+{"wall_clock_s": 1.366, "peak_concurrency": 4, "nodes_done": 5}
+```
+
+Worker swimlane (parallel, concurrency=4) — the `par` block boxes the four concurrent leaf calls: that overlap *is* `peak_concurrency = 4`.
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'16px'}}}%%
+sequenceDiagram
+    participant W1
+    participant W2
+    participant W3
+    participant W4
+    participant S as GraphStore
+    participant L as oMLX
+    Note over W1,W4: t0 — all 4 workers call claim_ready_node
+    W1->>S: claim → n1 (READY→RUNNING)
+    W2->>S: claim → None
+    W3->>S: claim → None
+    W4->>S: claim → None
+    Note over W2,W4: poll-sleep (no READY node)
+    W1->>L: run n1 (root LLM)
+    L-->>W1: text + tokens
+    W1->>S: mark_done(n1) → promote n2..n5 PENDING→READY
+    Note over W1,W4: t3 — 4 leaves READY, each worker claims one
+    par peak_concurrency = 4 — leaves overlap
+        W1->>L: run n2
+    and
+        W2->>L: run n3
+    and
+        W3->>L: run n4
+    and
+        W4->>L: run n5
+    end
+    Note over W1,W4: all leaves mark_done → no READY + run not running → workers return → run done
+```
+
+`n1` (the root) runs **alone** first — the Amdahl serial bottleneck — while the other 3 workers `poll-sleep` (red bars: idle, no READY node). The instant `n1`'s `mark_done` promotes the leaves, all four workers fire `run nX LLM` in the same window (the overlapping `active` bars). DB state per tic:
+
+| tic | n1 | n2 | n3 | n4 | n5 | note |
+|---|---|---|---|---|---|---|
+| t0 | READY | PENDING | PENDING | PENDING | PENDING | only n1 claimable |
+| t1 | RUNNING | PENDING | PENDING | PENDING | PENDING | one worker runs n1; 3 idle |
+| t2 | DONE | READY | READY | READY | READY | `mark_done` promoted all 4 at once |
+| t3 | DONE | RUNNING | RUNNING | RUNNING | RUNNING | 4 workers, true parallel — peak 4 |
+| t4 | DONE | DONE | DONE | DONE | DONE | no READY + run not running → workers return |
+
+The t0 zoom — why only one worker takes `n1`: all 4 enter `claim_lock` (async, in-process, serializes entry → one at a time) which wraps `FileLock` (`flock`, cross-process) around `SELECT … status=READY ORDER BY name LIMIT 1` — which returns exactly one row. The first worker in wins `n1` (`READY→RUNNING`); the rest find no READY row → `None` → sleep-retry. **Both locks are on this path**: `claim_lock` is the fix for the shared-fd race (BCJ), `FileLock` is the cross-process double-claim guard.
+
+**Step 4 — observe durable state + cost (`:61–70`).**
+
+```python
+for name, status in sorted(store.node_states(run_id).items()):
+    print(f"  {name:10s} {status}")          # all DONE — read from the DB, not memory
+print("run status:", store.run_status(run_id))
+print("pool result:", result)
+print("cost report:", cm.cost_report(run_id))
+```
+
+Measured output (run `r_bc350dfff2be`, 2026-06-17, live oMLX):
+
+```text
+── final node states ──
+  n1         done
+  n2         done
+  n3         done
+  n4         done
+  n5         done
+
+run status: done
+pool result: {'wall_clock_s': 1.366, 'peak_concurrency': 4, 'nodes_done': 5}
+cost report: {'tokens_in': 185, 'tokens_out': 10, 'tokens_total': 195, 'usd_cloud_equivalent': 0.000188, ...}
+cost csv: /tmp/durable_demo_…/cost.csv
+```
+
+`node_states` and `cost_report` are read **from SQLite, not process memory** — proof the state is durable. The process can exit and the DB still holds the run: that is what "durable" means, and why every printed number is queryable rather than just logged.
+
+`★ Insight ─────────────────────────────────────`
+- **Three-tier decoupling runs through the whole trace: trigger (writes READY) → storage (state machine) → worker (executes).** `trigger_manually` writes state and returns immediately — it never touches the LLM; the model is only called once a worker claims a node (t1, t3). That seam is exactly why a crashed executor recovers: state is in the DB, so a fresh process re-runs `claim_ready_node` and continues (the bench's SIGKILL test proves this).
+- **Parallelism emerges from the state machine — you never schedule it.** The instant `n1` is DONE, `mark_done` promotes all 4 leaves to READY, and the 4 workers naturally each grab one. You only *declare* "leaves have no deps" in the DAG; `peak=4 = min(simultaneously-READY=4, workers=4)`. (The throughput math — wall ≈ root + slowest leaf — is in the fan-out subsection below.)
+- **Two locks, each on this path, doing different jobs.** `claim_lock` (asyncio, in-process) guards the shared `FileLock` fd against sibling-thread races; `FileLock` (`flock`, cross-process) guards against two *processes* double-claiming. The single-process demo only exercises the first; a multi-process drainer (the bench's `_child_drain`) exercises the second.
+- **Verifiability is the soul of the lab.** Step 4 reads `node_states` + `cost_report` back *from SQLite*, and every number is traceable — `cost.csv` is one row per `(node, attempt)`. "All DONE" and "195 tokens" aren't printed-and-trusted; they're queried from the durable store. That is measured engineering: the artifact, not the prose, is the source of truth.
 
 **Result:** `$PY examples/example_graph.py` (live oMLX) prints the created graph and its 5 node names, the manual trigger's `run_id`, all five nodes `DONE`, `run status: done`, a `pool result` with `peak_concurrency: 4` (the parallel fan-out), a `cost report` with `tokens_total: 195` and a small `usd_cloud_equivalent`, and the path to the exported `cost.csv`. Requires oMLX serving `Qwen2.5-Coder-7B-Instruct-MLX-4bit` on `:8000`.
 
