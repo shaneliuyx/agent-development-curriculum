@@ -294,12 +294,78 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 
 **Conditionality.** The architecture is corpus-agnostic; the *verdict* ("global hybrid wins, routing rejected") is not. Re-fire the selector on drift (built-in), re-run the calibrator on domain shift, and re-check the routing oracle if a future corpus is genuinely bimodal (e.g. a code corpus + a prose corpus where one arm is useless on half the queries). The loop signals when its own assumptions break.
 
+### Pattern 38 — Subagent Status Contract + Polling-Timeout Safety-Net (don't trust "RUNNING")
+
+**Rule.** When a parent spawns an **async/background** subagent, the subagent's terminal state must be a **closed, enumerated status contract** — not a free-form string parsed differently on each side — *and* the parent's poll loop needs its **own stuck-detector** that is independent of the task's own timeout, because a hung child can report `RUNNING` forever. **deer-flow (`contracts/subagent_status_contract.json` + `subagents/status_contract.py` + `task_tool.py`):** statuses are `completed / failed / cancelled / timed_out / polling_timed_out`, and `polling_timed_out` ("RUNNING for 15 min ⇒ assume stuck") is a *separate* timer from the task's `timed_out` (900 s). This is the production extension of W4.6's heartbeat watchdog from in-process workers to async subagents.
+
+**Sub-rule A — Stuck-detection ≠ task timeout (two independent timers).** The task timeout bounds *expected* work; the polling timeout catches a child that *lies* about being alive. One can't substitute for the other: a 900 s task that wedges at second 5 still says `RUNNING` for 895 s unless a separate poll-stuck timer fires.
+
+**Sub-rule B — Enumerate pre-execution failures too.** `unknown subagent type`, `host bash disabled by config`, `background task disappeared` — validate and return a clear `failed` status *before* spending tokens, not after. Fail fast with a contract-shaped error.
+
+**Sub-rule C — Make the contract a cross-boundary test fixture.** One JSON (status values + cases + `expected_status`) that *both* the producer (backend) and consumer (frontend/parent) load and must agree on — so the status field can't silently drift apart across the boundary.
+
+**Anti-pattern.** Trusting a child's `RUNNING` indefinitely (the canonical "stuck subagent burns the budget" failure); ad-hoc status strings each side parses with its own regex; reporting failure only *after* the spend that a pre-check would have caught.
+
+**See also:**
+- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — heartbeat watchdog (L0/L1/L2) + stall; this pattern is the lab phase extending it to async subagents (lab `src/subagent.py`; stuck child → `polling_timed_out` in **0.32 s** at `poll_timeout=0.3`; source: bytedance/deer-flow). Productionised mirror in the agentkit shared lib at `agentkit/runtime/subagent.py`.
+- Pattern 39 — fan-out cost aggregation (the other half of "don't let a fan-out run away").
+
+### Pattern 39 — Fan-out Cost Aggregation + Parent-Level Ceiling
+
+**Rule.** A fan-out (star / tree / mesh) must **aggregate every child's token/cost up to the parent** and enforce a **budget ceiling that aborts the whole fan-out** — per-child `max_tokens` does *not* bound the total, so N children at the per-child limit is an N× blow-up. **deer-flow (`subagents/token_collector.py`):** a collector sums subagent token usage to the parent run. The ceiling is checked against the running sum, not per child.
+
+**Sub-rule — Meter before AND during.** A pre-flight estimate gates the spawn (refuse a fan-out that can't fit the budget); a running sum aborts mid-flight when it crosses the ceiling. Both, because estimates are wrong and a single runaway child can blow a budget the estimate approved.
+
+**Anti-pattern.** Setting per-agent `max_tokens` and calling it budgeted — the classic-AutoGPT cost failure reappears at fan-out scale (one task, N parallel children, no parent-level sum, surprise bill).
+
+**See also:**
+- [[Week 11.6 - Production Tracing and Cost Telemetry]] — per-node cost; this adds the cross-subagent rollup + ceiling.
+- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — the fan-out shapes whose cost this bounds (source: deer-flow).
+
+### Pattern 40 — Tool-Error-as-Observation (errors are data, not exceptions)
+
+**Rule.** A tool or subagent exception must be **caught and reframed as a structured observation the model can act on** — never propagated as a crash, never silently swallowed. **deer-flow (`ToolErrorHandlingMiddleware`):** a tool raise becomes a message like *"Error: Tool 'task' failed with TypeError: …. Continue with available context, or choose an alternative tool."* — the agent reads it and recovers (picks another tool / replans) instead of dying.
+
+**Sub-rule — Include the error TYPE + a recovery hint; keep the raw error in the trace.** The model needs the type (to decide whether to retry vs switch tools) and an explicit "what to do next"; the audit log keeps the untruncated original (the framed message is for the model, the trace is for you).
+
+**Anti-pattern.** A tool exception aborting the whole run (one bad tool call kills an hour of work); OR catching it and returning `""` (the agent loops blind, never learning the tool failed). agentkit already frames tool output via `quarantine` + records `mark_failed`; this pattern is the *recovery-hint* half on the model-facing side.
+
+**See also:**
+- [[Week 7 - Tool Harness]] — the planned refinement home for this (source: deer-flow).
+- Pattern 41 — implement this as one middleware in the stack, not a per-tool try/except.
+
+### Pattern 41 — Cross-Cutting Concerns as Middleware + Provider Seam
+
+**Rule.** Guardrails, sandboxing, cost-metering, and error-handling are **cross-cutting** — implement each as a **middleware that wraps every tool/sandbox call**, behind a `Provider` Protocol, composed as an ordered stack — *not* as checks copy-pasted into each call site. **deer-flow (`guardrails/{middleware,provider}.py`, `sandbox/middleware.py`):** a guardrail provider and a sandbox middleware intercept calls uniformly; swapping the policy is a provider swap, not a code sweep.
+
+**Sub-rule — Order is part of the design.** The stack is `guardrail (allow/deny) → cost-check (budget) → execute → error-wrap (Pattern 40) → trace`. Each layer is independently testable and swappable; the order encodes the policy (deny before spend; wrap errors before they reach the trace).
+
+**Anti-pattern.** An allowlist / timeout / cost check hand-pasted at each tool call site — guaranteed to drift, leave gaps (the one call site someone forgot), and resist testing. This is the same DI discipline as agentkit's `Embedder`/`LLMClient`/`UrlChecker` seams, applied to *enforcement* rather than *capability*.
+
+**See also:**
+- [[Week 11.5 - Agent Security]] — guardrail policy; this is the architecture that delivers it uniformly.
+- [[Week 7 - Tool Harness]] — where tool middleware composes (source: deer-flow).
+
 **See also:**
 - Pattern 27 — Router Selects, Ensemble Unions; both can LOSE to the best single backend (the ceiling-first check operationalizes this)
 - Pattern 29 — Eval Integrity (the instrument shapes the result) — Sub-rule D is this applied to the generator
 - Pattern 30 — New Complexity Must A/B-Earn Its Keep — routing failed exactly this test
 - Pattern 33 — Route the READ assembly by question type; select, don't union — W3.5.96 *tested* per-query routing and rejected it on this corpus (Pattern 33's conditionality made concrete)
 - [[Week 3.5.96 - Self-Wiring Memory (GBrain)#Phase 9 — A corpus-adaptive search policy, tuned on a real golden eval set|W3.5.96 Phase 9]] — selector (`policy_eval.ts`), routing test (`route_eval.ts`), answer A/B (`answer_route_ab.py`), verifier (`verify_arch.py`)
+
+### Pattern 42 — Corruption-Safe Concurrent Artifact Writes (lock the RMW, atomic-publish the file)
+
+**Rule.** Two subagents writing the **same artifact** race two *distinct* ways that need *distinct* primitives: a **lost update** (two read-modify-write cycles interleave; the second clobbers the first with stale data) is fixed by serializing the whole RMW under a cross-process **file lock**; a **torn read** (a reader observes a half-written file) is fixed by **`os.replace` atomic publication** — which needs no lock at all. Use both; neither substitutes for the other. **deer-flow (sandbox file operations):** subagent deliverables are written through a locked, atomically-published path.
+
+**Sub-rule A — Atomic publish is filesystem-scoped.** The temp must live on the *target's own filesystem* (`tempfile.mkstemp(dir=target.parent, …)`), or `os.replace` silently degrades from an atomic rename to a non-atomic cross-device copy.
+
+**Sub-rule B — Unique temp per *call*, not per process.** A pid-scoped temp name (`f"{name}.{pid}.tmp"`) passes every single-threaded test and crashes the instant two threads share a process — both create the same temp, and one writer's rename races the other's away. (Observed live: W4.6 BCJ Entry 3, `FileNotFoundError`.) `mkstemp` gives a guaranteed-unique name.
+
+**Anti-pattern.** "Just add a lock" — fixes lost updates but still ships half-written files to readers. "Just write atomically" — fixes torn reads but still drops concurrent edits. Per-pid temp names — green in serial tests, crash under real concurrency.
+
+**See also:**
+- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — Phase 7 lab (`src/artifact_writer.py`; **locked 400/400 every run, unlocked ≈ 51/400 — ~349 lost**; source: bytedance/deer-flow) + BCJ Entry 3 (the pid-temp-collision bug). Reuses Phase 3's `FileLock` primitive for a second job.
+- Pattern 38 — Subagent Status Contract (the other deer-flow durability pattern labbed on W4.6).
 
 ## Meta-pattern: How these patterns interact
 

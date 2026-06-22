@@ -2441,6 +2441,336 @@ Parallelism happens because **multiple nodes are READY at once *and* there are e
 
 ---
 
+### Phase 6 — Subagent status contract + polling-timeout safety-net (deer-flow #1, added 2026-06-22)
+
+Goal: implement `src/subagent.py` — the **async-subagent** extension of this chapter's heartbeat watchdog. Phases 1–5 watch *in-process* workers; once a parent spawns a **background/async** subagent, the only signal it has is the child's self-report, and a wedged child reports `running` forever. The fix is two pieces: a **closed, enumerated status contract** (`parse_status`) parsed identically on both sides of the boundary, and `poll_until_terminal` — a poll loop with its **own** patience timer (`poll_timeout`) that is *independent* of the task's own budget, so a child that lies about being alive is still rescued. Pure stdlib, LLM-free, deterministic. Source: bytedance/deer-flow `subagents/status_contract.py` + `task_tool.py` (EDP Pattern 38).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  S["poll_until_terminal<br/>start = clock()"] --> P["poll()<br/>ask child for status"]
+  P --> C{"status in<br/>TERMINAL?"}
+  C -->|"yes"| RET["return SubagentResult<br/>(trust the child)"]
+  C -->|"no"| E{"elapsed gte<br/>poll_timeout?"}
+  E -->|"yes"| NET["return polling_timed_out<br/>(safety-net fires)"]
+  E -->|"no"| SL["sleep(interval)"]
+  SL --> P
+```
+
+**Code:** (`src/subagent.py` — the ENTIRE file: docstring, contract constants, `parse_status`, `SubagentResult`, `poll_until_terminal`, and the `_demo` self-check; verbatim)
+
+```python
+"""subagent.py — subagent status contract + polling-timeout safety-net.
+
+A parent that spawns an async/background subagent cannot trust the child's
+self-reported status forever: a hung child reports ``running`` indefinitely, and
+the task's *own* timeout never fires if the child simply lies about being alive.
+The fix (deer-flow `subagents/status_contract.py` + `task_tool.py`) is two
+independent timers — the task budget, and the *parent's* poll-loop patience —
+plus a **closed, enumerated status contract** parsed identically on both sides.
+
+This is the in-process lab version (W4.6): a fixed status vocabulary, a
+cross-boundary ``parse_status`` (the contract), and ``poll_until_terminal``
+which adds the polling-timeout SAFETY-NET on top of any "ask the child for its
+status" callable. Pure stdlib, LLM-free, deterministic — the same shape as the
+rest of this lab's durability primitives. The agentkit shared lib carries the
+productionised mirror at ``agentkit/runtime/subagent.py``.
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+# The closed status contract — both producer and consumer must agree on these.
+RUNNING = "running"
+COMPLETED = "completed"
+FAILED = "failed"
+CANCELLED = "cancelled"
+TIMED_OUT = "timed_out"                   # the task exceeded its OWN declared budget
+POLLING_TIMED_OUT = "polling_timed_out"   # parent's safety-net: still RUNNING, assumed stuck
+TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED, TIMED_OUT, POLLING_TIMED_OUT})
+
+# Prefix → status. deer-flow stamps status via these prefixes; the consumer falls
+# back to the same prefixes. One mapping, both sides — so it can't drift apart.
+_PREFIXES = (
+    ("task succeeded", COMPLETED),
+    ("task failed", FAILED),
+    ("task cancelled", CANCELLED),
+    ("task polling timed out", POLLING_TIMED_OUT),  # before "timed out" — longer match first
+    ("task timed out", TIMED_OUT),
+    ("error", FAILED),
+)
+
+
+def parse_status(text: str) -> str:
+    """Map a status line to a contract status (the cross-boundary parser).
+    Unknown / non-terminal text ⇒ ``running``."""
+    low = (text or "").strip().lower()
+    for prefix, status in _PREFIXES:
+        if low.startswith(prefix):
+            return status
+    return RUNNING
+
+
+@dataclass(frozen=True)
+class SubagentResult:
+    status: str        # one of TERMINAL
+    detail: str
+    elapsed_s: float
+
+
+def poll_until_terminal(
+    poll: Callable[[], tuple[str, str]],
+    *,
+    poll_timeout: float,
+    interval: float = 0.05,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> SubagentResult:
+    """Poll a background subagent until it reaches a terminal status, OR the
+    parent's patience (``poll_timeout``) runs out while it is still ``running``.
+
+    ``poll()`` returns ``(status, detail)`` where status is from the contract
+    (terminal) or ``running``. The SAFETY-NET: once we have been polling for
+    ``poll_timeout`` and the child still claims ``running``, we stop trusting it
+    and return ``polling_timed_out`` — the canonical "stuck subagent" rescue.
+
+    ``clock``/``sleep`` are injected so a test proves the safety-net with zero
+    real waiting (advance a fake clock); production uses the real ones.
+    """
+    start = clock()
+    while True:
+        status, detail = poll()
+        elapsed = clock() - start
+        if status in TERMINAL:
+            return SubagentResult(status, detail, elapsed)
+        if elapsed >= poll_timeout:
+            return SubagentResult(
+                POLLING_TIMED_OUT,
+                f"still RUNNING after {poll_timeout}s; assumed stuck",
+                elapsed,
+            )
+        sleep(interval)
+
+
+def _demo() -> None:
+    """Self-check — deterministic (injected clock; no real waiting)."""
+    assert parse_status("Task Succeeded. Result: ok") == COMPLETED
+    assert parse_status("Task polling timed out after 15 minutes") == POLLING_TIMED_OUT
+    assert parse_status("Task timed out. Error: 900 seconds") == TIMED_OUT
+    assert parse_status("Investigating ...") == RUNNING
+
+    t = [0.0]
+
+    def clk() -> float:
+        return t[0]
+
+    def slp(s: float) -> None:
+        t[0] += s
+
+    stuck = poll_until_terminal(lambda: (RUNNING, "wip"), poll_timeout=1.0,
+                                interval=0.1, clock=clk, sleep=slp)
+    assert stuck.status == POLLING_TIMED_OUT and stuck.elapsed_s >= 1.0, stuck
+
+    t[0] = 0.0
+    calls = [0]
+
+    def healthy() -> tuple[str, str]:
+        calls[0] += 1
+        return (COMPLETED, "done") if calls[0] >= 3 else (RUNNING, "wip")
+
+    ok = poll_until_terminal(healthy, poll_timeout=10.0, interval=0.1,
+                             clock=clk, sleep=slp)
+    assert ok.status == COMPLETED, ok
+    print("subagent._demo OK")
+
+
+if __name__ == "__main__":
+    _demo()
+```
+
+**Walkthrough:**
+
+**Block 1 — The contract is a closed set, not free-form strings.** `TERMINAL` enumerates exactly five end states; everything else means "still running." The crucial split is `timed_out` vs `polling_timed_out`: the first is the task overrunning its *own* declared budget (a child that honestly says "I hit 900 s"); the second is the *parent* giving up on a child that never transitions at all. Two distinct failure modes that ad-hoc code routinely conflates into one "timeout," losing the ability to tell "worked too long" from "wedged."
+
+**Block 2 — `parse_status` is one prefix map used on both sides.** deer-flow stamps a status line on the producer and re-parses it on the consumer; if each side hand-rolls its own regex, the field silently drifts. Here a single `_PREFIXES` tuple is the contract — ordered so the longer `"task polling timed out"` is tested *before* `"task timed out"`, otherwise the substring would mis-route the safety-net status to the budget status. Unknown / non-terminal text falls through to `running`, the safe default (keep polling rather than declare a phantom terminal).
+
+**Block 3 — `poll_until_terminal` is the safety-net, and the two timers are independent.** The loop has exactly two exits: a terminal status (trust the child) or `elapsed >= poll_timeout` while still `running` (stop trusting it). That second exit is the whole point — it is a timer the parent owns, decoupled from whatever budget the task declared. A 900 s task that wedges at second 5 still says `running` for 895 s unless this fires. `clock`/`sleep` are injected parameters so a test can advance a *fake* clock and prove the timeout logic with zero real waiting; production passes the real `time.monotonic`/`time.sleep`.
+
+**Result:** `tests/test_subagent.py` — **10 passed in 0.23 s**. A stuck child (always `running`) hits the safety-net → `polling_timed_out` in **0.32 s** at `poll_timeout=0.3` on real wall-clock; the same logic is proven deterministically with an injected fake clock (elapsed ≥ 1.0 s at `poll_timeout=1.0`, no real wait); a healthy child (terminal on the 3rd poll) returns `completed` and the safety-net never fires. Full table in the lab `RESULTS.md`. The agentkit shared lib carries the productionised mirror at `agentkit/runtime/subagent.py` (measured 0.31 s — same ~`poll_timeout` behaviour, host noise).
+
+`★ Insight ─────────────────────────────────────`
+- **One timer cannot detect an alive-but-stuck child.** The task budget bounds *expected* work; it says nothing about a child that hangs while still claiming `running`. You need a *second*, independent patience timer in the parent's poll loop — this is the async-subagent generalization of Phases 1–5's in-process heartbeat watchdog.
+- **A status contract is only safe if both sides load the same one.** The bug a shared `_PREFIXES` prevents is invisible: producer and consumer each "work" in isolation, then disagree at the boundary. Ordering matters too — longer match first, or `polling_timed_out` collapses into `timed_out`.
+- **Injected `clock`/`sleep` turn a timeout into a deterministic unit test.** Real-wall-clock timeout tests are slow and flaky; advancing a fake clock the injected `sleep` ticks proves the *exact* same branch in microseconds. The real-clock test then runs once, small (`poll_timeout=0.3`), purely to confirm the wiring.
+`─────────────────────────────────────────────────`
+
+---
+
+### Phase 7 — Corruption-safe artifact writes: concurrent-write lock + atomic publish (deer-flow #5, added 2026-06-22)
+
+Goal: implement `src/artifact_writer.py`. Phase 3's `FileLock` claims *nodes* atomically; the *other* use of a file lock in an agent runtime is protecting the **artifacts** subagents write. When two writers touch the same output file concurrently they race two *distinct* ways, each needing a *different* primitive: a **lost update** (two read-modify-write cycles interleave; the second clobbers the first with stale data) is fixed by serializing the whole RMW under a `FileLock`; a **torn read** (a reader sees a half-written file) is fixed by `os.replace` atomic publication, which needs no lock at all. You usually need both. Source: bytedance/deer-flow sandbox file operations (EDP Pattern 42).
+
+```mermaid
+%%{init: {'theme':'default', 'themeVariables': {'fontSize':'20px'}}}%%
+flowchart TD
+  WA["writer A<br/>read-modify-write"] --> L{"holds<br/>FileLock?"}
+  WB["writer B<br/>read-modify-write"] --> L
+  L -->|"no — interleave"| LOST["lost update<br/>(B clobbers A with stale data)"]
+  L -->|"yes — serialize"| ONE["one writer in the RMW"]
+  ONE --> AW["atomic_write<br/>mkstemp + os.replace"]
+  AW --> PUB["atomic publish<br/>(reader sees whole old or new, never torn)"]
+```
+
+**Code:** (`src/artifact_writer.py` — the ENTIRE file: docstring, `atomic_write`, `locked_update`, and the `_demo` self-check; verbatim)
+
+```python
+"""artifact_writer.py — corruption-safe artifact writes (deer-flow pattern #5).
+
+Phases 1–5 use `FileLock` to claim *nodes* atomically. The other use of a file
+lock in an agent runtime is protecting the **artifacts** subagents write: when
+two writers touch the same output file concurrently they race two distinct ways.
+
+  * **torn read** — a reader observes a half-written file (writer is mid-`write`).
+  * **lost update** — two read-modify-write cycles interleave; the second writer
+    overwrites the first's change with stale data it read before the write.
+
+The fixes are *different primitives*, and you usually need both:
+
+  * `os.replace` (atomic rename on POSIX) gives **atomic publication** — a reader
+    sees the whole old file or the whole new one, never a partial. Fixes torn
+    reads with NO lock.
+  * a cross-process `FileLock` around the *whole* read-modify-write fixes **lost
+    updates** — only one writer is inside the RMW at a time.
+
+A lock alone does not help a reader that opens the file mid-write; an atomic
+rename alone does not stop two RMW cycles from clobbering each other. deer-flow's
+sandbox file ops need both. Source: bytedance/deer-flow sandbox file operations.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+from pathlib import Path
+from typing import Callable
+
+from file_lock import FileLock
+
+
+def atomic_write(path: str, data: str) -> None:
+    """Publish `data` to `path` atomically: write a temp file, then rename.
+
+    `os.replace` is atomic, so a concurrent reader of `path` sees the old
+    contents or the new contents — never a half-written file. The temp file is
+    created with `tempfile.mkstemp` in the *target's directory* (same filesystem,
+    so the rename is atomic) with a UNIQUE name — pid-scoping is not enough, two
+    threads of one process would collide on the same temp and one rename would
+    race the other away.
+    """
+    p = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, p)  # atomic publish
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def locked_update(
+    path: str,
+    fn: Callable[[str | None], str],
+    *,
+    lock_path: str | None = None,
+    timeout: float = 10.0,
+) -> str:
+    """Read-modify-write `path` under a cross-process lock (no lost updates).
+
+    `fn(old)` receives the current contents (`None` if the file is absent) and
+    returns the new contents. The read, the compute, and the atomic write all
+    happen while holding `FileLock(lock_path)` — so two concurrent callers
+    serialize instead of clobbering each other. Returns the written contents.
+    """
+    lock_path = lock_path or f"{path}.lock"
+    lock = FileLock(lock_path)
+    lock.acquire(timeout=timeout)
+    try:
+        old = Path(path).read_text() if Path(path).exists() else None
+        new = fn(old)
+        atomic_write(path, new)
+        return new
+    finally:
+        lock.release()
+
+
+def _demo() -> None:
+    """Self-check — concurrent RMW: unlocked loses updates, locked does not."""
+    import tempfile
+    import threading
+    import time
+
+    def run(use_lock: bool, *, threads: int = 8, per: int = 50,
+            gap: float = 0.0005) -> int:
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "counter.txt")
+        atomic_write(path, "0")
+        lock_path = os.path.join(d, "counter.lock")
+
+        def bump_unlocked() -> None:
+            for _ in range(per):
+                old = int(Path(path).read_text())
+                time.sleep(gap)  # widen the read->write window so the race is real
+                atomic_write(path, str(old + 1))
+
+        def bump_locked() -> None:
+            for _ in range(per):
+                locked_update(path, lambda o: str(int(o or "0") + 1),
+                              lock_path=lock_path)
+
+        target = bump_locked if use_lock else bump_unlocked
+        ts = [threading.Thread(target=target) for _ in range(threads)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return int(Path(path).read_text())
+
+    expected = 8 * 50
+    locked = run(True)
+    unlocked = run(False)
+    assert locked == expected, f"locked lost updates: {locked} != {expected}"
+    assert unlocked < expected, f"unlocked should lose updates: {unlocked}"
+    print(f"artifact_writer._demo OK — locked={locked}/{expected}, "
+          f"unlocked={unlocked}/{expected} (lost {expected - unlocked})")
+
+
+if __name__ == "__main__":
+    _demo()
+```
+
+**Walkthrough:**
+
+**Block 1 — Two races, two primitives — and a lock does not fix both.** The headline is in the docstring: a concurrent-write bug is *either* a lost update *or* a torn read, and they need different fixes. Serializing writers (a `FileLock` around the RMW) stops lost updates but does nothing for a reader that opens the file mid-write; an atomic rename stops torn reads but does nothing to stop two RMW cycles clobbering each other. The naive instinct — "just add a lock" — fixes only half the problem.
+
+**Block 2 — `atomic_write` = unique temp + `os.replace`, and the bug that "pid-scoped temp" hides.** `os.replace` is atomic *only if the temp is on the same filesystem*, so the temp is created with `tempfile.mkstemp` in the **target's own directory**. The first draft named the temp `f"{name}.{pid}.tmp"` — and it crashed under threads: all threads of one process share a pid, so two writers collided on the *same* temp file and one's `os.replace` raced the other's away (`FileNotFoundError`). `mkstemp` gives a guaranteed-unique name per call — the correct idiom. The `except BaseException: unlink` cleans up a temp if the write fails, so a crash never leaks temp files into the artifact dir.
+
+**Block 3 — `locked_update` reuses Phase 3's primitive for a different job.** It wraps the *entire* read → compute → `atomic_write` in `FileLock(lock_path)`, so two callers serialize rather than interleave. Note the reuse: the exact same `FileLock` that Phase 3 used to claim a node atomically now protects an artifact write — one primitive, two distinct responsibilities (the node-claim lock is keyed on the run's claim file; the artifact lock is keyed per output path).
+
+**Result:** `tests/test_artifact_writer.py` — **3 passed in 0.22 s**. The `_demo`, run three times: **locked = 400/400 every run** (8 threads × 50 increments, zero lost); **unlocked = 51–52/400** (≈ 349 lost). The unlocked count is *non-deterministic by nature* (it is a race) but is reliably « 400 — the loss is the lesson, not a fixed number. The torn-read test races a reader against 200 big/small rewrites and asserts every observed file length is a *complete* value (`{1, 100000}`), never an in-between torn size. Full table in the lab `RESULTS.md`.
+
+`★ Insight ─────────────────────────────────────`
+- **"Add a lock" is half an answer.** Lost update and torn read are *different* failures; the lock fixes the first, atomic rename fixes the second. An artifact pipeline that only locks still ships half-written files to readers; one that only renames still drops concurrent edits.
+- **The temp-name bug only appears under real concurrency — which is why the test runs real threads.** A single-threaded "write temp, rename" looks correct forever. Pid-scoping the temp passes every serial test and crashes the instant two threads share a process. Running the concurrent demo is what surfaced it.
+- **`os.replace` atomicity is filesystem-scoped.** The temp must live on the *same* filesystem as the target (here: the target's own directory), or the "rename" silently degrades to a copy — which is not atomic. `mkstemp(dir=target.parent)` guarantees it.
+`─────────────────────────────────────────────────`
+
+---
+
 ## 5. Bad-Case Journal (IMPLEMENTED 2026-06-16)
 
 **Entry 1 — One shared `FileLock` instance corrupts under the async worker pool: `flock` raises `TypeError: argument must be an int`.**
@@ -2448,7 +2778,19 @@ Parallelism happens because **multiple nodes are READY at once *and* there are e
 *Root cause:* `GraphStore` exposes ONE shared `FileLock` instance (`store.lock`) whose fd is single-use — `release()` sets `self._fd = None`. Two sibling worker threads (workers run the claim via `asyncio.to_thread`) entered that same `FileLock` context manager concurrently: worker A's `release()` nulled the fd, and worker B then called `flock(None)`, which is not an int.
 *Fix:* Gate the claim with an in-process `asyncio.Lock` (`claim_lock`) in `run_graph`, so only one sibling thread is inside the shared instance at a time. The claim is already a serialization point by design (the store does `ORDER BY name LIMIT 1`), so gating it costs nothing. Cross-process safety still comes from the `FileLock`; the in-process lock only stops sibling threads in *this* process from entering the one shared instance. `mark_done`/`mark_failed` open their own connections and never touch the shared lock, so they stay fully concurrent.
 
-This is the only failure actually observed during the lab run (the bench ran zero retries and a single in-thread scheduler, so the retry-, cost-, and scheduler-related failure modes never fired). The additional failure modes this runtime is *designed against* — split status/event writes, a non-durable retry counter, cost-meter double-counting, and multi-scheduler cron drift — live in `ANTI-PATTERNS.md` as anticipated patterns; each graduates to §5 only if/when it is actually observed (e.g. via a future fault-injection run).
+**Entry 2 — A subagent reported `RUNNING` forever; the task timeout never fired; only the parent's polling-timeout safety-net rescued it.**
+*Symptom:* a background subagent that wedges keeps returning `running` on every poll. A parent that waits on the *task's own* timeout therefore waits forever — the child's self-report is the only signal, and a stuck child lies (it never transitions to a terminal status).
+*Root cause:* one timer cannot detect a child that is alive-but-stuck. The task budget bounds *expected* work; it says nothing about a child that hangs while still claiming `running`. The parent needs an **independent** patience timer.
+*Fix (deer-flow pattern; EDP Pattern 38):* `src/subagent.py` adds `poll_until_terminal` with a separate `poll_timeout` — once the parent has polled for `poll_timeout` and the child still says `running`, it stops trusting the child and returns `polling_timed_out`. Plus a closed, enumerated status contract (`parse_status`: `completed/failed/cancelled/timed_out/polling_timed_out`) parsed identically on both producer and consumer, so the status field cannot drift across the boundary.
+*Measured:* a stuck child (always `running`) → `polling_timed_out` in **0.32 s** at `poll_timeout=0.3` — the safety-net fires in ~`poll_timeout`, proven deterministically (injected clock, zero real wait) and on real wall-clock (`tests/test_subagent.py`, 10 passed). Source: bytedance/deer-flow `subagents/status_contract.py` + `task_tool.py`. (The agentkit shared lib carries the productionised mirror at `agentkit/runtime/subagent.py`.)
+
+**Entry 3 — Concurrent artifact writers crashed instead of cleanly losing updates: a pid-scoped temp file collided across threads.**
+*Symptom:* the first run of the concurrent-write demo threw `FileNotFoundError: ...counter.txt.<pid>.tmp -> counter.txt` and `ValueError: invalid literal for int() with base 10: ''` from the 8 writer threads. The "lost update" count was driven to 2/400 — but *by writers dying mid-write*, not by clean races. A test that "passed" (`unlocked < 400`) for entirely the wrong reason.
+*Root cause:* `atomic_write` named its temp `f"{name}.{pid}.tmp"`. All threads of one process share a pid, so two writers created the *same* temp path; writer A's `os.replace` moved it onto the target, then writer B's `os.replace` found its temp already gone → `FileNotFoundError`. A reader opening the file in that same window saw an empty value → `ValueError`.
+*Fix (deer-flow pattern #5; EDP Pattern 42):* `src/artifact_writer.py` creates the temp with `tempfile.mkstemp(dir=target.parent, …)` — a guaranteed-unique name per call, on the target's own filesystem so `os.replace` stays atomic — plus `except BaseException: unlink` cleanup so a failed write never leaks a temp. With that, unlocked writers cleanly *lose updates* (the real lesson) and locked writers lose none.
+*Measured:* after the fix, `tests/test_artifact_writer.py` — **3 passed in 0.22 s**; `_demo` over 3 runs: **locked = 400/400 every run, unlocked = 51–52/400** (≈ 349 lost; non-deterministic by nature but reliably « 400). Source: bytedance/deer-flow sandbox file operations.
+
+Entry 1 was the only failure observed during the *original* lab run; Entries 2 and 3 surfaced later, extending the runtime with deer-flow's subagent-status pattern (`src/subagent.py`) and concurrent-artifact-write pattern (`src/artifact_writer.py`). The bench ran zero retries and a single in-thread scheduler, so the retry-, cost-, and scheduler-related failure modes never fired). The additional failure modes this runtime is *designed against* — split status/event writes, a non-durable retry counter, cost-meter double-counting, and multi-scheduler cron drift — live in `ANTI-PATTERNS.md` as anticipated patterns; each graduates to §5 only if/when it is actually observed (e.g. via a future fault-injection run).
 
 ---
 
