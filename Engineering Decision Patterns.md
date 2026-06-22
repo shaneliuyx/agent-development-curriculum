@@ -396,6 +396,43 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 - [[Week 11 - System Design]] Concept 6 + the Exercise-1 retrieval-ACL checklist (the necessary-but-insufficient half) (source: deer-flow).
 - Pattern 38 — pre-execution failure enumeration (the fail-fast-before-spend move).
 
+### Pattern 45 — Group-Relative Experience Distillation (rank rollouts, keep the above-mean lesson; no weights)
+
+**Rule.** To make an experience/reflection memory *select* better lessons without fine-tuning, sample a **group of N rollouts** per task, score each with a verifier, and keep the natural-language lesson only from rollouts whose reward beats the **group mean** — GRPO's group-relative advantage $\hat{A}_i = (r_i - \mu_{\text{group}})/\sigma_{\text{group}}$, consumed by the prompt layer instead of an optimizer. **Youtu-agent (Training-Free GRPO, arXiv:2510.08191):** the same variance-reduction statistic that stabilizes RL, applied to text — the model stays frozen, the experience buffer is the policy.
+
+**Sub-rule — A lesson needs a comparison class, not just a post-mortem.** Plain Reflexion critiques one trajectory with no baseline, so a confidently-wrong lesson enters memory unchallenged. Group-relative ranking gives every lesson a baseline (the group mean); below-mean rollouts become "what not to do" counter-lessons.
+
+**Anti-pattern.** Reaching for weight-GRPO (LoRA + RL trainer infra) when textual distillation hasn't plateaued — paying GPU-hours for selection a prompt layer does for free. Inverse anti-pattern: assuming textual distillation lifts *capability* — it only reweights behaviors the frozen model already has; new capability still needs weights.
+
+**See also:**
+- [[Week 5.5 - Metacognition]] Theory Primer — Training-Free GRPO (the textual cousin) vs [[Week 9.5 - Agentic RL Fine-Tuning]] (weight-GRPO; same statistic, optimizer-consumed).
+- Pattern 29 — Eval Integrity (the verifier scoring the rollouts is the lever; a convenient verifier distills convenient lessons).
+
+### Pattern 46 — Auto-Tool-Gen Gated by an In-Loop Debugger (generation is cheap; the repair loop is the contract)
+
+**Rule.** When an agent generates its own tools, the load-bearing stage is not generation but **validation+repair**: draft schema → draft code → run in a **subprocess sandbox** → feed the traceback to an in-loop debugger agent that patches and re-runs until it executes once → only then emit as an MCP manifest and register. **Youtu-agent (auto-tool-generation):** query → schema → code → manifest, subprocess-validated, with a debugger agent in the loop. Schema-first fixes the contract before implementation.
+
+**Sub-rule — "Passed validation" is only as strong as the validation inputs.** Smoke inputs that miss the production distribution make a self-written tool a Pattern 29 failure in disguise. Side-effecting generated tools (write/pay/deploy) stay gated behind a human or a real suite; read-only tools are the safe auto-register entry point.
+
+**Anti-pattern.** Registering an LLM-drafted tool because it *looks* right (imports a nonexistent lib, mishandles the one edge case the agent hits) — hallucinated capability with zero executions behind it. The repair loop is what converts "plausible code" into "ran successfully at least once."
+
+**See also:**
+- [[Week 7 - Tool Harness]] Concept 7 (the five-stage pipeline) + Concept 5 (MCP manifest out).
+- [[Week 7.8 - Code-Agent Patterns AST Coverage Mocks]] — the same generate→measure→repair loop, run for test generation instead of tool generation.
+- Pattern 29 — Eval Integrity (convenient validation inputs = convenient pass).
+
+### Pattern 47 — Declarative Topology Composition (the multi-agent graph is config, not code)
+
+**Rule.** Compose a multi-agent topology — which agents, which edges, which models, which tools — from **declarative config** (YAML) rather than hand-wired code, so a new topology is a config file, not a code change. **Youtu-agent (Hydra `defaults` + `${oc.env:}`):** the whole agent graph is assembled from composable YAML groups with env-interpolated secrets; swapping STAR→MESH or adding a worker is a config edit the framework reads, not a new Python module.
+
+**Sub-rule — Config-composed ≠ config-toggled.** A boolean flag that picks between two hard-coded topologies is still code-defined. The pattern is true composition: the config *names the nodes and edges*, and the runtime builds the graph from that description (Hydra `defaults` lists, group overrides).
+
+**Anti-pattern.** Declarative-everything when the topology set is small and stable — a YAML DSL that reimplements Python with worse errors and no type-checking (config-as-system carries a real debuggability + onboarding tax). Code-defined topologies win when there are four shapes that rarely change; declarative wins when topologies are many, user-authored, or hot-swapped without a deploy.
+
+**See also:**
+- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] §2.5 (the 4-trigger × 6-topology design space, code-defined in `topologies.py`) — declarative composition is the config-side alternative.
+- agentkit `select_topology` (code/rule-based selection) — the same choose-a-topology decision, made in code.
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |

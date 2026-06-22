@@ -3,6 +3,7 @@ title: "Week 7 — Tool Harness"
 created: 2026-04-23
 updated: 2026-05-03
 tags: [agent, curriculum, week-7, tools, function-calling, runbook]
+updated: 2026-06-22
 companion_to: "Agent Development 3-Month Curriculum.md"
 lab_dir: "~/code/agent-prep/lab-07-tool-harness"
 estimated_time: "12–15 hours over 5–7 days"
@@ -192,6 +193,20 @@ The architecture matters because it generalizes the production-engineering patte
 The cost-benefit is workload-specific. For a research agent doing 8 sequential web searches, speculation cuts wall time roughly in half. For a coding agent where the next tool depends on the previous tool's exact output (read_file → modify based on contents → write_file), speculation hits 0% and burns 3× compute for nothing. The right move: instrument first, measure tool-call sequence predictability per workload, *then* decide whether speculation pays.
 
 > **Interview soundbite:** "PASTE is branch prediction for tool calls — speculate on the next 2–3 calls in parallel with the current one, discard wasted work. Cuts p95 by 30–50% on tool-heavy traces, at the cost of 2–3× compute. Only worth it for latency-critical paths where the workload's tool sequence is predictable enough that the speculator hits more than ~40% of the time. Otherwise it's pure compute waste."
+
+---
+
+### Concept 7 — Tools as generated artifacts: the auto-tool-gen pipeline
+
+Every concept above treats the tool set as **given** — hand-written, registered, validated. The frontier move (Youtu-agent, 2025) is to treat a tool as something the agent **generates on demand**: a missing-capability query becomes a new tool, written, validated, and registered inside the loop. (Design pattern: Engineering Decision Pattern 46.)
+
+The pipeline is five stages, each a gate in the same spirit as Concept 1: **query → schema → code → manifest → register**. (1) A capability gap is detected ("I need to compute IRR and have no tool for it"). (2) An LLM drafts the tool **schema** first — name, typed args, description — so the contract is fixed before implementation. (3) A second pass writes the **implementation** against that schema. (4) The candidate runs in a **subprocess sandbox** against generated smoke inputs; a stderr/exception trace is fed to an **in-loop debugger agent** that patches and re-runs — the same generate→measure→repair loop [[Week 7.8 - Code-Agent Patterns AST Coverage Mocks]] runs for *test* generation, retargeted to *tool* generation. (5) Only a tool that passes validation is emitted as an **MCP manifest** (Concept 5) and registered for use.
+
+Why the debugger agent is the load-bearing part, not the generation: an LLM writing a plausible-looking tool is easy and worthless — the failure mode is a tool that imports a nonexistent library or mishandles the one edge case the agent will actually hit. The subprocess-validate→repair loop is what converts "plausible code" into "code that ran successfully at least once," which is the minimum bar for putting a self-written tool on the agent's main path. Without it you have hallucinated capability; with it you have a tool with one real execution behind it.
+
+The honest ceiling: auto-generated tools are only as trustworthy as their validation inputs. A tool validated on smoke inputs that don't cover the production distribution is an eval-integrity failure (Engineering Decision Pattern 29) wearing a different hat — the tool "passed," but the test was convenient. Treat auto-tool-gen as a way to *draft* tools fast, gated by a human or a strong suite before anything with side effects (write, pay, deploy) gets registered. Read-only generated tools are the safe entry point.
+
+> **Interview soundbite:** "Auto-tool-gen is query→schema→code→manifest, but generation is the easy 20% — the load-bearing part is an in-loop debugger agent that runs the candidate in a subprocess and repairs it from the traceback until it executes once. Schema-first so the contract is fixed before code; MCP manifest out so it registers like any other tool. The trap is validating on convenient smoke inputs — that's eval-integrity failure in disguise, so side-effecting tools stay gated behind a human or a real test suite."
 
 ---
 

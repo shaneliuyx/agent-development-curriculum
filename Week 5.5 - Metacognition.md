@@ -1,7 +1,7 @@
 ---
 title: Week 5.5 - Metacognition (Reflexion + Self-Critique)
 created: 2026-04-30
-updated: 2026-05-14
+updated: 2026-06-22
 tags:
   - agent
   - metacognition
@@ -63,6 +63,18 @@ Both Reflexion and Self-Refine depend on the model's ability to evaluate its own
 - A human-in-the-loop signal sampled at low frequency.
 
 The verifier produces a scalar reward or a binary pass/fail signal. Reflexion uses this signal to decide whether to trigger a reflection pass. The quality of the verifier is the single biggest lever on Reflexion's downstream performance — covered in the Bad-Case Journal below.
+
+### Training-Free GRPO — Group-Relative Experience Distillation
+
+Reflexion writes one post-mortem per trajectory, self-generated and unranked. Training-Free GRPO (Youtu-agent, 2025; arXiv:2510.08191) sharpens *which* lessons survive by borrowing the ranking signal from GRPO — the RL workhorse fine-tuning method in [[Week 9.5 - Agentic RL Fine-Tuning|weight-GRPO]] — without touching a single weight. (Design pattern: Engineering Decision Pattern 45.)
+
+The move: for a task, sample a **group** of N rollouts (same prompt, temperature > 0). Score each with the verifier. Instead of computing a gradient, compute GRPO's group-relative advantage — each rollout's reward relative to the group — and keep the natural-language reasoning only from the **above-mean** rollouts, distilled into a compact textual "experience" appended to the episodic buffer. Below-mean rollouts contribute a "what not to do" counter-lesson. The buffer is the policy; the model is frozen.
+
+$$\hat{A}_i = \frac{r_i - \mu_{\text{group}}}{\sigma_{\text{group}}}$$
+
+Why this is *not* just Reflexion-with-N-samples: Reflexion's reflection has **no comparison class**, so a confidently-wrong post-mortem enters memory unchallenged (the verifier-quality lever in the Bad-Case Journal). Group-relative distillation gives every lesson a **baseline** — a lesson survives only if its rollout beat the group average, the same variance reduction GRPO uses to stabilize RL, applied to text instead of gradients.
+
+Why this is *not* weight-GRPO: the advantage $\hat{A}_i$ is computed identically, but consumed by a **retrieval/prompt** layer rather than an optimizer — no LoRA, no trainer infra, no GPU-hours. The trade is explicit: zero training cost and instant iteration, bought with a permanent inference tax (the experience buffer rides in every prompt) and a hard ceiling — you can only reweight behaviors the frozen model can *already* express; new capability still needs weights. This is the cheap rung of the same ladder [[Week 9.5 - Agentic RL Fine-Tuning|weight-GRPO]] climbs; reach for weights only when textual distillation plateaus.
 
 ### What This Is Not: W9 Faithfulness Checker
 
@@ -597,6 +609,8 @@ An additional constraint: metacognition is only worth the token cost if baseline
 
 - Anthropic. (2024). *Claude's extended thinking and self-critique in production agentic settings*. Anthropic Engineering Blog. https://www.anthropic.com/research
 
+- Youtu-agent Team (ByteDance). (2025). *Training-Free Group Relative Policy Optimization*. arXiv:2510.08191. https://arxiv.org/abs/2510.08191 — group-relative ranking of N rollouts distilled into a textual experience library; the weight-free cousin of [[Week 9.5 - Agentic RL Fine-Tuning|weight-GRPO]].
+
 ---
 
 ## Cross-References
@@ -604,6 +618,8 @@ An additional constraint: metacognition is only worth the token cost if baseline
 - **Builds on**: W4 ReAct From Scratch — Reflexion is ReAct plus inter-episode memory and a self-reflection module. All W4 primitives (Thought/Action/Observation loop, tool registry) carry forward unchanged.
 
 - **Distinguish from**: W9 Faithfulness Checker — W9 is a post-hoc external validator that audits final outputs against retrieved context. It does not participate in the agent's execution loop and does not influence retry behavior. Metacognition is inline: the reflection module fires during execution, writes to memory before the next trial begins, and directly shapes subsequent agent behavior.
+
+- **Distinguish from**: [[Week 9.5 - Agentic RL Fine-Tuning]] — W9.5's GRPO spends GPU-hours to move **weights** via group-relative advantage; Training-Free GRPO (this chapter's Theory Primer) reuses the identical group-relative ranking statistic but distills it into a **textual** experience buffer with zero gradient steps. Same statistic, different consumer (optimizer vs prompt layer); reach for weights only when textual distillation plateaus.
 
 - **Consumed by**: W11 System Design — when designing a production Reflexion deployment, you will need to make explicit architectural decisions about verifier placement (inline vs async), memory eviction policy (recency vs relevance), and cost guardrails (max-trials × avg-episode-cost must fit your latency and spend budget). W11 builds those decisions into a full system diagram.
 - **Cited by:** chapters that reference this chapter as a prerequisite or build-on; reverse links per Pattern 21 (Bidirectional Cross-Reference Invariant):
