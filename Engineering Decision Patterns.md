@@ -320,7 +320,7 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 
 **See also:**
 - [[Week 11.6 - Production Tracing and Cost Telemetry]] — per-node cost; this adds the cross-subagent rollup + ceiling.
-- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — the fan-out shapes whose cost this bounds (source: deer-flow).
+- [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — Phase 8 lab (`src/cost_ceiling.py`: `FanoutBudget` + `run_fanout`; uncapped 10×100 = **1000**, ceiling 350 → aborts on child 4, **spent 400, saved 600**; source: deer-flow). The fan-out shapes whose cost this bounds.
 
 ### Pattern 40 — Tool-Error-as-Observation (errors are data, not exceptions)
 
