@@ -331,7 +331,7 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 **Anti-pattern.** A tool exception aborting the whole run (one bad tool call kills an hour of work); OR catching it and returning `""` (the agent loops blind, never learning the tool failed). agentkit already frames tool output via `quarantine` + records `mark_failed`; this pattern is the *recovery-hint* half on the model-facing side.
 
 **See also:**
-- [[Week 7 - Tool Harness]] — the planned refinement home for this (source: deer-flow).
+- [[Week 7 - Tool Harness]] — **implemented** as Concept 4 (error-as-prompt) + Diagram 1c (error-recovery flow) + the `run()` loop (errors are tool results with a different payload shape); deer-flow's `ToolErrorHandlingMiddleware` is the convergent third source (alongside Claude Code `query.ts` and Codex `execpolicy`).
 - Pattern 41 — implement this as one middleware in the stack, not a per-tool try/except.
 
 ### Pattern 41 — Cross-Cutting Concerns as Middleware + Provider Seam
