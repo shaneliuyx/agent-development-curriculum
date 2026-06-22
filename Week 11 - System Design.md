@@ -265,6 +265,18 @@ The practical translation for a system design interview: when you describe a tea
 
 ---
 
+### Concept 6 — Two Production-Serving Concerns Beyond the Rubric: Streaming + Tenant Isolation
+
+Concepts 1–5 map to the scoring rubric. Two more concerns live one layer down — at the *serving* boundary — and a senior names them the moment a system-design question turns to "how do users actually hit this in production." Both are convergent patterns from bytedance/deer-flow's SuperAgent harness (see [[Engineering Decision Patterns]] Patterns 43–44).
+
+**Streaming partial output (don't block to completion).** A long-horizon agent that researches, calls tools, and writes can take tens of seconds to a terminal answer. Returning nothing until done is both a UX failure (the user assumes it hung) and an observability failure (you can't see where a slow run spends its time). The fix is to stream *partial* output — tokens, tool-call boundaries, intermediate reasoning steps — as they are produced (deer-flow's `stream_bridge`; SSE / chunked transfer / a websocket). The metric that matters is **time-to-first-token (TTFT)**, not just total latency: a 40-second run that streams its first token in 800 ms feels responsive; the same run that blocks for 40 s feels broken. Architecturally, streaming forces the harness to emit an event at every gate (tool start/end, model delta) rather than only at the end — which is the *same event spine* your tracing (W11.6) already needs, so the two reuse one event bus. Caveat: streaming and Pattern 38's polling-timeout safety-net are complementary — a stream that goes silent is exactly the "alive-but-stuck" signal the parent watches for.
+
+**Per-request tenant context isolation + pre-execution validation.** This chapter's retrieval section already covers ACL-aware *retrieval* isolation (namespace / metadata filter at query time — see the Exercise-1 checklist). The deer-flow addition is *harness-level*: every request carries a `user_context` (tenant id, permissions, quota) threaded through the *entire* agent run — memory reads/writes, sandbox file paths, tool credentials — and **validated before execution begins**, not after the spend. Without it a multi-tenant agent leaks across tenants in non-obvious ways: subagent A's scratch memory is visible to tenant B's run, or a tool reads a file path that wasn't scoped to the caller. The discipline is two-fold: (1) scope every stateful resource (memory namespace, sandbox dir, tool auth) *by* the `user_context`, so isolation is structural, not a filter someone might forget; (2) validate the request *before* the first tool runs (unknown tenant, missing permission, exhausted quota → fail fast with a contract-shaped error — the Pattern 38 Sub-rule B move), because validating after execution has already leaked or already spent.
+
+> **Interview soundbite:** "Two serving-layer concerns I'd name explicitly: stream partial output so TTFT is sub-second even when the full run takes 40 seconds — over the same event bus the tracing uses — and thread a per-request `user_context` through the whole run, validated before the first tool call, so memory, sandbox, and tool creds are tenant-scoped structurally, not by a filter someone forgets. Retrieval ACL filtering is necessary but not sufficient: cross-tenant leakage usually comes through the harness's own state, not the index."
+
+---
+
 ### Companion Texts — Gulli Cross-References
 
 - **[Gulli *Agentic Design Patterns* Ch 9 — Learning and Adaptation]** + **[Ch 18 — Guardrails/Safety]** + **[Ch 20 — Prioritization]** — senior-signal vocabulary for system-design rounds. ~60 min total
@@ -1681,6 +1693,7 @@ Most pragmatic shape for teams without GPU infra: run compute-light data-heavy s
 - **Ray Project (2024).** *Ray Serve docs.* docs.ray.io/en/latest/serve. Model routing, replica autoscaling, batching for LLM serving.
 - **KServe docs (2024).** kserve.github.io. K8s-native model serving for existing K8s clusters.
 - **Microsoft (2025-26).** *Agent Governance Toolkit.* github.com/microsoft/agent-governance-toolkit. Six governance dimensions.
+- **bytedance/deer-flow (2025).** github.com/bytedance/deer-flow. Production long-horizon SuperAgent harness; source for Concept 6's two serving-layer patterns — **streaming partial output** (`stream_bridge`; TTFT over total latency → [[Engineering Decision Patterns]] Pattern 43) and **per-request tenant `user_context` isolation + pre-execution validation** (→ Pattern 44, the harness-level complement to retrieval-ACL isolation).
 
 ---
 

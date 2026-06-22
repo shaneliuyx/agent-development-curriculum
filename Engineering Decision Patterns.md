@@ -367,6 +367,35 @@ The Bayesian framing: many triples = Bayesian model averaging (errors cancel); f
 - [[Week 4.6 - Durable Agent Runtime and Process Topologies]] — Phase 7 lab (`src/artifact_writer.py`; **locked 400/400 every run, unlocked ≈ 51/400 — ~349 lost**; source: bytedance/deer-flow) + BCJ Entry 3 (the pid-temp-collision bug). Reuses Phase 3's `FileLock` primitive for a second job.
 - Pattern 38 — Subagent Status Contract (the other deer-flow durability pattern labbed on W4.6).
 
+### Pattern 43 — Stream Partial Output (optimize TTFT, not just total latency)
+
+**Rule.** A long-horizon agent must **stream partial output** — tokens, tool-call boundaries, intermediate steps — as it produces them, never block until a terminal answer. The metric that matters is **time-to-first-token (TTFT)**, not total latency: a 40 s run that streams its first token in 800 ms feels responsive; the same run that blocks for 40 s reads as hung. **deer-flow (`stream_bridge`):** partial results are bridged to the client over a streaming channel (SSE / chunked / websocket) as they are generated.
+
+**Sub-rule — One event spine for streaming AND tracing.** Streaming forces the harness to emit an event at every gate (tool start/end, model delta); that is the *same* event stream your tracing/telemetry needs. Build one event bus, feed both — don't bolt on a separate ad-hoc emit path for the UI.
+
+**Sub-rule — Silence is a signal.** A stream that stalls is exactly the "alive-but-stuck" case Pattern 38's polling-timeout watches for; the two are complementary, not redundant.
+
+**Anti-pattern.** Block-to-completion (the user assumes it hung; you get zero visibility into where a slow run spends time); a UI-only emit path separate from the trace bus (they drift).
+
+**See also:**
+- [[Week 11 - System Design]] Concept 6 — serving-layer treatment (source: deer-flow).
+- [[Week 11.6 - Production Tracing and Cost Telemetry]] — the event bus streaming reuses.
+- Pattern 38 — a silent stream is the stuck-subagent signal.
+
+### Pattern 44 — Per-Request Tenant Context Isolation + Pre-Execution Validation
+
+**Rule.** In a multi-tenant agent, thread a per-request **`user_context`** (tenant id, permissions, quota) through the *entire* run — memory, sandbox paths, tool credentials — and **validate it before execution begins**. Retrieval ACL filtering is necessary but **not sufficient**: the agent's *own* state must be tenant-scoped structurally, or you leak across tenants through the harness, not the index. **deer-flow (`user_context` + pre-execution validation):** the request context is established and checked before any tool runs.
+
+**Sub-rule A — Scope state by context, don't filter after.** Memory namespace, sandbox dir, and tool auth are *keyed on* `user_context`, so isolation is structural — not a filter a future call site can forget.
+
+**Sub-rule B — Validate pre-execution (fail fast, contract-shaped).** Unknown tenant / missing permission / exhausted quota → return a clear `failed` *before* spending tokens (the same pre-execution enumeration as Pattern 38 Sub-rule B). Validating after execution has already leaked or already spent.
+
+**Anti-pattern.** Relying on retrieval ACL alone → cross-tenant leakage via subagent scratch memory, sandbox files, or shared tool creds; validating the request only after the run has touched state.
+
+**See also:**
+- [[Week 11 - System Design]] Concept 6 + the Exercise-1 retrieval-ACL checklist (the necessary-but-insufficient half) (source: deer-flow).
+- Pattern 38 — pre-execution failure enumeration (the fail-fast-before-spend move).
+
 ## Meta-pattern: How these patterns interact
 
 | Pattern | When in the work cycle | Prevents |
